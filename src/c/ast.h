@@ -26,6 +26,7 @@ typedef enum {
     AST_LIST,
     AST_ATTRSET,
     AST_SELECT,
+    AST_WITH,
 } AstKind;
 
 typedef struct Ast Ast;
@@ -87,6 +88,10 @@ struct Ast {
             const char *attr;
             size_t attr_len;
         } select; /* AST_SELECT */
+        struct {
+            Ast *attrs;
+            Ast *body;
+        } with1; /* AST_WITH */
     } as;
 };
 

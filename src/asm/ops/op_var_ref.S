@@ -18,6 +18,7 @@ asnix_op_var_ref:                       // a = depth, b = slot
     testq %rdx, %rdx
     jz .Lvar_ref_done
     movq ASNIX_ENV_OFF_UP(%rcx), %rcx
+    andq $-8, %rcx                      // mask off ASNIX_ENV_WITH_TAG in case this hop is a with-frame
     decq %rdx
     jmp .Lvar_ref_walk
 .Lvar_ref_done:

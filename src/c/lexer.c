@@ -36,7 +36,7 @@ typedef struct {
 static const Keyword KEYWORDS[] = {
     { "let", TOK_LET },     { "in", TOK_IN },     { "if", TOK_IF },
     { "then", TOK_THEN },   { "else", TOK_ELSE },  { "true", TOK_TRUE },
-    { "false", TOK_FALSE }, { "null", TOK_NULL },
+    { "false", TOK_FALSE }, { "null", TOK_NULL },  { "with", TOK_WITH },
 };
 
 Token *asnix_lex(const char *src, size_t *out_count) {
