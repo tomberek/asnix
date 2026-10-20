@@ -280,6 +280,16 @@ static Value build_isFunction(void) { return make_primop_value((void *)prim_isFu
 static Value build_isInt(void) { return make_primop_value((void *)prim_isInt, 1); }
 static Value build_isBool(void) { return make_primop_value((void *)prim_isBool, 1); }
 
+/* `builtins.nixVersion` -- a plain string constant, not a function (real
+ * Nix's is a build-time-baked version string, not computed). This
+ * `build()` slot doesn't require a PrimOp: it's called once, at
+ * `builtins`-attrset construction time, and whatever Value it returns is
+ * stored directly -- no wrapping needed for a non-callable constant.
+ * Reports the real Nix compat version installed on this dev machine
+ * (`nix-instantiate --version`), comfortably above any `>= "2.18"`-style
+ * nixpkgs/lib version gate. */
+static Value build_nixVersion(void) { return asnix_make_string_value("2.35.2", 6); }
+
 const AsnixBuiltinMiscDef ASNIX_BUILTINS_MISC[] = {
     { "substring", build_substring },
     { "stringLength", build_stringLength },
@@ -291,6 +301,7 @@ const AsnixBuiltinMiscDef ASNIX_BUILTINS_MISC[] = {
     { "isFunction", build_isFunction },
     { "isInt", build_isInt },
     { "isBool", build_isBool },
+    { "nixVersion", build_nixVersion },
 };
 
 const size_t ASNIX_BUILTINS_MISC_COUNT = sizeof(ASNIX_BUILTINS_MISC) / sizeof(ASNIX_BUILTINS_MISC[0]);
