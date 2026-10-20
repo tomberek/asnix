@@ -20,3 +20,4 @@ tests/c/test_daemon_client
 tests/ir/test_m6_fixtures
 tests/ir/test_m7_fixtures
 tests/c/test_hash_shim
+tests/asm/test_stacklimits

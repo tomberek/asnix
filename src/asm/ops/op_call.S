@@ -1,6 +1,7 @@
 #include "asnix/env.h"
 #include "asnix/heap.h"
 #include "asnix/ir.h"
+#include "asnix/stackcheck.h"
 #include "asnix/value.h"
 
     .section .rodata
@@ -52,6 +53,7 @@ asnix_op_call:                          // a = argc
     popq %rsi
 
     movq %r15, %r12                      // pop callee+args off VALSTACK in one shot
+    ASNIX_CHECK_VALSTACK %rcx            // %rcx dead (copied into %r15 earlier, never reread)
     movq %rax, (%r12)                    // push the primop's result
     addq $8, %r12
     addq $ASNIX_IROP_SIZE, %rsi
@@ -93,6 +95,7 @@ asnix_op_call:                          // a = argc
     popq %rcx                           // saved IP
     addq $ASNIX_IROP_SIZE, %rcx         // return_ip = saved IP past this CALL record
 
+    ASNIX_CHECK_RETSP %r8               // %r8 dead (held arity for the comparison above, unused since)
     movq %rcx, ASNIX_RETFRAME_OFF_IP(%r14)
     movq %rdx, ASNIX_RETFRAME_OFF_ENV(%r14)
     movq %r13, ASNIX_RETFRAME_OFF_POOL(%r14) // save the caller's constant pool too (see ir.h)

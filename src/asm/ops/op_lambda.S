@@ -1,4 +1,5 @@
 #include "asnix/ir.h"
+#include "asnix/stackcheck.h"
 #include "asnix/value.h"
 
     .text
@@ -31,6 +32,7 @@ asnix_op_lambda:                        // a = arity, b = pool index of {body Ir
 
     movq %rax, %rdx
     orq $ASNIX_TAG_CLOSURE, %rdx
+    ASNIX_CHECK_VALSTACK %rcx           // %rcx dead (held the pool index, unused since)
     movq %rdx, (%r12)
     addq $8, %r12
 

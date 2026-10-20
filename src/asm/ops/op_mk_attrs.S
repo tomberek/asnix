@@ -1,5 +1,6 @@
 #include "asnix/heap.h"
 #include "asnix/ir.h"
+#include "asnix/stackcheck.h"
 #include "asnix/value.h"
 
     .text
@@ -39,6 +40,11 @@ asnix_op_mk_attrs:                      // a = count, b = pool index of `count` 
 .Lop_mk_attrs_done:
     movq %rax, %rdx
     orq $ASNIX_TAG_ATTRS, %rdx
+    // Net effect of this op is a pop (count values replaced by 1 attrset),
+    // so this push can never actually exceed the cap -- checked anyway,
+    // same rationale as op_mk_list.S. %rcx == 0 here (fill loop above
+    // counts it down to zero).
+    ASNIX_CHECK_VALSTACK %rcx
     movq %rdx, (%r12)
     addq $8, %r12
 

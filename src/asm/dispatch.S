@@ -23,8 +23,18 @@
 // dispatch loop is ever re-entered after the first jump.
 #include "asnix/ir.h"
 
-    .equ ASNIX_VALSTACK_BYTES, 32768   // 4096 Values
-    .equ ASNIX_RETSTACK_BYTES, 4096    // 128 call frames (ASNIX_RETFRAME_SIZE=32 as of M6's force_target field)
+    // Sized generously and bounds-checked (see include/asnix/stackcheck.h)
+    // rather than grown dynamically, consistent with this project's
+    // never-free bump-arena philosophy -- a single fixed allocation per
+    // asnix_eval call, with a loud fatal abort if a pathological program
+    // (e.g. thousands of dependent nested `let` bindings, or a single
+    // huge list/attrset literal) ever exceeds it. Previously 32768/4096
+    // bytes (4096 Values / 128 call frames) with NO bounds check at all --
+    // silently corrupting whatever the arena allocated next past that
+    // point instead of failing loudly; see docs/architecture.md's "Known
+    // bugs" list.
+    .equ ASNIX_VALSTACK_BYTES, 8388608 // 1,048,576 Values, 8 MiB
+    .equ ASNIX_RETSTACK_BYTES, 2097152 // 65,536 call frames (ASNIX_RETFRAME_SIZE=32), 2 MiB
 
     .text
 
@@ -46,10 +56,14 @@ asnix_eval:                             // Value asnix_eval(IrProgram *prog, Env
     movq $ASNIX_VALSTACK_BYTES, %rdi
     call asnix_arena_alloc
     movq %rax, %r12                     // VALSTACK base
+    leaq ASNIX_VALSTACK_BYTES(%r12), %rcx
+    movq %rcx, asnix_valstack_limit(%rip) // one past the last valid Value slot
 
     movq $ASNIX_RETSTACK_BYTES, %rdi
     call asnix_arena_alloc
     movq %rax, %r14                     // RETSP base
+    leaq ASNIX_RETSTACK_BYTES(%r14), %rcx
+    movq %rcx, asnix_retsp_limit(%rip)  // one past the last valid RetFrame slot
 
     movq %rbx, %rcx                     // rcx = prog
     movq %rbp, %rdi                     // ENV = root_env

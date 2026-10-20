@@ -1,4 +1,5 @@
 #include "asnix/ir.h"
+#include "asnix/stackcheck.h"
 #include "asnix/value.h"
 
     .text
@@ -28,6 +29,7 @@ asnix_op_mk_thunk:                      // b = pool index of {body IrOp*, body p
 
     movq %rax, %rdx
     orq $ASNIX_TAG_THUNK, %rdx
+    ASNIX_CHECK_VALSTACK %rcx           // %rcx dead (held the pool index, unused since)
     movq %rdx, (%r12)
     addq $8, %r12
 
