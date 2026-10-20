@@ -11,6 +11,30 @@
 #include "symtab.h"
 #include "value_util.h"
 
+/* Prints a quoted, escaped string literal the way real `nix-instantiate
+ * --eval` does: `"` and `\` are backslash-escaped, `\n`/`\r`/`\t` print as
+ * their two-character escapes, everything else (including other control
+ * bytes -- not checked against real Nix beyond the five cases above, but
+ * not exercised by anything that currently produces them either) passes
+ * through verbatim. See Known Bugs entry below for why this exists: the
+ * original version of this function printed raw bytes between bare `"`s
+ * with no escaping at all. */
+static void print_escaped_string(const char *bytes, int64_t len) {
+    putchar('"');
+    for (int64_t i = 0; i < len; i++) {
+        char c = bytes[i];
+        switch (c) {
+            case '"': printf("\\\""); break;
+            case '\\': printf("\\\\"); break;
+            case '\n': printf("\\n"); break;
+            case '\r': printf("\\r"); break;
+            case '\t': printf("\\t"); break;
+            default: putchar(c);
+        }
+    }
+    putchar('"');
+}
+
 static void print_value_inner(Value v) {
     v = asnix_force_for_print(v); /* list elements and attrset values are lazy (M6) */
     switch (asnix_tag_of(v)) {
@@ -30,7 +54,7 @@ static void print_value_inner(Value v) {
             /* Paths print bare/unquoted (an absolute filesystem path, not
              * string syntax) -- matches `nix-instantiate --eval`. */
             if (asnix_value_is_path(v)) printf("%.*s", (int)len, bytes);
-            else printf("\"%.*s\"", (int)len, bytes);
+            else print_escaped_string(bytes, len);
             return;
         }
         case ASNIX_TAG_LIST: {

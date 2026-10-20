@@ -30,7 +30,8 @@ what's actually implemented and the scope decisions made along the way.
 | M15 — `import` + path literals (`src/c/eval_file.c`) | done, **scoped** (see below) |
 | M16 — `asnix_apply`, general re-entrant call-a-Value-from-C (`src/asm/apply.S`) | done (see below) |
 | M17 — builtins expansion (list/attrs/string/type-predicate) | done (see below) |
-| M18+ | not started |
+| M18 — `genericClosure` + second builtins-expansion pass | done, **scoped** (see below) |
+| M19+ | not started |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
 
@@ -1144,6 +1145,188 @@ curried-Closure chain rather than a single PrimOp) into
   already documented elsewhere in this file, confirmed by comparing the
   actual (forced) values through `foldl'` instead of the raw printed form.
 
+## M18 scope notes: `genericClosure` + second builtins-expansion pass
+
+Implements `builtins.genericClosure` (deliberately cut from M17, see that
+section's own note above) plus a survey-and-implement pass over other
+commonly-needed nixpkgs/`lib` staples still missing: `elem`, `any`, `all`,
+`concatMap`, `sort`, `lessThan`, `splitVersion`, `compareVersions`,
+`replaceStrings`, `stringToCharacters`, `toJSON`, `genList`, `foldl`,
+`foldr`, `partition`, `attrByPath`, `filterAttrs`, `listToAttrs`,
+`catAttrs`. `functionArgs` was surveyed and deliberately **not**
+implemented — see "Cut" below. `isFunction` (checked, not re-implemented)
+already existed per M17.
+
+- **New files**: `src/c/builtins_closure.c` (`genericClosure` alone, the
+  milestone's flagship feature — large enough to deserve its own
+  translation unit), `src/c/builtins_list2.c` (`elem`/`any`/`all`/
+  `concatMap`/`sort`/`genList`/`partition`/`foldl`/`foldr`/`catAttrs`),
+  `src/c/builtins_attrs2.c` (`filterAttrs`/`listToAttrs`/`attrByPath`),
+  `src/c/builtins_compare.c` (`lessThan`/`splitVersion`/`compareVersions`/
+  `replaceStrings`/`stringToCharacters`/`toJSON`) — one file per feature
+  batch, matching M17's established per-module convention, even though
+  (unlike M17's three parallel agents) one agent wrote all four of these
+  at once; see the next bullet for why that still didn't mean reusing
+  M17's "don't share, duplicate instead" policy outright.
+- **`src/c/builtins_shared.{h,c}`, a new exception to M17's own "each
+  module duplicates its own small helpers" rule**: M17's three sibling
+  modules each deliberately *re-declared* tiny helpers like
+  `make_primop_value`/list-and-attrs raw accessors instead of sharing
+  them, specifically so three agents working in parallel never collided
+  on one shared file. That reason doesn't apply when one agent writes
+  four new modules in the same pass — four-way duplication of
+  `builtins_misc.c`'s `make_curried_native` (needed by nearly every
+  builtin added here, since almost all of them are arity ≥2) plus a dozen
+  tiny List/Attrs accessors would be pure, unmotivated duplication. One
+  precedent for sharing already existed (`builtins_attrs.h` includes
+  `builtins_list.h` for the `AsnixPrimFn`/`AsnixBuiltinDef` shape rather
+  than redefining it) — `builtins_shared.h` is that same judgment call
+  applied further: `asnix_bshared_make_curried_native` (ported from
+  `builtins_misc.c`), `asnix_bshared_apply2`, List/Attrs raw accessors,
+  `asnix_bshared_make_attrs` (sorts by sym id in place — several new
+  builtins build an attrset from freshly-interned symbols whose relative
+  sym-id order isn't known in advance, unlike `removeAttrs`/`mapAttrs`
+  which only ever inherit order from an already-sorted input), and two
+  new comparison primitives (`asnix_bshared_value_eq`/`_value_lt`, see
+  below).
+- **Registration**: `asnix_make_builtins_attrs` (`builtins.c`) now merges
+  *nine* sources instead of M17's four — rewritten to loop over two small
+  tables-of-tables (one per shape: the plain `{name,fn,arity}` shape, and
+  the `{name,build()}` shape `builtins_misc.c` introduced) rather than
+  hand-repeating the same four-line block a ninth time.
+- **Currying**: every new arity≥2 builtin here uses
+  `asnix_bshared_make_curried_native` uniformly (a curried Closure chain,
+  same mechanism `builtins_misc.c`'s `substring`/`concatStringsSep`
+  established) — including the ones that would fit M17's other curry
+  pattern (`build_curry2_body`, a cheaper 2-level-only PrimOp-based
+  trick) just as well, since several of this pass's builtins are
+  genuinely arity 3 (`attrByPath`, `replaceStrings`, `foldl`, `foldr`),
+  and using one mechanism for everything was simpler than carrying two.
+- **`genericClosure`**: real signature `genericClosure { startSet; operator;
+  }`, arity 1 (no currying needed). Semantics verified directly against
+  real `nix-instantiate --eval` (2.35.2) before writing any code — see
+  `builtins_closure.c`'s header comment for the exact scenarios checked
+  (breadth-first worklist order, not depth-first; dedup by `key` happens
+  when an item is *popped*, not when it's *pushed*, so an `operator` that
+  re-produces an already-seen key is silently dropped rather than
+  re-visited; non-`key` fields are preserved verbatim in the output).
+  Implemented as a plain dynamic-array FIFO queue plus a linear-scan
+  seen-keys list (not real Nix's `std::map`-backed dedup) — see "Cut"
+  below for why equality, not a full ordering, is enough here.
+- **Cut: `functionArgs`**. Surveyed, not implemented. Real Nix's
+  `functionArgs f` returns `{fieldName = hasDefault; ...}` for a
+  pattern-destructured lambda (`{a, b ? 1}: ...`) and `{}` for a plain
+  lambda or any primop. This project's Closure heap object
+  (`{up;body;arity;pool}`, `ir.h`) has no formals-metadata field at all —
+  M14's lambda-patterns milestone deliberately desugars `{a, b ? 1}: body`
+  entirely at compile time into synthetic `OP_CHECK_FORMALS`/
+  `OP_FRAME_ALLOC` IR (see that section above), so by the time a Closure
+  exists at runtime there is no retained list of field names anywhere to
+  read back. Correctly implementing `functionArgs` would need a real
+  representation change (a new field on `ASNIX_CLOSURE_*`, threaded
+  through `compiler.c`'s `AST_LAMBDA` case and `ir.h`), not a builtins-
+  side addition — and returning `{}` unconditionally (the only thing
+  implementable without that change) would be observably *wrong* for
+  every pattern-lambda, not just narrower than real Nix, so it was left
+  out rather than shipped half-right. A genuine follow-up, in the same
+  spirit as M4.5's own "lambdas/calls deferred" cut.
+- **Not core Nix builtins, added under `builtins` anyway**: `attrByPath`,
+  `stringToCharacters`, `foldl`, `foldr` are confirmed *not* present in
+  real Nix's `builtins` (`builtins ? attrByPath` etc. all report `false`
+  on `nix-instantiate` 2.35.2) — they're nixpkgs `lib` functions
+  (`lib.attrByPath`, `lib.stringToCharacters`, `lib.foldl`, `lib.foldr`).
+  Added here as `builtins.attrByPath` etc. anyway, since this project has
+  no "with lib" (or even "with builtins") root scope the way real Nix
+  programs reach `lib` at all (`m7_builtin_as_value.nix`'s own
+  `builtins.toString`-only convention, unchanged) — everything useful has
+  to live directly under `builtins` here or not be reachable at all.
+  `filterAttrs`/`sort`/`lessThan`/`elem`/`any`/`all`/`concatMap`/
+  `partition`/`genList`/`catAttrs`/`listToAttrs`/`splitVersion`/
+  `compareVersions`/`replaceStrings`/`toJSON` *are* all real
+  `builtins.*` entries on this Nix version — confirmed individually via
+  `builtins ? <name>`, not assumed from memory.
+- **`splitVersion`/`compareVersions` ported line-for-line from
+  `~/nix/src/libstore/names.cc`'s `nextComponent`/`componentsLT`/
+  `compareVersions`** — same "port from the real source, don't guess"
+  discipline `base32.c`/`store_path.c` already established (M8), needed
+  here because this algorithm has several genuinely non-obvious rules a
+  from-the-manual reimplementation would likely miss (`"1pre" < "1"`,
+  `"1.0" > "1"`, `"1.2.3" < "1.2.3abc"`, a digit/non-digit transition
+  splits a component even with no explicit `.`/`-` separator present —
+  see `builtins_compare.c`'s header comment for every case individually
+  checked against real `nix-instantiate --eval` before trusting the
+  port). `replaceStrings` is likewise ported line-for-line from
+  `~/nix/src/libexpr/primops.cc`'s `prim_replaceStrings` (first-match-in-
+  list-order at each scan position, not longest-match; an empty `from`
+  entry advances by one character instead of looping forever).
+- **`elem`/`genericClosure`'s dedup equality, and `lessThan`/`sort`'s
+  ordering, both deliberately widen one existing documented scope cut
+  by a controlled amount, rather than leaving it as-is or fully lifting
+  it**: the `==` operator (`op_cmp.S`, see the Operators section above)
+  falls back to pointer identity for every non-INT/IMM tag, including
+  strings — two separate same-content string literals are `false` there.
+  `asnix_bshared_value_eq` (`builtins_shared.c`) upgrades *just* strings
+  to real content equality (the bytes are already in hand; every
+  consumer below needs correct string-keyed dedup to be useful at all —
+  `elem "a" ["a"]`/`genericClosure` keyed by derivation-name-shaped
+  strings are the overwhelmingly common real cases), while still falling
+  back to pointer identity for lists/attrsets/closures/primops/thunks —
+  deep structural equality on those remains exactly as un-implemented as
+  `==` itself already documents. Similarly, `<`/`>` (`op_cmp.S`) is
+  INT-only; `asnix_bshared_value_lt` (used by `lessThan`/`sort`) adds
+  string-vs-string lexicographic ordering on top (so `sort
+  builtins.lessThan` is actually useful on the string lists real callers
+  have) but still rejects paths/lists/attrsets, matching real Nix's
+  broader `CompareValues` only partially, by design, not by oversight.
+  `genericClosure`'s own dedup uses equality (a linear scan), not real
+  Nix's `std::map`-with-a-comparator approach, specifically so it never
+  needs a full ordering over int/string/bool/null/list/attrs keys this
+  project doesn't have anyway — observably identical to real Nix for
+  every case that doesn't mix incomparable key types, which is the
+  common case (string or int keys, never mixed).
+- **`toJSON` kept in scope, not cut** (the task flagged it as a candidate
+  rabbit hole worth skipping if it turned out to be one) — recursive,
+  compact (no whitespace) JSON serialization of
+  int/bool/null/string/list/attrset, with alphabetically-sorted attrset
+  keys (matching real Nix's `lexicographicOrder`, and this project's own
+  existing attrset-printer convention) and standard JSON string escaping
+  (`\" \\ \b \f \n \r \t`, other control bytes as `\u00XX`, everything
+  else passed through unescaped — matching `nlohmann::json::dump()`'s
+  default, which is what real Nix's `value-to-json.cc` actually uses
+  under the hood). Functions/primops are rejected (`"cannot convert a
+  function to JSON"`, matching real Nix). A `Path` argument's bytes are
+  emitted as plain text, not copied into the Nix store the way real
+  Nix's `toJSON` does — the same already-accepted, already-documented
+  string-context/`AddToStore` gap `toString` and `"${path}"`
+  interpolation both already have (see M8/M15's scope notes above), not
+  a new divergence introduced here.
+- **Verified against real `nix-instantiate --eval`/`nix-instantiate
+  --eval --strict`** (2.35.2) for every builtin added, independently of
+  whatever this section's own prose claims — see each new module's
+  per-builtin comments for the exact commands, and
+  `tests/e2e/m18_*.nix`/`.expected` for the on-disk fixtures (20 pairs,
+  one or more per builtin, including three dedicated to `genericClosure`:
+  breadth-first ordering, dedup when `operator` re-produces an
+  already-seen key, and non-`key` fields surviving round-trip).
+  `tests/c/test_builtins_m18.c` additionally exercises a representative
+  subset through the real `asnix_eval`/`OP_CALL` dispatch loop (not by
+  calling the native C functions directly), with its own dedicated
+  `genericClosure` BFS+dedup fixture built from a hand-written native C
+  "operator" standing in for a user lambda (same idiom
+  `tests/c/test_builtins_list.c` already established for `map`/`filter`).
+- **A real bug found along the way, in pre-existing M5-era code, not in
+  anything added this pass** — see Known Bugs entry #15 below: the
+  top-level printer (`main.c`) never escaped `"`/`\`/control characters
+  inside a printed string value. Nothing before this pass routinely
+  produced string *values* containing an embedded quote or backslash
+  worth round-tripping through the printer and comparing byte-for-byte
+  against real Nix, so the gap had gone unnoticed; `toJSON`'s typical
+  output (a string containing lots of both) made it immediately visible.
+  Fixed in `main.c` only; see that entry for the fix and the four
+  pre-existing `tests/e2e/str_indented_*.expected` fixtures it required
+  updating (their old expected output had baked in the bug — a raw,
+  unescaped embedded newline — not real Nix's actual behavior).
+
 ## Known bugs found and fixed during implementation (worth knowing about)
 
 1. **Register corruption across `asnix_eval`** (M3): `op_let.S`/
@@ -1376,3 +1559,30 @@ curried-Closure chain rather than a single PrimOp) into
    actually matches `<name...>`, otherwise falling through unchanged to
    ordinary operator lexing. Verified directly (`1 < 2` -> `true`, `2 < 1`
    -> `false`) after the fix.
+15. **The top-level printer never escaped quotes, backslashes, or control
+   characters inside a printed string value** (M5-era bug, found while
+   adding `builtins.toJSON` in M18 -- `toJSON`'s typical output is a
+   string containing lots of both `"` and `\`, which is what finally made
+   this visible; no builtin before `toJSON` routinely produced a *string
+   value* worth round-tripping through the printer and comparing against
+   real Nix byte-for-byte). `main.c`'s `print_value_inner` printed an
+   `ASNIX_TAG_PTR` string as `printf("\"%.*s\"", len, bytes)` -- the raw
+   bytes, verbatim, between two bare quote characters, with no escaping
+   at all. Reproduced directly: `"a\"b\\c"` printed as `"a"b\c"` (a
+   syntactically broken, mis-quoted result) instead of real Nix's
+   `"a\"b\\c"`; a string containing a literal newline printed the raw
+   newline instead of `\n`. Fixed by adding `print_escaped_string`
+   (escapes `"`, `\`, `\n`, `\r`, `\t` the same two-character way real
+   Nix's own value printer does; every other byte passes through
+   verbatim, matching every case checked). This is a real, independently
+   confirmed divergence from real Nix, not a cosmetic nit: a value
+   containing a literal `"` previously printed as text that doesn't even
+   round-trip back through this project's own lexer. Required updating
+   four pre-existing `tests/e2e/str_indented_*.expected` fixtures whose
+   recorded "expected" output had a literal, unescaped newline baked in
+   (matching the bug, not real Nix -- re-verified against a fresh
+   `nix-instantiate --eval` for all four before changing anything, per
+   this project's standing "the test failing isn't automatically the
+   code being wrong, check which one it actually is" discipline, this
+   time applied to the test fixtures' own prior-recorded expectations
+   rather than the implementation).
