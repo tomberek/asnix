@@ -1,0 +1,15 @@
+Benchmark 1: asnix
+  Time (mean ± σ):     981.8 µs ± 431.9 µs    [User: 263.8 µs, System: 526.1 µs]
+  Range (min … max):   498.9 µs … 6201.1 µs    3651 runs
+ 
+  Warning: Statistical outliers were detected. Consider re-running this benchmark on a quiet system without any interferences from other programs. It might help to use the '--warmup' or '--prepare' options.
+ 
+Benchmark 2: nix-instantiate
+  Time (mean ± σ):      73.5 ms ±  94.0 ms    [User: 33.6 ms, System: 27.0 ms]
+  Range (min … max):    37.6 ms … 613.1 ms    57 runs
+ 
+  Warning: Statistical outliers were detected. Consider re-running this benchmark on a quiet system without any interferences from other programs. It might help to use the '--warmup' or '--prepare' options.
+ 
+Summary
+  asnix ran
+   74.84 ± 101.25 times faster than nix-instantiate
