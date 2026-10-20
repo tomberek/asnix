@@ -26,9 +26,19 @@ typedef enum {
     AST_LIST,
     AST_ATTRSET,
     AST_SELECT,
+    AST_HAS_ATTR,
 } AstKind;
 
 typedef struct Ast Ast;
+
+/* One formal in a lambda-pattern (`{a, b ? default, ...}: body`) parameter
+ * list. Plain-malloc'd, same rationale as AstBinding above. `default_`
+ * is NULL for a required field (no `? expr`). */
+typedef struct {
+    const char *name;
+    size_t name_len;
+    Ast *default_;
+} AstFormal;
 
 /* One `name = value;` binding in an AST_ATTRSET literal. Plain-malloc'd
  * (not arena-allocated): it's a compile-time-only auxiliary array, not
@@ -59,9 +69,21 @@ struct Ast {
             Ast *cond, *then_, *else_;
         } if1; /* AST_IF */
         struct {
-            const char *param;
+            const char *param;    /* plain-identifier form (`a: body`); unused when is_pattern */
             size_t param_len;
             Ast *body;
+            int is_pattern;        /* 1 for `{...}: body` / `{...}@n: body` / `n@{...}: body` */
+            /* Pattern-only fields below (see docs/architecture.md's lambda-patterns
+             * notes): a destructuring lambda is still arity-1 at the OP_CALL ABI
+             * level -- the compiler desugars the pattern into synthetic
+             * AST_IF/AST_HAS_ATTR/AST_SELECT nodes over the one real attrset
+             * argument (see compiler.c's AST_LAMBDA case). */
+            AstFormal *formals;
+            size_t formals_count;
+            int has_ellipsis;      /* `...` present: extra fields beyond `formals` are allowed */
+            int has_as_name;       /* an `@name` alias was given, either position */
+            const char *as_name;
+            size_t as_name_len;
         } lambda; /* AST_LAMBDA */
         struct {
             Ast *fn, *arg;
@@ -87,6 +109,11 @@ struct Ast {
             const char *attr;
             size_t attr_len;
         } select; /* AST_SELECT */
+        struct {
+            Ast *target;
+            const char *attr;
+            size_t attr_len;
+        } has_attr; /* AST_HAS_ATTR: `target ? attr` */
     } as;
 };
 

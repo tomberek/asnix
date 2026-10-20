@@ -103,6 +103,12 @@ Token *asnix_lex(const char *src, size_t *out_count) {
             continue;
         }
 
+        if (c == '.' && src[i + 1] == '.' && src[i + 2] == '.') {
+            push_tok(&v, (Token){ .kind = TOK_ELLIPSIS });
+            i += 3;
+            continue;
+        }
+
         TokKind single;
         switch (c) {
             case '+': single = TOK_PLUS; break;
@@ -118,6 +124,9 @@ Token *asnix_lex(const char *src, size_t *out_count) {
             case '}': single = TOK_RBRACE; break;
             case '[': single = TOK_LBRACKET; break;
             case ']': single = TOK_RBRACKET; break;
+            case '?': single = TOK_QUESTION; break;
+            case ',': single = TOK_COMMA; break;
+            case '@': single = TOK_AT; break;
             default:
                 fprintf(stderr, "asnix: unrecognized character '%c' in source\n", c);
                 exit(1);

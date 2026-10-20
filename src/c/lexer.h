@@ -29,6 +29,10 @@ typedef enum {
     TOK_LBRACKET,
     TOK_RBRACKET,
     TOK_STRING,
+    TOK_QUESTION,  /* '?' -- has-attr operator / lambda-pattern default marker */
+    TOK_COMMA,     /* ',' -- lambda-pattern formal separator */
+    TOK_AT,        /* '@' -- lambda-pattern whole-arg alias (`n@{...}` / `{...}@n`) */
+    TOK_ELLIPSIS,  /* '...' -- lambda-pattern "allow extra fields" marker */
     TOK_EOF,
 } TokKind;
 

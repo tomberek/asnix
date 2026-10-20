@@ -105,6 +105,28 @@ enum {
     OP_MK_ATTRS,   /* M5: a = count, b = pool index of `count` sorted symbol ids */
     OP_SELECT,     /* M5: a = symbol id; pops an Attrs, pushes the matching value or aborts */
     OP_MK_THUNK,   /* M6: b = pool index of {body IrOp*, body pool} -- see OP_LAMBDA's note */
+    OP_HAS_ATTR,   /* lambda-patterns: a = symbol id; pops a value, pushes TRUE/FALSE --
+                     * FALSE (not a fatal error) if the value isn't even an Attrs, matching
+                     * real Nix's `expr ? attr` operator. Never forces the matched entry's
+                     * value (membership-only; see op_has_attr.S). */
+    OP_CHECK_FORMALS, /* lambda-patterns: a = required-field count, b = pool index -- see
+                        * ib_check_formals()/op_check_formals.S for the exact pool layout.
+                        * Pops an Attrs (fatal if not one), eagerly validates every required
+                        * field is present and (unless the pattern had `...`) every given
+                        * field is declared, then pushes nothing back -- mirrors real Nix's
+                        * eager (not lazy) argument-pattern validation. */
+    OP_FRAME_NEW,     /* lambda-patterns: a = nslots; allocates a new Env frame (up = current
+                        * ENV) with all slots still unbound, and makes it the current ENV --
+                        * does NOT touch VALSTACK. Paired with OP_FRAME_BIND_SLOT below so a
+                        * pattern's per-field thunks can all capture this *same* frame as
+                        * their scope before any of its slots are filled in, giving the
+                        * fields letrec-style mutual/forward visibility (the "allocate the
+                        * frame before constructing the thunks" fix docs/architecture.md's M6
+                        * notes describe for `let`, applied narrowly here instead of to
+                        * general `let`/attrset bindings). */
+    OP_FRAME_BIND_SLOT, /* lambda-patterns: a = slot index; pops one value off VALSTACK and
+                          * stores it into the *current* ENV frame's values[a] -- no
+                          * allocation, unlike OP_LET/OP_FRAME_NEW. */
     OP_COUNT
 };
 

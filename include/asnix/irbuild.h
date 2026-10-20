@@ -56,6 +56,31 @@ size_t ib_select(IrBuilder *b, uint32_t sym);
  * runs -- same pool-travels-with-it rationale as ib_lambda. */
 size_t ib_mk_thunk(IrBuilder *b, IrProgram *body_prog);
 
+/* Lambda-patterns: pops a value, pushes TRUE/FALSE -- see op_has_attr.S. */
+size_t ib_has_attr(IrBuilder *b, uint32_t sym);
+
+/* Lambda-patterns: eager pre-destructuring validation of the call argument
+ * (see op_check_formals.S for the exact semantics and pool layout).
+ * `required_syms_sorted` must have `required_count` entries, sorted
+ * ascending. `all_syms_sorted` is read (and must have `total_count`
+ * sorted-ascending entries) only when `total_count >= 0`; pass
+ * `total_count = -1` and `all_syms_sorted = NULL` for a pattern with `...`
+ * (skips the "no extra fields" check entirely). */
+size_t ib_check_formals(IrBuilder *b, int64_t required_count, const uint32_t *required_syms_sorted,
+                         int64_t total_count, const uint32_t *all_syms_sorted);
+
+/* Lambda-patterns: allocates a new Env frame (up = current ENV) with
+ * `nslots` still-unbound slots and makes it the current ENV -- does not
+ * touch VALSTACK. See op_frame.S / ir.h's OP_FRAME_NEW. */
+size_t ib_frame_new(IrBuilder *b, int64_t nslots);
+
+/* Lambda-patterns: pops one value off VALSTACK into the *current* ENV
+ * frame's values[slot] -- no allocation, unlike ib_let(). Meant to be
+ * paired with ib_frame_new() and one ib_mk_thunk() per slot in between, so
+ * each field's thunk captures the (already-current) new frame as its own
+ * scope before any slot is actually filled in -- see op_frame.S. */
+size_t ib_frame_bind_slot(IrBuilder *b, int64_t slot);
+
 /* Finalizes the builder: runs ir_link() over the accumulated ops in place
  * and returns an IrProgram ready for asnix_eval(). */
 IrProgram *ib_finish(IrBuilder *b);

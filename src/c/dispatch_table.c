@@ -28,6 +28,10 @@ extern void asnix_op_mk_list(void);
 extern void asnix_op_mk_attrs(void);
 extern void asnix_op_select(void);
 extern void asnix_op_mk_thunk(void);
+extern void asnix_op_has_attr(void);
+extern void asnix_op_check_formals(void);
+extern void asnix_op_frame_new(void);
+extern void asnix_op_frame_bind_slot(void);
 
 void *asnix_handler_table[OP_COUNT] = {
     [OP_PUSH_INT] = (void *)asnix_op_push_int,
@@ -50,6 +54,10 @@ void *asnix_handler_table[OP_COUNT] = {
     [OP_MK_ATTRS] = (void *)asnix_op_mk_attrs,
     [OP_SELECT] = (void *)asnix_op_select,
     [OP_MK_THUNK] = (void *)asnix_op_mk_thunk,
+    [OP_HAS_ATTR] = (void *)asnix_op_has_attr,
+    [OP_CHECK_FORMALS] = (void *)asnix_op_check_formals,
+    [OP_FRAME_NEW] = (void *)asnix_op_frame_new,
+    [OP_FRAME_BIND_SLOT] = (void *)asnix_op_frame_bind_slot,
 };
 
 void ir_link(IrOp *ops, size_t n) {
