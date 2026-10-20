@@ -115,6 +115,18 @@ size_t ib_mk_thunk(IrBuilder *b, IrProgram *body_prog) {
     return ib_emit(b, OP_MK_THUNK, 0, (int64_t)pool_idx);
 }
 
+size_t ib_frame_alloc(IrBuilder *b, int64_t nslots) {
+    return ib_emit(b, OP_FRAME_ALLOC, nslots, 0);
+}
+
+size_t ib_frame_set(IrBuilder *b, int64_t slot) {
+    return ib_emit(b, OP_FRAME_SET, slot, 0);
+}
+
+size_t ib_frame_exit(IrBuilder *b) {
+    return ib_emit(b, OP_FRAME_EXIT, 0, 0);
+}
+
 IrProgram *ib_finish(IrBuilder *b) {
     ir_link(b->ops, b->len);
     IrProgram *prog = calloc(1, sizeof(IrProgram));

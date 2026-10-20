@@ -22,7 +22,8 @@ what's actually implemented and the scope decisions made along the way.
 | M7 — builtins + primop dispatch (`src/c/builtins.c`) | done, **scoped** (see below) |
 | M8 — derivations + store-path hashing + daemon protocol | done, **scoped** (see below): connect/handshake/`IsValidPath` only, no realization |
 | M9 — benchmark harness (`bench/`) | done (see below) |
-| M10+ | not started |
+| M10 — recursive `let`/`rec {}`/`inherit` | done (see below) |
+| M11+ | not started |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
 
@@ -38,13 +39,14 @@ The parser implements real Nix syntax for the subset it covers: single-
 param curried lambdas (`a: b: body`, exactly like real Nix — *not* the
 multi-param arrow syntax M3's own hand-fed test fixtures used as a
 shortcut), function application by juxtaposition, `let`/`in`, `if`/`then`/
-`else`, arithmetic. A multi-binding `let` desugars at parse time into a
-chain of nested single-binding `AST_LET` nodes (`src/c/parser.c`), which
-keeps name resolution trivial (every frame has exactly one slot) at the
-cost of not supporting mutual recursion between sibling bindings in one
-`let` — not exercised by the current fixture set. Identifiers exclude `-`
-(real Nix allows hyphenated identifiers; that collides with binary minus in
-this minimal lexer and isn't needed yet).
+`else`, arithmetic. A multi-binding `let` parses into one flat `AST_LET`
+binding list (`src/c/parser.c`) — originally (M4) this desugared into a
+chain of nested single-binding `AST_LET` nodes instead, which kept name
+resolution trivial but meant sibling bindings in one `let` couldn't see
+each other; see the "Recursive `let`/`rec {}`/`inherit`" section below for
+why and how that changed. Identifiers exclude `-` (real Nix allows
+hyphenated identifiers; that collides with binary minus in this minimal
+lexer and isn't needed yet).
 
 ## M4.5 scope notes
 
@@ -148,15 +150,17 @@ Adds real laziness: `let` and attrset binding *values* are deferred
   self-referential thunk) aborts cleanly via `asnix_fatal` (blackholing).
 - **List elements and function-call arguments are still eager** — not
   thunked. Making them lazy too (matching real Nix) is future work.
-- **Scope limitation: `let`/attrset bindings are not recursive.** Real Nix
-  `let` is implicitly `letrec` (bindings can reference themselves or
-  siblings — e.g. `let fact = n: if n==0 then 1 else n*fact(n-1); in ...`
-  relies on `fact` seeing itself). This implementation's thunks capture
-  the *outer* scope (whatever env is active when `OP_MK_THUNK` runs, which
-  is *before* `OP_LET` creates the new frame) — so a binding cannot see
-  itself or siblings in the same `let`/attrset. Fixing this needs `OP_LET`
-  restructured to allocate the frame *before* constructing the thunk(s),
-  so they can capture that frame as their own scope — not attempted here.
+- **Scope limitation (fixed, see below): at M6, `let`/attrset bindings were
+  not recursive.** Real Nix `let` is implicitly `letrec` (bindings can
+  reference themselves or siblings — e.g. `let fact = n: if n==0 then 1
+  else n*fact(n-1); in ...` relies on `fact` seeing itself). M6's thunks
+  captured the *outer* scope (whatever env was active when `OP_MK_THUNK`
+  ran, which was *before* `OP_LET` created the new frame) — so a binding
+  couldn't see itself or siblings in the same `let`/attrset. Fixed by the
+  `OP_FRAME_ALLOC`/`OP_FRAME_SET`/`OP_FRAME_EXIT` rework described in the
+  "Recursive `let`/`rec {}`/`inherit`" section below, exactly along the
+  lines sketched here (allocate the frame before constructing the
+  thunks, so they capture it as their own scope).
 - **`asnix_force_for_print`** (`src/asm/force.S`): a narrow, separate
   C-callable force entry point used only by the top-level printer
   (`main.c`) to recursively force thunks nested inside lists/attrsets for
@@ -522,6 +526,88 @@ work on disk did) before it had written `bench/README.md` or this
 section — picked up and finished directly rather than re-run from
 scratch, after independently re-verifying its correctness claims.
 
+## Recursive `let`/`rec {}`/`inherit`
+
+Makes `let ... in` genuinely `letrec` (matching real Nix: every binding in
+one block is visible to itself and every sibling, regardless of source
+order), adds `rec { ... }` (an attrset literal with the same self/sibling
+visibility; plain `{ ... }` stays non-recursive), and adds `inherit`/
+`inherit (expr) ...` as a pure parse-time desugaring.
+
+- **AST**: `AST_LET` now carries a flat binding list (`AstBinding[]` +
+  `body`), not one name/value pair desugared into nested single-binding
+  nodes — this is the structural prerequisite for mutual visibility: one
+  `let` block == one scope level == one runtime `Env` frame with a slot
+  per binding, so a sibling reference is just an ordinary same-depth
+  `OP_VAR_REF`. `AST_ATTRSET` grew an `is_rec` flag. `AstBinding` grew
+  `is_inherit`, set by the parser for bare `inherit x;` only (see below).
+- **Three new ops** (`src/asm/ops/op_frame.S`): `OP_FRAME_ALLOC` (a =
+  nslots) allocates a new `Env` and installs it as the current `ENV`
+  *before* any binding's thunk is built, `OP_FRAME_SET` (a = slot) pops
+  one value into that `Env`'s slot, `OP_FRAME_EXIT` restores `ENV` to its
+  parent. Compiling a `let`/`rec {}` is: `FRAME_ALLOC(n)`, then for each
+  binding, build its thunk (still lazy, unchanged `OP_MK_THUNK`) and
+  `FRAME_SET` it into its slot, then (for `let`) compile the body or (for
+  `rec {}`) read the n values back off the frame in sorted-symbol order
+  via plain `OP_VAR_REF(0, slot)` and feed them to the existing
+  `OP_MK_ATTRS` unchanged, then `FRAME_EXIT`. Because `OP_MK_THUNK`
+  captures "whatever `ENV` is right now", and `FRAME_ALLOC` already
+  switched `ENV` to the new frame before any thunk is built, every
+  binding's thunk naturally captures the new frame — self/sibling
+  references just resolve like any other variable, once forced later.
+  `OP_FRAME_EXIT` matters for correctness even though a `let`'s body
+  often *is* the rest of the enclosing thunk/lambda body (where it looks
+  redundant, immediately followed by `OP_RET`): `let`/`rec {}` are also
+  ordinary subexpressions (a function argument, a binop operand, a list
+  element, ...), and without restoring `ENV` on the way out, a
+  non-tail use would leave the extra frame installed, corrupting the
+  depth of every `OP_VAR_REF` the compiler emitted *after* it assuming
+  the pre-frame scope (see Known bugs #6 below — this was a real,
+  independently-confirmed latent gap in the original M6 `OP_LET`, not
+  just a theoretical risk introduced by this change).
+- **`inherit` desugars entirely at parse time** (`src/c/parser.c`):
+  `inherit x;` becomes a binding `x = x` (an `AST_VAR`), `inherit (expr)
+  x y;` becomes `x = expr.x; y = expr.y` (an `AST_SELECT` per name,
+  `expr`'s subtree reused — compiled, and so re-evaluated, once per
+  inherited name, same as real Nix). The two forms resolve the
+  right-hand side against *different* scopes, confirmed against real
+  `nix-instantiate` (see Known bugs #7): `inherit (expr) ...`'s `expr`
+  resolves against this block's *own* (possibly recursive) scope, just
+  like any ordinary binding's value — `let inherit (pt) x y; pt = {
+  ... }; in ...` sees the sibling `pt`. A bare `inherit x;`, however,
+  resolves `x` against the scope *enclosing* this block, never its own
+  — `rec { inherit x; }` can't accidentally self-reference the `x` it's
+  pulling in from outside. The compiler threads this through
+  `AstBinding.is_inherit` plus a dummy zero-name `ScopeFrame` ("`skip`")
+  wrapped around the enclosing scope for inherited bindings, so compile-
+  time depths correctly account for the one extra real `Env` level
+  `OP_FRAME_ALLOC` always inserts before any binding's thunk — including
+  inherited ones — gets built.
+- **`rec` keyword**: lexer keyword, parser accepts `rec { ... }` wherever
+  a plain `{ ... }` is accepted (atom position).
+- **M4.5 native codegen** (`src/c/codegen.c`) is explicitly out of scope
+  (per its own documented cut: literals/arithmetic/if/non-recursive
+  `let` only) — its `AST_LET` handling was adapted only to the new flat-
+  binding-list shape (iterating `n` bindings sequentially onto the
+  native stack, exactly the semantics the old nested-desugaring produced),
+  not given recursion; `inherit` in this path is a clear `exit(1)` error.
+- **Verified against real `nix-instantiate --eval`** for every case named
+  in the task: `rec { a = 1; b = a + 1; }`, `rec { a = b; b = 1; }.a` =>
+  `1`, nested `let`s referencing outer-scope siblings, self- and mutually-
+  recursive named functions (`let f = x: g x; g = x: if x then 1 else f
+  true; in f false` => `1` — using boolean branching instead of `==`/`<`
+  since comparison operators aren't implemented yet, per the task's own
+  guidance), both `inherit` forms (plain and `(expr)`, including the
+  sibling-visibility case above), `let`/`rec {}` used in non-tail
+  position (`let a = 1; x = (let y = 1; in y) + a; in x` => `2`), and
+  that plain non-rec `{ a = a; }` still correctly fails to resolve `a`
+  (an "undefined variable" compile-time error, matching real Nix exactly
+  — not a blackhole, since no self-reference is even possible without a
+  recursive scope). All match real Nix exactly except the pre-existing,
+  unrelated difference in how unforced thunks print (`<CODE>` in real
+  Nix vs. this project's printer eagerly forcing for display — a known,
+  deliberate M6-era choice, not part of this change).
+
 ## Known bugs found and fixed during implementation (worth knowing about)
 
 1. **Register corruption across `asnix_eval`** (M3): `op_let.S`/
@@ -625,3 +711,42 @@ scratch, after independently re-verifying its correctness claims.
    separate limit entirely so the VALSTACK/RETSP checks stay isolated.
    Left as a known gap for whoever picks up deep `let`-chain support
    through real Nix source next.
+7. **`let` (and `rec {}`) used as a non-tail subexpression leaked its Env
+   frame into whatever followed it** (latent since M6's `OP_LET`, found
+   while implementing recursive `let`/`rec {}`): `OP_LET` switches `ENV`
+   to the new frame and never switches it back, which is harmless when a
+   `let`'s body is the last thing in its enclosing thunk/lambda body (the
+   common case every existing fixture happened to use), but wrong the
+   moment a `let`/`rec {}` appears as an ordinary subexpression — e.g.
+   `let a = 1; x = (let y = 1; in y) + a; in x`: after the inner
+   `let y = 1; in y` finishes, `ENV` is still the inner frame, so the
+   following `+ a` (compiled assuming the *outer* `let`'s frame is
+   depth 0) reads the wrong slot at the wrong depth. Reproduced directly
+   against this exact expression before the fix (returned garbage/wrong
+   depth instead of `2`). Fixed by giving every scope-introducing
+   construct (`OP_FRAME_ALLOC`'s callers) a matching `OP_FRAME_EXIT`
+   once the frame is no longer needed — see "Recursive `let`/`rec {}`/
+   `inherit`" above. `OP_LET` itself (now unused by the compiler, kept
+   for its existing asm/IR tests) was never patched the same way, since
+   nothing compiles it anymore.
+8. **`inherit (expr) x;`'s `expr` does *not* resolve the same way as
+   bare `inherit x;`'s implicit right-hand side** (found implementing
+   `inherit`, confirmed against real `nix-instantiate` before trusting
+   either assumption): a first implementation treated both forms as
+   "resolve against the scope enclosing this `let`/`rec {}`" by analogy,
+   which breaks `let inherit (pt) x y; pt = { x = 1; y = 2; }; in x + y`
+   (real Nix: `3` — `pt`, a *sibling* in the same `let`, must be visible
+   to `expr`) and also corrupts bare `inherit x;` under the recursive
+   frame scheme above: once `OP_FRAME_ALLOC` installs the new frame
+   *before* any binding's thunk is built, a thunk compiled as if it
+   still captured the old (one-level-shallower) scope actually captures
+   the new frame at runtime, a depth-accounting mismatch that made
+   `let x = 10; in rec { inherit x; y = x + 1; }` blackhole instead of
+   returning `{ x = 10; y = 11; }`. Fixed by (a) treating `inherit
+   (expr) ...` as an entirely ordinary binding (its value resolves
+   against the block's own scope, siblings included — matching real
+   Nix) and (b) resolving bare `inherit x;` against a dummy zero-name
+   scope level wrapped around the enclosing scope, so compile-time depth
+   counting accounts for the one real `Env` frame `OP_FRAME_ALLOC` always
+   inserts first. Both forms verified against real `nix-instantiate`
+   after the fix.

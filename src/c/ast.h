@@ -4,13 +4,15 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* A multi-binding `let` desugars at parse time into a chain of nested
- * single-binding AST_LET nodes (see parser.c) -- so every scope-introducing
- * node (AST_LET, AST_LAMBDA) binds exactly one name, which keeps name
- * resolution trivial (every frame has exactly one slot, always index 0).
- * This is a deliberate M4-scope simplification: it doesn't support mutual
- * recursion between sibling bindings in one `let`, which isn't exercised
- * by the M4 fixture set (see docs/architecture.md). */
+/* `let` is genuinely recursive (letrec), matching real Nix: every binding
+ * in one `let ... in` is visible to itself and to every sibling binding,
+ * regardless of source order. AST_LET therefore carries its whole binding
+ * list (like AST_ATTRSET), not just one name -- see compiler.c's AST_LET
+ * case for how that list becomes a single multi-slot Env frame built
+ * *before* any binding's thunk is constructed. `rec { ... }` gives an
+ * attrset literal the same self/sibling visibility (AST_ATTRSET.is_rec);
+ * plain `{ ... }` keeps the old non-recursive behavior (bindings only see
+ * the enclosing scope). */
 
 typedef enum {
     AST_INT,
@@ -30,14 +32,28 @@ typedef enum {
 
 typedef struct Ast Ast;
 
-/* One `name = value;` binding in an AST_ATTRSET literal. Plain-malloc'd
- * (not arena-allocated): it's a compile-time-only auxiliary array, not
- * part of the runtime Value graph the arena exists to serve -- same
- * rationale as IrBuilder's growable arrays in irbuild.c. */
+/* One binding in a `let`/`rec {}`/`{}` binding list. Plain-malloc'd (not
+ * arena-allocated): it's a compile-time-only auxiliary array, not part of
+ * the runtime Value graph the arena exists to serve -- same rationale as
+ * IrBuilder's growable arrays in irbuild.c.
+ *
+ * `inherit x;` / `inherit (expr) x y;` desugar at parse time (parser.c)
+ * into ordinary bindings whose `value` is an AST_VAR(x) (bare form) or
+ * AST_SELECT(expr, x) (`(expr)` form). Only the BARE form sets
+ * `is_inherit`: verified against real nix-instantiate, `inherit (expr)
+ * x;`'s `expr` resolves against the enclosing block's own (possibly
+ * recursive) scope just like any ordinary binding's value -- siblings
+ * are visible (`let inherit (pt) x; pt = {...}; in ...` sees `pt`) -- so
+ * it needs no special treatment. A bare `inherit x;`, however, must
+ * resolve `x` against the scope *enclosing* the let/rec/attrset, never
+ * against that construct's own scope, so `rec { inherit x; }` can't
+ * accidentally self-reference the `x` it's trying to pull in from
+ * outside (also verified against real nix-instantiate). */
 typedef struct {
     const char *name;
     size_t name_len;
     Ast *value;
+    int is_inherit;
 } AstBinding;
 
 struct Ast {
@@ -50,9 +66,8 @@ struct Ast {
             size_t name_len;
         } var; /* AST_VAR */
         struct {
-            const char *name;
-            size_t name_len;
-            Ast *value;
+            AstBinding *bindings;
+            size_t count;
             Ast *body;
         } let1; /* AST_LET */
         struct {
@@ -81,6 +96,7 @@ struct Ast {
         struct {
             AstBinding *bindings;
             size_t count;
+            int is_rec; /* `rec { ... }` vs plain `{ ... }` */
         } attrset; /* AST_ATTRSET */
         struct {
             Ast *target;
