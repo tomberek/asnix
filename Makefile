@@ -5,7 +5,11 @@ CC           ?= cc
 # for bench/ runs only -- the hot path under measurement is hand-written asm,
 # not compiler-optimized C, so the everyday loop shouldn't pay -O2 compile cost.
 OPT          ?= -O0
-CFLAGS       := -std=c11 -Wall -Wextra -g $(OPT) $(INC) -MMD -MP -U_FORTIFY_SOURCE -Wa,--noexecstack
+# `=` (recursive), not `:=` -- CFLAGS must re-expand $(OPT) at each use so
+# `release`'s target-specific `OPT := -O2` (below) actually takes effect.
+# `:=` would bake in whatever OPT was at *this* line (-O0) permanently,
+# silently making `make release` build an unoptimized binary.
+CFLAGS       = -std=c11 -Wall -Wextra -g $(OPT) $(INC) -MMD -MP -U_FORTIFY_SOURCE -Wa,--noexecstack
 LDFLAGS      :=
 
 MAKEFLAGS    += -j$(shell nproc 2>/dev/null || echo 4)
