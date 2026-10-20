@@ -7,39 +7,18 @@
 
 #include "asnix/arena.h"
 #include "asnix/heap.h"
+#include "derivation.h"
 #include "hash_shim.h"
 #include "symtab.h"
+#include "value_util.h"
 
 static Value make_string(const char *s, size_t len) {
-    void *mem = asnix_arena_alloc(8 + len);
-    *(int64_t *)((char *)mem + ASNIX_STRING_OFF_LEN) = (int64_t)len;
-    memcpy((char *)mem + ASNIX_STRING_OFF_BYTES, s, len);
-    return (Value){ .raw = (uint64_t)(uintptr_t)mem | ASNIX_TAG_PTR };
+    return asnix_make_string_value(s, len);
 }
 
 static Value prim_toString(const Value *args, int64_t argc) {
     (void)argc;
-    Value v = args[0];
-    char buf[32];
-    switch (asnix_tag_of(v)) {
-        case ASNIX_TAG_INT: {
-            int n = snprintf(buf, sizeof(buf), "%lld", (long long)asnix_int_value(v));
-            return make_string(buf, (size_t)n);
-        }
-        case ASNIX_TAG_IMM:
-            switch (asnix_imm_subtag(v)) {
-                case ASNIX_IMM_TRUE: return make_string("true", 4);
-                case ASNIX_IMM_FALSE: return make_string("false", 5);
-                case ASNIX_IMM_NULL: return make_string("", 0); /* matches real Nix */
-                default: break;
-            }
-            break;
-        case ASNIX_TAG_PTR:
-            return v; /* already a string */
-        default: break;
-    }
-    fprintf(stderr, "asnix: toString: unsupported value type\n");
-    exit(1);
+    return asnix_coerce_to_string(args[0]);
 }
 
 static Value prim_typeOf(const Value *args, int64_t argc) {
@@ -182,6 +161,7 @@ static const BuiltinDef BUILTINS[] = {
     { "typeOf", prim_typeOf, 1 },
     { "length", prim_length, 1 },
     { "hashString", prim_hashString, 1 }, /* true arity 2, curried -- see hash_apply's comment above */
+    { "derivation", asnix_prim_derivation, 1 },
 };
 
 Value asnix_make_builtins_attrs(void) {

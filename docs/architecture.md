@@ -20,7 +20,7 @@ what's actually implemented and the scope decisions made along the way.
 | M5 — strings/lists/attrsets/symbol interning | done (interpreter path only; see below) |
 | M6 — lazy `let`/attrset bindings via thunks, blackholing | done, **scoped** (see below) |
 | M7 — builtins + primop dispatch (`src/c/builtins.c`) | done, **scoped** (see below) |
-| M8 — derivations + store-path hashing + daemon protocol | **in progress** (see below): `hashString`, `base32`/`store_path`/`aterm` done; `derivation {...}` wiring + daemon protocol not yet |
+| M8 — derivations + store-path hashing | done, **scoped** (see below); daemon protocol not started |
 | M9+ | not started |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
@@ -220,7 +220,7 @@ passed around, etc., same as a closure).
   `OP_CALL`'s primop branch (arg layout, arity checking, result handling)
   independent of any real builtin's logic.
 
-## M8 progress notes (in progress)
+## M8 scope notes
 
 Store-path hashing and derivation construction, bit-exact-compatible with
 real Nix — a much bigger jump than M0-M7 (external, precisely-specified
@@ -328,10 +328,52 @@ as deferred in M7's own scope notes was actually needed for.
   `nix-instantiate -E 'derivation { name = "asnix-test"; ... }'` — both in
   Python first, matching exactly, before writing `aterm.c`;
   `tests/c/test_aterm.c` keeps both as its oracle.
-- **Next**: wire `base32`/`store_path`/`aterm`/`hash_shim` together behind
-  a minimal `derivation {...}` builtin (single fixed output, no input
-  derivations — see the worked-example research above for the exact
-  scope ordering), then `builtins.toFile`.
+### `builtins.derivation {...}` (done)
+
+Wires `base32`/`store_path`/`aterm`/`hash_shim` together (`src/c/derivation.c`)
+into a minimal, real `derivation {...}`: single fixed output named `"out"`,
+zero input derivations, zero input sources. Required attrs: `name`,
+`system`, `builder`; optional `args` (list of strings); every other attr
+becomes an environment variable (coerced to a string via the same rules
+as `toString`, factored out into `src/c/value_util.c` once a second
+caller needed it). Attrset binding values are lazy (M6), so each attr is
+explicitly forced (via `asnix_force_for_print`, which turns out to be
+safe to call even from *inside* an active primop call — it's just a
+properly save/restore'd function, so it nests like any other call despite
+its `_for_print`-suggestive name) before being read.
+
+Returns `{ outPath; drvPath; type = "derivation"; out = outPath; }` —
+deliberately does **not** merge the original input attrs back into the
+result the way real Nix's own Nix-level `derivation` wrapper does (that
+needs `//`, which this project doesn't have), and carries no string
+context, so a derivation's `outPath` can't yet be used as another
+derivation's input. Multiple outputs, fixed-output (content-addressed)
+derivations, and derivation-to-derivation dependencies are all explicitly
+out of scope for this slice — a prioritized list for what to tackle in
+that order lives in the commit history's research notes.
+
+**A third real bug, found by the same "verify against real Nix before
+trusting it" discipline**: the first implementation fed `sha256(masked
+ATerm)` directly into `asnix_make_store_path_from_digest`, skipping
+`makeStorePath`'s *middle* step entirely — hex-encoding that digest with
+its `"sha256:"` prefix, assembling the `"type:hash:storeDir:name"`
+preimage via `asnix_store_path_preimage`, and hashing *that* to get the
+digest `asnix_make_store_path_from_digest` actually expects. `store_path.c`
+was deliberately split into two crypto-free pieces precisely so the two
+hashing steps couldn't be silently merged into one inside that module —
+but nothing stopped the *caller* from doing the equivalent wrong thing by
+simply forgetting to call one of the pieces. Caught immediately because
+the computed `outPath` didn't match the already-verified real
+`nix-instantiate` oracle; fixed by adding `compute_store_path()` as the
+single place this two-step composition happens, so there's only one spot
+for this specific mistake to ever recur.
+
+- **Verified against the same 2 real references already proven for
+  `aterm.c`** (`ia-advanced-attributes-defaults.drv`'s real output path,
+  and a fresh `nix-instantiate -E 'derivation { name = "asnix-test"; ...
+  }'` run for both `outPath` and `drvPath`), plus extra-attr-as-env-var
+  and missing-required-attr error paths, all exercised end-to-end through
+  the real lexer/parser/compiler/evaluator in `tests/e2e/m8_derivation_*.nix`.
 
 ## Checked against numtide/nix-conformance
 
@@ -428,3 +470,13 @@ savings and shouldn't be quoted as such.
    `main.c`'s printer only (re-sorts by name for display); the runtime
    representation and `OP_SELECT` are untouched. See "Checked against
    numtide/nix-conformance" above for how this was found.
+5. **Skipped a hashing step in `makeStorePath`** (M8): fed
+   `sha256(masked ATerm)` directly into
+   `asnix_make_store_path_from_digest`, omitting the middle step —
+   hex-encoding that digest with its `sha256:` prefix, assembling the
+   `"type:hash:storeDir:name"` preimage, and hashing *that*. Caught
+   immediately because the computed `outPath` didn't match the
+   already-verified real `nix-instantiate` oracle (`derivation {...}`'s
+   M8 scope notes above have the full writeup); fixed by adding a single
+   `compute_store_path()` helper so the two-step composition only exists
+   in one place.
