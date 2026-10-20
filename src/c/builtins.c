@@ -7,6 +7,9 @@
 
 #include "asnix/arena.h"
 #include "asnix/heap.h"
+#include "builtins_attrs.h"
+#include "builtins_list.h"
+#include "builtins_misc.h"
 #include "derivation.h"
 #include "eval_file.h"
 #include "hash_shim.h"
@@ -204,14 +207,45 @@ static const BuiltinDef BUILTINS[] = {
     { "import", prim_import, 1 },
 };
 
+/* Merges this file's own BUILTINS[] with the three builtins-expansion
+ * modules (list/attrs/misc), each kept in its own translation unit so the
+ * agents that wrote them in parallel didn't textually collide on one
+ * shared array -- see builtins_list.h/builtins_attrs.h/builtins_misc.h's
+ * own "integration step" comments, which this function fulfills. The misc
+ * module's shape differs (a `build()` callback returning a ready Value,
+ * since a couple of its entries are curried Closures rather than a plain
+ * PrimOp) so it's merged via a small adapter loop rather than sharing the
+ * {name,fn,arity} shape the other three use. */
 Value asnix_make_builtins_attrs(void) {
-    size_t n = sizeof(BUILTINS) / sizeof(BUILTINS[0]);
-    uint32_t syms[sizeof(BUILTINS) / sizeof(BUILTINS[0])];
-    size_t order[sizeof(BUILTINS) / sizeof(BUILTINS[0])];
-    for (size_t i = 0; i < n; i++) {
-        syms[i] = asnix_intern(BUILTINS[i].name, strlen(BUILTINS[i].name));
-        order[i] = i;
+    size_t n_base = sizeof(BUILTINS) / sizeof(BUILTINS[0]);
+    size_t n_list = asnix_builtins_list_count;
+    size_t n_attrs = ASNIX_ATTRS_BUILTINS_COUNT;
+    size_t n_misc = ASNIX_BUILTINS_MISC_COUNT;
+    size_t n = n_base + n_list + n_attrs + n_misc;
+
+    uint32_t *syms = malloc(n * sizeof(uint32_t));
+    Value *vals = malloc(n * sizeof(Value));
+    size_t *order = malloc(n * sizeof(size_t));
+
+    size_t k = 0;
+    for (size_t i = 0; i < n_base; i++, k++) {
+        syms[k] = asnix_intern(BUILTINS[i].name, strlen(BUILTINS[i].name));
+        vals[k] = make_primop_value((void *)BUILTINS[i].fn, BUILTINS[i].arity);
     }
+    for (size_t i = 0; i < n_list; i++, k++) {
+        syms[k] = asnix_intern(asnix_builtins_list[i].name, strlen(asnix_builtins_list[i].name));
+        vals[k] = make_primop_value((void *)asnix_builtins_list[i].fn, asnix_builtins_list[i].arity);
+    }
+    for (size_t i = 0; i < n_attrs; i++, k++) {
+        syms[k] = asnix_intern(ASNIX_ATTRS_BUILTINS[i].name, strlen(ASNIX_ATTRS_BUILTINS[i].name));
+        vals[k] = make_primop_value((void *)ASNIX_ATTRS_BUILTINS[i].fn, ASNIX_ATTRS_BUILTINS[i].arity);
+    }
+    for (size_t i = 0; i < n_misc; i++, k++) {
+        syms[k] = asnix_intern(ASNIX_BUILTINS_MISC[i].name, strlen(ASNIX_BUILTINS_MISC[i].name));
+        vals[k] = ASNIX_BUILTINS_MISC[i].build();
+    }
+
+    for (size_t i = 0; i < n; i++) order[i] = i;
     for (size_t i = 1; i < n; i++) {
         size_t j = i;
         while (j > 0 && syms[order[j - 1]] > syms[order[j]]) {
@@ -227,8 +261,10 @@ Value asnix_make_builtins_attrs(void) {
     for (size_t i = 0; i < n; i++) {
         char *entry = (char *)mem + ASNIX_ATTRS_OFF_ENTRIES + i * ASNIX_ATTR_SIZE;
         *(int64_t *)(entry + ASNIX_ATTR_OFF_SYM) = (int64_t)syms[order[i]]; /* zero-extends; see heap.h */
-        *(Value *)(entry + ASNIX_ATTR_OFF_VALUE) =
-            make_primop_value((void *)BUILTINS[order[i]].fn, BUILTINS[order[i]].arity);
+        *(Value *)(entry + ASNIX_ATTR_OFF_VALUE) = vals[order[i]];
     }
+    free(syms);
+    free(vals);
+    free(order);
     return (Value){ .raw = (uint64_t)(uintptr_t)mem | ASNIX_TAG_ATTRS };
 }

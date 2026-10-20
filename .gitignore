@@ -24,3 +24,5 @@ tests/asm/test_stacklimits
 tests/ir/test_strings_fixtures
 tests/c/test_value_util
 tests/c/test_apply
+tests/c/test_builtins_list
+tests/c/test_builtins_misc

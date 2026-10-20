@@ -29,7 +29,8 @@ what's actually implemented and the scope decisions made along the way.
 | M14 — lambda-destructuring patterns | done (see below) |
 | M15 — `import` + path literals (`src/c/eval_file.c`) | done, **scoped** (see below) |
 | M16 — `asnix_apply`, general re-entrant call-a-Value-from-C (`src/asm/apply.S`) | done (see below) |
-| M17+ | not started |
+| M17 — builtins expansion (list/attrs/string/type-predicate) | done (see below) |
+| M18+ | not started |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
 
@@ -1082,6 +1083,66 @@ implementation to apply the user-supplied closure to each list element.
   for a Closure arity mismatch, a PrimOp arity mismatch, and a
   non-function type error (fork + exit-code check, same pattern as
   `tests/asm/test_stacklimits.c`).
+
+## M17 scope notes: builtins expansion
+
+Adds `map`, `filter`, `foldl'`, `elemAt`, `concatLists`, `tail`, `head`
+(`src/c/builtins_list.c`); `attrNames`, `attrValues`, `hasAttr`,
+`getAttr`, `mapAttrs`, `removeAttrs` (`src/c/builtins_attrs.c`);
+`substring`, `stringLength`, `concatStringsSep`, and the type predicates
+`isNull`/`isString`/`isList`/`isAttrs`/`isFunction`/`isInt`/`isBool`
+(`src/c/builtins_misc.c`). Built by three agents in parallel, each in its
+own translation unit specifically to avoid textually colliding on
+`builtins.c`'s shared registration table — integrated by merging each
+module's own small `{name, fn, arity}` array (or, for `builtins_misc.c`,
+a `{name, build()}` array, since `substring`/`concatStringsSep` build a
+curried-Closure chain rather than a single PrimOp) into
+`asnix_make_builtins_attrs`.
+
+- **`asnix_apply` dependency**: `map`/`filter`/`foldl'`/`mapAttrs` all need
+  to call a user-supplied Closure/PrimOp from C — exactly what the M16
+  stage above provides. Both agents that needed it correctly anticipated
+  it wasn't merged yet (each wrote its own narrowly-scoped local stand-in
+  with an explicit "delete this and repoint at the real one" integration
+  note), so the integration step here deleted both local stand-ins
+  (`src/c/apply_shim.h`+a local `src/asm/apply.S` from the list module,
+  `include/asnix/apply.h`+another local `src/asm/apply.S` from the attrs
+  module) and repointed both at the real `asnix_apply` (`#include
+  "asnix/ir.h"`) — same signature, so no call-site changes were needed
+  beyond the `#include` itself.
+- **Duplicate typedef, found integrating**: `builtins_list.h` and
+  `builtins_attrs.h` independently defined the identical
+  `AsnixPrimFn`/`AsnixBuiltinDef` shape (unsurprising — both were mirroring
+  `builtins.c`'s own `PrimFn`/`BuiltinDef`), which collides the moment both
+  headers land in the same translation unit (`builtins.c`). Fixed by
+  keeping one definition (`builtins_list.h`) and having `builtins_attrs.h`
+  include it instead of redefining it.
+- **`asnix_make_builtins_attrs` rewritten** to merge four sources
+  (`builtins.c`'s own `BUILTINS[]` plus the three new modules) into one
+  `malloc`'d, sorted-by-symbol-id array before building the final `Attrs`
+  object — the function used to work over a single compile-time-sized
+  array; `n` is no longer known at compile time once four independent
+  source counts are involved.
+- **Currying**: every arity>1 builtin here uses the same curried-via-
+  dedicated-arity-1-stages pattern established for `hashString` (M8) —
+  `hasAttr`/`getAttr`/`mapAttrs`/`removeAttrs` via a shared
+  `build_curry2_body` helper, `substring`/`concatStringsSep` via a short
+  chain of real Closures (`builtins_misc.c`'s `make_curried_native`,
+  needed because their arguments come from an unbounded domain — an
+  integer start/length, an arbitrary separator string — unlike
+  `hashString`'s finite 4-algorithm enum trick, which can't generalize).
+- **`genericClosure` deliberately cut** (`builtins_list.c`) rather than
+  rushed under time pressure — documented as a follow-up, not attempted.
+- **Verified against real `nix-instantiate --eval`**, beyond what each
+  module's own implementer already checked: `map`/`foldl'` composed
+  together, `filter`, `attrNames` (sorted-by-name order), `hasAttr`,
+  `substring`, `isList`. One real difference confirmed as pre-existing
+  and *not* a bug in this stage: `mapAttrs`'s *values* print differently
+  (`{ a = 2; b = 3; }` here vs. real Nix's `{ a = <CODE>; b = <CODE>; }`)
+  because this project's printer eagerly forces nested values for display
+  while real Nix's does not — the same deliberate M6-era divergence
+  already documented elsewhere in this file, confirmed by comparing the
+  actual (forced) values through `foldl'` instead of the raw printed form.
 
 ## Known bugs found and fixed during implementation (worth knowing about)
 
