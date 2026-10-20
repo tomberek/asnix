@@ -20,7 +20,7 @@ what's actually implemented and the scope decisions made along the way.
 | M5 — strings/lists/attrsets/symbol interning | done (interpreter path only; see below) |
 | M6 — lazy `let`/attrset bindings via thunks, blackholing | done, **scoped** (see below) |
 | M7 — builtins + primop dispatch (`src/c/builtins.c`) | done, **scoped** (see below) |
-| M8 — derivations + store-path hashing | done, **scoped** (see below); daemon protocol not started |
+| M8 — derivations + store-path hashing + daemon protocol | done, **scoped** (see below): connect/handshake/`IsValidPath` only, no realization |
 | M9+ | not started |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
@@ -374,6 +374,64 @@ for this specific mistake to ever recur.
   }'` run for both `outPath` and `drvPath`), plus extra-attr-as-env-var
   and missing-required-attr error paths, all exercised end-to-end through
   the real lexer/parser/compiler/evaluator in `tests/e2e/m8_derivation_*.nix`.
+
+### Daemon protocol (minimal slice: connect + handshake + `IsValidPath`)
+
+`src/c/daemon_client.{h,c}`: a from-scratch client for the real Nix worker
+(daemon) wire protocol, scoped to the smallest slice that proves the
+mechanism against a live daemon — connect over the Unix socket, complete
+the version handshake, and perform `IsValidPath` (the simplest read-only
+op). No build/realization ops, no NAR transfer; the stderr sideband's
+`start_activity`/`stop_activity`/`result` messages are parsed just enough
+to stay framed correctly and otherwise discarded (there's no build-output
+UI to forward them to yet).
+
+- **Cross-checked against two independent real implementations before
+  writing any code** (same discipline as the rest of M8): cppnix's own
+  `~/nix/src/libstore/include/nix/store/worker-protocol.hh` (magic
+  numbers, op codes) and daemon-side `~/nix/src/libstore/daemon.cc`
+  (confirms `IsValidPath`'s exact read-a-string/write-a-bool shape), plus
+  `~/gnix/fix`'s from-scratch Zig reimplementation
+  (`src/store/daemon/{wire,client}.zig`) for the handshake sequence and
+  the stderr-sideband error-serialization format. Both agreed exactly.
+- **Wire format**: every value is a little-endian `u64`; a string is a
+  `u64` byte length followed by the bytes, zero-padded to the next 8-byte
+  boundary. Handshake: client sends `WORKER_MAGIC_1`
+  (`0x6e697863`), reads `WORKER_MAGIC_2` (`0x6478696f`) and the daemon's
+  protocol version, checks the major version matches and the minor is
+  `>= 26`, sends asnix's own version (`1.35`), conditionally sends two
+  obsolete fields modern daemons still expect (CPU affinity if
+  minor`>=`14, reserve-space if minor`>=`11, both always 0), conditionally
+  reads a Nix-version string (minor`>=`33) and a trusted-client flag
+  (minor`>=`35), then drains the initial stderr sideband.
+- **Validated against the real, live `nix-daemon` already running on
+  this dev machine** (`tests/c/test_daemon_client.c`): connects for
+  real, confirms a made-up (but *well-formed*) store path is reported
+  invalid — twice in a row, and interleaved with a third repeat of the
+  first path, to specifically exercise that the connection correctly
+  resynchronizes between calls, the part of this protocol most likely to
+  silently desync if the sideband-draining logic ever mis-parses a
+  field — and confirms a real, dynamically-discovered valid path
+  (`nix-instantiate`'s own resolved location, not hardcoded) is reported
+  valid. Skips gracefully (not a failure) if no daemon is reachable, so
+  it doesn't break `make test` in an environment without one.
+- **A near-miss worth recording**: the *first* version of this test used
+  a malformed placeholder path (a 31-character hash instead of the
+  required 32), which the daemon correctly rejected with a structured
+  parse error — and then closed the connection, which looked at first
+  like a bug in `daemon_client.c`'s framing until re-reading the error
+  message (`"...hash part is not followed by a '-'"`) made clear the
+  daemon was responding exactly as it should to genuinely malformed
+  input; the fix was in the test's fixture data, not the client. Recorded
+  here (not in the numbered "Known bugs" list below) precisely because
+  it *wasn't* a real bug — a reminder that "the test failed" and "the
+  code is wrong" aren't the same claim, and checking which one is true
+  is itself a verification step.
+- **Daemon realization (actually building derivations) is not
+  implemented** — this slice only proves connectivity and the simplest
+  op; wiring `derivation {...}`'s computed paths to an actual
+  `BuildPaths`/`AddToStore` call (closing the loop from "compute a store
+  path" to "the path actually exists on disk") is future work.
 
 ## Checked against numtide/nix-conformance
 

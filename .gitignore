@@ -16,6 +16,7 @@ tests/ir/test_m5_fixtures
 tests/c/test_symtab
 tests/c/test_store_path
 tests/c/test_aterm
+tests/c/test_daemon_client
 tests/ir/test_m6_fixtures
 tests/ir/test_m7_fixtures
 tests/c/test_hash_shim
