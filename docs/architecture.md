@@ -567,6 +567,107 @@ fixtures alone. Full methodology and the 4 verified cases are in
   for more candidates rather than assuming today's 4-case result still
   reflects available coverage.
 
+**Re-screened after M10-M17** (recursive `let`/`rec {}`/`inherit`,
+comparisons/`&&`/`||`/`!`/`assert`/`//`, string interpolation + multi-line
+strings, `with`, lambda-destructuring patterns, `import` + path literals,
+and the expanded builtins set): same clone (`/tmp/nix-conformance`,
+commit `466c61d`, still 532 `eval-okay-*` cases), same methodology, run
+mechanically this time rather than by hand -- every case was actually
+executed through `./asnix` and diffed against its `.exp` sidecar (not just
+grepped for disallowed tokens), since asnix's lack of type-checking on `+`/
+`==`/etc. means a case using an unimplemented feature can still exit 0
+with a *wrong, non-matching* answer rather than a clean parse/type error
+(see `eval-okay-if`/`eval-okay-new-let`/`eval-okay-patterns`/
+`eval-okay-ind-string` below) -- running and comparing catches that for
+free, where a pure syntax whitelist would not.
+
+- **15 additional cases qualify** (now 19 total, up from 4): `abs-path-
+  default`, `abs-path-warn`, `backslash-newline-1`, `backslash-newline-2`,
+  `concatstringssep`, `empty-args`, `equal-function-attrset-distinct-
+  similar`, `equal-function-direct-distinct-similar`, `equal-function-
+  list-distinct-similar`, `nested-with`, `scope-1`, `scope-2`, `scope-3`,
+  `scope-7`, `url-literal-quoted-fatal`. Added to `tests/conformance/` in
+  the same `.nix`/`.expected` pair convention; all pass via
+  `make test-conformance`.
+- **One real bug found and fixed** (see "Known bugs" #15 above): the
+  `backslash-newline-{1,2}` pair surfaced that the printer never escaped
+  special characters (`\n`/`\r`/`\t`/`"`/`\`/a literal `${` run) when
+  displaying a string -- it printed raw bytes verbatim instead of real
+  Nix's escaped form. Fixed in `main.c`; four pre-existing
+  `tests/e2e/str_indented_*.expected` fixtures had to be updated in the
+  same change since they'd baked in the old, wrong unescaped output.
+- **Explicitly screened out, not added, and why** (ruling out
+  printer-divergence false positives per this project's own caveat about
+  the eager-forcing printer before concluding anything else was a real
+  mismatch):
+  - `eval-okay-eq`, `eval-okay-eq-slot-attrs`: rely on deep structural
+    equality on lists/attrsets and/or string *content* equality
+    (`"foo" == "f" + "oo"`) -- the already-documented `==`/`!=`
+    pointer-identity scope cut (see the Operators section above), not a
+    new finding.
+  - `eval-okay-equal-function-{direct,attrset,list}-identical`: exercise
+    real Nix's documented "value identity optimization" for `==` on
+    attrsets/lists (member-pointer-identity short-circuits *before*
+    falling back to "functions are never equal, even to themselves,"
+    which is why `f == f` is `false` in real Nix but `{a=f;} == {a=f;}`
+    is `true`) -- asnix's simpler all-levels pointer-identity rule gives
+    the opposite answer on both shapes (`f == f` -> `true`,
+    `{a=f;}=={a=f;}` -> `false`). A sharper manifestation of the same
+    documented scope cut above, not a separate bug; implementing real
+    Nix's exact rule would be new feature work, out of scope here. (The
+    three *-distinct-similar siblings of these, which compare two
+    genuinely different closures, happen to agree with real Nix under
+    either semantics -- both say `false` -- which is why those three
+    *did* qualify above.)
+  - `eval-okay-if`, `eval-okay-new-let`, `eval-okay-patterns`,
+    `eval-okay-ind-string`: all rely on `+` as *string* concatenation
+    (`"f" + "oo"`) or multi-string `+`-chains -- asnix's `+` is
+    INT-only and untyped (`op_add.S` just treats both operand words as
+    ints), so these don't error, they silently compute a garbage integer
+    that happens not to match the `.exp` string -- exactly the footgun
+    this task's own brief warned about. Not a bug to fix (string `+` is
+    a real missing language feature, not in scope here) and not safe to
+    add even though asnix "ran" them.
+  - `eval-okay-overrides`, `eval-okay-overrides-thunks`: rely on real
+    Nix's legacy `__overrides`-in-`rec{}` special-casing (confirmed via
+    the comment in `eval-okay-overrides-thunks.nix` itself, a
+    `eval.cc`-era mechanism), which asnix's `rec {}` doesn't implement --
+    asnix treats `__overrides` as an ordinary attribute name with no
+    special effect. A genuine, narrow scope gap, not a bug; not
+    implemented (a legacy, rarely-used Nix feature, not attempted here).
+  - `eval-okay-autoargs`: needs CLI-level `--arg`/autoargs injection into
+    a top-level lambda, a feature of `nix-instantiate`'s own driver, not
+    the language -- asnix's `main()` has no equivalent mechanism and
+    this isn't a language-evaluator gap at all.
+  - `eval-okay-dotslash-path-fatal`, `eval-okay-dotdotslash-path-fatal`,
+    `eval-okay-short-path-literal-warn`, `eval-okay-short-path-variation`:
+    their `.exp` files use a `/pwd`-prefixed placeholder path that
+    nix-conformance's own (unimplemented-here) test harness substitutes
+    at run time -- not directly byte-comparable without that harness.
+    Spot-checked qualitatively instead: asnix's resolved path has the
+    same relative structure (e.g. `.../lang/test/subdir`), just rooted at
+    this clone's real directory instead of the placeholder -- not a bug,
+    just not mechanically comparable yet (same `SPEC.md`-adapter gap the
+    original screening already flagged as future work).
+  - Every other case needing a comparison/`&&`/`&&`/`with`/`rec`/
+    `inherit`/`//`/`?`/string-interpolation/multi-line-string/pattern-
+    lambda/`import`/path-literal feature not yet implemented, or a
+    builtin outside the current set (`attrNames`/`attrValues`/`hasAttr`/
+    `getAttr`/`mapAttrs`/`removeAttrs`/`map`/`filter`/`foldl'`/`elemAt`/
+    `concatLists`/`tail`/`head`/`substring`/`stringLength`/
+    `concatStringsSep`/`toString`/`typeOf`/`length`/`hashString`/
+    `derivation`/`import`/the type predicates -- see the M7/M17 scope
+    notes above for the exhaustive list), errored cleanly (parse error,
+    "unrecognized character", "undefined variable", or a fatal type
+    error) and was excluded -- the large majority of the 532 cases, as
+    expected: real Nix's language surface, builtins (`genericClosure`,
+    regex, `fromJSON`/`toJSON`/`fromTOML`, `tryEval`, `builtins.trace`,
+    floats, `?`-default function args beyond patterns, `++`, string/
+    division operators, deep equality, `__overrides`, and much more) are
+    still far larger than this project's current subset.
+- As asnix's language coverage grows further, re-run this same screening
+  process again rather than assuming this 19-case result is final.
+
 ## Measured: dispatch-elimination thesis (`bench/microbench_m45.c`)
 
 Ad hoc, not a pass/fail gate (see M9 in the roadmap for the real harness).
@@ -1466,3 +1567,27 @@ of which one is actually correct).
    actually matches `<name...>`, otherwise falling through unchanged to
    ordinary operator lexing. Verified directly (`1 < 2` -> `true`, `2 < 1`
    -> `false`) after the fix.
+15. **The printer never escaped special characters inside a string literal**
+   (found re-screening numtide/nix-conformance after the operators/strings/
+   `with`/pattern-lambda/`import` milestones landed -- see "Checked against
+   numtide/nix-conformance" below): `main.c`'s `print_value_inner` used to
+   `printf("\"%.*s\"", ...)` a string's raw bytes verbatim between quotes.
+   For a string whose bytes contain an actual newline (e.g. `"a\<literal
+   newline>b"` or `''a''\<literal newline>b''`, both of which decode to the
+   3-byte sequence `a`, `\n`, `b` per the Strings milestone's own escape
+   rules), this printed a raw embedded newline instead of real Nix's
+   `"a\nb"` -- confirmed directly against `nix-instantiate --eval` on
+   `eval-okay-backslash-newline-{1,2}`. Also affected (same root cause,
+   found auditing the fix against every other special character
+   `nix-instantiate` escapes): a literal `"` or `\` byte inside the string,
+   and a literal `${` run (real Nix backslash-escapes the `$` specifically
+   when followed by `{`, so the printed form could be pasted back into Nix
+   source without accidentally starting an interpolation -- confirmed a
+   bare `$` *not* followed by `{`, e.g. `"e$f"`, is left unescaped). Fixed
+   by `print_string_bytes` (`main.c`), a small per-byte loop replacing the
+   single `printf`; re-verified all of `tests/e2e/str_indented_*` and
+   `str_interp_*` against `nix-instantiate --eval` after the fix (four
+   `tests/e2e/str_indented_*.expected` fixtures had themselves been
+   silently encoding the *old*, wrong unescaped-newline/dollar-brace
+   behavior and needed updating to the correct escaped form once the
+   printer stopped matching real Nix by coincidence).
