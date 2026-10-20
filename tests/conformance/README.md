@@ -6,17 +6,24 @@ These `.nix`/`.expected` pairs are copied from
 own functional test suite), not written by this project. `.expected`
 holds the exact output Nix 2.34.8 produces.
 
-Only a handful of nix-conformance's 532 `eval-okay-*` cases are copied
-here: asnix's current language subset (M0-M7: integer arithmetic,
-non-recursive `let`/attrsets, `if`, curried lambdas/application, lists,
-attribute selection, 3 builtins) is tiny compared to full Nix, so most
-cases need unimplemented features (string concatenation, `++`, comparison/
-logical operators, `with`, `rec`, `inherit`, `?`, floats, paths, escape
-sequences, most builtins) and would fail for that reason alone -- not
-informative as a conformance check yet. The cases here were manually
-screened to use *only* currently-implemented syntax; see
-`docs/architecture.md`'s conformance notes for how they were found and
-what fixing this screening turned up.
+Only 19 of nix-conformance's 532 `eval-okay-*` cases are copied here (up
+from an original 4, after re-screening once the language subset grew
+through M10-M17: recursive `let`/`rec {}`/`inherit`, comparisons/`&&`/
+`||`/`!`/`assert`/`//`, string interpolation + multi-line strings, `with`,
+lambda-destructuring patterns, `import` + path literals, and an expanded
+builtins set). Most of the remaining 513 still need unimplemented features
+(string concatenation via `+`, `++`, floats, division, deep/structural
+equality on lists/attrsets or content equality on strings, real Nix's
+legacy `__overrides` mechanism, regex, JSON/TOML builtins, `genericClosure`,
+CLI-level `--arg` autoargs, and more) and were excluded -- either because
+asnix cleanly errors on them, or (more subtly, since asnix doesn't
+type-check `+`/`==`) because they run to completion but produce a
+*different* answer than the `.exp` sidecar, which is caught by actually
+running and diffing every case rather than just grepping for disallowed
+syntax. See `docs/architecture.md`'s conformance notes for the full
+screening methodology, the complete list of what's included/excluded and
+why, and one real printer bug (unescaped special characters in displayed
+strings) this latest pass found and fixed.
 
 As asnix's language coverage grows, re-screen nix-conformance's `lang/`
 directory (cloned separately, not vendored into this repo) for more

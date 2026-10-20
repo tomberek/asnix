@@ -1,1 +1,1 @@
-"literal ${foo} end"
+"literal \${foo} end"

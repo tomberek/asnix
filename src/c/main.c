@@ -11,6 +11,45 @@
 #include "symtab.h"
 #include "value_util.h"
 
+/* Prints a string literal's bytes the way real Nix's own printer does
+ * (confirmed against `nix-instantiate --eval` -- see docs/architecture.md's
+ * "Known bugs" list, the entry about conformance-driven printer escaping):
+ * `\n`/`\r`/`\t` become the two-character escape, `"` and `\` are
+ * backslash-escaped, and a literal `${` run is escaped to `\${` (so the
+ * printed form could be pasted back into Nix source without accidentally
+ * starting an interpolation) -- but a bare `$` *not* followed by `{` is
+ * left alone (confirmed: `"e$f"` prints as `"e$f"`, not `"e\$f"`). Before
+ * this fix, `print_value_inner` just `printf`'d the raw bytes between
+ * quotes verbatim, so a string containing an actual newline byte (e.g. from
+ * `"a\<literal-newline>b"` or `''a''\<literal-newline>b''`, both of which
+ * decode to the 2-byte sequence {'a','\n','b'} per the Strings milestone's
+ * escape rules) printed as a raw embedded newline instead of the two
+ * visible characters `\n` -- found re-screening numtide/nix-conformance's
+ * eval-okay-backslash-newline-{1,2}. */
+static void print_string_bytes(const char *bytes, int64_t len) {
+    putchar('"');
+    for (int64_t i = 0; i < len; i++) {
+        char c = bytes[i];
+        switch (c) {
+            case '\n': fputs("\\n", stdout); break;
+            case '\r': fputs("\\r", stdout); break;
+            case '\t': fputs("\\t", stdout); break;
+            case '"': fputs("\\\"", stdout); break;
+            case '\\': fputs("\\\\", stdout); break;
+            case '$':
+                if (i + 1 < len && bytes[i + 1] == '{') {
+                    fputs("\\${", stdout);
+                    i++; /* consume the '{' too */
+                } else {
+                    putchar('$');
+                }
+                break;
+            default: putchar(c); break;
+        }
+    }
+    putchar('"');
+}
+
 static void print_value_inner(Value v) {
     v = asnix_force_for_print(v); /* list elements and attrset values are lazy (M6) */
     switch (asnix_tag_of(v)) {
@@ -30,7 +69,7 @@ static void print_value_inner(Value v) {
             /* Paths print bare/unquoted (an absolute filesystem path, not
              * string syntax) -- matches `nix-instantiate --eval`. */
             if (asnix_value_is_path(v)) printf("%.*s", (int)len, bytes);
-            else printf("\"%.*s\"", (int)len, bytes);
+            else print_string_bytes(bytes, len);
             return;
         }
         case ASNIX_TAG_LIST: {
