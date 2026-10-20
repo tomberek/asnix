@@ -29,9 +29,10 @@ TEST_IR_BINS  := $(TEST_IR_SRCS:.c=)
 TEST_C_SRCS   := $(wildcard tests/c/*.c)
 TEST_C_BINS   := $(TEST_C_SRCS:.c=)
 
-E2E_NIX       := $(wildcard tests/e2e/*.nix)
+E2E_NIX         := $(wildcard tests/e2e/*.nix)
+CONFORMANCE_NIX := $(wildcard tests/conformance/*.nix)
 
-.PHONY: all release test test-e2e clean watch
+.PHONY: all release test test-e2e test-conformance clean watch
 all: asnix
 
 release: OPT := -O2
@@ -83,6 +84,19 @@ tests/c/%: tests/c/%.c libasnix.a
 # subprocess-per-case is slower than tier 1's in-process checks.
 test-e2e: asnix
 	@set -e; for f in $(E2E_NIX); do \
+		exp="$${f%.nix}.expected"; \
+		got=$$(./asnix "$$f"); \
+		want=$$(cat "$$exp"); \
+		if [ "$$got" = "$$want" ]; then echo "== $$f == OK"; \
+		else echo "== $$f == FAIL (got '$$got', want '$$want')"; exit 1; fi; \
+	done
+
+# Tier-3: cases mined from numtide/nix-conformance (see tests/conformance/
+# README.md) -- same mechanics as test-e2e, separate target since these
+# check against an external reference's expectations, not this project's
+# own fixtures.
+test-conformance: asnix
+	@set -e; for f in $(CONFORMANCE_NIX); do \
 		exp="$${f%.nix}.expected"; \
 		got=$$(./asnix "$$f"); \
 		want=$$(cat "$$exp"); \

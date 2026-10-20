@@ -219,6 +219,37 @@ passed around, etc., same as a closure).
   `OP_CALL`'s primop branch (arg layout, arity checking, result handling)
   independent of any real builtin's logic.
 
+## Checked against numtide/nix-conformance
+
+[numtide/nix-conformance](https://github.com/numtide/nix-conformance) is
+an external, independently-maintained Nix-language conformance suite
+(532 `eval-okay-*` cases as of this check, expected output from real Nix
+2.34.8) — a stronger correctness bar than this project's own hand-written
+fixtures alone. Full methodology and the 4 verified cases are in
+`tests/conformance/` (`make test-conformance`); summary:
+
+- Screened all 532 `lang/eval-okay-*.nix` cases for ones using *only*
+  currently-implemented syntax (no `==`/`!=`/comparisons, `&&`/`||`,
+  `with`, `rec`, `inherit`, `//`, `?`, string interpolation, `assert`,
+  floats, paths, escape sequences, or builtins beyond `toString`/
+  `typeOf`/`length`). Only 4 of 532 qualified — expected, given asnix's
+  current language subset is still a small fraction of real Nix; this
+  isn't a conformance *score*, just the set actually checkable yet.
+- All 4 matched Nix's expected output exactly on the first run — **except**
+  one real bug the check surfaced: `eval-okay-attrs6`'s expected output
+  showed attrset keys printed alphabetically by name (`{ __overrides =
+  ...; bar = ...; foo = ...; }`), but asnix's printer displayed them in
+  symbol-intern order (first-seen-in-source order) instead, since `Attrs`
+  entries are stored sorted by *symbol id* for `OP_SELECT`'s binary
+  search — a representation choice with no reason to coincide with
+  alphabetical name order. Confirmed directly: `{ b = 1; a = 2; }`
+  printed as `{ b = 1; a = 2; }` instead of Nix's `{ a = 2; b = 1; }`.
+  Fixed in `main.c`'s printer only (re-sorts entries by name for display;
+  the stored symbol-id order, and `OP_SELECT`'s lookup, are untouched).
+- As asnix's language coverage grows, re-run this same screening process
+  for more candidates rather than assuming today's 4-case result still
+  reflects available coverage.
+
 ## Measured: dispatch-elimination thesis (`bench/microbench_m45.c`)
 
 Ad hoc, not a pass/fail gate (see M9 in the roadmap for the real harness).
@@ -274,3 +305,12 @@ savings and shouldn't be quoted as such.
    `y`'s frame straight into garbage memory. Fixed in both `op_lambda.S`
    and `op_mk_thunk.S` by popping directly into `%rdi` (then copying from
    the now-correct `%rdi` into the heap object), not through `%rdx`.
+4. **Attrset printing used storage order instead of name order** (M5,
+   found by checking against nix-conformance in M7): `Attrs` entries are
+   stored sorted by symbol id (intern order) for `OP_SELECT`'s binary
+   search, which the printer wrongly assumed was also the right *display*
+   order. Real Nix always prints attrset keys sorted alphabetically by
+   name, regardless of declaration or internal storage order. Fixed in
+   `main.c`'s printer only (re-sorts by name for display); the runtime
+   representation and `OP_SELECT` are untouched. See "Checked against
+   numtide/nix-conformance" above for how this was found.
