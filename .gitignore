@@ -27,3 +27,4 @@ tests/c/test_apply
 tests/c/test_builtins_list
 tests/c/test_builtins_misc
 tests/c/test_abort
+tests/c/test_builtins_m18

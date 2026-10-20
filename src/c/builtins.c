@@ -8,7 +8,11 @@
 #include "asnix/arena.h"
 #include "asnix/heap.h"
 #include "builtins_attrs.h"
+#include "builtins_attrs2.h"
+#include "builtins_closure.h"
+#include "builtins_compare.h"
 #include "builtins_list.h"
+#include "builtins_list2.h"
 #include "builtins_misc.h"
 #include "derivation.h"
 #include "eval_file.h"
@@ -225,15 +229,6 @@ static const BuiltinDef BUILTINS[] = {
     { "abort", prim_abort, 1 },
 };
 
-/* Merges this file's own BUILTINS[] with the three builtins-expansion
- * modules (list/attrs/misc), each kept in its own translation unit so the
- * agents that wrote them in parallel didn't textually collide on one
- * shared array -- see builtins_list.h/builtins_attrs.h/builtins_misc.h's
- * own "integration step" comments, which this function fulfills. The misc
- * module's shape differs (a `build()` callback returning a ready Value,
- * since a couple of its entries are curried Closures rather than a plain
- * PrimOp) so it's merged via a small adapter loop rather than sharing the
- * {name,fn,arity} shape the other three use. */
 Value asnix_make_import_primop(void) {
     return make_primop_value((void *)prim_import, 1);
 }
@@ -246,33 +241,65 @@ Value asnix_make_toString_primop(void) {
     return make_primop_value((void *)prim_toString, 1);
 }
 
+/* Merges this file's own BUILTINS[] with the builtins-expansion modules
+ * added across two passes (M17: list/attrs/misc; this pass: closure/
+ * list2/attrs2/compare), each kept in its own translation unit so agents
+ * working in parallel (M17) or on independent feature batches (this pass)
+ * don't textually collide on one shared array -- see builtins_list.h/
+ * builtins_attrs.h/builtins_misc.h/builtins_closure.h/builtins_list2.h/
+ * builtins_attrs2.h/builtins_compare.h's own "integration step" comments,
+ * which this function fulfills.
+ *
+ * Two source shapes, merged via two small adapter loops: the plain
+ * {name,fn,arity} shape (this file's own BUILTINS[], plus
+ * asnix_builtins_list/ASNIX_ATTRS_BUILTINS -- arity>1 entries here are
+ * themselves arity-1 PrimOps that *return* the next curried stage, see
+ * those modules' own comments) is registered as a single PrimOp of the
+ * given arity; the {name,build()} shape (ASNIX_BUILTINS_MISC and this
+ * pass's four new modules -- build() already returns a fully-formed
+ * Value, since several entries are curried Closure chains rather than a
+ * single PrimOp, see builtins_shared.h's make_curried_native) is
+ * registered by just calling build(). */
 Value asnix_make_builtins_attrs(void) {
-    size_t n_base = sizeof(BUILTINS) / sizeof(BUILTINS[0]);
-    size_t n_list = asnix_builtins_list_count;
-    size_t n_attrs = ASNIX_ATTRS_BUILTINS_COUNT;
-    size_t n_misc = ASNIX_BUILTINS_MISC_COUNT;
-    size_t n = n_base + n_list + n_attrs + n_misc;
+    static const BuiltinDef *const plain_tables[] = { BUILTINS };
+    static const size_t plain_counts[] = { sizeof(BUILTINS) / sizeof(BUILTINS[0]) };
+    const AsnixBuiltinDef *const list_shaped_tables[] = { asnix_builtins_list, ASNIX_ATTRS_BUILTINS };
+    const size_t list_shaped_counts[] = { asnix_builtins_list_count, ASNIX_ATTRS_BUILTINS_COUNT };
+    const AsnixBuiltinMiscDef *const build_tables[] = {
+        ASNIX_BUILTINS_MISC, ASNIX_CLOSURE_BUILTINS, ASNIX_LIST2_BUILTINS, ASNIX_ATTRS2_BUILTINS, ASNIX_COMPARE_BUILTINS,
+    };
+    const size_t build_counts[] = {
+        ASNIX_BUILTINS_MISC_COUNT, ASNIX_CLOSURE_BUILTINS_COUNT, ASNIX_LIST2_BUILTINS_COUNT,
+        ASNIX_ATTRS2_BUILTINS_COUNT, ASNIX_COMPARE_BUILTINS_COUNT,
+    };
+
+    size_t n = 0;
+    for (size_t t = 0; t < sizeof(plain_counts) / sizeof(plain_counts[0]); t++) n += plain_counts[t];
+    for (size_t t = 0; t < sizeof(list_shaped_counts) / sizeof(list_shaped_counts[0]); t++) n += list_shaped_counts[t];
+    for (size_t t = 0; t < sizeof(build_counts) / sizeof(build_counts[0]); t++) n += build_counts[t];
 
     uint32_t *syms = malloc(n * sizeof(uint32_t));
     Value *vals = malloc(n * sizeof(Value));
     size_t *order = malloc(n * sizeof(size_t));
 
     size_t k = 0;
-    for (size_t i = 0; i < n_base; i++, k++) {
-        syms[k] = asnix_intern(BUILTINS[i].name, strlen(BUILTINS[i].name));
-        vals[k] = make_primop_value((void *)BUILTINS[i].fn, BUILTINS[i].arity);
+    for (size_t t = 0; t < sizeof(plain_counts) / sizeof(plain_counts[0]); t++) {
+        for (size_t i = 0; i < plain_counts[t]; i++, k++) {
+            syms[k] = asnix_intern(plain_tables[t][i].name, strlen(plain_tables[t][i].name));
+            vals[k] = make_primop_value((void *)plain_tables[t][i].fn, plain_tables[t][i].arity);
+        }
     }
-    for (size_t i = 0; i < n_list; i++, k++) {
-        syms[k] = asnix_intern(asnix_builtins_list[i].name, strlen(asnix_builtins_list[i].name));
-        vals[k] = make_primop_value((void *)asnix_builtins_list[i].fn, asnix_builtins_list[i].arity);
+    for (size_t t = 0; t < sizeof(list_shaped_counts) / sizeof(list_shaped_counts[0]); t++) {
+        for (size_t i = 0; i < list_shaped_counts[t]; i++, k++) {
+            syms[k] = asnix_intern(list_shaped_tables[t][i].name, strlen(list_shaped_tables[t][i].name));
+            vals[k] = make_primop_value((void *)list_shaped_tables[t][i].fn, list_shaped_tables[t][i].arity);
+        }
     }
-    for (size_t i = 0; i < n_attrs; i++, k++) {
-        syms[k] = asnix_intern(ASNIX_ATTRS_BUILTINS[i].name, strlen(ASNIX_ATTRS_BUILTINS[i].name));
-        vals[k] = make_primop_value((void *)ASNIX_ATTRS_BUILTINS[i].fn, ASNIX_ATTRS_BUILTINS[i].arity);
-    }
-    for (size_t i = 0; i < n_misc; i++, k++) {
-        syms[k] = asnix_intern(ASNIX_BUILTINS_MISC[i].name, strlen(ASNIX_BUILTINS_MISC[i].name));
-        vals[k] = ASNIX_BUILTINS_MISC[i].build();
+    for (size_t t = 0; t < sizeof(build_counts) / sizeof(build_counts[0]); t++) {
+        for (size_t i = 0; i < build_counts[t]; i++, k++) {
+            syms[k] = asnix_intern(build_tables[t][i].name, strlen(build_tables[t][i].name));
+            vals[k] = build_tables[t][i].build();
+        }
     }
 
     for (size_t i = 0; i < n; i++) order[i] = i;

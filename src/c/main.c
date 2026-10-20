@@ -25,7 +25,11 @@
  * decode to the 2-byte sequence {'a','\n','b'} per the Strings milestone's
  * escape rules) printed as a raw embedded newline instead of the two
  * visible characters `\n` -- found re-screening numtide/nix-conformance's
- * eval-okay-backslash-newline-{1,2}. */
+ * eval-okay-backslash-newline-{1,2}. (A second agent working in parallel,
+ * on the builtins-expansion/toJSON pass, independently found and fixed the
+ * same underlying bug -- its narrower `print_escaped_string` handled
+ * `" \ \n \r \t` but not the `${` case; this version was kept as the more
+ * complete of the two.) */
 static void print_string_bytes(const char *bytes, int64_t len) {
     putchar('"');
     for (int64_t i = 0; i < len; i++) {
