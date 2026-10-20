@@ -349,6 +349,25 @@ Token *asnix_lex(const char *src, size_t *out_count) {
             while (src[i] && src[i] != '\n') i++;
             continue;
         }
+        if (c == '/' && src[i + 1] == '*') { /* block comment -- real Nix files are full of these
+                                               * (e.g. nixpkgs's pkgs/top-level/impure.nix opens with
+                                               * one); previously unhandled entirely, so the lexer hit
+                                               * "unrecognized character '/'" on the literal '/*' the
+                                               * moment any real-world file was fed in -- found
+                                               * evaluating real nixpkgs via d.nix, see
+                                               * docs/architecture.md's Known Bugs list. Checked before
+                                               * try_scan_path below: '/*' never matches a path literal
+                                               * anyway ('*' isn't a path_char), but comments should
+                                               * never compete with path-literal scanning regardless. */
+            i += 2;
+            while (src[i] && !(src[i] == '*' && src[i + 1] == '/')) i++;
+            if (!src[i]) {
+                fprintf(stderr, "asnix: unterminated block comment\n");
+                exit(1);
+            }
+            i += 2;
+            continue;
+        }
 
         /* Tried before digit/string/ident/single-char below -- see
          * try_scan_path's comment for why this has to come first. */
@@ -406,6 +425,24 @@ Token *asnix_lex(const char *src, size_t *out_count) {
             if (src[j] == '\n') i = j + 1;
             mode_push(&modes, MODE_ISTRING);
             push_tok(&v, (Token){ .kind = TOK_ISTR_START });
+            continue;
+        }
+
+        /* `${expr}` directly in normal-mode code (not inside a string) --
+         * real Nix's dynamic attribute syntax, `set.${name}` (checked
+         * before `{` below, which it would otherwise shadow). Reuses the
+         * exact same TOK_DOLLAR_LBRACE/mode-push-MODE_NORMAL mechanism
+         * string interpolation already uses (lex_dquote_run/
+         * lex_indented_run above): the matching '}' pops back out via the
+         * ordinary '}' handling just below, same as any other nested
+         * '{'. Previously `$` had no meaning at all outside an active
+         * string mode, so this hit "unrecognized character '$'" -- found
+         * evaluating real nixpkgs (`pkgs/top-level/default.nix` uses
+         * `set.${name}`), see docs/architecture.md's Known Bugs list. */
+        if (c == '$' && src[i + 1] == '{') {
+            i += 2;
+            mode_push(&modes, MODE_NORMAL);
+            push_tok(&v, (Token){ .kind = TOK_DOLLAR_LBRACE });
             continue;
         }
 
@@ -467,6 +504,7 @@ Token *asnix_lex(const char *src, size_t *out_count) {
         else if (c == '&' && src[i + 1] == '&') { kind = TOK_ANDAND; width = 2; }
         else if (c == '|' && src[i + 1] == '|') { kind = TOK_OROR; width = 2; }
         else if (c == '/' && src[i + 1] == '/') { kind = TOK_SLASHSLASH; width = 2; }
+        else if (c == '-' && src[i + 1] == '>') { kind = TOK_ARROW; width = 2; }
         else {
             switch (c) {
                 case '+': kind = TOK_PLUS; break;

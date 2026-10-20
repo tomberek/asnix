@@ -173,6 +173,15 @@ enum {
                      * in-line. Scope cut: only protects the single select this op
                      * corresponds to, not every segment of a longer `a.b.c` chain --
                      * see op_select_or.S's header comment. */
+    OP_SELECT_DYNAMIC, /* `expr.${nameExpr}`: pops the attribute-name Value then the select
+                          * target (reverse push order); interns the name (must be a string,
+                          * fatal otherwise) and looks it up at runtime, since (unlike plain
+                          * OP_SELECT) the symbol can't be known at compile time -- see
+                          * asnix_bshared_select_dynamic (builtins_shared.c) and
+                          * op_select_dynamic.S. Fatal on a non-attrset target or a missing
+                          * key, matching plain OP_SELECT (not OP_SELECT_OR's graceful
+                          * fallthrough) -- `.${expr} or default` is rejected at parse time
+                          * instead (see parser.c), so this op never needs a miss path. */
     OP_COUNT
 };
 

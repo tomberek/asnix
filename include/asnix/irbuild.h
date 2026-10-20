@@ -51,6 +51,11 @@ size_t ib_mk_list(IrBuilder *b, int64_t count);
 size_t ib_mk_attrs(IrBuilder *b, int64_t count, const uint32_t *sorted_syms);
 size_t ib_select(IrBuilder *b, uint32_t sym);
 
+/* `expr.${nameExpr}`: pops the name Value then the select target (both
+ * already pushed by the compiler), looks the name up at runtime -- see
+ * OP_SELECT_DYNAMIC's own comment (ir.h) and op_select_dynamic.S. */
+size_t ib_select_dynamic(IrBuilder *b);
+
 /* M6: pushes a thunk wrapping body_prog (compiled like a lambda body,
  * ending in OP_RET) captured over the *current* Env at the point this op
  * runs -- same pool-travels-with-it rationale as ib_lambda. */

@@ -10,6 +10,7 @@
 #include "asnix/heap.h"
 #include "asnix/ir.h"
 #include "asnix/irbuild.h"
+#include "symtab.h"
 #include "value_util.h"
 
 Value asnix_bshared_make_primop(void *fn, int64_t arity) {
@@ -172,6 +173,26 @@ int asnix_bshared_value_eq(Value a, Value b) {
         }
         default: return a.raw == b.raw; /* pointer identity: closures/primops/thunks */
     }
+}
+
+Value asnix_bshared_select_dynamic(Value target, Value name_val) {
+    if (asnix_tag_of(target) != ASNIX_TAG_ATTRS) {
+        fprintf(stderr, "asnix: cannot select an attribute (dynamic) on a non-attrset value\n");
+        exit(1);
+    }
+    if (asnix_tag_of(name_val) != ASNIX_TAG_PTR || asnix_value_is_path(name_val)) {
+        fprintf(stderr, "asnix: a dynamic '.${...}' attribute name must be a string\n");
+        exit(1);
+    }
+    int64_t len;
+    const char *bytes = asnix_ptr_bytes(name_val, &len);
+    uint32_t sym = asnix_intern(bytes, (size_t)len);
+    int64_t idx = asnix_bshared_attrs_find(target, sym);
+    if (idx < 0) {
+        fprintf(stderr, "asnix: attribute '%.*s' missing, aborting\n", (int)len, bytes);
+        exit(1);
+    }
+    return asnix_force_for_print(asnix_bshared_attrs_value(target, idx));
 }
 
 int asnix_bshared_value_lt(Value a, Value b, const char *who) {

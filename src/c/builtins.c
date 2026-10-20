@@ -34,15 +34,32 @@ static Value prim_toString(const Value *args, int64_t argc) {
  * error message: '<msg>'"; the "while calling" trace context real Nix
  * also prints isn't reproduced -- asnix has no call-trace infrastructure
  * at all, same simplification every other fatal error in this project
- * already makes). No distinct `throw` exists yet -- asnix has no
- * exception/catch mechanism (no `builtins.tryEval`), so the two would be
- * behaviorally identical here anyway; left as a documented follow-up. */
+ * already makes). */
 static Value prim_abort(const Value *args, int64_t argc) {
     (void)argc;
     Value msg = asnix_coerce_to_string(args[0]);
     int64_t len;
     const char *bytes = asnix_ptr_bytes(msg, &len);
     fprintf(stderr, "asnix: evaluation aborted with the following error message: '%.*s'\n", (int)len, bytes);
+    exit(1);
+}
+
+/* `throw msg` -- also unconditionally fatal, but with real Nix's distinct,
+ * plainer wording (confirmed directly: `throw "x"` -> "error: x", not
+ * `abort`'s "evaluation aborted with the following error message: 'x'").
+ * Real Nix's `builtins.tryEval`/`try`-style catching would make these two
+ * genuinely different (`throw` is catchable, `abort` never is) -- asnix
+ * has no such mechanism, so the only observable difference here is the
+ * message wording, a documented, narrower scope cut. One of real Nix's
+ * bare root-scope globals too (found needed evaluating real nixpkgs,
+ * `pkgs/top-level/default.nix` uses bare `throw`), see eval_file.c/
+ * compiler.c's root scope. */
+static Value prim_throw(const Value *args, int64_t argc) {
+    (void)argc;
+    Value msg = asnix_coerce_to_string(args[0]);
+    int64_t len;
+    const char *bytes = asnix_ptr_bytes(msg, &len);
+    fprintf(stderr, "asnix: %.*s\n", (int)len, bytes);
     exit(1);
 }
 
@@ -227,6 +244,7 @@ static const BuiltinDef BUILTINS[] = {
     { "derivation", asnix_prim_derivation, 1 },
     { "import", prim_import, 1 },
     { "abort", prim_abort, 1 },
+    { "throw", prim_throw, 1 },
 };
 
 Value asnix_make_import_primop(void) {
@@ -235,6 +253,10 @@ Value asnix_make_import_primop(void) {
 
 Value asnix_make_abort_primop(void) {
     return make_primop_value((void *)prim_abort, 1);
+}
+
+Value asnix_make_throw_primop(void) {
+    return make_primop_value((void *)prim_throw, 1);
 }
 
 Value asnix_make_toString_primop(void) {

@@ -258,6 +258,8 @@ static void parse_binding_stmt(Parser *p, BindingVec *out) {
                 sel->as.select.target = src_expr;
                 sel->as.select.attr = name->start;
                 sel->as.select.attr_len = name->len;
+                sel->as.select.attr_expr = NULL;
+                sel->as.select.default_ = NULL;
                 value = sel;
             } else {
                 Ast *v = asnix_ast_new(AST_VAR);
@@ -456,16 +458,41 @@ static Ast *parse_atom(Parser *p) {
 static Ast *parse_select(Parser *p) {
     Ast *e = parse_atom(p);
     int had_select = 0;
+    int had_dynamic = 0;
     while (cur(p)->kind == TOK_DOT) {
         advance(p);
-        Token *attr = expect(p, TOK_IDENT, "an attribute name");
         Ast *n = asnix_ast_new(AST_SELECT);
         n->as.select.target = e;
-        n->as.select.attr = attr->start;
-        n->as.select.attr_len = attr->len;
         n->as.select.default_ = NULL;
+        if (cur(p)->kind == TOK_DOLLAR_LBRACE) {
+            /* Dynamic attribute name, `.${expr}` -- real Nix's grammar
+             * for a computed-at-runtime attrpath segment, e.g.
+             * `set.${name}` (found needed evaluating real nixpkgs,
+             * pkgs/top-level/default.nix). */
+            advance(p);
+            Ast *name_expr = parse_expr(p);
+            expect(p, TOK_RBRACE, "'}' closing a dynamic attribute name");
+            n->as.select.attr_expr = name_expr;
+            n->as.select.attr = NULL;
+            n->as.select.attr_len = 0;
+            had_dynamic = 1;
+        } else {
+            Token *attr = expect(p, TOK_IDENT, "an attribute name");
+            n->as.select.attr_expr = NULL;
+            n->as.select.attr = attr->start;
+            n->as.select.attr_len = attr->len;
+        }
         e = n;
         had_select = 1;
+    }
+    if (had_dynamic && cur(p)->kind == TOK_OR) {
+        /* `set.${name} or default` -- a real, valid combination in real
+         * Nix, not supported here: fatal rather than silently
+         * mishandling it (documented, narrow scope cut -- see ast.h's
+         * AstSelect.attr_expr comment). Not needed by anything this
+         * project has hit yet. */
+        fprintf(stderr, "asnix: parse error: 'or' after a dynamic '.${...}' attribute is not supported\n");
+        exit(1);
     }
     /* `expr.attr or default` -- real Nix's grammar attaches `or` to the
      * whole preceding `expr '.' attrpath`, not per-segment (confirmed
@@ -557,6 +584,7 @@ static Ast *parse_add(Parser *p) {
  * `(!true) // {}`, confirmed by the runtime error naming `false`, the
  * result of the `!`, not `true`)):
  *
+ *   parse_impl  ->              right-assoc, chainable, LOWEST of all of these
  *   parse_or    ||              left-assoc, chainable
  *   parse_and   &&              left-assoc, chainable
  *   parse_eq    == !=           non-assoc (single occurrence only)
@@ -564,6 +592,10 @@ static Ast *parse_add(Parser *p) {
  *   parse_update //             right-assoc, chainable
  *   parse_not   ! (prefix)      binds the rest of this chain down to parse_add
  *   parse_add   + -             (already existed, M4)
+ *
+ * `->`'s precedence/associativity (lowest, right-assoc) cross-checked
+ * against cppnix's real grammar (~/nix/src/libexpr/parser.y: `%right
+ * IMPL`, declared before `%left OR`, i.e. binding looser).
  */
 static Ast *parse_not(Parser *p) {
     if (cur(p)->kind == TOK_BANG) {
@@ -643,6 +675,26 @@ static Ast *parse_or(Parser *p) {
         n->as.logic.lhs = lhs;
         n->as.logic.rhs = rhs;
         lhs = n;
+    }
+    return lhs;
+}
+
+/* `a -> b` desugars directly to `(!a) || b` -- exactly real Nix's own
+ * ExprOpImpl::eval semantics (`!evalBool(e1) || evalBool(e2)`, cppnix's
+ * eval.cc), so this gets short-circuiting (b is never evaluated when a is
+ * false) for free by reusing the already-correct AST_OR/AST_NOT
+ * compilation, no new AST node or IR op needed. */
+static Ast *parse_impl(Parser *p) {
+    Ast *lhs = parse_or(p);
+    if (cur(p)->kind == TOK_ARROW) {
+        advance(p);
+        Ast *rhs = parse_impl(p); /* right-recurse: right-associative, matching real Nix */
+        Ast *not_lhs = asnix_ast_new(AST_NOT);
+        not_lhs->as.not1.operand = lhs;
+        Ast *n = asnix_ast_new(AST_OR);
+        n->as.logic.lhs = not_lhs;
+        n->as.logic.rhs = rhs;
+        return n;
     }
     return lhs;
 }
@@ -837,11 +889,11 @@ static Ast *parse_expr(Parser *p) {
             n->as.lambda.body = body;
             return n;
         }
-        /* Not a pattern: fall through to parse_or (the top of the full
+        /* Not a pattern: fall through to parse_impl (the top of the full
          * operator-precedence chain), whose own fallthrough eventually
          * reaches parse_atom, which handles '{' as an attrset literal. */
     }
-    return parse_or(p);
+    return parse_impl(p);
 }
 
 Ast *asnix_parse(Token *toks, size_t count) {

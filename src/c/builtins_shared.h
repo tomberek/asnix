@@ -114,4 +114,13 @@ int asnix_bshared_value_eq(Value a, Value b);
  * wording). */
 int asnix_bshared_value_lt(Value a, Value b, const char *who);
 
+/* Runtime implementation of `expr.${nameExpr}` (dynamic attribute select,
+ * OP_SELECT_DYNAMIC -- see ir.h and op_select_dynamic.S). Fatal on a
+ * non-attrset target, a non-string name, or a missing key (same error
+ * class as plain OP_SELECT -- op_select.S), unlike OP_SELECT_OR's
+ * graceful fallthrough (`.${expr} or default` isn't supported, see
+ * parser.c). Forces the result if it's an unforced thunk, matching plain
+ * OP_SELECT's laziness. */
+Value asnix_bshared_select_dynamic(Value target, Value name_val);
+
 #endif /* ASNIX_BUILTINS_SHARED_H */

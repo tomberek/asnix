@@ -144,8 +144,17 @@ struct Ast {
         } attrset; /* AST_ATTRSET */
         struct {
             Ast *target;
-            const char *attr;
+            const char *attr;      /* valid when attr_expr == NULL (static `.name`) */
             size_t attr_len;
+            Ast *attr_expr;        /* non-NULL for a dynamic `.${expr}` attribute name --
+                                       `attr`/`attr_len` are unused in that case. The name is
+                                       resolved (interned) at runtime, not compile time -- see
+                                       compiler.c's AST_SELECT case and
+                                       src/asm/ops/op_select_dynamic.S. Real Nix's `.${expr} or
+                                       default` combination is a documented, narrower scope cut:
+                                       parser.c rejects it outright (fatal at parse time) rather
+                                       than silently mishandling it, since it isn't needed by
+                                       anything this project has hit yet. */
             Ast *default_; /* `expr.attr or default` -- NULL for a plain select (fatal if
                               * missing/wrong type, see compiler.c's AST_SELECT case). Scope
                               * cut: only the single select this node represents is covered,

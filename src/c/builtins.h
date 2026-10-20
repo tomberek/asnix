@@ -26,6 +26,9 @@ Value asnix_make_import_primop(void);
 /* Same idea, for `abort` -- also one of real Nix's bare-global names. */
 Value asnix_make_abort_primop(void);
 
+/* Same idea, for `throw` -- also one of real Nix's bare-global names. */
+Value asnix_make_throw_primop(void);
+
 /* Same idea, for `toString` -- also one of real Nix's bare-global names. */
 Value asnix_make_toString_primop(void);
 

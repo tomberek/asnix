@@ -273,6 +273,12 @@ static Value prim_isBool(const Value *args, int64_t argc) {
 }
 
 static Value build_isNull(void) { return make_primop_value((void *)prim_isNull, 1); }
+
+/* `isNull` is one of real Nix's bare root-scope globals (verified against
+ * `nix-instantiate --eval`, same research as M18's import/map/abort/
+ * toString -- see docs/architecture.md). Wraps the exact same `prim_isNull`
+ * `builtins.isNull` itself uses. */
+Value asnix_make_isNull_primop(void) { return make_primop_value((void *)prim_isNull, 1); }
 static Value build_isString(void) { return make_primop_value((void *)prim_isString, 1); }
 static Value build_isList(void) { return make_primop_value((void *)prim_isList, 1); }
 static Value build_isAttrs(void) { return make_primop_value((void *)prim_isAttrs, 1); }

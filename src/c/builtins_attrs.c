@@ -279,6 +279,16 @@ static Value prim_removeAttrs(const Value *args, int64_t argc) {
     return make_curried2(args[0], inner);
 }
 
+/* `removeAttrs` is one of real Nix's bare root-scope globals (verified
+ * directly against `nix-instantiate --eval`, same research as M18's
+ * import/map/abort/toString -- see docs/architecture.md) -- found
+ * actually needed evaluating real nixpkgs (`pkgs/top-level/impure.nix`
+ * calls bare `removeAttrs`, not `builtins.removeAttrs`). Wraps the exact
+ * same `prim_removeAttrs` `builtins.removeAttrs` itself uses. */
+Value asnix_make_removeAttrs_primop(void) {
+    return make_primop_value((void *)prim_removeAttrs, 1);
+}
+
 /* ---- mapAttrs ----
  *
  * Real Nix's `builtins.mapAttrs f set` is lazy (each output value is a

@@ -34,7 +34,8 @@ what's actually implemented and the scope decisions made along the way.
 | M19 — `genericClosure` + second builtins-expansion pass | done, **scoped** (see below) |
 | M20 — daemon realization: `SetOptions`/`AddToStore`/`BuildPaths` (`src/c/daemon_client.c`) | done, **scoped** (see below) |
 | M21 — real structural `==`/`!=` + real `+` operator dispatch | done, **scoped** (see below) |
-| M22+ | not started |
+| M22 — real-nixpkgs-evaluation sweep: block comments, `->`, more bare globals, dynamic attrs, directory-import fix | done, **in progress** (see below -- real nixpkgs still doesn't fully evaluate) |
+| M23+ | not started |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
 
@@ -1964,3 +1965,171 @@ for the full writeup of each. Summary:
   (the lexer only ever recognizes `/` as part of a path literal or the
   `//` update operator) — a real, separate gap, not yet fixed; flagged to
   the user rather than unilaterally continuing to expand scope.
+
+## M22 scope notes: real-nixpkgs-evaluation sweep
+
+A chain of real, previously-undiscovered gaps, each found by repeatedly
+re-running `d.nix` (`import`ing real nixpkgs's `default.nix`) against the
+live system Nix install and real nixpkgs checkout on this dev machine,
+fixing whatever it hit next, and re-running -- not a single planned
+milestone, but logged together since each fix was small and the whole
+chain was driven by the same investigation. **Real nixpkgs still does not
+fully evaluate** (the chain is ongoing; see Known Bugs #19-#24 for each
+individual fix's full writeup):
+
+- **Block comments** (`/* ... */`, including `/** ... */` doc comments)
+  were not recognized at all -- `lexer.c` only ever handled `#` line
+  comments. Fatal the instant any real-world `.nix` file (which are full
+  of these) was lexed. Fixed: a plain skip-to-`*/` loop, same shape as the
+  existing `#`-to-end-of-line skip.
+- **`->` (logical implication)** had no token and no grammar rule at all.
+  Added at the correct precedence (lowest of all binary operators,
+  right-associative -- cross-checked against cppnix's real grammar,
+  `~/nix/src/libexpr/parser.y`'s `%right IMPL`) by desugaring directly to
+  `(!a) || b` at parse time (`parser.c`'s new `parse_impl`), reusing the
+  already-correct short-circuiting `AST_OR`/`AST_NOT` compilation -- no
+  new IR op needed.
+- **More bare root-scope globals**: `removeAttrs`, `isNull` (both already
+  existed under `builtins.*`, just needed root-scope exposure, same
+  mechanism M18 established for `import`/`map`/`abort`/`toString`), and
+  `throw` (did not exist under `builtins.*` at all -- added as a close
+  sibling of `abort`, same unconditionally-fatal shape but real Nix's
+  distinct, plainer error wording: `throw "x"` -> `error: x`, not
+  `abort`'s `"evaluation aborted with the following error message: 'x'"`
+  -- confirmed directly against `nix-instantiate`). Root `Env`/
+  `ScopeFrame` grew from 5 to 8 slots across this milestone.
+- **`import`ing a directory** (`import ./.`, real nixpkgs's own
+  `pkgs/top-level/impure.nix` does exactly this) silently corrupted the
+  heap instead of erroring or working -- see Known Bugs #22, the most
+  serious finding in this sweep (a real memory-safety bug, not a missing
+  feature). Fixed by detecting a directory and appending `/default.nix`,
+  matching real Nix's own `import somedir` convention, plus defensive
+  hardening in `read_file` so a bad path can never reach that corruption
+  path again regardless of call site.
+- **Dynamic attribute access** (`set.${name}`, used by real nixpkgs's own
+  `pkgs/top-level/default.nix`) didn't exist in any form -- no lexer
+  support for `${` outside an active string context, no AST/compiler
+  support. Added for the **select** form only (`expr.${nameExpr}`): new
+  `OP_SELECT_DYNAMIC` op, deferring entirely to a new C helper
+  (`asnix_bshared_select_dynamic`, `builtins_shared.c`: interns the name
+  at runtime via the already-existing `asnix_intern`, binary-searches,
+  forces an unforced thunk) rather than hand-rolling the lookup in asm,
+  since this isn't a hot path. **Scope cut, deliberately narrower than
+  real Nix**: dynamic keys in attrset *literals* (`{${name} = val;}`) are
+  **not** implemented -- `AST_ATTRSET` compiles by interning and sorting
+  every binding's name at compile time (`compiler.c`), which has no
+  runtime-name path at all; adding one would need a real redesign of that
+  construction mechanism (build incrementally at runtime and merge a
+  dynamically-named entry in, rather than a single compile-time sort) and
+  wasn't attempted since nothing hit so far has actually needed it.
+  `expr.${name} or default` (combining dynamic select with `or`) is also
+  rejected at parse time (fatal, not silently mishandled) for the same
+  reason -- not yet needed.
+
+## M22's Known Bugs entries (continuing the numbered list above)
+
+19. **Block comments (`/* ... */`) were not recognized at all.** `lexer.c`
+   only ever handled `#` line comments -- any `/*` (including nixpkgs's
+   own ubiquitous `/** ... */` doc comments) hit "unrecognized character
+   '/'" immediately, since `/` otherwise only has meaning as part of a
+   path literal or the `//` update operator. Found running `d.nix`
+   against real nixpkgs: `pkgs/top-level/impure.nix`, the very first file
+   nixpkgs imports, opens with a block comment. Fixed by a plain skip-to-
+   `*/` loop in the main lex loop, same shape as the existing `#`-to-end-
+   of-line skip, checked before path-literal scanning (a block comment's
+   `/*` never matches a path literal anyway, since `*` isn't a path
+   character, but comments should never compete with path scanning
+   regardless).
+20. **`->` (logical implication) had no token and no grammar rule at
+   all.** Found immediately after fixing #19: `pkgs/top-level/impure.nix`
+   uses `assert args ? localSystem -> !(args ? system);`, and `->` fell
+   through the lexer's two-character-operator checks straight to ordinary
+   `-` (minus) followed by `>` (greater-than), which the parser then
+   choked on as "unexpected token" trying to parse `a - (>...)`. Fixed by
+   adding `TOK_ARROW` and a new `parse_impl` at the correct precedence
+   (lowest of all binary operators, right-associative -- cross-checked
+   against cppnix's real grammar, `~/nix/src/libexpr/parser.y`'s `%right
+   IMPL`, declared looser than `%left OR`), desugaring `a -> b` directly
+   to `(!a) || b` at parse time -- exactly real Nix's own
+   `ExprOpImpl::eval` semantics (`!evalBool(e1) || evalBool(e2)`,
+   cppnix's `eval.cc`) -- so short-circuiting (the RHS is never evaluated
+   when the LHS is false) comes for free from the already-correct
+   `AST_OR`/`AST_NOT` compilation, no new IR op needed. Verified against
+   real `nix-instantiate --eval` for associativity (`false -> false ->
+   true` => `true`) and precedence relative to `||` (`false || true ->
+   false` => `false`).
+21. **`removeAttrs`/`isNull` are real Nix bare root-scope globals, not
+   yet exposed as such.** Both already existed correctly under
+   `builtins.*`; M18's bare-globals research had already identified them
+   (along with `throw`, `baseNameOf`, `dirOf`, `fetchTarball`,
+   `__curPos`) as part of real Nix's small curated bare-global set, but
+   only `import`/`map`/`abort`/`toString` were actually wired up at the
+   time. Found needed directly: `pkgs/top-level/impure.nix` calls bare
+   `removeAttrs args [...]`, not `builtins.removeAttrs`. Fixed by adding
+   `asnix_make_removeAttrs_primop()` (`builtins_attrs.c`, alongside the
+   existing `prim_removeAttrs`) and `asnix_make_isNull_primop()`
+   (`builtins_misc.c`, alongside `prim_isNull`), each just wrapping the
+   same native function its `builtins.X` counterpart already uses -- same
+   pattern M18 established. Root `Env`/`ScopeFrame` grew from 5 to 7
+   slots.
+22. **`import`ing a directory corrupted the heap instead of erroring or
+   working -- a real memory-safety bug, not just a missing feature.**
+   Real Nix's `import somedir` means `import somedir/default.nix`; asnix
+   had no such handling, so the raw directory path reached
+   `eval_file.c`'s `read_file()` directly. `fopen()` on a directory
+   "succeeds" on Linux, but the subsequent `fseek(SEEK_END); long size =
+   ftell(f);` returns `-1` (a directory stream doesn't support seeking).
+   `malloc((size_t)size + 1)` with `size == -1` wraps to `malloc(0)`, and
+   the following `buf[size] = '\0'` then writes to `buf[-1]` -- one byte
+   *before* that ~0-byte allocation, corrupting the heap. Confirmed via
+   `gdb`: segfaulted inside `read_file` at exactly that line, called from
+   `asnix_eval_file` <- `prim_import` <- `asnix_op_call`, triggered by
+   `pkgs/top-level/impure.nix`'s own `import ./.`. This is the same
+   segfault originally reported at the very start of this investigation
+   ("running `./asnix d.nix` is a segfault") -- it took fixing #17-#21
+   above to even reach this deeper point in nixpkgs's own evaluation.
+   Fixed two ways: (a) `asnix_eval_file` now checks (via `stat()`)
+   whether the resolved path is a directory and appends `/default.nix`
+   before reading, matching real Nix's own convention; (b) `read_file`
+   itself now checks for a negative `ftell()` result and errors cleanly
+   instead of corrupting memory, as defense in depth so a bad path can
+   never reach this corruption again regardless of which call site hands
+   it one.
+23. **Dynamic attribute access (`set.${name}`) didn't exist in any
+   form.** `$` had no meaning anywhere outside an active string-
+   interpolation context -- the lexer's `MODE_NORMAL` dispatch had no
+   case for it at all, so `set.${name}` hit "unrecognized character '$'"
+   the instant the lexer reached the bare `$` in `.${`. Found running
+   `d.nix`: `pkgs/top-level/default.nix` (the file `impure.nix` imports)
+   uses exactly this (`set.${name}`). Implemented for the select form
+   only (see M22's scope notes above for what's deliberately still
+   missing -- dynamic attrset-literal keys): new `TOK_DOLLAR_LBRACE`
+   recognition in `MODE_NORMAL` (reusing the exact mechanism string
+   interpolation already uses -- mode-push `MODE_NORMAL`, matching `}`
+   pops back out through the ordinary `}` handling), a new
+   `AstSelect.attr_expr` field (`ast.h`), `parse_select` parsing
+   `.${expr}` as an alternative to a plain `.name` segment, a new
+   `OP_SELECT_DYNAMIC` IR op, and `asnix_bshared_select_dynamic`
+   (`builtins_shared.c`) doing the actual runtime work (intern the name
+   via the already-existing `asnix_intern`, binary-search, force an
+   unforced thunk) -- deferred entirely to C rather than hand-rolled in
+   asm, since this isn't a hot path (plain `.foo` with a compile-time-
+   known symbol remains the fast, all-asm path, untouched).
+24. **`throw` doesn't exist in any form (not even under
+   `builtins.throw`), despite being one of real Nix's bare globals and
+   confirmed needed.** Found immediately after fixing #23:
+   `pkgs/top-level/default.nix` calls bare `throw` directly (`inherit
+   (lib) throwIfNot throwIf;` plus direct `throw "..."` calls elsewhere
+   in the same file). A prior comment in `builtins.c` (next to
+   `prim_abort`) had explicitly deferred implementing a distinct `throw`,
+   reasoning that without a `tryEval`/catch mechanism the two would be
+   "behaviorally identical anyway" -- true for *control flow* (both are
+   unconditionally fatal here), but not for *wording*: confirmed directly
+   against `nix-instantiate --eval` that `throw "x"` reports plain
+   `error: x`, while `abort "x"` reports `error: evaluation aborted with
+   the following error message: 'x'` -- a real, user-visible difference
+   worth getting right even without exception handling. Fixed by adding
+   `prim_throw` (`builtins.c`, a close sibling of `prim_abort` with the
+   corrected wording) registered under `builtins.throw`, plus
+   `asnix_make_throw_primop()` for bare-global exposure (root `Env`/
+   `ScopeFrame` grew from 7 to 8 slots).

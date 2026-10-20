@@ -31,4 +31,9 @@ typedef struct {
 extern const AsnixBuiltinMiscDef ASNIX_BUILTINS_MISC[];
 extern const size_t ASNIX_BUILTINS_MISC_COUNT;
 
+/* Exposes `isNull` as a bare root-scope global (see eval_file.c's root
+ * Env / compiler.c's root ScopeFrame) -- one of real Nix's small set of
+ * bare globals (M18's import/map/abort/toString, extended here). */
+Value asnix_make_isNull_primop(void);
+
 #endif /* ASNIX_BUILTINS_MISC_H */

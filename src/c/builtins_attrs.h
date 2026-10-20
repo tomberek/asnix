@@ -23,4 +23,9 @@
 extern const AsnixBuiltinDef ASNIX_ATTRS_BUILTINS[];
 extern const size_t ASNIX_ATTRS_BUILTINS_COUNT;
 
+/* Exposes `removeAttrs` as a bare root-scope global (see eval_file.c's
+ * root Env / compiler.c's root ScopeFrame) -- one of real Nix's small set
+ * of bare globals (M18's import/map/abort/toString, extended here). */
+Value asnix_make_removeAttrs_primop(void);
+
 #endif /* ASNIX_BUILTINS_ATTRS_H */
