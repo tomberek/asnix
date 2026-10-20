@@ -22,6 +22,7 @@ what's actually implemented and the scope decisions made along the way.
 | M7 — builtins + primop dispatch (`src/c/builtins.c`) | done, **scoped** (see below) |
 | M8 — derivations + store-path hashing + daemon protocol | done, **scoped** (see below): connect/handshake/`IsValidPath` only, no realization |
 | M9 — benchmark harness (`bench/`) | done (see below) |
+| M7+ — `asnix_apply`, general re-entrant call-a-Value-from-C (`src/asm/apply.S`) | done (see below) |
 | M10+ | not started |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
@@ -521,6 +522,59 @@ registry doesn't survive that, though the worktree and its completed
 work on disk did) before it had written `bench/README.md` or this
 section — picked up and finished directly rather than re-run from
 scratch, after independently re-verifying its correctness claims.
+
+## `asnix_apply` — general re-entrant "call this Value from C" (M7+)
+
+`asnix_force_for_print` (M6, `src/asm/force.S`) only forces a thunk with
+zero arguments — its own header comment explicitly scoped out "a general
+re-entrant builtin-calls-force mechanism... that's M7+". Builtins like
+`map`/`filter`/`foldl'` (next stage) need exactly that: a way to call an
+arbitrary Closure or PrimOp Value from plain C code and get its result
+back, e.g. `map (x: x + 1) [1 2 3]` needs `builtins.c`'s `map`
+implementation to apply the user-supplied closure to each list element.
+
+`Value asnix_apply(Value fn, const Value *args, int64_t argc)`
+(`src/asm/apply.S`) fills that gap, modeled closely on
+`asnix_force_for_print`'s self-contained-dispatch-context pattern and
+`op_call.S`'s two dispatch paths:
+
+- **Type/arity checked exactly like `OP_CALL`**: anything that isn't a
+  Closure or PrimOp Value is a fatal type error; an argc that doesn't
+  match `fn`'s arity is a fatal arity error — same two checks, same
+  wording style (own copies of the messages, since `op_call.S`'s are
+  file-local `.L` labels, not exported symbols).
+- **PrimOp target**: no Env/VALSTACK/RETSP needed at all — a primop has
+  no lexical body to run through the dispatch loop, so this is a plain
+  tail call (`jmp`) straight into the native `fn(args, argc)`, letting
+  its own `ret` return directly to the C caller with zero overhead.
+- **Closure target**: needs a real dispatch context to run the closure's
+  IR body, so `asnix_apply` brings its **own fresh VALSTACK/RETSP** (via
+  `asnix_arena_alloc`, sized and bounds-checked the same way
+  `force.S`'s nested context is — see "Known bugs" item 6 below),
+  allocates a new call frame, copies `args` into it,
+  and pushes a sentinel `RetFrame` (`force_target = 0`: an ordinary call,
+  nothing to memoize) whose `return_ip` points at a small epilogue
+  (`asnix_apply_epilogue`) that restores every saved register and hands
+  the result back to the C caller — the same "fake RetFrame whose IP is
+  native-callable code" trick as `force.S`'s own
+  `.Lforce_sentinel_ir`/`asnix_force_epilogue`, just for an ordinary
+  application instead of thunk-forcing.
+- **Never aliases an already-active context**: this can be called
+  reentrantly (a builtin called from within an actively-running
+  `asnix_eval` that itself calls back into `asnix_apply`, or nested
+  `asnix_apply` calls), so it never reuses whatever VALSTACK/RETSP/
+  `asnix_valstack_limit`/`asnix_retsp_limit` an enclosing context set up
+  — it saves and restores those globals around its own fresh allocation,
+  exactly like `force.S` already does around its own nested use.
+- **No user-visible language feature by itself** — pure infrastructure,
+  consumed by the next (builtins-expansion) stage. Verified directly via
+  `tests/c/test_apply.c`: a hand-built Closure (unary and binary, via
+  `IrBuilder`/`ib_lambda`, never `OP_CALL`ed in-language) and a hand-built
+  PrimOp target, sequential and nested call sequences (proving no leaked
+  state between fresh-buffer setups), plus dedicated abort-cleanly checks
+  for a Closure arity mismatch, a PrimOp arity mismatch, and a
+  non-function type error (fork + exit-code check, same pattern as
+  `tests/asm/test_stacklimits.c`).
 
 ## Known bugs found and fixed during implementation (worth knowing about)
 

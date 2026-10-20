@@ -130,6 +130,16 @@ Value asnix_eval(IrProgram *prog, Env *root_env);
  * see src/asm/force.S for exactly what this does and doesn't cover. */
 Value asnix_force_for_print(Value v);
 
+/* M7+: applies `fn` (a Closure or PrimOp Value -- anything else is a fatal
+ * type error) to `argc` arguments, usable from C code with or without an
+ * active asnix_eval/asnix_force_for_print/asnix_apply invocation already
+ * on the native call stack (brings its own fresh VALSTACK/RETSP, never
+ * shares one with an already-active context -- see src/asm/apply.S). This
+ * is the general re-entrant "call this Value" mechanism builtins like
+ * map/filter/foldl' need; `argc` must exactly match `fn`'s arity (a fatal
+ * error otherwise, matching op_call.S's own arity check). */
+Value asnix_apply(Value fn, const Value *args, int64_t argc);
+
 #endif /* __ASSEMBLER__ */
 
 #endif /* ASNIX_IR_H */
