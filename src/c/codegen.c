@@ -127,13 +127,40 @@ static void codegen_expr(CodeBuf *cb, Ast *node, ScopeFrame2 *scope, size_t dept
             codegen_var(cb, node, scope, depth);
             return;
         case AST_LET: {
-            codegen_expr(cb, node->as.let1.value, scope, depth); /* net +1 */
-            ScopeFrame2 frame = { .up = scope, .name = node->as.let1.name,
-                                   .name_len = node->as.let1.name_len, .stack_index = depth };
-            codegen_expr(cb, node->as.let1.body, &frame, depth + 1); /* net +1 */
-            emit_pop_rax(cb);         /* rax = body result */
-            emit_add_rsp_imm8(cb, 8); /* discard the now-dead bound value */
-            emit_push_rax(cb);        /* net effect of the whole AST_LET: +1 */
+            /* compiler.c's AST_LET is now genuinely recursive (letrec) via
+             * a heap Env frame -- out of scope for this native path (see
+             * codegen.h: no closures/heap Env here). This path keeps its
+             * original, deliberately simpler semantics: each binding is
+             * pushed, strictly, in source order onto the native stack, so
+             * a binding can only see bindings *before* it (no self/sibling
+             * recursion) -- equivalent to what the old nested-single-
+             * binding desugaring produced, just iterating one multi-
+             * binding AST_LET node instead of recursing through n nested
+             * ones. `inherit` isn't supported here (M5+ feature, same as
+             * strings/lists/attrsets below). */
+            size_t n = node->as.let1.count;
+            AstBinding *bindings = node->as.let1.bindings;
+            ScopeFrame2 *frames = malloc(n * sizeof(ScopeFrame2));
+            ScopeFrame2 *cur_scope = scope;
+            size_t cur_depth = depth;
+            for (size_t i = 0; i < n; i++) {
+                if (bindings[i].is_inherit) {
+                    fprintf(stderr,
+                            "asnix: M4.5 native codegen does not support 'inherit'\n");
+                    exit(1);
+                }
+                codegen_expr(cb, bindings[i].value, cur_scope, cur_depth); /* net +1 */
+                frames[i] = (ScopeFrame2){ .up = cur_scope, .name = bindings[i].name,
+                                            .name_len = bindings[i].name_len,
+                                            .stack_index = cur_depth };
+                cur_scope = &frames[i];
+                cur_depth++;
+            }
+            codegen_expr(cb, node->as.let1.body, cur_scope, cur_depth); /* net +1 */
+            emit_pop_rax(cb);                      /* rax = body result */
+            emit_add_rsp_imm8(cb, (uint8_t)(n * 8)); /* discard the now-dead bound values */
+            emit_push_rax(cb);                      /* net effect of the whole AST_LET: +1 */
+            free(frames);
             return;
         }
         case AST_IF: {

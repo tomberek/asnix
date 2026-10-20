@@ -15,6 +15,8 @@ typedef enum {
     TOK_IF,
     TOK_THEN,
     TOK_ELSE,
+    TOK_REC,
+    TOK_INHERIT,
     TOK_PLUS,
     TOK_MINUS,
     TOK_STAR,

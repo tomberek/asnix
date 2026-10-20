@@ -105,6 +105,17 @@ enum {
     OP_MK_ATTRS,   /* M5: a = count, b = pool index of `count` sorted symbol ids */
     OP_SELECT,     /* M5: a = symbol id; pops an Attrs, pushes the matching value or aborts */
     OP_MK_THUNK,   /* M6: b = pool index of {body IrOp*, body pool} -- see OP_LAMBDA's note */
+    OP_FRAME_ALLOC, /* a = nslots; allocates a new Env{up=current ENV, nslots} and installs
+                      * it as the current ENV (no popping) -- the recursive-scope building
+                      * block: thunks constructed afterward (OP_MK_THUNK) naturally capture
+                      * THIS frame, enabling self/sibling reference. Paired with
+                      * OP_FRAME_EXIT once all consumers of the frame are done. */
+    OP_FRAME_SET,   /* a = slot index; pops one value off VALSTACK and stores it into
+                      * slot `a` of the CURRENT Env (set up by OP_FRAME_ALLOC). */
+    OP_FRAME_EXIT,  /* no operands; ENV = ENV->up -- undoes exactly one OP_FRAME_ALLOC,
+                      * restoring the enclosing scope so a `let`/`rec {}` used as a
+                      * non-tail subexpression doesn't leak its frame into whatever
+                      * depth-relative OP_VAR_REF comes after it in the same IR stream. */
     OP_COUNT
 };
 

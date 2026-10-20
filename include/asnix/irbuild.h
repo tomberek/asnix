@@ -56,6 +56,15 @@ size_t ib_select(IrBuilder *b, uint32_t sym);
  * runs -- same pool-travels-with-it rationale as ib_lambda. */
 size_t ib_mk_thunk(IrBuilder *b, IrProgram *body_prog);
 
+/* Recursion support (letrec / rec attrsets): allocate a new Env frame with
+ * `nslots` slots and install it as the current ENV (OP_FRAME_ALLOC), store
+ * the value on top of VALSTACK into slot `slot` of the current ENV
+ * (OP_FRAME_SET), and restore ENV to its parent (OP_FRAME_EXIT) -- see
+ * ir.h for the full rationale. */
+size_t ib_frame_alloc(IrBuilder *b, int64_t nslots);
+size_t ib_frame_set(IrBuilder *b, int64_t slot);
+size_t ib_frame_exit(IrBuilder *b);
+
 /* Finalizes the builder: runs ir_link() over the accumulated ops in place
  * and returns an IrProgram ready for asnix_eval(). */
 IrProgram *ib_finish(IrBuilder *b);

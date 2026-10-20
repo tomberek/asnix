@@ -55,7 +55,7 @@ static Token *expect(Parser *p, TokKind kind, const char *what) {
 
 static int starts_atom(TokKind k) {
     return k == TOK_INT || k == TOK_IDENT || k == TOK_TRUE || k == TOK_FALSE || k == TOK_NULL ||
-           k == TOK_LPAREN || k == TOK_STRING || k == TOK_LBRACKET || k == TOK_LBRACE;
+           k == TOK_LPAREN || k == TOK_STRING || k == TOK_LBRACKET || k == TOK_LBRACE || k == TOK_REC;
 }
 
 static Ast *parse_expr(Parser *p);
@@ -65,6 +65,62 @@ static Ast *parse_expr(Parser *p);
  * `expr` -- matching real Nix, where `[ f x ]` is a 2-element list and
  * putting a function call in a list needs parens: `[ (f x) ]`. */
 static Ast *parse_select(Parser *p);
+
+/* Parses one binding-list statement (an ordinary `name = value;`, or an
+ * `inherit x y;` / `inherit (expr) x y;` form) and appends the resulting
+ * binding(s) to `out`. Shared by `let ... in`, `rec { ... }`, and plain
+ * `{ ... }` -- all three use the same binding-list grammar (see ast.h's
+ * note on AstBinding.is_inherit for why the desugared value differs by
+ * form but `is_inherit` is attached regardless). */
+static void parse_binding_stmt(Parser *p, BindingVec *out) {
+    if (cur(p)->kind == TOK_INHERIT) {
+        advance(p);
+        Ast *src_expr = NULL;
+        if (cur(p)->kind == TOK_LPAREN) {
+            advance(p);
+            src_expr = parse_expr(p);
+            expect(p, TOK_RPAREN, "')'");
+        }
+        while (cur(p)->kind == TOK_IDENT) {
+            Token *name = cur(p);
+            advance(p);
+            Ast *value;
+            if (src_expr) {
+                Ast *sel = asnix_ast_new(AST_SELECT);
+                sel->as.select.target = src_expr;
+                sel->as.select.attr = name->start;
+                sel->as.select.attr_len = name->len;
+                value = sel;
+            } else {
+                Ast *v = asnix_ast_new(AST_VAR);
+                v->as.var.name = name->start;
+                v->as.var.name_len = name->len;
+                value = v;
+            }
+            /* `inherit (expr) x;` is sugar for an ordinary binding `x =
+             * expr.x;` -- expr resolves against this block's own scope
+             * just like any other binding's value (siblings visible,
+             * confirmed against real nix-instantiate: `let inherit (pt)
+             * x y; pt = { ... }; in ...` sees the sibling `pt`). Only the
+             * bare `inherit x;` form needs the is_inherit escape-to-
+             * outer-scope treatment below (see ast.h) -- real Nix
+             * resolves a bare inherited name against the scope
+             * *enclosing* this block, not the block's own recursive
+             * scope, even though plain `x` would otherwise self-match. */
+            bindingvec_push(out, (AstBinding){
+                .name = name->start, .name_len = name->len, .value = value,
+                .is_inherit = (src_expr == NULL) });
+        }
+        expect(p, TOK_SEMI, "';'");
+        return;
+    }
+    Token *name = expect(p, TOK_IDENT, "a binding name");
+    expect(p, TOK_EQUALS, "'='");
+    Ast *value = parse_expr(p);
+    expect(p, TOK_SEMI, "';'");
+    bindingvec_push(out, (AstBinding){
+        .name = name->start, .name_len = name->len, .value = value, .is_inherit = 0 });
+}
 
 static Ast *parse_atom(Parser *p) {
     Token *t = cur(p);
@@ -124,17 +180,24 @@ static Ast *parse_atom(Parser *p) {
         case TOK_LBRACE: {
             advance(p);
             BindingVec bindings = { 0 };
-            while (cur(p)->kind != TOK_RBRACE) {
-                Token *name = expect(p, TOK_IDENT, "an attribute name");
-                expect(p, TOK_EQUALS, "'='");
-                Ast *value = parse_expr(p);
-                expect(p, TOK_SEMI, "';'");
-                bindingvec_push(&bindings, (AstBinding){ .name = name->start, .name_len = name->len, .value = value });
-            }
+            while (cur(p)->kind != TOK_RBRACE) parse_binding_stmt(p, &bindings);
             advance(p); /* '}' */
             Ast *n = asnix_ast_new(AST_ATTRSET);
             n->as.attrset.bindings = bindings.items;
             n->as.attrset.count = bindings.len;
+            n->as.attrset.is_rec = 0;
+            return n;
+        }
+        case TOK_REC: {
+            advance(p);
+            expect(p, TOK_LBRACE, "'{'");
+            BindingVec bindings = { 0 };
+            while (cur(p)->kind != TOK_RBRACE) parse_binding_stmt(p, &bindings);
+            advance(p); /* '}' */
+            Ast *n = asnix_ast_new(AST_ATTRSET);
+            n->as.attrset.bindings = bindings.items;
+            n->as.attrset.count = bindings.len;
+            n->as.attrset.is_rec = 1;
             return n;
         }
         default:
@@ -198,24 +261,18 @@ static Ast *parse_add(Parser *p) {
     return lhs;
 }
 
-/* Parses the bindings following `let`, recursing once per binding so that
- * N bindings desugar into N nested single-binding AST_LET nodes (see
- * ast.h). Base case: `in expr`. */
+/* Parses the bindings following `let` into one flat binding list (real Nix
+ * `let ... in` is always implicitly `letrec`: every binding sees itself
+ * and every sibling regardless of source order -- see ast.h/compiler.c). */
 static Ast *parse_let_bindings(Parser *p) {
-    if (cur(p)->kind == TOK_IN) {
-        advance(p);
-        return parse_expr(p);
-    }
-    Token *name = expect(p, TOK_IDENT, "a binding name");
-    expect(p, TOK_EQUALS, "'='");
-    Ast *value = parse_expr(p);
-    expect(p, TOK_SEMI, "';'");
-    Ast *body = parse_let_bindings(p);
+    BindingVec bindings = { 0 };
+    while (cur(p)->kind != TOK_IN) parse_binding_stmt(p, &bindings);
+    advance(p); /* 'in' */
+    Ast *body = parse_expr(p);
 
     Ast *n = asnix_ast_new(AST_LET);
-    n->as.let1.name = name->start;
-    n->as.let1.name_len = name->len;
-    n->as.let1.value = value;
+    n->as.let1.bindings = bindings.items;
+    n->as.let1.count = bindings.len;
     n->as.let1.body = body;
     return n;
 }

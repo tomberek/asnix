@@ -28,6 +28,9 @@ extern void asnix_op_mk_list(void);
 extern void asnix_op_mk_attrs(void);
 extern void asnix_op_select(void);
 extern void asnix_op_mk_thunk(void);
+extern void asnix_op_frame_alloc(void);
+extern void asnix_op_frame_set(void);
+extern void asnix_op_frame_exit(void);
 
 void *asnix_handler_table[OP_COUNT] = {
     [OP_PUSH_INT] = (void *)asnix_op_push_int,
@@ -50,6 +53,9 @@ void *asnix_handler_table[OP_COUNT] = {
     [OP_MK_ATTRS] = (void *)asnix_op_mk_attrs,
     [OP_SELECT] = (void *)asnix_op_select,
     [OP_MK_THUNK] = (void *)asnix_op_mk_thunk,
+    [OP_FRAME_ALLOC] = (void *)asnix_op_frame_alloc,
+    [OP_FRAME_SET] = (void *)asnix_op_frame_set,
+    [OP_FRAME_EXIT] = (void *)asnix_op_frame_exit,
 };
 
 void ir_link(IrOp *ops, size_t n) {
