@@ -81,6 +81,10 @@ size_t ib_update(IrBuilder *b);
  * freed, exactly like string literals -- see AST_STRING). */
 size_t ib_assert_fail(IrBuilder *b, const char *msg, size_t len);
 
+/* Pops `count` values (reverse push order) and pushes one concatenated
+ * String -- see OP_STR_CONCAT in ir.h. */
+size_t ib_str_concat(IrBuilder *b, int64_t count);
+
 /* Finalizes the builder: runs ir_link() over the accumulated ops in place
  * and returns an IrProgram ready for asnix_eval(). */
 IrProgram *ib_finish(IrBuilder *b);

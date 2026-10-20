@@ -158,6 +158,10 @@ size_t ib_assert_fail(IrBuilder *b, const char *msg, size_t len) {
     return ib_emit(b, OP_ASSERT_FAIL, 0, (int64_t)pool_idx);
 }
 
+size_t ib_str_concat(IrBuilder *b, int64_t count) {
+    return ib_emit(b, OP_STR_CONCAT, count, 0);
+}
+
 IrProgram *ib_finish(IrBuilder *b) {
     ir_link(b->ops, b->len);
     IrProgram *prog = calloc(1, sizeof(IrProgram));

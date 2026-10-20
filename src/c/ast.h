@@ -36,6 +36,18 @@ typedef enum {
 
 typedef struct Ast Ast;
 
+/* One piece of an AST_STRING literal: either a literal chunk of text
+ * (escapes already decoded, and -- for a '' ... '' literal -- indentation
+ * already stripped by the time the parser builds this) or an interpolated
+ * expression ("${ ... }"). Plain-malloc'd, same rationale as AstBinding
+ * below. */
+typedef struct {
+    int is_expr;
+    const char *text;   /* valid when !is_expr */
+    size_t text_len;
+    Ast *expr;           /* valid when is_expr */
+} AstStringPart;
+
 /* One binding in a `let`/`rec {}`/`{}` binding list. Plain-malloc'd (not
  * arena-allocated): it's a compile-time-only auxiliary array, not part of
  * the runtime Value graph the arena exists to serve -- same rationale as
@@ -94,8 +106,8 @@ struct Ast {
             Ast *lhs, *rhs;
         } binop; /* AST_BINOP */
         struct {
-            const char *text;
-            size_t len;
+            AstStringPart *parts;
+            size_t count;
         } string; /* AST_STRING */
         struct {
             Ast **elems;

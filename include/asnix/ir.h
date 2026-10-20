@@ -133,6 +133,10 @@ enum {
                       * right-biased sorted-array merge (asnix_attrs_update, src/c/attrs_update.c) */
     OP_ASSERT_FAIL, /* b = pool index of {msg ptr, msg len}; unconditionally asnix_fatal()s --
                       * compiler.c's AST_ASSERT only reaches this on the cond-false branch */
+    OP_STR_CONCAT, /* strings: a = count; pops `count` values (reverse push order like
+                    * OP_MK_LIST), coerces each to a string (same rules as
+                    * builtins.toString), concatenates them in order, pushes one
+                    * String -- the runtime half of string interpolation. */
     OP_COUNT
 };
 

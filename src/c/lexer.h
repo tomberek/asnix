@@ -31,7 +31,6 @@ typedef enum {
     TOK_RBRACE,
     TOK_LBRACKET,
     TOK_RBRACKET,
-    TOK_STRING,
     /* Operators (comparisons/booleans/update): see docs/architecture.md's
      * "operators" milestone notes for precedence rationale. */
     TOK_EQEQ,    /* == */
@@ -44,17 +43,43 @@ typedef enum {
     TOK_OROR,    /* || */
     TOK_BANG,    /* ! */
     TOK_SLASHSLASH, /* // */
+    /* Strings: "..." and ''...'' no longer lex to one flat TOK_STRING --
+     * "${" inside either kind re-enters normal expression lexing until the
+     * matching "}" (TOK_RBRACE, reused -- see asnix_lex's mode-stack
+     * comment), then resumes string-content lexing. A string literal is
+     * now a TOK_STR_START/TOK_ISTR_START, zero or more of (TOK_STR_PART |
+     * TOK_DOLLAR_LBRACE ... TOK_RBRACE), and a matching TOK_STR_END/
+     * TOK_ISTR_END. */
+    TOK_STR_START,     /* '"' opening a double-quoted string */
+    TOK_STR_PART,      /* a literal chunk inside "...", escapes already applied */
+    TOK_STR_END,       /* '"' closing a double-quoted string */
+    TOK_ISTR_START,     /* "''" opening an indented string */
+    TOK_ISTR_PART,      /* a raw literal chunk inside ''...'', NOT yet indentation-
+                         * stripped (that happens once all of one indented string's
+                         * parts are collected -- see parser.c's strip_indentation,
+                         * ported from real Nix's ParserState::stripIndentation) */
+    TOK_ISTR_END,       /* "''" closing an indented string */
+    TOK_DOLLAR_LBRACE,  /* "${" -- starts an interpolated expression */
     TOK_EOF,
 } TokKind;
 
 typedef struct {
     TokKind kind;
     int64_t int_val;    /* TOK_INT */
-    const char *start;  /* TOK_IDENT / TOK_STRING: pointer into the source buffer */
-    size_t len;          /* TOK_IDENT / TOK_STRING: length (TOK_STRING excludes the quotes) */
+    const char *start;  /* TOK_IDENT / TOK_STR_PART / TOK_ISTR_PART: pointer into a buffer
+                          * (TOK_IDENT points into the original source; TOK_STR_PART/
+                          * TOK_ISTR_PART point into a freshly malloc'd decoded buffer,
+                          * since escape processing can shrink/change the bytes) */
+    size_t len;          /* length of the above */
     const char *pos;     /* every token: pointer to its first byte in the source buffer --
                            * used to recover the exact source text of an `assert` condition
                            * for the failure message (see parser.c / compiler.c AST_ASSERT) */
+    int istr_has_indentation; /* TOK_ISTR_PART only: 1 if this chunk came from plain
+                                * string content (counts toward the indented string's
+                                * indentation computation), 0 if it came from an escape
+                                * sequence (''$, ''', ''\<c> -- treated as a boundary,
+                                * not scanned for leading whitespace, exactly like real
+                                * Nix's StringToken::hasIndentation). */
 } Token;
 
 /* Tokenizes the whole source in one pass into a malloc'd array terminated

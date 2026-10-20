@@ -10,6 +10,7 @@
 #include "asnix/irbuild.h"
 #include "asnix/value.h"
 #include "symtab.h"
+#include "value_util.h"
 
 /* One compile-time scope level == one runtime Env frame: `count` names,
  * each living at its own slot (De Bruijn depth = how many ScopeFrame.up
@@ -212,12 +213,46 @@ static void compile_expr(IrBuilder *b, Ast *node, ScopeFrame *scope) {
             return;
         }
         case AST_STRING: {
-            size_t len = node->as.string.len;
-            void *mem = asnix_arena_alloc(8 + len);
-            *(int64_t *)((char *)mem + ASNIX_STRING_OFF_LEN) = (int64_t)len;
-            memcpy((char *)mem + ASNIX_STRING_OFF_BYTES, node->as.string.text, len);
-            Value v = { .raw = (uint64_t)(uintptr_t)mem | ASNIX_TAG_PTR };
-            ib_push_const(b, (int64_t)v.raw);
+            size_t count = node->as.string.count;
+            AstStringPart *parts = node->as.string.parts;
+
+            int all_literal = 1;
+            for (size_t i = 0; i < count; i++) {
+                if (parts[i].is_expr) { all_literal = 0; break; }
+            }
+
+            if (all_literal) {
+                /* No interpolation at all (the common case, including every
+                 * plain "..."/''...'' literal) -- fold into one compile-time
+                 * constant, exactly like pre-interpolation M5 did. */
+                size_t total = 0;
+                for (size_t i = 0; i < count; i++) total += parts[i].text_len;
+                void *mem = asnix_arena_alloc(8 + total);
+                *(int64_t *)((char *)mem + ASNIX_STRING_OFF_LEN) = (int64_t)total;
+                char *out = (char *)mem + ASNIX_STRING_OFF_BYTES;
+                for (size_t i = 0; i < count; i++) {
+                    memcpy(out, parts[i].text, parts[i].text_len);
+                    out += parts[i].text_len;
+                }
+                Value v = { .raw = (uint64_t)(uintptr_t)mem | ASNIX_TAG_PTR };
+                ib_push_const(b, (int64_t)v.raw);
+                return;
+            }
+
+            /* At least one interpolated part: push each literal chunk (as
+             * its own string constant) and each interpolated expression's
+             * raw result, then let OP_STR_CONCAT (runtime) coerce the
+             * non-string ones and concatenate everything in source order --
+             * see docs/architecture.md's strings scope notes. */
+            for (size_t i = 0; i < count; i++) {
+                if (parts[i].is_expr) {
+                    compile_expr(b, parts[i].expr, scope);
+                } else {
+                    Value v = asnix_make_string_value(parts[i].text, parts[i].text_len);
+                    ib_push_const(b, (int64_t)v.raw);
+                }
+            }
+            ib_str_concat(b, (int64_t)count);
             return;
         }
         case AST_LIST: {
