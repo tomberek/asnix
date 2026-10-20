@@ -31,4 +31,11 @@ typedef struct {
 extern const AsnixBuiltinDef asnix_builtins_list[];
 extern const size_t asnix_builtins_list_count;
 
+/* `map` is one of a small, fixed set of names real Nix exposes as a bare
+ * global in addition to `builtins.map` (confirmed directly against
+ * nix-instantiate -- see builtins.h's asnix_make_import_primop comment
+ * for the full list checked). Wraps the exact same native function
+ * `builtins.map` uses. */
+Value asnix_make_map_primop(void);
+
 #endif /* ASNIX_BUILTINS_LIST_H */

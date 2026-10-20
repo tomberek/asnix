@@ -189,6 +189,10 @@ size_t ib_check_formals(IrBuilder *b, int64_t required_count, const uint32_t *re
     return ib_emit(b, OP_CHECK_FORMALS, required_count, (int64_t)pool_idx);
 }
 
+size_t ib_select_or(IrBuilder *b, uint32_t sym) {
+    return ib_emit(b, OP_SELECT_OR, 0, (int64_t)sym);
+}
+
 IrProgram *ib_finish(IrBuilder *b) {
     ir_link(b->ops, b->len);
     IrProgram *prog = calloc(1, sizeof(IrProgram));

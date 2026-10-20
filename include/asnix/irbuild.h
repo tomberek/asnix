@@ -116,6 +116,11 @@ size_t ib_has_attr(IrBuilder *b, uint32_t sym);
 size_t ib_check_formals(IrBuilder *b, int64_t required_count, const uint32_t *required_syms_sorted,
                          int64_t total_count, const uint32_t *all_syms_sorted);
 
+/* `expr.attr or default`: emits with a placeholder delta (operand `a`,
+ * patched via ib_patch_delta, same convention as ib_if/ib_jmp/ib_with_try)
+ * and the fixed symbol id `sym` (operand `b`) -- see OP_SELECT_OR in ir.h. */
+size_t ib_select_or(IrBuilder *b, uint32_t sym);
+
 /* Finalizes the builder: runs ir_link() over the accumulated ops in place
  * and returns an IrProgram ready for asnix_eval(). */
 IrProgram *ib_finish(IrBuilder *b);

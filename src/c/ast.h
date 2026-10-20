@@ -146,6 +146,11 @@ struct Ast {
             Ast *target;
             const char *attr;
             size_t attr_len;
+            Ast *default_; /* `expr.attr or default` -- NULL for a plain select (fatal if
+                              * missing/wrong type, see compiler.c's AST_SELECT case). Scope
+                              * cut: only the single select this node represents is covered,
+                              * not every segment of a longer chain -- see
+                              * src/asm/ops/op_select_or.S's header comment. */
         } select; /* AST_SELECT */
         struct {
             Ast *lhs, *rhs;

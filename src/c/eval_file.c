@@ -11,6 +11,7 @@
 #include "asnix/env.h"
 #include "asnix/ir.h"
 #include "builtins.h"
+#include "builtins_list.h"
 #include "compiler.h"
 #include "lexer.h"
 #include "parser.h"
@@ -59,9 +60,18 @@ Value asnix_eval_file(const char *path) {
     IrProgram *prog = asnix_compile(ast, base_dir);
 
     /* Fresh root env/builtins every call -- an imported file does not
-     * inherit the importing file's local scope (see eval_file.h). */
-    Env *root_env = asnix_env_alloc(NULL, 1);
+     * inherit the importing file's local scope (see eval_file.h). Slots
+     * 1-4 (`import`, `map`, `abort`, `toString`) are four of the small
+     * set of names real Nix exposes as bare globals in addition to
+     * `builtins.X` -- see builtins.h's asnix_make_import_primop comment
+     * for the full list checked; compiler.c's root ScopeFrame must list
+     * the same names in the same order. */
+    Env *root_env = asnix_env_alloc(NULL, 5);
     root_env->values[0] = asnix_make_builtins_attrs();
+    root_env->values[1] = asnix_make_import_primop();
+    root_env->values[2] = asnix_make_map_primop();
+    root_env->values[3] = asnix_make_abort_primop();
+    root_env->values[4] = asnix_make_toString_primop();
 
     Value result = asnix_eval(prog, root_env);
 

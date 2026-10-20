@@ -165,6 +165,14 @@ enum {
                         * allocate the frame before constructing the thunks, so defaults get
                         * letrec-style mutual/forward visibility) rather than a second,
                         * duplicate alloc/bind op pair. */
+    OP_SELECT_OR,  /* `expr.attr or default`: a = byte delta to jump to (the default's IR)
+                     * on a miss, b = symbol id. Pops the select target; non-attrset or
+                     * missing key both fall through to the delta jump (not fatal, unlike
+                     * plain OP_SELECT -- see op_select_or.S). Found: forces the entry if
+                     * it's an unforced thunk (same as OP_SELECT) and falls through
+                     * in-line. Scope cut: only protects the single select this op
+                     * corresponds to, not every segment of a longer `a.b.c` chain --
+                     * see op_select_or.S's header comment. */
     OP_COUNT
 };
 

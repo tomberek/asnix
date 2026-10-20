@@ -19,6 +19,11 @@ typedef enum {
     TOK_INHERIT,
     TOK_ASSERT,
     TOK_WITH,
+    TOK_OR, /* `expr.attr or default` -- see parser.c's parse_select. Deliberate scope cut
+             * (documented in docs/architecture.md): a genuine reserved keyword here, unlike
+             * real Nix where `or` is contextually special ("cursed or") but can still be used
+             * as an ordinary identifier elsewhere; asnix's `or` can't be used as a plain
+             * identifier at all. */
     TOK_PLUS,
     TOK_MINUS,
     TOK_STAR,

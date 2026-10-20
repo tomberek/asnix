@@ -25,6 +25,23 @@ static Value prim_toString(const Value *args, int64_t argc) {
     return asnix_coerce_to_string(args[0]);
 }
 
+/* `abort msg` -- unconditionally fatal (matches real Nix's core wording,
+ * confirmed directly: "error: evaluation aborted with the following
+ * error message: '<msg>'"; the "while calling" trace context real Nix
+ * also prints isn't reproduced -- asnix has no call-trace infrastructure
+ * at all, same simplification every other fatal error in this project
+ * already makes). No distinct `throw` exists yet -- asnix has no
+ * exception/catch mechanism (no `builtins.tryEval`), so the two would be
+ * behaviorally identical here anyway; left as a documented follow-up. */
+static Value prim_abort(const Value *args, int64_t argc) {
+    (void)argc;
+    Value msg = asnix_coerce_to_string(args[0]);
+    int64_t len;
+    const char *bytes = asnix_ptr_bytes(msg, &len);
+    fprintf(stderr, "asnix: evaluation aborted with the following error message: '%.*s'\n", (int)len, bytes);
+    exit(1);
+}
+
 static Value prim_typeOf(const Value *args, int64_t argc) {
     (void)argc;
     switch (asnix_tag_of(args[0])) {
@@ -205,6 +222,7 @@ static const BuiltinDef BUILTINS[] = {
     { "hashString", prim_hashString, 1 }, /* true arity 2, curried -- see hash_apply's comment above */
     { "derivation", asnix_prim_derivation, 1 },
     { "import", prim_import, 1 },
+    { "abort", prim_abort, 1 },
 };
 
 /* Merges this file's own BUILTINS[] with the three builtins-expansion
@@ -216,6 +234,18 @@ static const BuiltinDef BUILTINS[] = {
  * since a couple of its entries are curried Closures rather than a plain
  * PrimOp) so it's merged via a small adapter loop rather than sharing the
  * {name,fn,arity} shape the other three use. */
+Value asnix_make_import_primop(void) {
+    return make_primop_value((void *)prim_import, 1);
+}
+
+Value asnix_make_abort_primop(void) {
+    return make_primop_value((void *)prim_abort, 1);
+}
+
+Value asnix_make_toString_primop(void) {
+    return make_primop_value((void *)prim_toString, 1);
+}
+
 Value asnix_make_builtins_attrs(void) {
     size_t n_base = sizeof(BUILTINS) / sizeof(BUILTINS[0]);
     size_t n_list = asnix_builtins_list_count;

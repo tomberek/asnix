@@ -30,7 +30,8 @@ what's actually implemented and the scope decisions made along the way.
 | M15 — `import` + path literals (`src/c/eval_file.c`) | done, **scoped** (see below) |
 | M16 — `asnix_apply`, general re-entrant call-a-Value-from-C (`src/asm/apply.S`) | done (see below) |
 | M17 — builtins expansion (list/attrs/string/type-predicate) | done (see below) |
-| M18+ | not started |
+| M18 — bare globals (`import`/`map`/`abort`/`toString`) + `expr.attr or default` | done (see below) |
+| M19+ | not started |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
 
@@ -1143,6 +1144,95 @@ curried-Closure chain rather than a single PrimOp) into
   while real Nix's does not — the same deliberate M6-era divergence
   already documented elsewhere in this file, confirmed by comparing the
   actual (forced) values through `foldl'` instead of the raw printed form.
+
+## M18 scope notes: bare globals + `expr.attr or default`
+
+**Bare globals**: `import`, `map`, `abort`, and `toString` are now
+reachable as bare identifiers, not only as
+`builtins.import`/`builtins.map`/`builtins.abort`/`builtins.toString`.
+Confirmed directly against `nix-instantiate` which (bare) names real Nix
+actually exposes as globals before implementing anything -- it's a small,
+fixed, curated list (`import abort throw map removeAttrs isNull toString
+baseNameOf dirOf fetchTarball derivation builtins true false null
+__curPos`), *not* every `builtins.*` entry (`filter`/`foldl`/`typeOf`/
+`length`/`hashString`/`genericClosure` all stay `builtins.`-only there
+too, confirmed the same way). asnix exposes only
+`import`/`map`/`abort`/`toString` bare so far (the ones reported
+missing); the rest of that list is a documented follow-up, not attempted
+here.
+
+- **Mechanism**: the root `Env`/`ScopeFrame` grew from one slot
+  (`builtins`) to five (`builtins, import, map, abort, toString`) --
+  `eval_file.c`'s root `Env` and `compiler.c`'s `asnix_compile`'s root
+  `ScopeFrame` must list the same names in the same order, since slot
+  index is what actually ties a name to its value at runtime. Each bare
+  name is a *fresh* `PrimOp` Value wrapping the exact same native function
+  its `builtins.X` counterpart uses (`asnix_make_import_primop`/
+  `asnix_make_map_primop`/`asnix_make_abort_primop`) -- same behavior,
+  reachable two ways, no shared mutable state between them.
+- **`abort msg`**: didn't exist in any form before this (not even under
+  `builtins.`) -- new `prim_abort` in `builtins.c`. Matches real Nix's
+  core wording (confirmed directly: "evaluation aborted with the
+  following error message: '<msg>'"); the "while calling" trace context
+  real Nix also prints isn't reproduced, same simplification every other
+  fatal error in this project already makes. No distinct `throw` exists
+  yet -- asnix has no exception/catch mechanism (no `builtins.tryEval`),
+  so the two would be behaviorally identical here anyway; documented
+  follow-up, not attempted.
+
+**`expr.attr or default`**: real Nix's select-with-default, confirmed
+against its own grammar (`~/nix/src/libexpr/parser.y`'s `expr_select:
+expr_simple '.' attrpath OR_KW expr_select` production) rather than
+guessed from black-box probing alone (black-box testing alone can't
+distinguish precedence here: since the selected attribute is always
+missing in a "does `or` fire" test, every candidate grouping of the
+surrounding expression happens to evaluate to the same number regardless
+of which one is actually correct).
+
+- **New op** (`OP_SELECT_OR`, `src/asm/ops/op_select_or.S`): modeled
+  directly on the already-existing `OP_WITH_TRY`'s binary-search +
+  delta-jump shape (same pop-search-found/push-fallthrough-or-jump-by-
+  delta mechanism, same `ib_patch_delta` convention `AST_IF`/`AST_WITH`
+  already use), with one behavioral difference: a non-attrset target is
+  *not* fatal here (confirmed: `(5).foo or 10` → `10`, the same "not even
+  an attrset simply means not found" rule `OP_HAS_ATTR`/`?` already
+  established), whereas `OP_WITH_TRY`'s non-attrset `with`-value *is*
+  fatal (a `with` value is only ever consulted once something inside
+  actually needs it, so the type error is real and immediate by the time
+  it runs).
+- **`or`'s default is parsed at `expr_select` tightness, not full `expr`**
+  (confirmed from the real grammar, not assumed): `{a=1;}.b or 5 + 1`
+  parses as `({a=1;}.b or 5) + 1` (= 6), *not* `{a=1;}.b or (5 + 1)` --
+  the default extends only as far as another select-chain, not past
+  operators. `parser.c`'s `parse_select` checks for `TOK_OR` once, after
+  its postfix-`.attr` loop, on the *outermost* (last) `AST_SELECT` node,
+  and parses the default via a recursive `parse_select` call at that same
+  tightness (so `a.b or c.d or e` chains sensibly).
+- **Scope cut, documented at the op/AST/IR level, not just here**: `or`
+  only protects the *single* select it's grammatically attached to.
+  `a.b.c or 5` compiles as nested `AST_SELECT` (`.c`'s target is `.b`'s
+  result), and only the outermost (`.c`) gets `OP_SELECT_OR`'s graceful
+  fallback -- an earlier segment missing (`a.b` itself missing or not an
+  attrset) is still a fatal plain `OP_SELECT` abort. Real Nix's `or`
+  catches a miss at *any* point along the whole path in one `attrpath`
+  production; asnix's current scope only covers the last segment.
+  Confirmed directly: `{a={b=1;};}.x.c or 5` → `5` in real Nix (the
+  *first* segment, `x`, is missing) but aborts in asnix. A real
+  divergence, not silently swept under a passing test -- deliberately
+  scoped this way rather than threading a whole-path fallback through
+  nested selects under time pressure; `tests/e2e/m18_or_chain_last_missing.nix`
+  covers the case this scope *does* handle (last segment missing), not
+  the uncovered one.
+- **`or` is a hard reserved keyword here** (`TOK_OR`), unlike real Nix
+  where it's only contextually special (the "cursed or" grammar rule
+  lets `or` still be used as an ordinary identifier elsewhere) -- a
+  documented, deliberate simplification; `or` can't be used as a plain
+  identifier anywhere in asnix now.
+- **Verified against real `nix-instantiate --eval`**: missing key with
+  fallback, present key (no fallback used), a multi-segment chain where
+  only the last segment is missing, a non-attrset target, and operator
+  precedence (`1 + {a=1;}.b or 5` → `6`, `or`'s result participating
+  normally in the surrounding `+`).
 
 ## Known bugs found and fixed during implementation (worth knowing about)
 

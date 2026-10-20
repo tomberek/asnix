@@ -455,6 +455,7 @@ static Ast *parse_atom(Parser *p) {
 
 static Ast *parse_select(Parser *p) {
     Ast *e = parse_atom(p);
+    int had_select = 0;
     while (cur(p)->kind == TOK_DOT) {
         advance(p);
         Token *attr = expect(p, TOK_IDENT, "an attribute name");
@@ -462,7 +463,26 @@ static Ast *parse_select(Parser *p) {
         n->as.select.target = e;
         n->as.select.attr = attr->start;
         n->as.select.attr_len = attr->len;
+        n->as.select.default_ = NULL;
         e = n;
+        had_select = 1;
+    }
+    /* `expr.attr or default` -- real Nix's grammar attaches `or` to the
+     * whole preceding `expr '.' attrpath`, not per-segment (confirmed
+     * against nix-instantiate's own parser.y: `expr_simple '.' attrpath
+     * OR_KW expr_select`), so this is checked once, after the loop, on
+     * the outermost (last) AST_SELECT node -- see that node's `default_`
+     * field comment in ast.h for the resulting scope cut (only the last
+     * segment's failure is caught, not an earlier one in a longer
+     * chain). `default` itself is parsed at this same parse_select
+     * tightness (matching real Nix: the default is NOT a full `expr`,
+     * e.g. `+`/`==` outside are not absorbed into it), recursively, so
+     * `a.b or c.d or e` chains sensibly. No `or` is possible without at
+     * least one preceding `.select` (real Nix's grammar agrees -- a bare
+     * `x or y` is the separate, unsupported "cursed or" rule). */
+    if (had_select && cur(p)->kind == TOK_OR) {
+        advance(p);
+        e->as.select.default_ = parse_select(p);
     }
     return e;
 }

@@ -75,6 +75,7 @@ static const Keyword KEYWORDS[] = {
     { "false", TOK_FALSE },     { "null", TOK_NULL },
     { "rec", TOK_REC },         { "inherit", TOK_INHERIT },
     { "assert", TOK_ASSERT },   { "with", TOK_WITH },
+    { "or", TOK_OR },
 };
 
 /* Lexer mode stack -- a from-scratch equivalent of real Nix's flex state

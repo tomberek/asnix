@@ -164,6 +164,10 @@ static Value prim_map(const Value *args, int64_t argc) {
     return make_primop1((void *)prim_map_stage2, 1, args[0]);
 }
 
+Value asnix_make_map_primop(void) {
+    return make_primop0((void *)prim_map, 1);
+}
+
 /* --------------------------------------------------------------------- */
 /* filter pred list                                                      */
 /* --------------------------------------------------------------------- */

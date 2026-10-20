@@ -700,7 +700,24 @@ static void compile_expr(IrBuilder *b, Ast *node, ScopeFrame *scope) {
         case AST_SELECT: {
             compile_expr(b, node->as.select.target, scope);
             uint32_t sym = asnix_intern(node->as.select.attr, node->as.select.attr_len);
-            ib_select(b, sym);
+            if (!node->as.select.default_) {
+                ib_select(b, sym);
+                return;
+            }
+            /* `expr.attr or default`: OP_SELECT_OR falls through in-line
+             * on a hit (value already on VALSTACK); on a miss it jumps
+             * (by the delta patched below) straight to the default's
+             * code. The OP_JMP right after is only reached on the hit
+             * path, skipping over the default's code to the shared end --
+             * same two-site patch-after-the-fact shape AST_IF already
+             * uses for its then/else branches. */
+            size_t try_site = ib_select_or(b, sym);
+            size_t jmp_site = ib_jmp(b);
+            size_t default_idx = ib_len(b);
+            ib_patch_delta(b, try_site, default_idx);
+            compile_expr(b, node->as.select.default_, scope);
+            size_t end_idx = ib_len(b);
+            ib_patch_delta(b, jmp_site, end_idx);
             return;
         }
         case AST_WITH: {
@@ -739,13 +756,17 @@ static void compile_expr(IrBuilder *b, Ast *node, ScopeFrame *scope) {
 IrProgram *asnix_compile(Ast *root, const char *base_dir) {
     g_compile_base_dir = base_dir;
     IrBuilder *b = ib_new();
-    /* The root env (constructed by main.c) has exactly one slot: the
-     * `builtins` attrset. This scope frame makes `builtins.toString 5`
-     * etc. resolve like any other variable reference. */
-    static const char *builtins_names[1] = { "builtins" };
-    static size_t builtins_name_lens[1] = { 8 };
+    /* The root env (constructed by eval_file.c) has five slots: the
+     * `builtins` attrset, plus `import`/`map`/`abort`/`toString` bare --
+     * four of the small set of names real Nix exposes as bare globals in
+     * addition to `builtins.X` (see builtins.h's asnix_make_import_primop
+     * comment). This scope frame makes `builtins.toString 5` and bare
+     * `import ./x`/`map f xs`/`abort "msg"`/`toString 5` all resolve like
+     * any other variable reference. */
+    static const char *builtins_names[5] = { "builtins", "import", "map", "abort", "toString" };
+    static size_t builtins_name_lens[5] = { 8, 6, 3, 5, 8 };
     ScopeFrame builtins_frame = {
-        .up = NULL, .names = builtins_names, .name_lens = builtins_name_lens, .count = 1 };
+        .up = NULL, .names = builtins_names, .name_lens = builtins_name_lens, .count = 5 };
     compile_expr(b, root, &builtins_frame);
     ib_halt(b);
     return ib_finish(b);
