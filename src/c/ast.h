@@ -28,6 +28,10 @@ typedef enum {
     AST_LIST,
     AST_ATTRSET,
     AST_SELECT,
+    AST_AND,    /* short-circuit `&&`: as.logic */
+    AST_OR,     /* short-circuit `||`: as.logic */
+    AST_NOT,    /* unary `!`: as.not1 */
+    AST_ASSERT, /* `assert cond; body`: as.assert1 */
 } AstKind;
 
 typedef struct Ast Ast;
@@ -82,7 +86,11 @@ struct Ast {
             Ast *fn, *arg;
         } app; /* AST_APP */
         struct {
-            char op; /* '+', '-', '*' */
+            /* '+' '-' '*'                  arithmetic (M4)
+             * 'e' '==' 'n' '!='            equality/inequality
+             * 'l' '<' 'g' '>' 'L' '<=' 'G' '>='   ordering (INT-only, see compiler.c)
+             * 'u' '//'                     attrset update/merge */
+            char op;
             Ast *lhs, *rhs;
         } binop; /* AST_BINOP */
         struct {
@@ -103,6 +111,18 @@ struct Ast {
             const char *attr;
             size_t attr_len;
         } select; /* AST_SELECT */
+        struct {
+            Ast *lhs, *rhs;
+        } logic; /* AST_AND / AST_OR -- compiled branch-shaped (if/then/else), not as an
+                   * eager binop, so the untaken side is never evaluated (see compiler.c). */
+        struct {
+            Ast *operand;
+        } not1; /* AST_NOT */
+        struct {
+            Ast *cond, *body;
+            const char *cond_text; /* raw source span of `cond`, for the failure message */
+            size_t cond_text_len;
+        } assert1; /* AST_ASSERT */
     } as;
 };
 

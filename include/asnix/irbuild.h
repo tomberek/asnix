@@ -65,6 +65,22 @@ size_t ib_frame_alloc(IrBuilder *b, int64_t nslots);
 size_t ib_frame_set(IrBuilder *b, int64_t slot);
 size_t ib_frame_exit(IrBuilder *b);
 
+/* "operators" milestone: comparisons (INT-only for ordering, see
+ * op_cmp.S), booleans, attrset update, assert. `&&`/`||` have no
+ * dedicated op -- see ir.h's OP_EQ block comment. */
+size_t ib_eq(IrBuilder *b);
+size_t ib_neq(IrBuilder *b);
+size_t ib_lt(IrBuilder *b);
+size_t ib_gt(IrBuilder *b);
+size_t ib_le(IrBuilder *b);
+size_t ib_ge(IrBuilder *b);
+size_t ib_not(IrBuilder *b);
+size_t ib_update(IrBuilder *b);
+/* Emits OP_ASSERT_FAIL over a {msg, len} pool pair; `msg` must outlive the
+ * resulting IrProgram (compiler.c arena-allocates it, which is never
+ * freed, exactly like string literals -- see AST_STRING). */
+size_t ib_assert_fail(IrBuilder *b, const char *msg, size_t len);
+
 /* Finalizes the builder: runs ir_link() over the accumulated ops in place
  * and returns an IrProgram ready for asnix_eval(). */
 IrProgram *ib_finish(IrBuilder *b);

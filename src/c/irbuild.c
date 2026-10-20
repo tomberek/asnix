@@ -127,6 +127,37 @@ size_t ib_frame_exit(IrBuilder *b) {
     return ib_emit(b, OP_FRAME_EXIT, 0, 0);
 }
 
+size_t ib_eq(IrBuilder *b) {
+    return ib_emit(b, OP_EQ, 0, 0);
+}
+size_t ib_neq(IrBuilder *b) {
+    return ib_emit(b, OP_NEQ, 0, 0);
+}
+size_t ib_lt(IrBuilder *b) {
+    return ib_emit(b, OP_LT, 0, 0);
+}
+size_t ib_gt(IrBuilder *b) {
+    return ib_emit(b, OP_GT, 0, 0);
+}
+size_t ib_le(IrBuilder *b) {
+    return ib_emit(b, OP_LE, 0, 0);
+}
+size_t ib_ge(IrBuilder *b) {
+    return ib_emit(b, OP_GE, 0, 0);
+}
+size_t ib_not(IrBuilder *b) {
+    return ib_emit(b, OP_NOT, 0, 0);
+}
+size_t ib_update(IrBuilder *b) {
+    return ib_emit(b, OP_UPDATE, 0, 0);
+}
+
+size_t ib_assert_fail(IrBuilder *b, const char *msg, size_t len) {
+    size_t pool_idx = ib_pool_add(b, (int64_t)(intptr_t)msg);
+    ib_pool_add(b, (int64_t)len); /* always pool_idx+1, see op_assert.S */
+    return ib_emit(b, OP_ASSERT_FAIL, 0, (int64_t)pool_idx);
+}
+
 IrProgram *ib_finish(IrBuilder *b) {
     ir_link(b->ops, b->len);
     IrProgram *prog = calloc(1, sizeof(IrProgram));

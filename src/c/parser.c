@@ -1,5 +1,6 @@
 #include "parser.h"
 
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -261,6 +262,107 @@ static Ast *parse_add(Parser *p) {
     return lhs;
 }
 
+/* Operator precedence below `parse_expr`'s keyword forms (`let`/`if`/
+ * lambda/`assert`), lowest to highest, verified directly against real
+ * `nix-instantiate` (see docs/architecture.md's "operators" milestone
+ * notes -- this is NOT the same ordering a literal reading of the Nix
+ * manual's summary table might suggest for `!`, which binds looser than
+ * `+`/`-` but tighter than `//`; confirmed with
+ * `! 1 + 1` (parses as `!(1 + 1)`, confirmed by the runtime type error
+ * complaining about `2`, not `1`) and `! true // {}` (parses as
+ * `(!true) // {}`, confirmed by the runtime error naming `false`, the
+ * result of the `!`, not `true`)):
+ *
+ *   parse_or    ||              left-assoc, chainable
+ *   parse_and   &&              left-assoc, chainable
+ *   parse_eq    == !=           non-assoc (single occurrence only)
+ *   parse_cmp   < > <= >=       non-assoc (single occurrence only)
+ *   parse_update //             right-assoc, chainable
+ *   parse_not   ! (prefix)      binds the rest of this chain down to parse_add
+ *   parse_add   + -             (already existed, M4)
+ */
+static Ast *parse_not(Parser *p) {
+    if (cur(p)->kind == TOK_BANG) {
+        advance(p);
+        Ast *operand = parse_not(p); /* right-recurse: allows `!!x` */
+        Ast *n = asnix_ast_new(AST_NOT);
+        n->as.not1.operand = operand;
+        return n;
+    }
+    return parse_add(p);
+}
+
+static Ast *parse_update(Parser *p) {
+    Ast *lhs = parse_not(p);
+    if (cur(p)->kind == TOK_SLASHSLASH) {
+        advance(p);
+        Ast *rhs = parse_update(p); /* right-recurse: right-associative, matching real Nix */
+        Ast *n = asnix_ast_new(AST_BINOP);
+        n->as.binop.op = 'u';
+        n->as.binop.lhs = lhs;
+        n->as.binop.rhs = rhs;
+        return n;
+    }
+    return lhs;
+}
+
+static Ast *parse_cmp(Parser *p) {
+    Ast *lhs = parse_update(p);
+    TokKind k = cur(p)->kind;
+    if (k == TOK_LT || k == TOK_GT || k == TOK_LE || k == TOK_GE) {
+        advance(p);
+        Ast *rhs = parse_update(p); /* no loop: non-associative, matching real Nix (`1 < 2 < 3` is a parse error there too) */
+        char op = k == TOK_LT ? 'l' : k == TOK_GT ? 'g' : k == TOK_LE ? 'L' : 'G';
+        Ast *n = asnix_ast_new(AST_BINOP);
+        n->as.binop.op = op;
+        n->as.binop.lhs = lhs;
+        n->as.binop.rhs = rhs;
+        return n;
+    }
+    return lhs;
+}
+
+static Ast *parse_eq(Parser *p) {
+    Ast *lhs = parse_cmp(p);
+    TokKind k = cur(p)->kind;
+    if (k == TOK_EQEQ || k == TOK_NEQ) {
+        advance(p);
+        Ast *rhs = parse_cmp(p); /* non-associative, same reasoning as parse_cmp */
+        Ast *n = asnix_ast_new(AST_BINOP);
+        n->as.binop.op = k == TOK_EQEQ ? 'e' : 'n';
+        n->as.binop.lhs = lhs;
+        n->as.binop.rhs = rhs;
+        return n;
+    }
+    return lhs;
+}
+
+static Ast *parse_and(Parser *p) {
+    Ast *lhs = parse_eq(p);
+    while (cur(p)->kind == TOK_ANDAND) {
+        advance(p);
+        Ast *rhs = parse_eq(p);
+        Ast *n = asnix_ast_new(AST_AND);
+        n->as.logic.lhs = lhs;
+        n->as.logic.rhs = rhs;
+        lhs = n;
+    }
+    return lhs;
+}
+
+static Ast *parse_or(Parser *p) {
+    Ast *lhs = parse_and(p);
+    while (cur(p)->kind == TOK_OROR) {
+        advance(p);
+        Ast *rhs = parse_and(p);
+        Ast *n = asnix_ast_new(AST_OR);
+        n->as.logic.lhs = lhs;
+        n->as.logic.rhs = rhs;
+        lhs = n;
+    }
+    return lhs;
+}
+
 /* Parses the bindings following `let` into one flat binding list (real Nix
  * `let ... in` is always implicitly `letrec`: every binding sees itself
  * and every sibling regardless of source order -- see ast.h/compiler.c). */
@@ -306,7 +408,23 @@ static Ast *parse_expr(Parser *p) {
         n->as.lambda.body = body;
         return n;
     }
-    return parse_add(p);
+    if (cur(p)->kind == TOK_ASSERT) {
+        advance(p);
+        Token *start_tok = cur(p);
+        Ast *cond = parse_expr(p);
+        Token *semi_tok = cur(p); /* captured before expect() consumes it */
+        expect(p, TOK_SEMI, "';'");
+        size_t span_len = (size_t)(semi_tok->pos - start_tok->pos);
+        while (span_len > 0 && isspace((unsigned char)start_tok->pos[span_len - 1])) span_len--;
+        Ast *body = parse_expr(p);
+        Ast *n = asnix_ast_new(AST_ASSERT);
+        n->as.assert1.cond = cond;
+        n->as.assert1.body = body;
+        n->as.assert1.cond_text = start_tok->pos;
+        n->as.assert1.cond_text_len = span_len;
+        return n;
+    }
+    return parse_or(p);
 }
 
 Ast *asnix_parse(Token *toks, size_t count) {

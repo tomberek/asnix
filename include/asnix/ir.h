@@ -116,6 +116,23 @@ enum {
                       * restoring the enclosing scope so a `let`/`rec {}` used as a
                       * non-tail subexpression doesn't leak its frame into whatever
                       * depth-relative OP_VAR_REF comes after it in the same IR stream. */
+    /* "operators" milestone: comparisons/booleans/update/assert. `&&`/
+     * `||` are deliberately NOT ops here -- they compile to the existing
+     * branch-shaped OP_IF/OP_JMP (see compiler.c's AST_AND/AST_OR cases)
+     * so the untaken side is provably never evaluated (short-circuit). */
+    OP_EQ,          /* pops rhs,lhs; pushes TRUE/FALSE -- see op_cmp.S for the scope cut
+                      * (INT numeric equality, IMM subtag equality, pointer identity for
+                      * everything else -- no deep structural equality on lists/attrsets) */
+    OP_NEQ,         /* ditto, negated */
+    OP_LT,          /* pops rhs,lhs (both must be TAG_INT, else fatal); pushes TRUE/FALSE */
+    OP_GT,
+    OP_LE,
+    OP_GE,
+    OP_NOT,         /* in-place: top of stack must be TAG_IMM true/false, else fatal */
+    OP_UPDATE,      /* pops rhs,lhs (both must be TAG_ATTRS, else fatal); pushes the
+                      * right-biased sorted-array merge (asnix_attrs_update, src/c/attrs_update.c) */
+    OP_ASSERT_FAIL, /* b = pool index of {msg ptr, msg len}; unconditionally asnix_fatal()s --
+                      * compiler.c's AST_ASSERT only reaches this on the cond-false branch */
     OP_COUNT
 };
 
