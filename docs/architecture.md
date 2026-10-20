@@ -27,7 +27,8 @@ what's actually implemented and the scope decisions made along the way.
 | M12 — strings: `"${expr}"` interpolation, `''...''` multi-line strings | done (see below) |
 | M13 — `with` expressions | done (see below) |
 | M14 — lambda-destructuring patterns | done (see below) |
-| M15+ | not started |
+| M15 — `import` + path literals (`src/c/eval_file.c`) | done, **scoped** (see below) |
+| M16+ | not started |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
 
@@ -938,6 +939,96 @@ compiled body, not in the call mechanism.
   missing-required-field abort, defaults (both used and overridden),
   `...` with extra fields present, and both `@`-binding positions.
 
+## M15 scope notes: `import` + path literals
+
+**Path literals**: a new lexer token (`src/c/lexer.c`'s `try_scan_path`),
+distinct from quoted strings — bare `./foo.nix`, `../foo.nix`, `/abs/foo`,
+and bare relative `foo/bar.nix` (all four forms checked against
+`nix-instantiate --eval`'s `builtins.typeOf`/`builtins.toString`). There's
+no division operator anywhere in this grammar, so any `/` outside a string
+is unambiguously a path — that's what lets the lexer try path-scanning
+*before* digit/ident scanning with no new lookahead machinery breaking any
+existing token. A **relative** path literal resolves (at *compile* time,
+not eval time — see `compiler.c`'s `AST_PATH` case and
+`g_compile_base_dir`) against the directory of the `.nix` file it's
+*written in*, matching real Nix exactly (confirmed with a nested-import
+fixture: `a/b.nix`'s own `./c.nix` resolves to `a/c.nix`, not wherever the
+file that `import`ed `a/b.nix` lives, and not the process's cwd) — not
+against the importing file's directory, and not the process's cwd.
+Resolution runs the result through a lexical canonicalizer (collapses
+`.`/`..`/doubled slashes, no symlink resolution) matching real Nix's
+`canonPath` for the cases checked (`./sub/../foo.nix` → `.../foo.nix`,
+verified against `nix-instantiate`). A trailing slash is rejected with the
+same message real Nix uses ("path has a trailing slash") rather than
+silently stripped.
+
+**Value representation**: no new tag — all 8 `ASNIX_TAG_*` slots are
+already spent (see `include/asnix/value.h`), so a Path reuses
+`ASNIX_TAG_PTR` exactly as `value.h`'s own comment on that tag
+anticipates ("generic heap pointer... via a header Kind byte"):
+distinguished from a String by a reserved negative sentinel in the
+leading word (a genuine String's leading word is always its own
+non-negative length) — see `include/asnix/heap.h`'s `ASNIX_PATH_MARKER`
+and `src/c/value_util.c`'s `asnix_value_is_path`/`asnix_ptr_bytes`. Every
+place that used to assume "`ASNIX_TAG_PTR` means String" (`typeOf`,
+`toString`, the printer, `hashString`) was updated to dispatch on the
+marker; `toString`ing a Path produces a plain String with the same bytes
+(real Nix changes the value's *type* from `"path"` to `"string"` here —
+checked directly), and `hashString` now rejects a Path argument instead
+of misreading the marker as a bogus length (checked against
+`nix-instantiate`: real Nix also rejects it, "expected a string but found
+a path").
+
+**Search-path literals** (`<nixpkgs>`-style): included — cheap enough
+(just `NIX_PATH` parsing + one `stat()`, no new value kind). Implements
+real Nix's `findFile` rule (checked against `nix-instantiate`, with
+`NIX_PATH` set to both `name=dir` and plain-`dir` forms): colon-separated
+`NIX_PATH` entries, `name=dir` matched by exact leading-component name
+(trusted without a filesystem check — matching real Nix), plain `dir`
+entries probed for `dir/<name>` via `stat()`; first match wins. **Not**
+added to the committed `tests/e2e` suite, unlike everything else here:
+asserting on a `NIX_PATH`-derived absolute path would bake this
+particular checkout's filesystem location into a fixture meant to run
+from any clone — manually verified against `nix-instantiate --eval
+'builtins.toString <foo>'` with `NIX_PATH=foo=<dir>` instead (see this
+milestone's session transcript).
+
+**`import`**: `src/c/main.c`'s `main()` used to inline the whole
+lex→parse→compile→eval pipeline directly; it's now `asnix_eval_file()`
+(`src/c/eval_file.c`), called by both `main()` and the new
+`builtins.import` primop (`src/c/builtins.c`'s `prim_import`) so the
+pipeline exists in exactly one place. Each call gets a brand-new root
+`Env`/`builtins` attrset — an imported file never implicitly sees the
+importing file's local scope (checked: this falls out for free from
+`asnix_env_alloc(NULL, 1)` building a parentless frame every time, not
+from any explicit "don't leak scope" logic). Accepts either a Path or an
+**absolute**-path String; a relative-path String is rejected with real
+Nix's exact wording ("string '...' doesn't represent an absolute path")
+rather than silently resolving it against cwd — there's no "containing
+file" to resolve a bare string argument against the way a path *literal*
+resolves against its own file at compile time.
+
+**Cut, deliberately**: `import` (and every other builtin) is reachable
+only as `builtins.import` — this codebase has no implicit "with builtins"
+root scope the way real Nix exposes `import`/`map`/`throw`/etc as bare
+globals (consistent with `m7_builtin_as_value.nix`'s existing
+`builtins.toString`-only pattern, not a new gap this milestone
+introduces). Path **arithmetic** (`somePath + "/file"`, path equality,
+etc.) isn't implemented — `AST_BINOP`'s `+` is still integer-only
+(`op_add.S`); giving `+` path semantics would mean touching the hot
+arithmetic op handler for a feature outside this milestone's ask. String
+**interpolation** of a path (`"${./foo}"`) segfaulted (see Known bugs
+below) until fixed during integration with the separately-landed string-
+interpolation milestone — now coerces the path the same plain way
+`toString` does, which is still not what real Nix does: real Nix's
+interpolation of a path copies it to the Nix store and substitutes the
+resulting store path (checked: `"${./foo.nix}"` evaluates to a
+`/nix/store/...` string there, not the plain path text) — a "string
+context" / content-addressing feature well beyond either milestone's
+scope (no daemon `AddToStore` is wired up — see M8's scope notes above),
+not a simple text substitution. Flagged here as a known, documented
+behavioral gap (not a crash) for whoever wires up `AddToStore`.
+
 ## Known bugs found and fixed during implementation (worth knowing about)
 
 1. **Register corruption across `asnix_eval`** (M3): `op_let.S`/
@@ -1120,3 +1211,53 @@ compiled body, not in the call mechanism.
    (via `fork()`, since the rejection path is a process-exit fatal error
    like every other "cannot coerce" site in this project, not a
    catchable exception).
+12. **Nested `asnix_eval` corrupted the enclosing invocation's VALSTACK/
+   RETSP bounds-check limits** (found integrating `import`/path-literals
+   against the already-merged VALSTACK/RETSP fix, bug #6 above):
+   `builtins.import` made nested `asnix_eval` calls possible for the
+   first time (`eval_file.c`'s `asnix_eval_file` calls `asnix_eval` again,
+   from inside the importing file's own still-active `asnix_eval`), but
+   `dispatch.S`'s `asnix_eval` unconditionally overwrote the shared global
+   `asnix_valstack_limit`/`asnix_retsp_limit` on entry and never restored
+   the caller's values on the way out -- `force.S`'s own nested-forcing
+   path already saved/restored these two globals around its use (see bug
+   #6), but `asnix_eval` itself, written before any nested-`asnix_eval`
+   scenario existed, never got the same treatment. Reproduced directly:
+   every `import`-based `tests/e2e/m11_*.nix` fixture aborted with
+   "value stack overflow" even on trivial imported files, because once
+   the inner (imported file's) `asnix_eval` returned, the *resumed outer*
+   invocation's pushes were being checked against the inner call's now-
+   defunct buffer instead of its own. Fixed by giving `asnix_eval` the
+   exact same save-before-overwrite/restore-on-exit treatment `force.S`
+   already has, in `dispatch.S`'s prologue and `op_halt.S`'s epilogue.
+13. **String-interpolating a path literal segfaulted** (found manually
+   probing the interaction between the separately-landed string-
+   interpolation and path-literals branches -- neither branch could have
+   caught this alone, since each was built without the other): `"${./foo}"`
+   crashed. Root cause: `value_util.c`'s `coerce_to_string_for_interp`
+   treated *any* `ASNIX_TAG_PTR` value as an already-valid `String` and
+   returned it unchanged, but `Path` (added by the path-literals work) is
+   a *second*, differently-shaped `ASNIX_TAG_PTR` kind (a 16-byte
+   `{marker;len;bytes[]}` header, not `String`'s 8-byte `{len;bytes[]}`) --
+   `asnix_concat_strings` then read the Path's marker field as a bogus
+   string length, corrupting memory. Fixed by checking
+   `asnix_value_is_path` explicitly and routing a Path through
+   `asnix_coerce_to_string`'s existing path-handling branch first,
+   matching real Nix's rule that a path (unlike an int/bool/null) doesn't
+   need an explicit `builtins.toString` in an interpolation.
+14. **The path-literals branch's `<` handling unconditionally captured
+   every use of `<`, including the already-merged `<` comparison
+   operator** (found integrating against bug #6's operators work, which
+   the path-literals branch was built without): a bare `if (c == '<')`
+   block in `lexer.c`, written when `<` had no other meaning yet (only
+   `<nixpkgs>`-style search-path literals), tried to lex a search path
+   and `exit(1)`'d with "unrecognized character" on anything that didn't
+   match -- never falling through to the two-character-operator lookahead
+   below that already handles plain `<` as `TOK_LT` and `<=` as `TOK_LE`.
+   Would have silently broken every comparison using `<` (either a lex
+   error on `a < b`-shaped source, as above, or outright consuming
+   `<...>`-shaped non-path content as a bogus search path) had it been
+   merged as-is. Fixed by only consuming the `<` when the lookahead
+   actually matches `<name...>`, otherwise falling through unchanged to
+   ordinary operator lexing. Verified directly (`1 < 2` -> `true`, `2 < 1`
+   -> `false`) after the fix.

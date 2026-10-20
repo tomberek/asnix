@@ -15,6 +15,30 @@ Value asnix_make_string_value(const char *s, size_t len) {
     return (Value){ .raw = (uint64_t)(uintptr_t)mem | ASNIX_TAG_PTR };
 }
 
+Value asnix_make_path_value(const char *abs_path, size_t len) {
+    void *mem = asnix_arena_alloc(16 + len);
+    *(int64_t *)((char *)mem + ASNIX_PATH_OFF_MARKER) = ASNIX_PATH_MARKER;
+    *(int64_t *)((char *)mem + ASNIX_PATH_OFF_LEN) = (int64_t)len;
+    memcpy((char *)mem + ASNIX_PATH_OFF_BYTES, abs_path, len);
+    return (Value){ .raw = (uint64_t)(uintptr_t)mem | ASNIX_TAG_PTR };
+}
+
+int asnix_value_is_path(Value v) {
+    if (asnix_tag_of(v) != ASNIX_TAG_PTR) return 0;
+    const char *base = (const char *)(v.raw & ~0x7ULL);
+    return *(const int64_t *)(base + ASNIX_PATH_OFF_MARKER) == ASNIX_PATH_MARKER;
+}
+
+const char *asnix_ptr_bytes(Value v, int64_t *out_len) {
+    const char *base = (const char *)(v.raw & ~0x7ULL);
+    if (asnix_value_is_path(v)) {
+        *out_len = *(const int64_t *)(base + ASNIX_PATH_OFF_LEN);
+        return base + ASNIX_PATH_OFF_BYTES;
+    }
+    *out_len = *(const int64_t *)(base + ASNIX_STRING_OFF_LEN);
+    return base + ASNIX_STRING_OFF_BYTES;
+}
+
 Value asnix_coerce_to_string(Value v) {
     char buf[32];
     switch (asnix_tag_of(v)) {
@@ -36,8 +60,12 @@ Value asnix_coerce_to_string(Value v) {
                 default: break;
             }
             break;
-        case ASNIX_TAG_PTR:
-            return v; /* already a string */
+        case ASNIX_TAG_PTR: {
+            if (!asnix_value_is_path(v)) return v; /* already a string */
+            int64_t len;
+            const char *bytes = asnix_ptr_bytes(v, &len);
+            return asnix_make_string_value(bytes, (size_t)len); /* path -> string, see value_util.h */
+        }
         default: break;
     }
     fprintf(stderr, "asnix: cannot coerce this value to a string\n");
@@ -61,7 +89,23 @@ Value asnix_coerce_to_string(Value v) {
  * trusting it) caught that bare interpolation of a non-string is
  * supposed to be a hard error, not silently stringified. */
 static Value coerce_to_string_for_interp(Value v) {
-    if (asnix_tag_of(v) == ASNIX_TAG_PTR) return v;
+    if (asnix_tag_of(v) == ASNIX_TAG_PTR) {
+        /* A Path is a second, differently-shaped ASNIX_TAG_PTR kind (see
+         * value_util.h) -- returning it unchanged, as if every TAG_PTR were
+         * already a plain String, reads its marker field as a bogus string
+         * length and corrupts memory (found interpolating a path literal:
+         * `"${./foo}"` segfaulted). Real Nix accepts a path here without
+         * `builtins.toString` (unlike ints/bools/null -- see this
+         * function's own comment above), so reject isn't right either;
+         * coerce it the same way `asnix_coerce_to_string` does. Real Nix
+         * additionally copies the path to the store and substitutes the
+         * resulting store path here -- not implemented (no daemon
+         * AddToStore yet, see docs/architecture.md's import/path-literals
+         * scope notes) -- so this produces the plain path text instead,
+         * a known, documented behavioral gap, not a crash. */
+        if (asnix_value_is_path(v)) return asnix_coerce_to_string(v);
+        return v;
+    }
     const char *kind = "this value";
     switch (asnix_tag_of(v)) {
         case ASNIX_TAG_INT: kind = "an integer"; break;

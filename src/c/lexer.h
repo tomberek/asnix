@@ -65,16 +65,19 @@ typedef enum {
     TOK_COMMA,     /* ',' -- lambda-pattern formal separator */
     TOK_AT,        /* '@' -- lambda-pattern whole-arg alias (`n@{...}` / `{...}@n`) */
     TOK_ELLIPSIS,  /* '...' -- lambda-pattern "allow extra fields" marker */
+    TOK_PATH,        /* bare path literal: ./foo, ../foo, /foo, foo/bar (see lexer.c's try_scan_path) */
+    TOK_SEARCH_PATH, /* <nixpkgs>-style NIX_PATH search-path literal */
     TOK_EOF,
 } TokKind;
 
 typedef struct {
     TokKind kind;
     int64_t int_val;    /* TOK_INT */
-    const char *start;  /* TOK_IDENT / TOK_STR_PART / TOK_ISTR_PART: pointer into a buffer
-                          * (TOK_IDENT points into the original source; TOK_STR_PART/
-                          * TOK_ISTR_PART point into a freshly malloc'd decoded buffer,
-                          * since escape processing can shrink/change the bytes) */
+    const char *start;  /* TOK_IDENT / TOK_STR_PART / TOK_ISTR_PART / TOK_PATH / TOK_SEARCH_PATH: pointer
+                          * into a buffer (TOK_IDENT/TOK_PATH/TOK_SEARCH_PATH point into the original
+                          * source, TOK_SEARCH_PATH excluding the angle brackets; TOK_STR_PART/
+                          * TOK_ISTR_PART point into a freshly malloc'd decoded buffer, since escape
+                          * processing can shrink/change the bytes) */
     size_t len;          /* length of the above */
     const char *pos;     /* every token: pointer to its first byte in the source buffer --
                            * used to recover the exact source text of an `assert` condition

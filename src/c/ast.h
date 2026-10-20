@@ -34,6 +34,7 @@ typedef enum {
     AST_ASSERT, /* `assert cond; body`: as.assert1 */
     AST_WITH,
     AST_HAS_ATTR,
+    AST_PATH,
 } AstKind;
 
 typedef struct Ast Ast;
@@ -167,6 +168,11 @@ struct Ast {
             const char *attr;
             size_t attr_len;
         } has_attr; /* AST_HAS_ATTR: `target ? attr` */
+        struct {
+            const char *text; /* raw lexeme: e.g. "./foo.nix", or the bare name for a search path */
+            size_t len;
+            int is_search; /* 1 for `<name>`-style search-path literals, 0 for ordinary path literals */
+        } path; /* AST_PATH */
     } as;
 };
 

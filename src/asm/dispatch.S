@@ -53,6 +53,20 @@ asnix_eval:                             // Value asnix_eval(IrProgram *prog, Env
     movq %rdi, %rbx                     // stash prog (original rbx already safely saved above)
     movq %rsi, %rbp                     // stash root_env (original rbp already safely saved above)
 
+    // Save the enclosing asnix_eval's (if any -- e.g. the importing file's,
+    // when this call is `import`'s nested asnix_eval_file -> asnix_eval,
+    // see eval_file.c) VALSTACK/RETSP limits before overwriting them below,
+    // restored in op_halt.S's epilogue -- same save/restore force.S already
+    // does around ITS nested use, for the identical reason: without this,
+    // resuming the outer invocation after this one returns would check its
+    // pushes against this (now-defunct) inner buffer's limit instead of its
+    // own, either a spurious overflow abort or a missed real one depending
+    // on which buffer happens to sit at a lower address.
+    movq asnix_valstack_limit(%rip), %rcx
+    pushq %rcx
+    movq asnix_retsp_limit(%rip), %rcx
+    pushq %rcx
+
     movq $ASNIX_VALSTACK_BYTES, %rdi
     call asnix_arena_alloc
     movq %rax, %r12                     // VALSTACK base

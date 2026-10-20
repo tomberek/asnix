@@ -108,12 +108,33 @@ static void fixture_concat_empty(void) {
     CHECK(string_eq(v, ""), "OP_STR_CONCAT with count=0 yields an empty string, not a crash");
 }
 
+/* "p=" ++ <a Path value> ++ "!" == "p=/abs/foo.nix!" -- regression for a
+ * real integration bug (docs/architecture.md's Known bugs #13): Path is a
+ * second, differently-shaped ASNIX_TAG_PTR kind (added by the separately-
+ * landed path-literals milestone), and the interpolation coercion path
+ * used to treat every ASNIX_TAG_PTR as an already-valid String and return
+ * it unchanged -- reading a Path's marker field as a bogus string length
+ * and segfaulting. A fixed-string Path (not one resolved from an actual
+ * file) keeps this test deterministic and filesystem-independent. */
+static void fixture_concat_coerces_path(void) {
+    IrBuilder *b = ib_new();
+    ib_push_const(b, (int64_t)asnix_make_string_value("p=", 2).raw);
+    ib_push_const(b, (int64_t)asnix_make_path_value("/abs/foo.nix", 12).raw);
+    ib_push_const(b, (int64_t)asnix_make_string_value("!", 1).raw);
+    ib_str_concat(b, 3);
+    ib_halt(b);
+    IrProgram *prog = ib_finish(b);
+    Value v = asnix_eval(prog, NULL);
+    CHECK(string_eq(v, "p=/abs/foo.nix!"), "interpolating a Path coerces it to its text, not a crash");
+}
+
 int main(void) {
     asnix_arena_init(0);
     fixture_concat_all_strings();
     fixture_concat_already_stringified_int();
     fixture_concat_rejects_raw_int();
     fixture_concat_empty();
+    fixture_concat_coerces_path();
     if (failures) {
         fprintf(stderr, "%d failure(s)\n", failures);
         return 1;

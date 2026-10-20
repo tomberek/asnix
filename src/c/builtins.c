@@ -8,6 +8,7 @@
 #include "asnix/arena.h"
 #include "asnix/heap.h"
 #include "derivation.h"
+#include "eval_file.h"
 #include "hash_shim.h"
 #include "symtab.h"
 #include "value_util.h"
@@ -32,7 +33,7 @@ static Value prim_typeOf(const Value *args, int64_t argc) {
                 case ASNIX_IMM_NULL: return make_string("null", 4);
                 default: return make_string("imm", 3);
             }
-        case ASNIX_TAG_PTR: return make_string("string", 6);
+        case ASNIX_TAG_PTR: return asnix_value_is_path(args[0]) ? make_string("path", 4) : make_string("string", 6);
         case ASNIX_TAG_LIST: return make_string("list", 4);
         case ASNIX_TAG_ATTRS: return make_string("set", 3);
         case ASNIX_TAG_CLOSURE:
@@ -88,13 +89,15 @@ static Value make_primop_value(void *fn, int64_t arity) {
  */
 static Value hash_apply(const Value *args, int64_t (*hash_fn)(const void *, size_t, unsigned char *), size_t raw_len) {
     Value in = args[0];
-    if (asnix_tag_of(in) != ASNIX_TAG_PTR) {
+    if (asnix_tag_of(in) != ASNIX_TAG_PTR || asnix_value_is_path(in)) {
+        /* Real Nix is strict here too: `hashString "sha256" ./foo.nix`
+         * fails with "expected a string but found a path" (checked
+         * against nix-instantiate) -- a path isn't auto-coerced. */
         fprintf(stderr, "asnix: hashString: second argument must be a string\n");
         exit(1);
     }
-    const char *s = (const char *)(in.raw & ~0x7ULL);
-    int64_t len = *(const int64_t *)(s + ASNIX_STRING_OFF_LEN);
-    const char *bytes = s + ASNIX_STRING_OFF_BYTES;
+    int64_t len;
+    const char *bytes = asnix_ptr_bytes(in, &len);
 
     unsigned char raw[ASNIX_HASH_SHA512_LEN]; /* largest digest; raw_len is always <= this */
     int64_t rc = hash_fn(bytes, (size_t)len, raw);
@@ -130,13 +133,12 @@ static Value prim_hashString_apply_sha512(const Value *args, int64_t argc) {
 static Value prim_hashString(const Value *args, int64_t argc) {
     (void)argc;
     Value algo = args[0];
-    if (asnix_tag_of(algo) != ASNIX_TAG_PTR) {
+    if (asnix_tag_of(algo) != ASNIX_TAG_PTR || asnix_value_is_path(algo)) {
         fprintf(stderr, "asnix: hashString: first argument (algorithm name) must be a string\n");
         exit(1);
     }
-    const char *s = (const char *)(algo.raw & ~0x7ULL);
-    int64_t len = *(const int64_t *)(s + ASNIX_STRING_OFF_LEN);
-    const char *name = s + ASNIX_STRING_OFF_BYTES;
+    int64_t len;
+    const char *name = asnix_ptr_bytes(algo, &len);
 
     if (len == 3 && memcmp(name, "md5", 3) == 0) return make_primop_value((void *)prim_hashString_apply_md5, 1);
     if (len == 4 && memcmp(name, "sha1", 4) == 0) return make_primop_value((void *)prim_hashString_apply_sha1, 1);
@@ -146,6 +148,43 @@ static Value prim_hashString(const Value *args, int64_t argc) {
     fprintf(stderr, "asnix: hashString: unsupported algorithm \"%.*s\" (expected md5/sha1/sha256/sha512)\n",
             (int)len, name);
     exit(1);
+}
+
+/*
+ * builtins.import target -- runs the file at `target` (a Path, or an
+ * absolute-path String) through the full lex/parse/compile/eval pipeline
+ * via asnix_eval_file() (src/c/eval_file.c) and returns its Value. Not
+ * exposed as a bare `import` identifier (only `builtins.import`): this
+ * codebase doesn't give user programs an implicit "with builtins" root
+ * scope the way real Nix does for `import`/`map`/`throw`/etc -- see
+ * docs/architecture.md's import/path scope notes. A relative-path String
+ * (e.g. `import "foo.nix"`) is rejected exactly like real Nix does
+ * (checked against nix-instantiate: "string ... doesn't represent an
+ * absolute path") rather than silently resolving it against cwd --
+ * there's no "current file" to resolve a bare string against here the
+ * way a path *literal* resolves against its own file at compile time.
+ */
+static Value prim_import(const Value *args, int64_t argc) {
+    (void)argc;
+    Value target = args[0];
+    int64_t len;
+    const char *bytes;
+    if (asnix_value_is_path(target)) {
+        bytes = asnix_ptr_bytes(target, &len); /* already absolute -- see compiler.c's AST_PATH case */
+    } else if (asnix_tag_of(target) == ASNIX_TAG_PTR) {
+        bytes = asnix_ptr_bytes(target, &len);
+        if (len == 0 || bytes[0] != '/') {
+            fprintf(stderr, "asnix: import: string '%.*s' doesn't represent an absolute path\n", (int)len, bytes);
+            exit(1);
+        }
+    } else {
+        fprintf(stderr, "asnix: import: argument must be a path or an absolute-path string\n");
+        exit(1);
+    }
+    char *path = asnix_arena_alloc((size_t)len + 1);
+    memcpy(path, bytes, (size_t)len);
+    path[len] = '\0';
+    return asnix_eval_file(path);
 }
 
 typedef Value (*PrimFn)(const Value *, int64_t);
@@ -162,6 +201,7 @@ static const BuiltinDef BUILTINS[] = {
     { "length", prim_length, 1 },
     { "hashString", prim_hashString, 1 }, /* true arity 2, curried -- see hash_apply's comment above */
     { "derivation", asnix_prim_derivation, 1 },
+    { "import", prim_import, 1 },
 };
 
 Value asnix_make_builtins_attrs(void) {

@@ -22,3 +22,4 @@ tests/ir/test_m7_fixtures
 tests/c/test_hash_shim
 tests/asm/test_stacklimits
 tests/ir/test_strings_fixtures
+tests/c/test_value_util

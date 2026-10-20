@@ -18,6 +18,42 @@ static void push_tok(TokVec *v, Token t) {
     v->toks[v->len++] = t;
 }
 
+/* Path-literal scanning (import-paths). Real Nix's lexer recognizes PATH
+ * tokens with the (flex) regex `[A-Za-z0-9._+-]*(\/[A-Za-z0-9._+-]+)+\/?`
+ * -- an optional prefix of "path chars", followed by one-or-more `/segment`
+ * groups, with an optional trailing slash (which real Nix's *parser*, not
+ * the lexer, then rejects -- "path has a trailing slash"; checked against
+ * nix-instantiate). The `+` group is what makes this unambiguous against
+ * every other token in this grammar: nothing else in the language ever
+ * uses `/` (there's no division operator), so any occurrence of `/` that
+ * isn't inside a string is a path. That's also why this is tried *before*
+ * digit/ident scanning below, not after: `foo/bar.nix` must lex as one
+ * TOK_PATH, not TOK_IDENT("foo") followed by an unrecognized '/'. */
+static int path_char(char c) {
+    return isalnum((unsigned char)c) || c == '.' || c == '_' || c == '-' || c == '+';
+}
+
+/* Returns the length of a path literal starting at src[i], or 0 if this
+ * position isn't one (in which case the caller falls through to ordinary
+ * digit/ident/single-char scanning). */
+static size_t try_scan_path(const char *src, size_t i) {
+    size_t j = i;
+    while (path_char(src[j])) j++;
+    if (src[j] != '/') return 0; /* no `/segment` group at all -- not a path */
+    int saw_group = 0;
+    while (src[j] == '/') {
+        size_t seg_start = j + 1;
+        size_t k = seg_start;
+        while (path_char(src[k])) k++;
+        if (k == seg_start) break; /* '/' not followed by any path chars -- stop before consuming it */
+        j = k;
+        saw_group = 1;
+    }
+    if (!saw_group) return 0;
+    if (src[j] == '/') j++; /* optional trailing slash -- rejected later, in the compiler */
+    return j - i;
+}
+
 static int ident_start(char c) {
     return isalpha((unsigned char)c) || c == '_';
 }
@@ -311,6 +347,34 @@ Token *asnix_lex(const char *src, size_t *out_count) {
         if (c == '#') { /* line comment, a harmless real-Nix-ism to allow in fixtures */
             while (src[i] && src[i] != '\n') i++;
             continue;
+        }
+
+        /* Tried before digit/string/ident/single-char below -- see
+         * try_scan_path's comment for why this has to come first. */
+        {
+            size_t plen = try_scan_path(src, i);
+            if (plen > 0) {
+                push_tok(&v, (Token){ .kind = TOK_PATH, .start = src + i, .len = plen, .pos = src + tok_start });
+                i += plen;
+                continue;
+            }
+        }
+
+        if (c == '<') {
+            /* `<nixpkgs>`-style NIX_PATH search-path literal -- but only
+             * when the lookahead actually matches `<name...>`; `<` is also
+             * the less-than comparison operator (merged separately, see
+             * the two-char-operator block below), so a non-matching `<`
+             * must fall through to ordinary operator lexing instead of
+             * erroring here. */
+            size_t start = i + 1;
+            size_t k = start;
+            while (path_char(src[k]) || src[k] == '/') k++;
+            if (k > start && src[k] == '>') {
+                push_tok(&v, (Token){ .kind = TOK_SEARCH_PATH, .start = src + start, .len = k - start, .pos = src + tok_start });
+                i = k + 1;
+                continue;
+            }
         }
 
         if (isdigit((unsigned char)c)) {

@@ -30,7 +30,7 @@ static void bench_one(const char *label, const char *src, long iters) {
     Token *toks = asnix_lex(src, &ntoks);
     Ast *ast = asnix_parse(toks, ntoks);
 
-    IrProgram *prog = asnix_compile(ast);
+    IrProgram *prog = asnix_compile(ast, "."); /* no path literals in these workloads; base_dir is unused */
     Env *root = asnix_arena_alloc(8);
     root->up = NULL;
 
