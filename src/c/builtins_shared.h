@@ -80,20 +80,26 @@ Value asnix_bshared_make_attrs(uint32_t *syms, Value *vals, int64_t count);
  * this does NOT itself distinguish). */
 void asnix_bshared_string_bytes(Value v, const char **bytes_out, int64_t *len_out, const char *who);
 
-/* Equality used for dedup (genericClosure's seen-by-key set, elem): real
- * content equality for ints (numeric), IMM (raw subtag -- true/false/null),
- * and strings (byte content) -- the common, actually-useful cases for a
- * dedup/membership key -- pointer identity for every other tag (lists,
- * attrsets, closures, primops, thunks), the exact same fallback the `==`
- * operator itself already uses (op_cmp.S, see docs/architecture.md's
- * Operators section) for aggregate types. Upgrading strings specifically
- * from pointer identity to real content equality (easy here: the raw bytes
- * are already in hand) is a deliberate, narrow improvement over `==`'s own
- * scope cut -- *not* a claim that deep structural equality on lists/
- * attrsets is now supported; it still isn't, and callers below never need
- * it (genericClosure/elem's real-world keys are strings or ints, not
- * nested aggregates). A Path and a String are compared by raw bytes too,
- * same as `asnix_ptr_bytes` would read for either. */
+/* Real structural equality, matching real Nix's `==`/`!=`: ints (numeric),
+ * IMM (raw subtag -- true/false/null), strings/paths (byte content), lists
+ * (same length, elementwise recursive equality), attrsets (same set of
+ * attr names, recursive equality of each matching value) -- forcing any
+ * thunk found along the way (list/attrset elements are lazy and not
+ * pre-forced the way a bare variable reference is; see op_var_ref.S/
+ * op_select.S) via the already-existing `asnix_force_for_print` C-callable
+ * force entry point (`asnix/ir.h`), safe to call re-entrantly here for the
+ * same reason it's already safe to call from a builtin or from inside
+ * another nested force. Closures/primops (and thunks that are still
+ * in-progress, though that can't happen reached from here) fall back to
+ * pointer identity -- real Nix never structurally compares functions
+ * either (confirmed: two syntactically-identical-but-distinct lambdas are
+ * `!=`, see tests/conformance/equal-function-*.nix). This is the single
+ * implementation both the `==`/`!=` operators (op_cmp.S, which calls this
+ * directly) and dedup-style builtins (genericClosure, elem) use -- no
+ * separate, narrower "scope cut" version exists anymore (see Known Bugs
+ * entry below: the previous pointer-identity fallback for lists/attrsets
+ * was a real, high-impact bug, not an acceptable scope cut, since `==` on
+ * aggregates is pervasive in real nixpkgs code). */
 int asnix_bshared_value_eq(Value a, Value b);
 
 /* Ordering used by lessThan/sort: INT<INT (numeric) or string<string

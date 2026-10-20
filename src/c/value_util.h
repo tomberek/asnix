@@ -57,6 +57,24 @@ Value asnix_coerce_to_string(Value v);
  * an explicit `builtins.toString` in the source, same as real Nix. */
 Value asnix_concat_strings(const Value *parts, int64_t count);
 
+/* The `+` operator's full dispatch, not just integer arithmetic -- real
+ * Nix's `+` does int addition for two ints, but string/path concatenation
+ * (same coercion rules `asnix_concat_strings` already implements for
+ * `"${a}${b}"` interpolation) for anything else, and is a hard type error
+ * if exactly one side is an int (verified against `nix-instantiate
+ * --eval`: `1 + "a"` -> "cannot add a string to an integer", `"a" + 1` ->
+ * "cannot coerce an integer to a string" -- this project matches the
+ * *class* of error, not real Nix's exact wording, same convention as every
+ * other fatal message in this codebase). Result stays a Path (rather than
+ * becoming a plain String) when the LHS specifically was a Path -- matches
+ * the common real-world case (`somePath + "/subpath"`); mixed string+path
+ * or path+path beyond that single rule is a documented, narrower scope cut
+ * (real Nix additionally runs a path-existence check and copies-to-store
+ * in some of these mixed cases -- not replicated here, see
+ * docs/architecture.md). Used by `asnix_op_add` (src/asm/ops/op_arith.S)
+ * whenever both operands aren't already known to be ints. */
+Value asnix_add_values(Value lhs, Value rhs);
+
 /* Arena-allocates a NUL-terminated copy of an asnix String's bytes.
  * asnix strings are never NUL-terminated themselves (see heap.h), but
  * code boundaries that expect plain C strings (aterm.c's API) need one;

@@ -33,7 +33,8 @@ what's actually implemented and the scope decisions made along the way.
 | M18 — bare globals (`import`/`map`/`abort`/`toString`) + `expr.attr or default` | done (see below) |
 | M19 — `genericClosure` + second builtins-expansion pass | done, **scoped** (see below) |
 | M20 — daemon realization: `SetOptions`/`AddToStore`/`BuildPaths` (`src/c/daemon_client.c`) | done, **scoped** (see below) |
-| M21+ | not started |
+| M21 — real structural `==`/`!=` + real `+` operator dispatch | done, **scoped** (see below) |
+| M22+ | not started |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
 
@@ -1877,3 +1878,89 @@ against the real, live system daemon on this dev machine (not a mock).
    normalization, i.e. a genuine sandboxed build, not a cache hit. The
    expired Cachix token itself is a pre-existing, unrelated infrastructure
    issue on this machine and was not touched.
+17. **`==`/`!=` on lists/attrsets was pointer identity, not structural
+   equality -- previously documented as an acceptable "scope cut", it
+   isn't one** (found while debugging real nixpkgs's own
+   `lib/minfeatures.nix` compat check via `d.nix`: `missingFeatures != []`
+   was always `true` regardless of `missingFeatures`'s actual contents,
+   because the two `[]` values being compared are always two separately
+   allocated, distinct empty-list objects -- confirmed directly:
+   `[] != []` evaluated to `true`, and `[1 2] == [1 2]` evaluated to
+   `false`, in asnix). `op_cmp.S`'s original comment reasoned that since a
+   Value's tag is encoded in its own low bits, "same tag and same payload"
+   collapses to plain raw equality for every tag -- true for INT/IMM, but
+   wrong for PTR/LIST/ATTRS, where "same payload" actually means "same
+   pointer", not "same content". This is pervasive in real Nix code
+   (string/list/attrset `==` is everywhere in nixpkgs), not a narrow edge
+   case, so it was a real bug, not a defensible scope cut. Fixed by
+   upgrading `asnix_bshared_value_eq` (`builtins_shared.c`) to real
+   recursive structural equality for lists/attrsets (forcing nested lazy
+   elements via `asnix_force_for_print`) and wiring `op_eq`/`op_neq`
+   (`op_cmp.S`) to call it instead of doing a raw `cmpq` -- see M21's scope
+   notes above for the full before/after and the deliberately-preserved
+   identity semantics for functions.
+18. **`+` never dispatched to string/path concatenation -- always did raw
+   integer arithmetic on the operands' tagged bits, regardless of type**
+   (found immediately after fixing #17 above, debugging a *different*
+   string-equality case that still failed: `"fo" + "o" == "foo"` was
+   `false` even with #17's fix in place). Root cause: `op_arith.S`'s
+   `asnix_op_add` had no tag check at all (an early-milestone "trusted,
+   well-formed IR" assumption that was never revisited once strings
+   existed) -- it sign-extend-shifted both operands' raw 64-bit words as
+   if they were always `TAG_INT`-tagged integers and added them, so two
+   string pointers produced a nonsense int (`typeOf ("fo" + "o")` reported
+   `"int"`, with a garbage numeric value) instead of concatenating or
+   erroring. `-`/`*` had the identical no-check gap, just not yet observed
+   in practice (real Nix has no string/path semantics for either, so the
+   only correct behavior for a non-int operand is a fatal type error, not
+   silent garbage). Fixed by adding a real type dispatch to `asnix_op_add`
+   (int+int stays fast inline asm; otherwise defers to a new
+   `asnix_add_values`, `value_util.c`, which type-errors on an int-vs-
+   nonint mismatch and otherwise concatenates via `asnix_concat_strings`'s
+   existing coercion rules) and a plain "both operands must be TAG_INT"
+   fatal check to `asnix_op_sub`/`asnix_op_mul`. See M21's scope notes
+   above for the preserved-Path-ness rule and the one deliberate semantic
+   gap versus real Nix (no path-existence check on mixed string+path
+   concatenation).
+
+## M21 scope notes: real structural `==`/`!=` + real `+` operator dispatch
+
+Found and fixed while debugging why `d.nix` (importing real nixpkgs)
+failed its own compat check with a blank "missing feature" bullet: two
+separate, high-impact correctness bugs, previously misclassified as
+acceptable "scope cuts" in this doc. See Known Bugs entries #17/#18 below
+for the full writeup of each. Summary:
+
+- **`==`/`!=`** (`op_cmp.S` calling `src/c/builtins_shared.c`'s
+  `asnix_bshared_value_eq`, upgraded in place) now do real structural
+  equality for lists (elementwise, recursive) and attrsets (same attr
+  names, recursive value equality), forcing lazy elements along the way
+  via the existing `asnix_force_for_print` entry point. Previously: pure
+  pointer-identity `cmpq` on the raw Value words for every tag, meaning
+  `[] != []` evaluated to `true`. Functions (closures/primops) remain
+  compared by identity only, matching real Nix (verified: two
+  syntactically-identical-but-distinct lambdas are `!=`; see
+  `tests/conformance/equal-function-*.nix`, all still passing).
+- **`+`** (`op_arith.S`'s `asnix_op_add`, plus a new `asnix_add_values` in
+  `value_util.c`) now dispatches on operand type: int+int stays inline-asm
+  arithmetic (fast path unchanged); anything else defers to C, which
+  type-errors on an int-vs-non-int mismatch and otherwise concatenates via
+  the same coercion rules `"${a}${b}"` interpolation already uses
+  (`asnix_concat_strings`), preserving Path-ness when the LHS specifically
+  was a Path. Previously: *every* `+` did a raw arithmetic shift+add on
+  the two operands' raw bits regardless of tag, so `"fo" + "o"` silently
+  produced a garbage int instead of `"foo"` or an error. `-`/`*`
+  (`asnix_op_sub`/`asnix_op_mul`) gained the same "both operands must be
+  TAG_INT, fatal otherwise" check while in this file for the same reason
+  (previously the identical no-check footgun, just not yet observed in
+  practice) — real Nix has no string/path semantics for `-`/`*` at all.
+- **Cut, not fixed**: real Nix's `+` additionally runs a path-existence
+  check and copies-to-store in some mixed string+path cases (e.g.
+  `"a" + ./b` errors if `./b` doesn't exist on disk, before even getting
+  to string coercion) — not replicated; this project instead just coerces
+  the path to its plain text, succeeding where real Nix might error. Also
+  cut: plain `/` as integer division (`4 / 2`) — surveyed while chasing
+  `d.nix` further after this fix, confirmed **not implemented at all**
+  (the lexer only ever recognizes `/` as part of a path literal or the
+  `//` update operator) — a real, separate gap, not yet fixed; flagged to
+  the user rather than unilaterally continuing to expand scope.

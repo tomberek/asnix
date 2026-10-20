@@ -1,22 +1,19 @@
 // Comparison/boolean-NOT ops ("operators" milestone).
 //
-// Scope cut for == / != (see docs/architecture.md): since the tag is
-// literally encoded in a Value's low 3 bits, two Values with different
-// tags necessarily have different raw bit patterns -- so "same tag AND
-// same payload" collapses to plain raw equality for every tag kind this
-// evaluator has:
-//   - TAG_INT:  raw equal  <=>  same integer (n<<3|TAG_INT is injective in n)
-//   - TAG_IMM:  raw equal  <=>  same subtag (true/false/null/blackhole)
-//   - everything else (PTR/ATTRS/LIST/CLOSURE/THUNK/PRIMOP): raw equal
-//     <=>  same untagged pointer, i.e. pointer identity -- NOT deep
-//     structural equality. Two separately-allocated but content-identical
-//     strings/lists/attrsets compare unequal here, unlike real Nix (which
-//     does real structural equality for lists/attrsets, and content
-//     equality for strings). This is a deliberate scope cut (matching the
-//     task's own instructions): implementing real recursive structural
-//     equality on lists/attrsets is a rabbit hole not attempted here.
-// So OP_EQ/OP_NEQ are just `cmpq` on the two raw Value words, no tag
-// dispatch needed at all.
+// == / != delegate to asnix_bshared_value_eq (src/c/builtins_shared.c) for
+// real structural equality -- ints/IMM-subtag/string-or-path-bytes compare
+// directly, lists/attrsets recurse elementwise (forcing lazy elements
+// along the way), closures/primops/thunks fall back to pointer identity.
+// A pure-asm raw `cmpq` on the two Value words (the original
+// implementation here) is only correct for INT/IMM and happens to be
+// right whenever the two pointers are literally identical, but is WRONG
+// for any two separately-allocated but content-identical strings/lists/
+// attrsets -- e.g. `[] != []` evaluated to `true`. This was reached in
+// practice evaluating real nixpkgs (`(import ./lib/minfeatures.nix).missing
+// != []` always true, since the compared lists are always two distinct
+// empty-list allocations) -- see docs/architecture.md's Known Bugs list.
+// Not a hot path concern worth hand-rolling in asm: see op_update.S's
+// identical save-IP/ENV-around-a-plain-C-call convention, reused as-is.
 //
 // Ordering (< > <= >=) is scoped to TAG_INT only (see docs/architecture.md):
 // comparing anything else is a fatal type error, matching this project's
@@ -39,13 +36,22 @@
     .type asnix_op_eq, @function
 asnix_op_eq:
     subq $8, %r12
-    movq (%r12), %rcx                   // rhs
+    movq (%r12), %rcx                   // rhs raw
     subq $8, %r12
-    movq (%r12), %rax                   // lhs
-    cmpq %rcx, %rax
+    movq (%r12), %rax                   // lhs raw
+
+    pushq %rsi                          // save IP
+    pushq %rdi                          // save ENV (2 pushes -- stays 16-byte aligned)
+    movq %rax, %rdi                     // arg1 = lhs
+    movq %rcx, %rsi                     // arg2 = rhs
+    call asnix_bshared_value_eq
+    popq %rdi                           // ENV
+    popq %rsi                           // IP
+
+    testl %eax, %eax
     movq $((ASNIX_IMM_FALSE << ASNIX_TAG_BITS) | ASNIX_TAG_IMM), %rdx
     movq $((ASNIX_IMM_TRUE << ASNIX_TAG_BITS) | ASNIX_TAG_IMM), %rax
-    cmovneq %rdx, %rax
+    cmoveq %rdx, %rax                   // result == 0 -> FALSE, else TRUE
     movq %rax, (%r12)
     addq $8, %r12
     addq $ASNIX_IROP_SIZE, %rsi
@@ -57,13 +63,22 @@ asnix_op_eq:
     .type asnix_op_neq, @function
 asnix_op_neq:
     subq $8, %r12
-    movq (%r12), %rcx                   // rhs
+    movq (%r12), %rcx                   // rhs raw
     subq $8, %r12
-    movq (%r12), %rax                   // lhs
-    cmpq %rcx, %rax
+    movq (%r12), %rax                   // lhs raw
+
+    pushq %rsi                          // save IP
+    pushq %rdi                          // save ENV
+    movq %rax, %rdi                     // arg1 = lhs
+    movq %rcx, %rsi                     // arg2 = rhs
+    call asnix_bshared_value_eq
+    popq %rdi                           // ENV
+    popq %rsi                           // IP
+
+    testl %eax, %eax
     movq $((ASNIX_IMM_TRUE << ASNIX_TAG_BITS) | ASNIX_TAG_IMM), %rdx
     movq $((ASNIX_IMM_FALSE << ASNIX_TAG_BITS) | ASNIX_TAG_IMM), %rax
-    cmovneq %rdx, %rax
+    cmoveq %rdx, %rax                   // result == 0 -> TRUE (not equal), else FALSE
     movq %rax, (%r12)
     addq $8, %r12
     addq $ASNIX_IROP_SIZE, %rsi

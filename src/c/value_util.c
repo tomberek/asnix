@@ -152,6 +152,25 @@ Value asnix_concat_strings(const Value *parts, int64_t count) {
     return (Value){ .raw = (uint64_t)(uintptr_t)mem | ASNIX_TAG_PTR };
 }
 
+Value asnix_add_values(Value lhs, Value rhs) {
+    int lt = asnix_tag_of(lhs), rt = asnix_tag_of(rhs);
+    if (lt == ASNIX_TAG_INT && rt == ASNIX_TAG_INT) {
+        return asnix_make_int(asnix_int_value(lhs) + asnix_int_value(rhs));
+    }
+    if (lt == ASNIX_TAG_INT || rt == ASNIX_TAG_INT) {
+        fprintf(stderr, "asnix: '+': cannot add an integer and a non-integer\n");
+        exit(1);
+    }
+    Value parts[2] = { lhs, rhs };
+    Value result = asnix_concat_strings(parts, 2);
+    if (asnix_value_is_path(lhs)) {
+        int64_t len;
+        const char *bytes = asnix_ptr_bytes(result, &len);
+        return asnix_make_path_value(bytes, (size_t)len);
+    }
+    return result;
+}
+
 char *asnix_string_value_to_cstr(Value string_val) {
     const char *s = (const char *)(string_val.raw & ~0x7ULL);
     int64_t len = *(const int64_t *)(s + ASNIX_STRING_OFF_LEN);

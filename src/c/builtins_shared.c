@@ -136,6 +136,8 @@ void asnix_bshared_string_bytes(Value v, const char **bytes_out, int64_t *len_ou
 }
 
 int asnix_bshared_value_eq(Value a, Value b) {
+    a = asnix_force_for_print(a);
+    b = asnix_force_for_print(b);
     int ta = asnix_tag_of(a), tb = asnix_tag_of(b);
     if (ta == ASNIX_TAG_PTR && tb == ASNIX_TAG_PTR) {
         int64_t la, lb;
@@ -147,7 +149,28 @@ int asnix_bshared_value_eq(Value a, Value b) {
     switch (ta) {
         case ASNIX_TAG_INT: return asnix_int_value(a) == asnix_int_value(b);
         case ASNIX_TAG_IMM: return asnix_imm_subtag(a) == asnix_imm_subtag(b);
-        default: return a.raw == b.raw; /* pointer identity: attrs/list/closure/primop/thunk */
+        case ASNIX_TAG_LIST: {
+            if (a.raw == b.raw) return 1;
+            int64_t na = asnix_bshared_list_count(a), nb = asnix_bshared_list_count(b);
+            if (na != nb) return 0;
+            const Value *ea = asnix_bshared_list_elems(a), *eb = asnix_bshared_list_elems(b);
+            for (int64_t i = 0; i < na; i++) {
+                if (!asnix_bshared_value_eq(ea[i], eb[i])) return 0;
+            }
+            return 1;
+        }
+        case ASNIX_TAG_ATTRS: {
+            if (a.raw == b.raw) return 1;
+            int64_t na = asnix_bshared_attrs_count(a), nb = asnix_bshared_attrs_count(b);
+            if (na != nb) return 0;
+            for (int64_t i = 0; i < na; i++) {
+                if (asnix_bshared_attrs_sym(a, i) != asnix_bshared_attrs_sym(b, i)) return 0;
+                if (!asnix_bshared_value_eq(asnix_bshared_attrs_value(a, i), asnix_bshared_attrs_value(b, i)))
+                    return 0;
+            }
+            return 1;
+        }
+        default: return a.raw == b.raw; /* pointer identity: closures/primops/thunks */
     }
 }
 
