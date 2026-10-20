@@ -44,6 +44,8 @@ extern void asnix_op_str_concat(void);
 extern void asnix_op_with(void);
 extern void asnix_op_with_try(void);
 extern void asnix_op_with_miss(void);
+extern void asnix_op_has_attr(void);
+extern void asnix_op_check_formals(void);
 
 void *asnix_handler_table[OP_COUNT] = {
     [OP_PUSH_INT] = (void *)asnix_op_push_int,
@@ -82,6 +84,8 @@ void *asnix_handler_table[OP_COUNT] = {
     [OP_WITH] = (void *)asnix_op_with,
     [OP_WITH_TRY] = (void *)asnix_op_with_try,
     [OP_WITH_MISS] = (void *)asnix_op_with_miss,
+    [OP_HAS_ATTR] = (void *)asnix_op_has_attr,
+    [OP_CHECK_FORMALS] = (void *)asnix_op_check_formals,
 };
 
 void ir_link(IrOp *ops, size_t n) {

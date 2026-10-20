@@ -26,7 +26,8 @@ what's actually implemented and the scope decisions made along the way.
 | M11 — operators: comparisons, `&&`/`||`/`!`, `assert`, `//` | done, **scoped** (see below) |
 | M12 — strings: `"${expr}"` interpolation, `''...''` multi-line strings | done (see below) |
 | M13 — `with` expressions | done (see below) |
-| M14+ | not started |
+| M14 — lambda-destructuring patterns | done (see below) |
+| M15+ | not started |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
 
@@ -879,6 +880,63 @@ been consulted first for a different key.
   `with 5; x` errors on both with a type error); and the
   compile-time-vs-runtime "undefined variable" split (`with {a=1;}; zzz`
   errors on both). See `tests/e2e/m10_with_*.nix`.
+
+## M14 — lambda-destructuring patterns
+
+Adds `{a, b}: body`, `{a, b ? default}: body`, `{a, b, ...}: body`, and
+`@`-binding (`args@{a,b}: body` / `{a,b}@args: body`). Still arity-1 at
+the `OP_CALL`/`Closure` ABI level -- a pattern lambda still takes exactly
+one real attrset argument; destructuring happens entirely inside the
+compiled body, not in the call mechanism.
+
+- **Two synthetic scope frames per pattern lambda** (`compiler.c`'s
+  `AST_LAMBDA` case): an outer 1-slot `argframe` holding the raw attrset
+  argument (and its `@`-alias, if any -- an empty-string name if none,
+  which can never match a real identifier), and an inner `fieldframe`
+  (`up = &argframe`) with one slot per declared field. `fieldframe` is
+  allocated via `OP_FRAME_ALLOC` *before* any field's thunk is built, so
+  every field's thunk (built from synthetic `AST_SELECT`/`AST_HAS_ATTR`/
+  `AST_IF` nodes, going through the same `compile_expr` path hand-written
+  source would) naturally captures it -- giving fields letrec-style
+  mutual/forward visibility, confirmed against real Nix: `{a ? b+1, b ?
+  5}: a` applied to `{}` sees `b` from `a`'s default even though `b` is
+  declared after `a`.
+- **Eager, not lazy, pattern validation** (`OP_CHECK_FORMALS`,
+  `src/asm/ops/op_check_formals.S`): a missing required field, an
+  unexpected extra field (without `...`), or a non-attrset argument all
+  abort immediately on application, even if `body` never reads the
+  offending field -- matches real Nix's eager argument-pattern checking,
+  confirmed directly against `nix-instantiate`.
+- **`?` (has-attr)** (`OP_HAS_ATTR`, `src/asm/ops/op_has_attr.S`): `expr ?
+  attr` pushes `TRUE`/`FALSE`, `FALSE` (not a fatal error) if `expr` isn't
+  even an `Attrs` -- used to compile each optional field's `if hasAttr
+  then select else default` shape, and usable standalone in the language
+  too.
+- **Reused the existing recursive-`let` machinery instead of adding a
+  duplicate**: the implementing agent, working from a pre-recursion base,
+  independently reinvented `OP_FRAME_ALLOC`/`OP_FRAME_SET` under the names
+  `OP_FRAME_NEW`/`OP_FRAME_BIND_SLOT` -- functionally identical register-
+  for-register (same alloc-then-fill-before-body shape the "Recursive
+  `let`" section above already established). Found while integrating this
+  branch; resolved by dropping the duplicate ops entirely and pointing
+  pattern-field binding at the existing `OP_FRAME_ALLOC`/`OP_FRAME_SET`
+  pair instead of carrying two copies of the same mechanism.
+- **Two further integration-time fixes, both from the same root cause**
+  (this branch was built from a pre-recursion, pre-operators, pre-strings
+  base, so its own copy of shared code had drifted): its `AST_LET` case
+  still used the single-binding, non-recursive shape `AST_LET` had before
+  the "Recursive `let`" work (would not even have compiled against the
+  current `ast.h`) -- replaced with the already-merged recursive version
+  wholesale, nothing pattern-specific was lost. Its `ScopeFrame` also
+  independently grew multi-slot support (needed for the same reason the
+  recursive-`let` work needed it) under different field names (`nslots`
+  vs. `count`, and no `with`-fallback support at all) -- reconciled onto
+  the single already-merged `ScopeFrame` shape (`names`/`name_lens`/
+  `count`/`is_with`) rather than carrying two slightly-different
+  definitions.
+- **Verified against real `nix-instantiate --eval`**: plain destructuring,
+  missing-required-field abort, defaults (both used and overridden),
+  `...` with extra fields present, and both `@`-binding positions.
 
 ## Known bugs found and fixed during implementation (worth knowing about)
 

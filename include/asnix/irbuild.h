@@ -100,6 +100,22 @@ size_t ib_with_try(IrBuilder *b, uint32_t sym);
  * "undefined variable", same error class as the compile-time check. */
 size_t ib_with_miss(IrBuilder *b);
 
+/* Lambda-patterns: pops a value, pushes TRUE/FALSE -- see op_has_attr.S. */
+size_t ib_has_attr(IrBuilder *b, uint32_t sym);
+
+/* Lambda-patterns: eager pre-destructuring validation of the call argument
+ * (see op_check_formals.S for the exact semantics and pool layout).
+ * `required_syms_sorted` must have `required_count` entries, sorted
+ * ascending. `all_syms_sorted` is read (and must have `total_count`
+ * sorted-ascending entries) only when `total_count >= 0`; pass
+ * `total_count = -1` and `all_syms_sorted = NULL` for a pattern with `...`
+ * (skips the "no extra fields" check entirely). Per-slot binding of the
+ * destructured fields reuses ib_frame_alloc()/ib_frame_set()/
+ * ib_frame_exit() above -- recursive `let`'s own alloc-before-thunks
+ * mechanism, not a second duplicate op pair. */
+size_t ib_check_formals(IrBuilder *b, int64_t required_count, const uint32_t *required_syms_sorted,
+                         int64_t total_count, const uint32_t *all_syms_sorted);
+
 /* Finalizes the builder: runs ir_link() over the accumulated ops in place
  * and returns an IrProgram ready for asnix_eval(). */
 IrProgram *ib_finish(IrBuilder *b);

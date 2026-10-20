@@ -204,6 +204,7 @@ static void codegen_expr(CodeBuf *cb, Ast *node, ScopeFrame2 *scope, size_t dept
         case AST_LIST:
         case AST_ATTRSET:
         case AST_SELECT:
+        case AST_HAS_ATTR:
             fprintf(stderr,
                     "asnix: M4.5 native codegen does not yet support strings/lists/attrsets "
                     "(M5 feature, interpreter-only so far -- see docs/architecture.md)\n");

@@ -174,6 +174,21 @@ size_t ib_with_miss(IrBuilder *b) {
     return ib_emit(b, OP_WITH_MISS, 0, 0);
 }
 
+size_t ib_has_attr(IrBuilder *b, uint32_t sym) {
+    return ib_emit(b, OP_HAS_ATTR, (int64_t)sym, 0);
+}
+
+size_t ib_check_formals(IrBuilder *b, int64_t required_count, const uint32_t *required_syms_sorted,
+                         int64_t total_count, const uint32_t *all_syms_sorted) {
+    /* Pool layout -- see op_check_formals.S's long comment. */
+    size_t pool_idx = ib_pool_add(b, total_count); /* -1 means "has `...`, skip the extra-field check" */
+    for (int64_t i = 0; i < required_count; i++) ib_pool_add(b, (int64_t)required_syms_sorted[i]);
+    if (total_count >= 0) {
+        for (int64_t i = 0; i < total_count; i++) ib_pool_add(b, (int64_t)all_syms_sorted[i]);
+    }
+    return ib_emit(b, OP_CHECK_FORMALS, required_count, (int64_t)pool_idx);
+}
+
 IrProgram *ib_finish(IrBuilder *b) {
     ir_link(b->ops, b->len);
     IrProgram *prog = calloc(1, sizeof(IrProgram));

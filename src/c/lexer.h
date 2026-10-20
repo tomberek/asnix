@@ -61,6 +61,10 @@ typedef enum {
                          * ported from real Nix's ParserState::stripIndentation) */
     TOK_ISTR_END,       /* "''" closing an indented string */
     TOK_DOLLAR_LBRACE,  /* "${" -- starts an interpolated expression */
+    TOK_QUESTION,  /* '?' -- has-attr operator / lambda-pattern default marker */
+    TOK_COMMA,     /* ',' -- lambda-pattern formal separator */
+    TOK_AT,        /* '@' -- lambda-pattern whole-arg alias (`n@{...}` / `{...}@n`) */
+    TOK_ELLIPSIS,  /* '...' -- lambda-pattern "allow extra fields" marker */
     TOK_EOF,
 } TokKind;
 

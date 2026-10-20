@@ -378,6 +378,15 @@ Token *asnix_lex(const char *src, size_t *out_count) {
             continue;
         }
 
+        /* `...` (lambda-pattern ellipsis) is checked before any single- or
+         * double-character operator, same lookahead style as the two-char
+         * operators below. */
+        if (c == '.' && src[i + 1] == '.' && src[i + 2] == '.') {
+            push_tok(&v, (Token){ .kind = TOK_ELLIPSIS, .pos = src + tok_start });
+            i += 3;
+            continue;
+        }
+
         /* Two-character operators are checked before falling back to their
          * single-character meaning (or to "unrecognized character" for
          * '&'/'|'/'/' alone, none of which asnix gives a standalone
@@ -409,6 +418,9 @@ Token *asnix_lex(const char *src, size_t *out_count) {
                 case '<': kind = TOK_LT; break;
                 case '>': kind = TOK_GT; break;
                 case '!': kind = TOK_BANG; break;
+                case '?': kind = TOK_QUESTION; break;
+                case ',': kind = TOK_COMMA; break;
+                case '@': kind = TOK_AT; break;
                 default:
                     fprintf(stderr, "asnix: unrecognized character '%c' in source\n", c);
                     exit(1);

@@ -150,6 +150,21 @@ enum {
     OP_WITH_MISS,  /* All enclosing `with`s were tried and none had the symbol: aborts with
                      * "undefined variable" (mirrors the compile-time error raised when no
                      * `with` is in scope at all -- see compiler.c's AST_VAR case). */
+    OP_HAS_ATTR,   /* lambda-patterns: a = symbol id; pops a value, pushes TRUE/FALSE --
+                     * FALSE (not a fatal error) if the value isn't even an Attrs, matching
+                     * real Nix's `expr ? attr` operator. Never forces the matched entry's
+                     * value (membership-only; see op_has_attr.S). */
+    OP_CHECK_FORMALS, /* lambda-patterns: a = required-field count, b = pool index -- see
+                        * ib_check_formals()/op_check_formals.S for the exact pool layout.
+                        * Pops an Attrs (fatal if not one), eagerly validates every required
+                        * field is present and (unless the pattern had `...`) every given
+                        * field is declared, then pushes nothing back -- mirrors real Nix's
+                        * eager (not lazy) argument-pattern validation. Pattern fields'
+                        * per-slot binding reuses the existing OP_FRAME_ALLOC/OP_FRAME_SET/
+                        * OP_FRAME_EXIT trio above (recursive `let`'s own mechanism --
+                        * allocate the frame before constructing the thunks, so defaults get
+                        * letrec-style mutual/forward visibility) rather than a second,
+                        * duplicate alloc/bind op pair. */
     OP_COUNT
 };
 
