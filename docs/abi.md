@@ -80,6 +80,18 @@ back in native-callable code instead of another dispatch step. This is
 deliberately narrow (one thunk, one call) — not a general re-entrant
 force-from-anywhere mechanism; see `docs/architecture.md`'s M6 notes.
 
+### Primop calls (M7)
+
+A native builtin (`PrimOp`, `Value (*)(const Value *args, int64_t argc)`)
+is called directly from `OP_CALL` with a pointer straight into VALSTACK —
+no Env frame is allocated, since a primop has no lexical body to capture
+a scope for. `%rsi`/`%rdi` (IP/ENV) are saved/restored around the call the
+same way as every other call site in this project (2 pushes, see above);
+the callee-saved `%rbx`/`%r15` hold argc and the callee-slot address
+across it. Ordinary SysV argument/return registers apply to the call
+itself (`args` in `%rdi`, `argc` in `%rsi`, result in `%rax`) — a plain C
+function, nothing asnix-specific about its own convention.
+
 ## M4.5 native codegen (`src/c/codegen.c`)
 
 Generated functions are ordinary SysV-ABI `Value (*)(void)` — no special

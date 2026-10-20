@@ -29,4 +29,14 @@
 #define ASNIX_ATTR_OFF_VALUE    8
 #define ASNIX_ATTR_SIZE         16
 
+/* PrimOp (M7): {void *fn; int64_t arity;} -- a native builtin function.
+ * `fn` has signature `Value (*)(const Value *args, int64_t argc)`; OP_CALL
+ * invokes it directly with a pointer straight into VALSTACK (the same
+ * contiguous arg layout the Closure call path already reads from) rather
+ * than copying into a new Env frame -- primops have no lexical body to
+ * capture a scope for. */
+#define ASNIX_PRIMOP_OFF_FN    0
+#define ASNIX_PRIMOP_OFF_ARITY 8
+#define ASNIX_PRIMOP_SIZE      16
+
 #endif /* ASNIX_HEAP_H */

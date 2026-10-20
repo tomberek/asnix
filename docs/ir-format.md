@@ -48,7 +48,8 @@ slot count, binds that many just-pushed values into a new frame),
 `OP_LAMBDA` (`a` = arity, `b` = an index into a 2-entry-per-lambda constant
 pool: `{body IrOp*, body's own pool}` — see the Closure note in
 `docs/value-encoding.md`), `OP_CALL`/`OP_RET` (explicit call-frame stack,
-kept off the native machine stack — see `docs/abi.md`), `OP_HALT`.
+kept off the native machine stack — see `docs/abi.md`; `OP_CALL` as of M7
+also dispatches to `PRIMOP`-tagged callees, see below), `OP_HALT`.
 
 ## Op set (M5 additions)
 
@@ -66,6 +67,12 @@ sorted order, so the runtime fill never sorts anything), `OP_SELECT`
 pool-pair convention as `OP_LAMBDA` — builds a deferred, memoizable
 computation over the current env/pool; see `docs/value-encoding.md`'s
 Thunk note). No new forcing op: `OP_VAR_REF`/`OP_SELECT` force inline.
+
+## M7: no new ops, `OP_CALL` extended
+
+No new op — `OP_CALL` grew a second dispatch branch for `PRIMOP`-tagged
+callees (native builtins), alongside its existing `CLOSURE` branch. See
+`docs/abi.md`.
 
 ## M4.5: native codegen is a parallel path, not a consumer of this IR
 

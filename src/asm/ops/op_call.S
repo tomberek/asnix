@@ -1,4 +1,5 @@
 #include "asnix/env.h"
+#include "asnix/heap.h"
 #include "asnix/ir.h"
 #include "asnix/value.h"
 
@@ -28,7 +29,36 @@ asnix_op_call:                          // a = argc
     movq %rdx, %r8
     andq $ASNIX_TAG_MASK, %r8
     cmpq $ASNIX_TAG_CLOSURE, %r8
-    jne .Lop_call_type_error
+    je .Lop_call_is_closure
+    cmpq $ASNIX_TAG_PRIMOP, %r8
+    je .Lop_call_is_primop
+    jmp .Lop_call_type_error
+
+.Lop_call_is_primop:
+    andq $-8, %rdx                      // rdx = real PrimOp*
+    movq ASNIX_PRIMOP_OFF_ARITY(%rdx), %r8
+    cmpq %r8, %rbx
+    jne .Lop_call_arity_error
+
+    movq ASNIX_PRIMOP_OFF_FN(%rdx), %rbp // rbp = native fn ptr (callee-saved, survives the call below)
+    movq %rcx, %r15                      // r15 = callee slot address (args start at r15+8)
+
+    pushq %rsi                           // save IP
+    pushq %rdi                           // save ENV (2 pushes, stays 16-byte aligned)
+    leaq 8(%r15), %rdi                   // arg1 = args ptr (straight into VALSTACK, no Env copy)
+    movq %rbx, %rsi                      // arg2 = argc
+    call *%rbp
+    popq %rdi
+    popq %rsi
+
+    movq %r15, %r12                      // pop callee+args off VALSTACK in one shot
+    movq %rax, (%r12)                    // push the primop's result
+    addq $8, %r12
+    addq $ASNIX_IROP_SIZE, %rsi
+    movq (%rsi), %rax
+    jmp *%rax
+
+.Lop_call_is_closure:
     andq $-8, %rdx                      // rdx = real Closure* (arena pointers are 8-byte aligned)
 
     movq ASNIX_CLOSURE_OFF_ARITY(%rdx), %r8

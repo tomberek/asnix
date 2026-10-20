@@ -7,6 +7,7 @@
 #include "asnix/heap.h"
 #include "asnix/ir.h"
 #include "asnix/value.h"
+#include "builtins.h"
 #include "compiler.h"
 #include "lexer.h"
 #include "parser.h"
@@ -101,8 +102,8 @@ int main(int argc, char **argv) {
     Ast *ast = asnix_parse(toks, ntoks);
     IrProgram *prog = asnix_compile(ast);
 
-    Env *root_env = asnix_arena_alloc(8);
-    root_env->up = NULL;
+    Env *root_env = asnix_env_alloc(NULL, 1);
+    root_env->values[0] = asnix_make_builtins_attrs();
 
     Value result = asnix_eval(prog, root_env);
     print_value(result);

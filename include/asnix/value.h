@@ -34,7 +34,7 @@
 #define ASNIX_TAG_LIST     0x4 /* pointer to a list heap object */
 #define ASNIX_TAG_CLOSURE  0x5 /* pointer to a lambda/closure heap object */
 #define ASNIX_TAG_THUNK    0x6 /* pointer to a 2-word thunk cell */
-#define ASNIX_TAG_RESERVED 0x7 /* unused in v1 */
+#define ASNIX_TAG_PRIMOP   0x7 /* pointer to a native builtin-function heap object (M7) */
 
 /* IMM sub-tags, packed into bits [63:3] of an ASNIX_TAG_IMM word. */
 #define ASNIX_IMM_NULL      0

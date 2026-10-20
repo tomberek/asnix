@@ -19,7 +19,8 @@ what's actually implemented and the scope decisions made along the way.
 | M4.5 — copy-and-patch native codegen (`src/c/codegen.c`) | done, **scoped** (see below) |
 | M5 — strings/lists/attrsets/symbol interning | done (interpreter path only; see below) |
 | M6 — lazy `let`/attrset bindings via thunks, blackholing | done, **scoped** (see below) |
-| M7+ | not started |
+| M7 — builtins + primop dispatch (`src/c/builtins.c`) | done, **scoped** (see below) |
+| M8+ | not started |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
 
@@ -173,6 +174,50 @@ Adds real laziness: `let` and attrset binding *values* are deferred
   End-to-end (`tests/e2e/m6_*.nix`) demonstrates real observable laziness:
   `let x = {}.missing; in 5` prints `5` without ever erroring, because `x`
   is never forced.
+
+## M7 scope notes
+
+Adds real builtin functions, callable and first-class like any other Nix
+value (`let f = builtins.toString; in f 7` works — a primop can be bound,
+passed around, etc., same as a closure).
+
+- **`PrimOp`** (`include/asnix/heap.h`): `{fn; arity}`, 16 bytes, tagged
+  `ASNIX_TAG_PRIMOP` — the reserved 8th tag value from `docs/value-encoding.md`
+  finally has a use. `fn` has signature `Value (*)(const Value *args,
+  int64_t argc)`.
+- **`OP_CALL` dispatches on tag**: closure and primop calls share the same
+  callee-location/arity-check logic, then branch. A primop call skips
+  the Env-frame allocation entirely — `fn` is invoked directly with a
+  pointer straight into VALSTACK (the same contiguous arg layout the
+  closure path already reads from when copying into a new frame), since a
+  primop has no lexical body to capture a scope for.
+- **Builtins are exposed via a `builtins` attrset**, not ambient bare
+  names — matching real Nix's canonical form (real Nix *also* exposes a
+  few names bare at the top level via an implicit `with builtins;`-like
+  mechanism; this implementation doesn't yet). The compiler's top-level
+  scope chain starts with one frame named `"builtins"`
+  (`asnix_compile`'s `ScopeFrame`), and `main.c` constructs a matching
+  one-slot root `Env` holding `asnix_make_builtins_attrs()`'s result —
+  these two must stay in lockstep (if the root env ever grows more slots,
+  the compiler's root scope frame(s) must match exactly, in the same
+  order).
+- **Ships 3 builtins** (`src/c/builtins.c`): `toString`, `typeOf`,
+  `length` — implemented natively in C (not asm): none of these are
+  hot-path code, and C is simply easier to get right for `snprintf`-style
+  formatting and tag-switch dispatch than hand-rolling it. No crypto/hash
+  builtins yet (`hashString`, derivation-hashing) — those need the
+  dlopen-shim pattern `~/gnix/nixgoose` already proved out, deferred to
+  the M8 derivation milestone where they're actually needed.
+- **Call arguments to primops are not forced** before the native call —
+  consistent with M6's existing scope decision that call arguments are
+  eager in general (so by construction they're never raw unforced thunks
+  in the current language subset); a primop that someday receives a
+  thunk would need to force it explicitly, not assume `args[i]` is already
+  reduced.
+- **Validated with a hand-built `PrimOp` + hand-fed IR**
+  (`tests/ir/test_m7_fixtures.c`) before `builtins.c` existed, proving
+  `OP_CALL`'s primop branch (arg layout, arity checking, result handling)
+  independent of any real builtin's logic.
 
 ## Measured: dispatch-elimination thesis (`bench/microbench_m45.c`)
 

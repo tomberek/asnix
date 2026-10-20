@@ -173,7 +173,11 @@ static void compile_expr(IrBuilder *b, Ast *node, ScopeFrame *scope) {
 
 IrProgram *asnix_compile(Ast *root) {
     IrBuilder *b = ib_new();
-    compile_expr(b, root, NULL);
+    /* The root env (constructed by main.c) has exactly one slot: the
+     * `builtins` attrset. This scope frame makes `builtins.toString 5`
+     * etc. resolve like any other variable reference. */
+    ScopeFrame builtins_frame = { .up = NULL, .name = "builtins", .name_len = 8 };
+    compile_expr(b, root, &builtins_frame);
     ib_halt(b);
     return ib_finish(b);
 }

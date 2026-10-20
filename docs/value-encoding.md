@@ -27,7 +27,7 @@ word *is* the pointer).
 | `LIST` | `0x4` | list heap object | pointer |
 | `CLOSURE` | `0x5` | closure heap object | pointer |
 | `THUNK` | `0x6` | 2-word thunk cell | pointer |
-| reserved | `0x7` | unused in v1 | — |
+| `PRIMOP` | `0x7` | native builtin-function heap object (M7) | pointer |
 
 Four tag values are spent on heap *kinds* directly (`ATTRS`/`LIST`/
 `CLOSURE`/`THUNK`) rather than following a single generic `PTR` tag plus an
@@ -60,3 +60,8 @@ design was based on.
   memoized value after the first force. See `docs/architecture.md`'s M6
   scope notes for what this does and doesn't cover (not recursive bindings
   yet).
+- **PrimOp** (`include/asnix/heap.h`, M7): `{fn; arity}` — 16 bytes, a
+  native builtin function (`fn` signature: `Value (*)(const Value *args,
+  int64_t argc)`). `OP_CALL` dispatches to it the same way it dispatches
+  to a `Closure`, just skipping the Env-frame-allocation step since a
+  primop has no lexical body to capture a scope for.
