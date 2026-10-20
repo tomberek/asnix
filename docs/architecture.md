@@ -576,3 +576,52 @@ scratch, after independently re-verifying its correctness claims.
    M8 scope notes above have the full writeup); fixed by adding a single
    `compute_store_path()` helper so the two-step composition only exists
    in one place.
+6. **VALSTACK/RETSP had no bounds check at all** (found by a benchmark
+   agent; fixed post-M9): `dispatch.S` sized VALSTACK at 32768 bytes
+   (4096 `Value`s) and RETSP at 4096 bytes (128 call frames,
+   `ASNIX_RETFRAME_SIZE`=32), both via the shared bump arena, with
+   *nothing* checking whether a push still fit before writing — `force.S`
+   had the identical gap in its own separate, smaller buffers
+   (`ASNIX_FORCE_VALSTACK_BYTES`/`ASNIX_FORCE_RETSTACK_BYTES`, 4096/1024
+   bytes). A single list/attrset literal past ~4096 elements, or a chain
+   of ~128+ simultaneous dependent thunk-forces (each `let` binding
+   forcing the previous one), silently corrupted whatever the arena
+   allocated next — sometimes a clean segfault, sometimes a wrong answer,
+   never a clear error. Fixed by: (a) growing all four buffers
+   substantially (VALSTACK to 1,048,576 `Value`s / 8 MiB, RETSP to 65,536
+   frames / 2 MiB; `force.S`'s own to 32,768 `Value`s / 256 KiB and 2,048
+   frames / 64 KiB) and (b) adding a real bounds check
+   (`include/asnix/stackcheck.h`'s `ASNIX_CHECK_VALSTACK`/
+   `ASNIX_CHECK_RETSP` macros, backed by `src/asm/stacklimits.S`'s shared
+   `asnix_valstack_limit`/`asnix_retsp_limit` globals) at every push site
+   across `op_push.S`, `op_var_ref.S`, `op_select.S`, `op_call.S`,
+   `op_lambda.S`, `op_mk_thunk.S`, `op_mk_list.S`, `op_mk_attrs.S`, and
+   `force.S` itself, so exceeding the (now much larger) cap is a clean
+   `asnix_fatal` abort instead of silent corruption — the same philosophy
+   `ASNIX_MAX_MEMORY` already uses in `arena.S`. Because `force.S` can run
+   *nested* inside an active `asnix_eval` (e.g. `derivation.c`'s builtin
+   forcing a value mid-eval) or inside another `force.S` call, the two
+   limit globals are saved and restored around that nested use exactly
+   like `%r12`/`%r14` themselves. Verified directly against
+   `nix-instantiate` at depth/size well past both old caps (see
+   `tests/e2e/m9_deep_let_chain.nix`, `m9_large_list.nix`,
+   `m9_large_attrset.nix`) and with dedicated overflow-abort unit tests
+   (`tests/asm/test_stacklimits.c`).
+7. **Separate, unrelated native-C-stack-recursion limit in the compiler**
+   (found while verifying bug #6 above, *not* fixed here — out of scope
+   for that fix): a single `let` with enough bindings written as
+   literal, flat Nix source (not IR) — e.g. `let x0 = 0; x1 = x0 + 1;
+   ...; in x_N` — crashes with a real SIGSEGV around N≈31,000, reproduced
+   consistently and confirmed via `gdb` to be a native stack overflow
+   inside `compiler.c`'s `compile_expr`'s recursive `AST_LET` handling
+   (one native C stack frame per nested binding), not anything to do with
+   VALSTACK/RETSP — raising the process's native stack limit
+   (`ulimit -s unlimited`) makes it go away, which bug #6's fix (both
+   explicit stacks live in heap-arena memory, not the native stack)
+   cannot and does not affect either way. Distinguishing this from bug #6
+   is why this project's own regression tests for #6
+   (`tests/asm/test_stacklimits.c`) build IR directly via `IrBuilder`
+   rather than through the lexer/parser/compiler — that sidesteps this
+   separate limit entirely so the VALSTACK/RETSP checks stay isolated.
+   Left as a known gap for whoever picks up deep `let`-chain support
+   through real Nix source next.

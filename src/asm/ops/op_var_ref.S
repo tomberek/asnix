@@ -1,5 +1,6 @@
 #include "asnix/env.h"
 #include "asnix/ir.h"
+#include "asnix/stackcheck.h"
 #include "asnix/value.h"
 
     .section .rodata
@@ -44,6 +45,7 @@ asnix_op_var_ref:                       // a = depth, b = slot
 
     movq %rsi, %rdx
     addq $ASNIX_IROP_SIZE, %rdx         // return_ip = one past this VAR_REF record
+    ASNIX_CHECK_RETSP %rcx              // %rcx dead since the depth-walk loop above
     movq %rdx, ASNIX_RETFRAME_OFF_IP(%r14)
     movq %rdi, ASNIX_RETFRAME_OFF_ENV(%r14)     // ENV/POOL are unchanged by var_ref itself
     movq %r13, ASNIX_RETFRAME_OFF_POOL(%r14)
@@ -59,6 +61,7 @@ asnix_op_var_ref:                       // a = depth, b = slot
 .Lvar_ref_forced:
     movq ASNIX_THUNK_OFF_ENV(%rax), %rax // cached Value.raw (ENV slot repurposed once forced)
 .Lvar_ref_push:
+    ASNIX_CHECK_VALSTACK %rcx
     movq %rax, (%r12)
     addq $8, %r12
     addq $ASNIX_IROP_SIZE, %rsi

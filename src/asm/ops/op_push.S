@@ -1,4 +1,5 @@
 #include "asnix/ir.h"
+#include "asnix/stackcheck.h"
 #include "asnix/value.h"
 
     .text
@@ -9,6 +10,7 @@ asnix_op_push_int:
     movq ASNIX_IROP_OFF_A(%rsi), %rax
     salq $ASNIX_TAG_BITS, %rax
     orq $ASNIX_TAG_INT, %rax
+    ASNIX_CHECK_VALSTACK %rcx           // %rcx is unused in this handler
     movq %rax, (%r12)
     addq $8, %r12
     addq $ASNIX_IROP_SIZE, %rsi
@@ -20,6 +22,7 @@ asnix_op_push_int:
     .type asnix_op_push_true, @function
 asnix_op_push_true:
     movq $((ASNIX_IMM_TRUE << ASNIX_TAG_BITS) | ASNIX_TAG_IMM), %rax
+    ASNIX_CHECK_VALSTACK %rcx
     movq %rax, (%r12)
     addq $8, %r12
     addq $ASNIX_IROP_SIZE, %rsi
@@ -31,6 +34,7 @@ asnix_op_push_true:
     .type asnix_op_push_false, @function
 asnix_op_push_false:
     movq $((ASNIX_IMM_FALSE << ASNIX_TAG_BITS) | ASNIX_TAG_IMM), %rax
+    ASNIX_CHECK_VALSTACK %rcx
     movq %rax, (%r12)
     addq $8, %r12
     addq $ASNIX_IROP_SIZE, %rsi
@@ -42,6 +46,7 @@ asnix_op_push_false:
     .type asnix_op_push_null, @function
 asnix_op_push_null:
     movq $((ASNIX_IMM_NULL << ASNIX_TAG_BITS) | ASNIX_TAG_IMM), %rax
+    ASNIX_CHECK_VALSTACK %rcx
     movq %rax, (%r12)
     addq $8, %r12
     addq $ASNIX_IROP_SIZE, %rsi
@@ -54,6 +59,7 @@ asnix_op_push_null:
 asnix_op_push_const:                    // b = pool index of a pre-formed Value.raw
     movq ASNIX_IROP_OFF_B(%rsi), %rax
     movq (%r13, %rax, 8), %rax
+    ASNIX_CHECK_VALSTACK %rcx
     movq %rax, (%r12)
     addq $8, %r12
     addq $ASNIX_IROP_SIZE, %rsi
