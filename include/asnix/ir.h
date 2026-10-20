@@ -137,6 +137,19 @@ enum {
                     * OP_MK_LIST), coerces each to a string (same rules as
                     * builtins.toString), concatenates them in order, pushes one
                     * String -- the runtime half of string interpolation. */
+    OP_WITH,       /* `with`: pops the with-expr thunk pushed just before this op, binds it
+                     * into a new 1-slot Env frame whose `up` field has ASNIX_ENV_WITH_TAG
+                     * set (see env.h) so OP_WITH_TRY/the var-ref depth walk can recognize it
+                     * as a with-frame rather than an ordinary let/lambda frame. */
+    OP_WITH_TRY,   /* a = byte delta to jump to when the symbol isn't in this with-level's
+                     * attrs; b = symbol id. Pops the attrs value pushed by a preceding
+                     * OP_VAR_REF (which already forced the with-frame's slot) -- fatal if
+                     * not an attrset. Binary-searches for `b`; if found, pushes the
+                     * (force-if-thunk) matching value and falls through; otherwise jumps by
+                     * `a` to try the next enclosing `with` (or OP_WITH_MISS if exhausted). */
+    OP_WITH_MISS,  /* All enclosing `with`s were tried and none had the symbol: aborts with
+                     * "undefined variable" (mirrors the compile-time error raised when no
+                     * `with` is in scope at all -- see compiler.c's AST_VAR case). */
     OP_COUNT
 };
 

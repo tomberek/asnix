@@ -38,7 +38,7 @@ static const Keyword KEYWORDS[] = {
     { "then", TOK_THEN },       { "else", TOK_ELSE },  { "true", TOK_TRUE },
     { "false", TOK_FALSE },     { "null", TOK_NULL },
     { "rec", TOK_REC },         { "inherit", TOK_INHERIT },
-    { "assert", TOK_ASSERT },
+    { "assert", TOK_ASSERT },   { "with", TOK_WITH },
 };
 
 /* Lexer mode stack -- a from-scratch equivalent of real Nix's flex state

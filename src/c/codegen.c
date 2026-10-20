@@ -208,6 +208,11 @@ static void codegen_expr(CodeBuf *cb, Ast *node, ScopeFrame2 *scope, size_t dept
                     "asnix: M4.5 native codegen does not yet support strings/lists/attrsets "
                     "(M5 feature, interpreter-only so far -- see docs/architecture.md)\n");
             exit(1);
+        case AST_WITH:
+            fprintf(stderr,
+                    "asnix: M4.5 native codegen does not support `with` "
+                    "(interpreter-only -- see docs/architecture.md)\n");
+            exit(1);
     }
 }
 

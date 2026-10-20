@@ -162,6 +162,18 @@ size_t ib_str_concat(IrBuilder *b, int64_t count) {
     return ib_emit(b, OP_STR_CONCAT, count, 0);
 }
 
+size_t ib_with(IrBuilder *b) {
+    return ib_emit(b, OP_WITH, 0, 0);
+}
+
+size_t ib_with_try(IrBuilder *b, uint32_t sym) {
+    return ib_emit(b, OP_WITH_TRY, 0, (int64_t)sym);
+}
+
+size_t ib_with_miss(IrBuilder *b) {
+    return ib_emit(b, OP_WITH_MISS, 0, 0);
+}
+
 IrProgram *ib_finish(IrBuilder *b) {
     ir_link(b->ops, b->len);
     IrProgram *prog = calloc(1, sizeof(IrProgram));

@@ -601,6 +601,16 @@ static Ast *parse_expr(Parser *p) {
         advance(p);
         return parse_let_bindings(p);
     }
+    if (cur(p)->kind == TOK_WITH) {
+        advance(p);
+        Ast *attrs = parse_expr(p);
+        expect(p, TOK_SEMI, "';'");
+        Ast *body = parse_expr(p); /* recursing here is what lets further let/if/with/lambda follow */
+        Ast *n = asnix_ast_new(AST_WITH);
+        n->as.with1.attrs = attrs;
+        n->as.with1.body = body;
+        return n;
+    }
     if (cur(p)->kind == TOK_IF) {
         advance(p);
         Ast *cond = parse_expr(p);

@@ -18,6 +18,7 @@ typedef enum {
     TOK_REC,
     TOK_INHERIT,
     TOK_ASSERT,
+    TOK_WITH,
     TOK_PLUS,
     TOK_MINUS,
     TOK_STAR,

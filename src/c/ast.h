@@ -32,6 +32,7 @@ typedef enum {
     AST_OR,     /* short-circuit `||`: as.logic */
     AST_NOT,    /* unary `!`: as.not1 */
     AST_ASSERT, /* `assert cond; body`: as.assert1 */
+    AST_WITH,
 } AstKind;
 
 typedef struct Ast Ast;
@@ -135,6 +136,10 @@ struct Ast {
             const char *cond_text; /* raw source span of `cond`, for the failure message */
             size_t cond_text_len;
         } assert1; /* AST_ASSERT */
+        struct {
+            Ast *attrs;
+            Ast *body;
+        } with1; /* AST_WITH */
     } as;
 };
 

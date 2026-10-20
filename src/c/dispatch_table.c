@@ -41,6 +41,9 @@ extern void asnix_op_not(void);
 extern void asnix_op_update(void);
 extern void asnix_op_assert_fail(void);
 extern void asnix_op_str_concat(void);
+extern void asnix_op_with(void);
+extern void asnix_op_with_try(void);
+extern void asnix_op_with_miss(void);
 
 void *asnix_handler_table[OP_COUNT] = {
     [OP_PUSH_INT] = (void *)asnix_op_push_int,
@@ -76,6 +79,9 @@ void *asnix_handler_table[OP_COUNT] = {
     [OP_UPDATE] = (void *)asnix_op_update,
     [OP_ASSERT_FAIL] = (void *)asnix_op_assert_fail,
     [OP_STR_CONCAT] = (void *)asnix_op_str_concat,
+    [OP_WITH] = (void *)asnix_op_with,
+    [OP_WITH_TRY] = (void *)asnix_op_with_try,
+    [OP_WITH_MISS] = (void *)asnix_op_with_miss,
 };
 
 void ir_link(IrOp *ops, size_t n) {

@@ -18,16 +18,37 @@
  * root `builtins` frame just happen to use count==1; AST_LET and `rec {}`
  * use count==(number of bindings) so every binding in one block shares a
  * single frame -- the structural piece that makes them mutually visible
- * (see compiler.c's AST_LET/AST_ATTRSET cases and ir.h's OP_FRAME_* ops). */
+ * (see compiler.c's AST_LET/AST_ATTRSET cases and ir.h's OP_FRAME_* ops).
+ *
+ * `with` (see the AST_WITH case below) also introduces a ScopeFrame -- one
+ * new runtime Env frame per `with`, exactly like let/lambda -- but with
+ * `count == 0` (no statically-known names at all) and `is_with` set: it
+ * never matches a direct lexical lookup, yet still has to count as one
+ * more hop for every *other* name's depth, since depth is "how many
+ * runtime Env frames up" and a with-frame really is one. `is_with` is what
+ * lets AST_VAR's walk notice it and fall back to a bounded chain of
+ * runtime lookups against each enclosing with-value, innermost first --
+ * see the AST_VAR case. `count == 0` alone is NOT enough to mean "with
+ * frame": the dummy `skip` level AST_LET builds for `inherit`'s outer-
+ * scope resolution (see that case) is also zero-count but must NOT join
+ * the with-fallback chain, hence the separate flag. */
 typedef struct ScopeFrame {
     struct ScopeFrame *up;
     const char **names;
     size_t *name_lens;
     size_t count;
+    int is_with;
 } ScopeFrame;
 
+/* Bounds how many enclosing `with`s a single unresolved-name fallback
+ * chain can walk through -- real Nix has no such limit, but nesting this
+ * deep never happens in practice and a fixed-size stack array keeps the
+ * AST_VAR case simple (same spirit as other deliberate, documented scope
+ * cuts in this project, e.g. M6's non-recursive `let`). */
+#define ASNIX_MAX_WITH_CHAIN 64
+
 static int name_eq(const char *a, size_t alen, const char *b, size_t blen) {
-    return alen == blen && memcmp(a, b, alen) == 0;
+    return a != NULL && alen == blen && memcmp(a, b, alen) == 0;
 }
 
 static void compile_expr(IrBuilder *b, Ast *node, ScopeFrame *scope) {
@@ -46,7 +67,14 @@ static void compile_expr(IrBuilder *b, Ast *node, ScopeFrame *scope) {
             return;
         case AST_VAR: {
             int depth = 0;
+            int64_t with_depths[ASNIX_MAX_WITH_CHAIN];
+            size_t with_count = 0;
             for (ScopeFrame *f = scope; f; f = f->up, depth++) {
+                /* A lexical binding always wins over any enclosing `with`,
+                 * even one introduced further out than this match (real
+                 * Nix semantics: `with` is a fallback, never a shadow) --
+                 * returning here before ever looking at with_depths is
+                 * exactly that. */
                 for (size_t slot = 0; slot < f->count; slot++) {
                     if (name_eq(f->names[slot], f->name_lens[slot], node->as.var.name,
                                 node->as.var.name_len)) {
@@ -54,10 +82,45 @@ static void compile_expr(IrBuilder *b, Ast *node, ScopeFrame *scope) {
                         return;
                     }
                 }
+                if (f->is_with) {
+                    if (with_count >= ASNIX_MAX_WITH_CHAIN) {
+                        fprintf(stderr, "asnix: too many nested `with` scopes (limit %d)\n",
+                                ASNIX_MAX_WITH_CHAIN);
+                        exit(1);
+                    }
+                    with_depths[with_count++] = depth;
+                }
             }
-            fprintf(stderr, "asnix: undefined variable '%.*s'\n", (int)node->as.var.name_len,
-                    node->as.var.name);
-            exit(1);
+            if (with_count == 0) {
+                fprintf(stderr, "asnix: undefined variable '%.*s'\n", (int)node->as.var.name_len,
+                        node->as.var.name);
+                exit(1);
+            }
+            /* No lexical match anywhere -- fall back to a runtime search
+             * over each enclosing `with`'s attrset, innermost first,
+             * stopping at the first one that has the key (whether it
+             * does is a runtime fact; the *chain itself*, built here, is
+             * entirely compile-time since the with-nesting is static).
+             * Each level: OP_VAR_REF reads+forces that with-frame's slot 0
+             * (an ordinary lexical lookup -- the with-frame's depth is
+             * already known), OP_WITH_TRY searches it and either falls
+             * through with a match or jumps to the next level, and the
+             * OP_JMP right after only runs on a hit, skipping straight to
+             * `end` past every remaining level. If no level has the key,
+             * execution falls into OP_WITH_MISS. */
+            uint32_t sym = asnix_intern(node->as.var.name, node->as.var.name_len);
+            size_t jmp_sites[ASNIX_MAX_WITH_CHAIN];
+            for (size_t i = 0; i < with_count; i++) {
+                ib_var_ref(b, with_depths[i], 0);
+                size_t try_site = ib_with_try(b, sym);
+                jmp_sites[i] = ib_jmp(b);
+                size_t next_idx = ib_len(b);
+                ib_patch_delta(b, try_site, next_idx);
+            }
+            ib_with_miss(b);
+            size_t end_idx = ib_len(b);
+            for (size_t i = 0; i < with_count; i++) ib_patch_delta(b, jmp_sites[i], end_idx);
+            return;
         }
         case AST_LET: {
             /* Real Nix `let ... in` is implicitly `letrec`: every binding
@@ -345,6 +408,23 @@ static void compile_expr(IrBuilder *b, Ast *node, ScopeFrame *scope) {
             compile_expr(b, node->as.select.target, scope);
             uint32_t sym = asnix_intern(node->as.select.attr, node->as.select.attr_len);
             ib_select(b, sym);
+            return;
+        }
+        case AST_WITH: {
+            /* Lazy, same as `let`/attrset bindings (M6): the with-expr is
+             * compiled as its own thunk body captured over the *outer*
+             * scope (it can't see names `with` itself introduces), so a
+             * `with` whose value is never actually consulted (every name
+             * in `body` resolves lexically) never forces it -- matches
+             * real Nix (verified: `with (builtins.trace "x" {}); 5` never
+             * prints the trace). */
+            IrBuilder *thunk_b = ib_new();
+            compile_expr(thunk_b, node->as.with1.attrs, scope);
+            ib_ret(thunk_b);
+            ib_mk_thunk(b, ib_finish(thunk_b));
+            ib_with(b);
+            ScopeFrame frame = { .up = scope, .names = NULL, .name_lens = NULL, .count = 0, .is_with = 1 };
+            compile_expr(b, node->as.with1.body, &frame);
             return;
         }
     }

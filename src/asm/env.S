@@ -28,6 +28,7 @@ asnix_env_lookup:                       // Value asnix_env_lookup(Env *env, int6
     testq %rsi, %rsi
     jz .Lenv_lookup_done
     movq ASNIX_ENV_OFF_UP(%rdi), %rdi
+    andq $-8, %rdi                      // mask off ASNIX_ENV_WITH_TAG in case this hop is a with-frame
     decq %rsi
     jmp .Lenv_lookup_walk
 .Lenv_lookup_done:

@@ -8,6 +8,19 @@
 #define ASNIX_ENV_OFF_UP     0
 #define ASNIX_ENV_OFF_VALUES 8
 
+/* `with`: a with-frame is an ordinary 1-slot Env{up;values[0]=attrs} with
+ * one difference -- its OWN `up` field has this tag bit OR'd in (arena
+ * pointers are always 8-byte aligned, exactly the same free-low-bits trick
+ * `value.h` uses for Value tags), marking "I am a with-frame" so
+ * OP_WITH_TRY's fallback search can recognize with-frames while walking
+ * the Env chain without needing a separate parallel structure. Every
+ * walk that blindly chases `up` across a *generic* hop (not specifically
+ * looking for a with-frame -- e.g. OP_VAR_REF's depth walk, which may pass
+ * straight through a with-frame on its way to an outer lexical binding)
+ * must mask this bit back off before using the pointer, since nothing
+ * else ever sets it. */
+#define ASNIX_ENV_WITH_TAG   1
+
 #ifndef __ASSEMBLER__
 
 #include <stdint.h>

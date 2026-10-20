@@ -85,6 +85,21 @@ size_t ib_assert_fail(IrBuilder *b, const char *msg, size_t len);
  * String -- see OP_STR_CONCAT in ir.h. */
 size_t ib_str_concat(IrBuilder *b, int64_t count);
 
+/* `with`: pops the with-expr thunk (pushed by a preceding ib_mk_thunk, same
+ * convention as ib_let) into a new with-tagged 1-slot Env frame -- see
+ * ASNIX_ENV_WITH_TAG in env.h and op_with.S. */
+size_t ib_with(IrBuilder *b);
+/* Emits with a placeholder delta (operand `a`, patched via ib_patch_delta,
+ * same convention as ib_if/ib_jmp) and the fixed symbol id `sym` (operand
+ * `b`): pops the attrs value a preceding ib_var_ref forced/pushed,
+ * searches for `sym`, and either falls through with the match on top of
+ * VALSTACK or jumps by the (not-yet-patched) delta to try the next
+ * enclosing `with`. */
+size_t ib_with_try(IrBuilder *b, uint32_t sym);
+/* Every enclosing `with` was tried and none had the symbol: aborts with
+ * "undefined variable", same error class as the compile-time check. */
+size_t ib_with_miss(IrBuilder *b);
+
 /* Finalizes the builder: runs ir_link() over the accumulated ops in place
  * and returns an IrProgram ready for asnix_eval(). */
 IrProgram *ib_finish(IrBuilder *b);

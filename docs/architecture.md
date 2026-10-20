@@ -25,7 +25,8 @@ what's actually implemented and the scope decisions made along the way.
 | M10 — recursive `let`/`rec {}`/`inherit` | done (see below) |
 | M11 — operators: comparisons, `&&`/`||`/`!`, `assert`, `//` | done, **scoped** (see below) |
 | M12 — strings: `"${expr}"` interpolation, `''...''` multi-line strings | done (see below) |
-| M13+ | not started |
+| M13 — `with` expressions | done (see below) |
+| M14+ | not started |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
 
@@ -789,6 +790,95 @@ including the precedence-sensitive cases — see below.
   `nix-instantiate --eval` on the equivalent source during development
   (see the precedence bullet above for the specific disambiguating
   expressions used).
+
+## M13 — `with` expressions
+
+Adds `with expr; body`. Real Nix semantics (confirmed against
+`nix-instantiate` for every point below before trusting it, not just
+transcribed from memory): a `with` is a *fallback* for names that don't
+resolve lexically -- a lexical binding always wins, even one introduced
+further out than the `with` -- resolved at runtime against the
+with-expression's value, and evaluated lazily (the with-value is only
+forced the first time some name inside `body` actually needs to fall back
+to it). Nested `with`s chain innermost-first: if the nearest enclosing
+`with`'s attrset doesn't have the key, the search falls through to the
+next enclosing `with`, and so on; the first one (searching innermost-out)
+that *does* have the key wins, even if a nearer one would otherwise have
+been consulted first for a different key.
+
+- **Grammar**: only one form, `WITH expr ';' expr_function` (matching
+  real Nix's own grammar exactly) -- `cur(p)->kind == TOK_WITH` is handled
+  in `parser.c`'s `parse_expr`, the same precedence level as `let`/`if`.
+  There's no alternate colon/paren-only form in real Nix either; the
+  "parenthesized" form the task description anticipated is just an
+  ordinary parenthesized `expr` as the with-value (`with (foo); ...`),
+  already handled for free since `expr` parsing already supports parens.
+- **Resolution split between compile time and runtime.** `compiler.c`'s
+  `ScopeFrame` chain (by the time `with` landed, already multi-slot --
+  `names[]`/`name_lens[]`/`count` -- to support recursive `let`/`rec {}`'s
+  shared-frame bindings, see that section above) grows a dedicated
+  `is_with` flag for its third frame shape: a `with`-marker frame has
+  `count == 0` (no statically-known names, so the slot-search loop trivially
+  never matches) *and* `is_with` set. `count == 0` alone isn't enough to
+  mean "with frame": `AST_LET`'s dummy `skip` level (used to resolve
+  `inherit`'s outer-scope reference) is also zero-count but must not join
+  the with-fallback chain, which is exactly what the separate flag is for.
+  It still corresponds to exactly one new runtime `Env` frame, so it still
+  has to count as one hop for every *other* name's De Bruijn depth.
+  `AST_VAR`'s resolution walk now does two
+  things in one pass: look for a lexical match (as before -- if found,
+  return immediately, before ever consulting any collected `with`s, which
+  is exactly what makes a lexical binding always win); and collect the
+  depth of every with-marker frame passed along the way. If the walk
+  exhausts the scope chain with no lexical match: a compile error (as
+  before) if no `with`s were collected, otherwise a short runtime fallback
+  chain is emitted, one step per collected depth (innermost first,
+  bounded by `ASNIX_MAX_WITH_CHAIN = 64` -- real Nix has no such limit,
+  but nesting this deep never happens in practice; a documented scope cut
+  in the same spirit as M6's non-recursive `let`).
+- **Runtime representation reuses `Env{up;values[]}` exactly, per the task's
+  own design hint, rather than adding a parallel channel**: a `with`
+  introduces an ordinary 1-slot `Env` frame (`OP_WITH`, mirroring
+  `OP_LET`'s `nslots=1` case almost byte-for-byte -- see `op_with.S`)
+  whose *own* `up` field has one bit (`ASNIX_ENV_WITH_TAG` in `env.h`)
+  OR'd in to mark "this frame is a `with`". This costs nothing new: arena
+  pointers are always 8-byte-aligned (same precondition `value.h`'s own
+  tag bits already rely on), so the low 3 bits of `up` are free. The only
+  two places that blindly chase a generic `up` hop (`op_var_ref.S`'s
+  depth walk, `env.S`'s `asnix_env_lookup`) now mask the bit back off
+  after each hop -- cheap (`andq $-8`) and always safe, since ordinary
+  frames' `up` fields never have it set in the first place.
+- **The fallback search at each level is just an ordinary `OP_VAR_REF`
+  plus one new op, not a bespoke "walk the Env chain looking for
+  with-frames" routine**: since each with-marker frame's compile-time
+  depth is already known (collected above), reading+forcing its slot 0 is
+  *exactly* what `OP_VAR_REF(depth,0)` already does for any lexical
+  variable -- no new forcing code needed, and this is what gets `with`'s
+  laziness for free (forcing only happens when a level is actually
+  consulted). The new op, `OP_WITH_TRY(delta, sym)`, pops that
+  already-forced attrs value, type-checks it (fatal if not an attrset --
+  but only *when reached*, matching real Nix: `with 5; 1` succeeds since
+  the bad value is never consulted, while `with 5; x` errors), and
+  binary-searches for `sym` (reusing `OP_SELECT`'s exact search +
+  entry-thunk-forcing logic, since attrset binding values are lazy too).
+  Found: push the match, fall through to an unconditional `OP_JMP` the
+  compiler always emits right after, landing past every remaining level.
+  Not found: jump (by the compile-time-patched `delta`, same
+  `ib_patch_delta` mechanism `AST_IF`'s then/else branches already use)
+  to the next level's `OP_VAR_REF`/`OP_WITH_TRY` pair, or to `OP_WITH_MISS`
+  (aborts "undefined variable") if that was the last level.
+- **Verified against real `nix-instantiate --eval`** for every case the
+  task called out, plus a few more: basic `with`; a lexical name
+  shadowing a `with`-provided one (`let a = 100; in with {a=1;}; a` -> both
+  print `100`); nested `with`s falling through to an outer one for a key
+  the inner one lacks (`with {a=1;}; with {b=2;}; a+b` -> both `3`); an
+  inner `with` shadowing an outer one that has the *same* key
+  (`with {a=1;}; with {a=2;}; a` -> both `2`); a `with` whose value is a
+  variable, a lambda parameter, and a function-call result, not just a
+  literal attrset (all matched); laziness (`with 5; 1` succeeds on both,
+  `with 5; x` errors on both with a type error); and the
+  compile-time-vs-runtime "undefined variable" split (`with {a=1;}; zzz`
+  errors on both). See `tests/e2e/m10_with_*.nix`.
 
 ## Known bugs found and fixed during implementation (worth knowing about)
 
