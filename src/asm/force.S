@@ -8,10 +8,22 @@
 // own self-contained mini dispatch context (mirroring asnix_eval's own
 // prologue) to run one thunk's body to completion and return the result.
 #include "asnix/ir.h"
+#include "asnix/stackcheck.h"
 #include "asnix/value.h"
 
-    .equ ASNIX_FORCE_VALSTACK_BYTES, 4096
-    .equ ASNIX_FORCE_RETSTACK_BYTES, 1024
+    // Same silent-corruption-to-loud-abort fix as dispatch.S's main
+    // VALSTACK/RETSP (see include/asnix/stackcheck.h and
+    // docs/architecture.md's "Known bugs" list): previously 4096/1024
+    // bytes with no bounds check; now much larger (still smaller than
+    // dispatch.S's, since this context only ever runs one thunk-forcing
+    // sub-dispatch at a time) and bounds-checked via the same shared
+    // asnix_valstack_limit/asnix_retsp_limit globals the main dispatch
+    // loop uses -- save/restore them around this nested use exactly like
+    // %r12/%r14 themselves, since this routine can run nested inside an
+    // active asnix_eval (a builtin forcing a value, e.g. derivation.c) or
+    // even inside another asnix_force_for_print call.
+    .equ ASNIX_FORCE_VALSTACK_BYTES, 262144 // 32,768 Values, 256 KiB
+    .equ ASNIX_FORCE_RETSTACK_BYTES, 65536  // 2,048 call frames, 64 KiB
 
     .section .rodata
 .Lmsg_blackhole:
@@ -55,19 +67,34 @@ asnix_force_for_print:                  // Value asnix_force_for_print(Value v)
     subq $8, %rsp                       // alignment padding, undone in the epilogue below
     movq %rax, %rbx                     // stash the Thunk* across the alloc calls
 
+    // Save the enclosing dispatch context's VALSTACK/RETSP limits (the
+    // outer asnix_eval, or an outer asnix_force_for_print if this call
+    // nests inside another one) -- restored in the epilogue below,
+    // mirroring how %r12/%r14 themselves are saved/restored. %rax holds
+    // the live Thunk* here (see above); %rdx is free.
+    movq asnix_valstack_limit(%rip), %rdx
+    pushq %rdx
+    movq asnix_retsp_limit(%rip), %rdx
+    pushq %rdx
+
     movq $ASNIX_FORCE_VALSTACK_BYTES, %rdi
     call asnix_arena_alloc
     movq %rax, %r12
+    leaq ASNIX_FORCE_VALSTACK_BYTES(%r12), %rdx
+    movq %rdx, asnix_valstack_limit(%rip)
 
     movq $ASNIX_FORCE_RETSTACK_BYTES, %rdi
     call asnix_arena_alloc
     movq %rax, %r14
+    leaq ASNIX_FORCE_RETSTACK_BYTES(%r14), %rdx
+    movq %rdx, asnix_retsp_limit(%rip)
 
     movq $ASNIX_THUNK_STATE_IN_PROGRESS, ASNIX_THUNK_OFF_STATE(%rbx)
 
     // Sentinel retframe: when the thunk's OP_RET fires, it memoizes into
     // force_target (this thunk) then jumps to the sentinel's handler.
     leaq .Lforce_sentinel_ir(%rip), %rax
+    ASNIX_CHECK_RETSP %rcx             // %rcx dead here (last written by the mask check above)
     movq %rax, ASNIX_RETFRAME_OFF_IP(%r14)
     movq $0, ASNIX_RETFRAME_OFF_ENV(%r14)
     movq $0, ASNIX_RETFRAME_OFF_POOL(%r14)
@@ -82,6 +109,10 @@ asnix_force_for_print:                  // Value asnix_force_for_print(Value v)
 
 asnix_force_epilogue:
     movq -8(%r12), %rax                 // result, left on VALSTACK by the thunk body's own OP_RET
+    popq %rdx                           // restore the enclosing context's RETSP limit (pushed
+    movq %rdx, asnix_retsp_limit(%rip)  // last above, so popped first)
+    popq %rdx                           // ditto for the VALSTACK limit
+    movq %rdx, asnix_valstack_limit(%rip)
     addq $8, %rsp
     popq %r15
     popq %rbp

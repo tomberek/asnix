@@ -1,5 +1,6 @@
 #include "asnix/heap.h"
 #include "asnix/ir.h"
+#include "asnix/stackcheck.h"
 #include "asnix/value.h"
 
     .section .rodata
@@ -68,6 +69,7 @@ asnix_op_select:                        // a = symbol id; pops an attrset, pushe
 
     movq %rsi, %rdx
     addq $ASNIX_IROP_SIZE, %rdx
+    ASNIX_CHECK_RETSP %rcx              // %rcx dead since the binary search above
     movq %rdx, ASNIX_RETFRAME_OFF_IP(%r14)
     movq %rdi, ASNIX_RETFRAME_OFF_ENV(%r14)
     movq %r13, ASNIX_RETFRAME_OFF_POOL(%r14)
@@ -83,6 +85,7 @@ asnix_op_select:                        // a = symbol id; pops an attrset, pushe
 .Lselect_forced:
     movq ASNIX_THUNK_OFF_ENV(%rax), %rax
 .Lselect_push:
+    ASNIX_CHECK_VALSTACK %rcx
     movq %rax, (%r12)
     addq $8, %r12
     addq $ASNIX_IROP_SIZE, %rsi
