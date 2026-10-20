@@ -1,0 +1,37 @@
+// M3: Env frame allocation and De Bruijn lookup. Tested, C-callable
+// primitives -- op_var_ref/op_let/op_call inline the same logic directly
+// in the hot dispatch path rather than paying a `call` per use (same
+// precedent as src/asm/value.S).
+#include "asnix/env.h"
+
+    .text
+
+    .globl asnix_env_alloc
+    .type asnix_env_alloc, @function
+asnix_env_alloc:                        // Env *asnix_env_alloc(Env *up, int64_t nslots)
+    .cfi_startproc
+    pushq %rbx
+    movq %rdi, %rbx                     // save `up` across the call (rdi becomes the size arg)
+    leaq 8(, %rsi, 8), %rdi             // size = 8 + nslots*8
+    call asnix_arena_alloc
+    movq %rbx, ASNIX_ENV_OFF_UP(%rax)
+    popq %rbx
+    ret
+    .cfi_endproc
+    .size asnix_env_alloc, . - asnix_env_alloc
+
+    .globl asnix_env_lookup
+    .type asnix_env_lookup, @function
+asnix_env_lookup:                       // Value asnix_env_lookup(Env *env, int64_t depth, int64_t slot)
+    .cfi_startproc
+.Lenv_lookup_walk:
+    testq %rsi, %rsi
+    jz .Lenv_lookup_done
+    movq ASNIX_ENV_OFF_UP(%rdi), %rdi
+    decq %rsi
+    jmp .Lenv_lookup_walk
+.Lenv_lookup_done:
+    movq ASNIX_ENV_OFF_VALUES(%rdi, %rdx, 8), %rax
+    ret
+    .cfi_endproc
+    .size asnix_env_lookup, . - asnix_env_lookup

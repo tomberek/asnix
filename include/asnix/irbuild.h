@@ -1,0 +1,47 @@
+#ifndef ASNIX_TEST_IRBUILD_H
+#define ASNIX_TEST_IRBUILD_H
+
+#include <stddef.h>
+#include <stdint.h>
+#include "asnix/ir.h"
+
+/* IR-stream builder shared by the M3 test fixtures (tests/ir) and the real
+ * M4 compiler (src/c/compiler.c) -- "append an IrOp, track patch sites" is
+ * the same API either way. */
+
+typedef struct {
+    IrOp *ops;
+    size_t len, cap;
+    int64_t *pool;
+    size_t pool_len, pool_cap;
+} IrBuilder;
+
+IrBuilder *ib_new(void);
+size_t ib_len(IrBuilder *b);
+
+size_t ib_push_int(IrBuilder *b, int64_t v);
+size_t ib_push_true(IrBuilder *b);
+size_t ib_push_false(IrBuilder *b);
+size_t ib_push_null(IrBuilder *b);
+size_t ib_var_ref(IrBuilder *b, int64_t depth, int64_t slot);
+size_t ib_add(IrBuilder *b);
+size_t ib_sub(IrBuilder *b);
+size_t ib_mul(IrBuilder *b);
+size_t ib_if(IrBuilder *b);   /* emits with a placeholder delta; patch via ib_patch_delta */
+size_t ib_jmp(IrBuilder *b);  /* ditto */
+void ib_patch_delta(IrBuilder *b, size_t site, size_t target_idx);
+size_t ib_let(IrBuilder *b, int64_t nslots);
+/* body_prog must come from this same translation's ib_finish() -- its
+ * `pool` travels with the resulting closure (see ASNIX_CLOSURE_OFF_POOL in
+ * ir.h) so a lambda body containing its own nested OP_LAMBDA resolves
+ * against the right constant pool at call time, not the caller's. */
+size_t ib_lambda(IrBuilder *b, int64_t arity, IrProgram *body_prog);
+size_t ib_call(IrBuilder *b, int64_t argc);
+size_t ib_ret(IrBuilder *b);
+size_t ib_halt(IrBuilder *b);
+
+/* Finalizes the builder: runs ir_link() over the accumulated ops in place
+ * and returns an IrProgram ready for asnix_eval(). */
+IrProgram *ib_finish(IrBuilder *b);
+
+#endif /* ASNIX_TEST_IRBUILD_H */
