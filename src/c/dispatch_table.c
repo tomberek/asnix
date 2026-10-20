@@ -28,6 +28,15 @@ extern void asnix_op_mk_list(void);
 extern void asnix_op_mk_attrs(void);
 extern void asnix_op_select(void);
 extern void asnix_op_mk_thunk(void);
+extern void asnix_op_eq(void);
+extern void asnix_op_neq(void);
+extern void asnix_op_lt(void);
+extern void asnix_op_gt(void);
+extern void asnix_op_le(void);
+extern void asnix_op_ge(void);
+extern void asnix_op_not(void);
+extern void asnix_op_update(void);
+extern void asnix_op_assert_fail(void);
 
 void *asnix_handler_table[OP_COUNT] = {
     [OP_PUSH_INT] = (void *)asnix_op_push_int,
@@ -50,6 +59,15 @@ void *asnix_handler_table[OP_COUNT] = {
     [OP_MK_ATTRS] = (void *)asnix_op_mk_attrs,
     [OP_SELECT] = (void *)asnix_op_select,
     [OP_MK_THUNK] = (void *)asnix_op_mk_thunk,
+    [OP_EQ] = (void *)asnix_op_eq,
+    [OP_NEQ] = (void *)asnix_op_neq,
+    [OP_LT] = (void *)asnix_op_lt,
+    [OP_GT] = (void *)asnix_op_gt,
+    [OP_LE] = (void *)asnix_op_le,
+    [OP_GE] = (void *)asnix_op_ge,
+    [OP_NOT] = (void *)asnix_op_not,
+    [OP_UPDATE] = (void *)asnix_op_update,
+    [OP_ASSERT_FAIL] = (void *)asnix_op_assert_fail,
 };
 
 void ir_link(IrOp *ops, size_t n) {

@@ -110,8 +110,76 @@ static void compile_expr(IrBuilder *b, Ast *node, ScopeFrame *scope) {
                 case '+': ib_add(b); return;
                 case '-': ib_sub(b); return;
                 case '*': ib_mul(b); return;
+                case 'e': ib_eq(b); return;
+                case 'n': ib_neq(b); return;
+                case 'l': ib_lt(b); return;
+                case 'g': ib_gt(b); return;
+                case 'L': ib_le(b); return;
+                case 'G': ib_ge(b); return;
+                case 'u': ib_update(b); return;
             }
             return;
+        case AST_AND: {
+            /* Short-circuit, compiled branch-shaped like `if lhs then rhs
+             * else false` (NOT as an eager binop) -- see ir.h's OP_EQ
+             * comment: the untaken side's IR is simply never reached by
+             * the jmp-chain dispatch loop, so it's provably never
+             * evaluated (verified against real nix-instantiate with
+             * `false && (assert false; true)`, see tests/e2e). */
+            compile_expr(b, node->as.logic.lhs, scope);
+            size_t if_site = ib_if(b);
+            compile_expr(b, node->as.logic.rhs, scope);
+            size_t jmp_site = ib_jmp(b);
+            size_t else_idx = ib_len(b);
+            ib_patch_delta(b, if_site, else_idx);
+            ib_push_false(b);
+            size_t end_idx = ib_len(b);
+            ib_patch_delta(b, jmp_site, end_idx);
+            return;
+        }
+        case AST_OR: {
+            /* `if lhs then true else rhs` -- same short-circuit rationale as AST_AND. */
+            compile_expr(b, node->as.logic.lhs, scope);
+            size_t if_site = ib_if(b);
+            ib_push_true(b);
+            size_t jmp_site = ib_jmp(b);
+            size_t else_idx = ib_len(b);
+            ib_patch_delta(b, if_site, else_idx);
+            compile_expr(b, node->as.logic.rhs, scope);
+            size_t end_idx = ib_len(b);
+            ib_patch_delta(b, jmp_site, end_idx);
+            return;
+        }
+        case AST_NOT:
+            compile_expr(b, node->as.not1.operand, scope);
+            ib_not(b);
+            return;
+        case AST_ASSERT: {
+            /* `if cond then body else <fatal, naming the failed cond>` --
+             * same branch shape as AST_IF, reusing OP_IF/OP_JMP wholesale;
+             * only the "else" side differs (OP_ASSERT_FAIL instead of
+             * compiled code), see op_assert.S. */
+            compile_expr(b, node->as.assert1.cond, scope);
+            size_t if_site = ib_if(b);
+            compile_expr(b, node->as.assert1.body, scope);
+            size_t jmp_site = ib_jmp(b);
+            size_t else_idx = ib_len(b);
+            ib_patch_delta(b, if_site, else_idx);
+
+            static const char prefix[] = "asnix: assertion '";
+            static const char suffix[] = "' failed, aborting\n";
+            size_t text_len = node->as.assert1.cond_text_len;
+            size_t total = sizeof(prefix) - 1 + text_len + sizeof(suffix) - 1;
+            char *msg = asnix_arena_alloc(total);
+            memcpy(msg, prefix, sizeof(prefix) - 1);
+            memcpy(msg + sizeof(prefix) - 1, node->as.assert1.cond_text, text_len);
+            memcpy(msg + sizeof(prefix) - 1 + text_len, suffix, sizeof(suffix) - 1);
+            ib_assert_fail(b, msg, total);
+
+            size_t end_idx = ib_len(b);
+            ib_patch_delta(b, jmp_site, end_idx);
+            return;
+        }
         case AST_STRING: {
             size_t len = node->as.string.len;
             void *mem = asnix_arena_alloc(8 + len);

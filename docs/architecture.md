@@ -22,6 +22,7 @@ what's actually implemented and the scope decisions made along the way.
 | M7 — builtins + primop dispatch (`src/c/builtins.c`) | done, **scoped** (see below) |
 | M8 — derivations + store-path hashing + daemon protocol | done, **scoped** (see below): connect/handshake/`IsValidPath` only, no realization |
 | M9 — benchmark harness (`bench/`) | done (see below) |
+| Operators — comparisons, `&&`/`||`/`!`, `assert`, `//` | done, **scoped** (see below) |
 | M10+ | not started |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
@@ -521,6 +522,96 @@ registry doesn't survive that, though the worktree and its completed
 work on disk did) before it had written `bench/README.md` or this
 section — picked up and finished directly rather than re-run from
 scratch, after independently re-verifying its correctness claims.
+
+## Operators — comparisons, `&&`/`||`/`!`, `assert`, `//`
+
+Adds comparison operators (`== != < > <= >=`), short-circuiting booleans
+(`&& || !`), `assert cond; body`, and the attrset update/merge operator
+(`//`), plus real operator precedence for all of the above. Every new
+construct was checked against real `nix-instantiate --eval` (not just
+this project's own hand-written expectations) before being trusted,
+including the precedence-sensitive cases — see below.
+
+- **Precedence** (`src/c/parser.c`): the task brief's own summary table
+  placed unary `!` right next to application (tightest), but that's
+  *not* what real Nix actually does — confirmed directly:
+  `nix-instantiate --eval -E '! 1 + 1'` errors on `2` (the `+` already
+  ran, so `!` grabbed the whole `1 + 1`), while
+  `nix-instantiate --eval -E '! true // {}'` errors on `false` (the `//`
+  did *not* run first, so `!` only grabbed `true`). That pins `!` between
+  `+`/`-` (tighter) and `//` (looser), matching the Nix manual's actual
+  grammar table, not the approximate one in the brief. Implemented
+  precedence, loosest to tightest below `parse_expr`'s keyword forms
+  (`let`/`if`/lambda/`assert`): `||` (left-assoc) → `&&` (left-assoc) →
+  `==`/`!=` (non-assoc, single occurrence — chaining is a parse error in
+  real Nix too: `1 < 2 < 3` errors there) → `<`/`>`/`<=`/`>=` (non-assoc)
+  → `//` (right-assoc, chainable) → `!` (prefix) → `+`/`-` (existing) →
+  `*` (existing) → application (existing). All of these orderings were
+  independently confirmed against `nix-instantiate`, not just the one
+  example in the task brief (`1 + 2 == 3 && true`).
+- **`&&`/`||` are compiled branch-shaped, not as eager binops**
+  (`compiler.c`'s `AST_AND`/`AST_OR` cases): `a && b` lowers to `if a
+  then b else false`, `a || b` lowers to `if a then true else b`, reusing
+  `OP_IF`/`OP_JMP` wholesale — the untaken side's IR is simply never
+  reached by the jmp-chain dispatch loop, so short-circuiting is a direct
+  consequence of the control flow, not a separate thing to get right.
+  Verified real short-circuiting (not just the right *value*) by
+  confirming the untaken side is never *evaluated*:
+  `false && (assert false; true)` prints `false` without error (same
+  check with real Nix agrees), and the same expression with `true &&`
+  instead does error in both this implementation and real Nix.
+- **`assert cond; body`** (`AST_ASSERT`): lowers to `if cond then body
+  else <OP_ASSERT_FAIL>` (new op, `src/asm/ops/op_assert.S`), reusing the
+  same `OP_IF`/`OP_JMP` shape as `AST_IF`/`AST_AND`/`AST_OR` above. The
+  failure message names the actual failed condition's source text
+  (`asnix: assertion '<cond>' failed, aborting`) — the lexer now records
+  every token's starting byte offset (`Token.pos`, previously only
+  `TOK_IDENT`/`TOK_STRING` had a position at all), so the parser can
+  slice out the exact source span between `assert` and `;` and the
+  compiler bakes it into a pool-stashed message string at compile time
+  (arena-allocated, same never-free convention as string literals).
+- **`==`/`!=` scope cut** (`src/asm/ops/op_cmp.S`): collapses to plain
+  64-bit raw equality on the two `Value` words. This is exact for
+  `TAG_INT` (numeric equality) and `TAG_IMM` (true/false/null compared by
+  subtag), and falls back to **pointer identity** for every other tag
+  (strings, lists, attrsets, closures, thunks, primops) — because the
+  tag bits are literally part of the raw word, two values with different
+  tags are automatically unequal, and two values with the same non-
+  INT/IMM tag are equal here iff they're the same heap object. Real Nix
+  does deep structural equality for lists/attrsets and content equality
+  for strings (confirmed: `"a" == "a"` and `{} == {}` are both `true`
+  there); this implementation says `false` for both, since two separate
+  string/attrset literals are two separate arena allocations. This is a
+  deliberate, documented scope cut (deep structural equality on
+  recursive aggregates is a rabbit hole not attempted here), not a bug —
+  but it is a real behavioral difference from real Nix worth knowing
+  about if this is ever extended.
+- **`<`/`>`/`<=`/`>=` scope cut**: `TAG_INT` operands only; anything else
+  (including two strings, which real Nix *does* support ordering on) is
+  a fatal type error. Matches the task's explicit scope (no string/list/
+  attrset comparison support exists yet in this codebase at all).
+- **`//` update/merge** (`src/c/attrs_update.c`'s `asnix_attrs_update`,
+  called from `src/asm/ops/op_update.S`): a plain two-pointer merge of
+  the two (already sorted-by-symbol-id) `Attrs` arrays, right-biased on
+  a duplicate key — implemented in C rather than hand-rolled asm, since
+  it's not hot-path code and a linear merge is easy to get right in C
+  (same rationale `builtins.c` already uses for `toString`/`typeOf`).
+  Neither operand is forced or mutated; entries (including any still-
+  unforced `Thunk`) are copied through verbatim, so `//` itself stays
+  lazy per-key, matching real Nix.
+- **Not touched**: `src/c/codegen.c` (the M4.5 native compiler) — per
+  this project's standing scope cut, every new op in this slice is
+  interpreter-only. The four new `Ast` kinds (`AST_AND`/`AST_OR`/
+  `AST_NOT`/`AST_ASSERT`) are simply never passed to `codegen_expr` in
+  practice (nothing in `main.c` invokes the native path at all), so this
+  is intentionally left as an unhandled-`switch`-case compiler warning
+  rather than adding dead rejection cases to a file this project's scope
+  rules say not to touch.
+- **Validated**: `tests/e2e/ops_*.nix` + `.expected` pairs (wired into
+  `make test-e2e`), each independently checked against real
+  `nix-instantiate --eval` on the equivalent source during development
+  (see the precedence bullet above for the specific disambiguating
+  expressions used).
 
 ## Known bugs found and fixed during implementation (worth knowing about)
 
