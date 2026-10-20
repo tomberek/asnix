@@ -1,4 +1,5 @@
 /asnix
+/.claude
 *.o
 *.d
 *.a
@@ -13,6 +14,8 @@ tests/ir/test_m3_fixtures
 tests/ir/test_m45_codegen
 tests/ir/test_m5_fixtures
 tests/c/test_symtab
+tests/c/test_store_path
+tests/c/test_aterm
 tests/ir/test_m6_fixtures
 tests/ir/test_m7_fixtures
 tests/c/test_hash_shim

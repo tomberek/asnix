@@ -20,7 +20,8 @@ what's actually implemented and the scope decisions made along the way.
 | M5 — strings/lists/attrsets/symbol interning | done (interpreter path only; see below) |
 | M6 — lazy `let`/attrset bindings via thunks, blackholing | done, **scoped** (see below) |
 | M7 — builtins + primop dispatch (`src/c/builtins.c`) | done, **scoped** (see below) |
-| M8 — derivations | `builtins.hashString` slice done, **scoped** (see below); rest not started |
+| M8 — derivations + store-path hashing + daemon protocol | **in progress** (see below): `hashString`, `base32`/`store_path`/`aterm` done; `derivation {...}` wiring + daemon protocol not yet |
+| M9+ | not started |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
 
@@ -219,14 +220,24 @@ passed around, etc., same as a closure).
   `OP_CALL`'s primop branch (arg layout, arity checking, result handling)
   independent of any real builtin's logic.
 
-## M8 scope notes (hashString slice only)
+## M8 progress notes (in progress)
+
+Store-path hashing and derivation construction, bit-exact-compatible with
+real Nix — a much bigger jump than M0-M7 (external, precisely-specified
+binary format and hash algorithm, not just this project's own internal
+conventions), so each piece is being verified against real
+`nix-instantiate` output *before* being trusted, same discipline as the
+nix-conformance check above. Built in parallel by two independent
+subagents (`hashString`/`hash_shim`, and research into the exact ATerm
+`.drv` format) plus direct work on `base32`/`store_path`/`aterm`.
+
+### `builtins.hashString` (done)
 
 Adds `builtins.hashString algo s` (md5/sha1/sha256/sha512, hex output only
 — real Nix's `hashString` itself never produces base32/base64/SRI, so
-that's not a scope cut, just matching upstream). The rest of M8
-(derivation building/the store protocol) is not started; this slice was
-pulled forward because it's the one piece of M8 the dlopen-shim pattern
-flagged as deferred in M7's own scope notes was actually needed for.
+that's not a scope cut, just matching upstream). This slice was pulled
+forward because it's the one piece of M8 the dlopen-shim pattern flagged
+as deferred in M7's own scope notes was actually needed for.
 
 - **`src/c/hash_shim.{h,c}`**: `dlopen`/`dlsym` loads libcrypto at first
   use rather than linking it at build time, exactly like
@@ -276,6 +287,51 @@ flagged as deferred in M7's own scope notes was actually needed for.
   strings are never null-terminated — see `heap.h`). End-to-end fixtures
   (`tests/e2e/m8_hashstring_*.nix`) cover all four algorithms through the
   real lexer/parser/compiler/evaluator path.
+
+### Store-path hashing + ATerm serialization (done; not yet wired to a builtin)
+
+- **`src/c/base32.{h,c}`**: Nix's own base32 variant (alphabet
+  `0123456789abcdfghijklmnpqrsvwxyz`, non-standard bit-packing), ported
+  directly from `~/nix/src/libutil/base-nix-32.cc`'s `BaseNix32::encode`.
+- **`src/c/store_path.{h,c}`**: `makeStorePath`'s algorithm, ported from
+  `~/nix/src/libstore/store-dir-config.cc`: assemble
+  `"type:hashWithAlgoPrefix:storeDir:name"`, SHA-256 it, XOR-fold
+  (`compressHash`) the 32-byte digest down to 20 bytes, base32-encode,
+  format as `/nix/store/<32-char-hash>-<name>`. Deliberately has **no
+  crypto dependency of its own** — computing the SHA-256 digests is the
+  *caller's* job (now that `src/c/hash_shim.c` exists, that's
+  `asnix_hash_sha256`), so this module stays pure byte/string
+  manipulation, tested against hardcoded known-digest bytes.
+- **`src/c/aterm.{h,c}`**: `.drv` ATerm text serialization, scoped to a
+  single output named `"out"`, zero input derivations, zero input sources
+  (derivation-to-derivation dependencies need Nix's string-context
+  tracking, which this project doesn't have yet). Ported from
+  `~/nix/src/libstore/derivation/aterm.cc`'s escaping rule (only `\n \r \t
+  \" \\` are ever escaped — confirmed directly in that source, not
+  guessed) and `~/nix/src/libstore/derivation/masked.cc`'s
+  `hashDerivationModulo` shape (serialize once with the output path
+  blanked to compute the output's content hash, then once more with the
+  real path filled in for the derivation's own hash).
+- **Verified against real Nix before writing any code, twice over**: (1)
+  hand-derived `makeStorePath` from the C++ source and caught a real
+  discrepancy immediately by cross-checking — its hash argument is
+  `hash.to_string(HashFormat::Base16, /*includeAlgo=*/true)`, i.e.
+  prefixed `"sha256:"`, not the bare hex digest a first reading suggests;
+  confirmed by reproducing `builtins.toFile "foo.txt" "hello"`'s real
+  store path (via local `nix-instantiate`) in a throwaway Python script
+  before porting anything to C — `tests/c/test_store_path.c` keeps 4 such
+  verified (name, content) → real-store-path cases as its oracle. (2) The
+  full derivation-hashing pipeline (mask → hash → `makeOutputPath` →
+  unmask → hash → `makeStorePath` for the `.drv` itself) was independently
+  reproduced byte-for-byte against numtide/nix-conformance's real
+  `ia-advanced-attributes-defaults.drv` file *and* a second, freshly-run
+  `nix-instantiate -E 'derivation { name = "asnix-test"; ... }'` — both in
+  Python first, matching exactly, before writing `aterm.c`;
+  `tests/c/test_aterm.c` keeps both as its oracle.
+- **Next**: wire `base32`/`store_path`/`aterm`/`hash_shim` together behind
+  a minimal `derivation {...}` builtin (single fixed output, no input
+  derivations — see the worked-example research above for the exact
+  scope ordering), then `builtins.toFile`.
 
 ## Checked against numtide/nix-conformance
 
