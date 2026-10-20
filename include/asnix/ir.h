@@ -105,6 +105,10 @@ enum {
     OP_MK_ATTRS,   /* M5: a = count, b = pool index of `count` sorted symbol ids */
     OP_SELECT,     /* M5: a = symbol id; pops an Attrs, pushes the matching value or aborts */
     OP_MK_THUNK,   /* M6: b = pool index of {body IrOp*, body pool} -- see OP_LAMBDA's note */
+    OP_STR_CONCAT, /* strings: a = count; pops `count` values (reverse push order like
+                    * OP_MK_LIST), coerces each to a string (same rules as
+                    * builtins.toString), concatenates them in order, pushes one
+                    * String -- the runtime half of string interpolation. */
     OP_COUNT
 };
 

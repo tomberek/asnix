@@ -115,6 +115,10 @@ size_t ib_mk_thunk(IrBuilder *b, IrProgram *body_prog) {
     return ib_emit(b, OP_MK_THUNK, 0, (int64_t)pool_idx);
 }
 
+size_t ib_str_concat(IrBuilder *b, int64_t count) {
+    return ib_emit(b, OP_STR_CONCAT, count, 0);
+}
+
 IrProgram *ib_finish(IrBuilder *b) {
     ir_link(b->ops, b->len);
     IrProgram *prog = calloc(1, sizeof(IrProgram));

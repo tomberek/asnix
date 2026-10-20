@@ -22,6 +22,7 @@ what's actually implemented and the scope decisions made along the way.
 | M7 — builtins + primop dispatch (`src/c/builtins.c`) | done, **scoped** (see below) |
 | M8 — derivations + store-path hashing + daemon protocol | done, **scoped** (see below): connect/handshake/`IsValidPath` only, no realization |
 | M9 — benchmark harness (`bench/`) | done (see below) |
+| Strings — `"${expr}"` interpolation, `''...''` multi-line strings | done (see below) |
 | M10+ | not started |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
@@ -121,8 +122,9 @@ it is future work, not attempted here).
   arguments are parsed at "atom plus postfix `.attr` chain" precedence
   (`parse_select`), not full `expr` — matching real Nix, where `[ f x ]` is
   a 2-element list and a function call inside a list needs parens:
-  `[ (f x) ]`. String literals are plain quoted runs with no escapes or
-  interpolation yet.
+  `[ (f x) ]`. String literals were plain quoted runs with no escapes or
+  interpolation at M5 time — superseded by the Strings milestone below
+  (escapes, `"${expr}"` interpolation, and `''...''` multi-line strings).
 
 ## M6 scope notes
 
@@ -434,6 +436,95 @@ UI to forward them to yet).
   `BuildPaths`/`AddToStore` call (closing the loop from "compute a store
   path" to "the path actually exists on disk") is future work.
 
+## Strings scope notes: interpolation + multi-line strings
+
+Adds `"foo ${expr} bar"` string interpolation and `''...''` multi-line
+("indented") strings to the lexer/parser/compiler/interpreter path (same
+M4.5-codegen-excluded scope as every other M5+ feature — `codegen.c`
+rejects `AST_STRING` unconditionally regardless of whether it has
+interpolated parts).
+
+- **Lexer** (`src/c/lexer.c`): `asnix_lex` is no longer a single flat
+  per-character scan. It now carries an explicit mode stack (`MODE_NORMAL`/
+  `MODE_STRING`/`MODE_ISTRING`), a from-scratch equivalent of real Nix's
+  flex `%option stack`/`PUSH_STATE`/`POP_STATE` mechanism (`~/nix`'s
+  `src/libexpr/lexer.l`): entering a string pushes `STRING`/`ISTRING`;
+  every `"${"` *and* every plain `"{"` pushes `NORMAL` (the plain-`{`
+  case matters because `${ { a = 1; }.a }` needs the inner attrset's own
+  `"}"` to pop back to `NORMAL`, not prematurely resume string lexing);
+  every `"}"` pops one level. Only when a pop reveals `STRING`/`ISTRING`
+  underneath does that `"}"` actually mean "resume string-content
+  lexing" — verified end-to-end with `tests/e2e/str_interp_nested.nix`
+  and a hand-checked `"${ { a = 1; }.a }"` case (nested-brace handling)
+  during development. A string literal is no longer one flat `TOK_STRING`;
+  it's `TOK_STR_START`/`TOK_ISTR_START`, then any mix of `TOK_STR_PART`/
+  `TOK_ISTR_PART` (literal chunks, escapes already decoded) and
+  `TOK_DOLLAR_LBRACE ... TOK_RBRACE` (an interpolated expression, parsed
+  at full `expr` precedence via an ordinary recursive call into the
+  parser — `TOK_RBRACE` is reused as-is, not a separate token kind, since
+  the lexer's mode stack already disambiguates "closes an interpolation"
+  from "closes a nested attrset"), then `TOK_STR_END`/`TOK_ISTR_END`.
+- **Escapes** (`"..."`, verified against real `nix-instantiate --eval`):
+  `\n \r \t` map to the control character, any other `\X` (including
+  `\" \\ \$`) passes through as the literal `X` — and a literal,
+  un-escaped newline inside `"..."` is allowed verbatim (confirmed with
+  real Nix; a prior M5 version of this lexer rejected it, see Known Bugs
+  #6 below).
+- **Indented-string escapes (`''...''`)**, also verified against real
+  `nix-instantiate --eval`: `''$` → literal `"$"` (there is no separate
+  `"''${"` rule — writing `''${` in source is just this `''$` escape
+  immediately followed by an ordinary, non-special `"{"` character,
+  which is how it reads as a literal `"${"` without starting an
+  interpolation); `'''` → literal `"''"`; `''\<c>` → one escaped
+  character with the same decode rules as `"..."`; a bare `''` not
+  followed by `'`, `$`, or `\` always closes the string (so `''''` — four
+  quotes — decodes as the 3-quote escape `"''"` plus one leftover bare
+  quote `"'"`, i.e. `"'''"`, *not* two quotes; verified directly, since
+  this was genuinely surprising on first read of the grammar). The
+  opening `''` also swallows an immediately-following, optionally
+  space-padded newline (`\'\'(\ *\n)?` in real Nix's grammar) — consumed
+  entirely or not at all, never partially.
+- **Indentation stripping** (`src/c/parser.c`'s `strip_indentation`):
+  ported line-for-line from real Nix's `ParserState::stripIndentation`
+  (`~/nix`'s `src/libexpr/include/nix/expr/parser-state.hh`) rather than
+  reimplemented from a description, specifically because its two
+  subtleties are easy to get wrong by guessing: (1) a line that's ended by
+  an escape sequence or an interpolation (not just a raw newline) still
+  ends the "start of line" run for indentation-counting purposes, exactly
+  like a real content character would; (2) the "drop a trailing
+  whitespace-only line" rule applies only to the literal's overall *last*
+  raw part (upstream's `n == 1` check is "parts remaining including this
+  one", true exactly on the last loop iteration — not "the literal has
+  exactly one part total", which is a different, wrong condition this
+  implementation's first draft briefly had and fixed before landing).
+  Deliberate, documented scope cut vs. real Nix's lexer: a lone `'`
+  immediately followed by `$` is treated here as two ordinary content
+  characters (real Nix special-cases it as an indentation-counting
+  boundary, same as an escape). This only affects the indentation
+  *counting* boundary in the vanishingly rare case of a leading `'$` run
+  of whitespace, never any produced string's actual bytes — not exercised
+  by anything in `tests/e2e`, not worth the extra complexity here.
+- **Runtime concatenation**: a new `OP_STR_CONCAT` op (`a` = count; same
+  pop-`N`-reverse-order convention as `OP_MK_LIST`/`OP_MK_ATTRS`) and
+  handler (`src/asm/ops/op_str_concat.S`) call a new C helper,
+  `asnix_concat_strings` (`src/c/value_util.c`), with a pointer straight
+  into VALSTACK — mirroring `OP_MK_LIST`'s shape exactly, including which
+  registers need manual save/restore around the `call` (`%rsi`/`%rdi` via
+  `%rbp`/`%r15`; `%r12`/`%r13`/`%r14` are ordinary SysV callee-saved
+  registers and need no special handling). The **compiler** (`compiler.c`'s
+  `AST_STRING` case) only emits this path when at least one part is an
+  interpolated expression; an all-literal string (the common case,
+  including every plain `"..."`/`''...''` literal with no `${...}` at
+  all) still folds to a single compile-time constant exactly like
+  pre-interpolation M5 did — `OP_STR_CONCAT` is pure overhead-avoidance,
+  never required for correctness on that path. Validated with hand-fed
+  IR (`tests/ir/test_strings_fixtures.c`) before the parser/compiler
+  changes landed, same bug-isolation discipline as every other milestone.
+- **String interpolation's value coercion is intentionally *not*
+  `toString`'s** — this is the one place this slice's own "verify
+  against real Nix before trusting it" discipline caught a real design
+  mistake in the task's own starting assumption. See Known Bugs #7 below.
+
 ## Checked against numtide/nix-conformance
 
 [numtide/nix-conformance](https://github.com/numtide/nix-conformance) is
@@ -576,3 +667,43 @@ scratch, after independently re-verifying its correctness claims.
    M8 scope notes above have the full writeup); fixed by adding a single
    `compute_store_path()` helper so the two-step composition only exists
    in one place.
+6. **`asnix_coerce_to_string` (`builtins.toString`, M7) stringified
+   booleans wrong** (found while adding string-interpolation coercion,
+   see above): it returned `"true"`/`"false"` for `true`/`false`. Real
+   Nix's `toString true`/`toString false` are `"1"`/`""` (confirmed
+   directly: `nix-instantiate --eval -E 'builtins.toString true'` →
+   `"1"`; `builtins.toString false` and `builtins.toString null` both →
+   `""`). This had shipped since M7 with no fixture catching it (no
+   existing test exercised `toString` on a bool or `null`). Fixed in
+   `value_util.c`'s `asnix_coerce_to_string`; also fixed-forward into the
+   new `tests/ir/test_strings_fixtures.c`/`tests/e2e/
+   str_interp_tostring_bool_null.nix` so it stays covered.
+7. **String interpolation is not `toString`** (found the same way, while
+   implementing `OP_STR_CONCAT`): the task's own starting description
+   ("coerce each interpolated expression's value to a string — reuse
+   `asnix_coerce_to_string`") turns out to not match real Nix. Verified
+   directly: `nix-instantiate --eval -E '"${7}"'`,
+   `'"${true}"'`, and `'"${null}"'` **all fail** —
+   `error: cannot coerce an integer/a Boolean/null to a string` — even
+   though `builtins.toString 7`/`true`/`null` all succeed. Real Nix's
+   `EvalState::coerceToString` has a `coerceMore` flag; `toString` passes
+   `true`, plain `"${...}"`/`''${...}''` interpolation passes `false` —
+   only strings (and paths, and attrsets with `__toString`/`outPath`,
+   neither of which this project has yet) are accepted without it.
+   Implemented as a separate, stricter function
+   (`value_util.c`'s file-local `coerce_to_string_for_interp`, used only
+   by `asnix_concat_strings`) rather than changing
+   `asnix_coerce_to_string` itself, which stays exactly as `toString`
+   needs it. An interpolated non-string value needs an explicit
+   `builtins.toString` in the source, exactly like real Nix — confirmed
+   this asnix now also rejects `"${7}"`/`"${true}"`/`"${null}"`/
+   `"${x: x}"` (a bare lambda) with a fatal error, matching real Nix's
+   behavior (including, for the lambda case, nix-conformance's
+   `eval-fail-bad-string-interpolation-1`/`-3` fixtures, which were not
+   added to `tests/conformance/` since asnix has no stderr/exit-code
+   comparison harness yet — only the `eval-okay-*` stdout-match shape;
+   checked by hand instead). Covered by
+   `tests/ir/test_strings_fixtures.c`'s `fixture_concat_rejects_raw_int`
+   (via `fork()`, since the rejection path is a process-exit fatal error
+   like every other "cannot coerce" site in this project, not a
+   catchable exception).

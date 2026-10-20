@@ -56,6 +56,10 @@ size_t ib_select(IrBuilder *b, uint32_t sym);
  * runs -- same pool-travels-with-it rationale as ib_lambda. */
 size_t ib_mk_thunk(IrBuilder *b, IrProgram *body_prog);
 
+/* Pops `count` values (reverse push order) and pushes one concatenated
+ * String -- see OP_STR_CONCAT in ir.h. */
+size_t ib_str_concat(IrBuilder *b, int64_t count);
+
 /* Finalizes the builder: runs ir_link() over the accumulated ops in place
  * and returns an IrProgram ready for asnix_eval(). */
 IrProgram *ib_finish(IrBuilder *b);

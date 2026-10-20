@@ -2,6 +2,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 typedef struct {
     Ast **items;
@@ -30,6 +31,158 @@ static void bindingvec_push(BindingVec *v, AstBinding item) {
 }
 
 typedef struct {
+    AstStringPart *items;
+    size_t len, cap;
+} PartVec;
+
+static void partvec_push(PartVec *v, AstStringPart item) {
+    if (v->len == v->cap) {
+        v->cap = v->cap ? v->cap * 2 : 8;
+        v->items = realloc(v->items, v->cap * sizeof(AstStringPart));
+    }
+    v->items[v->len++] = item;
+}
+
+/* Raw piece of a '' ... '' literal as collected straight off the lexer,
+ * before indentation stripping -- same shape as AstStringPart plus the
+ * per-literal-chunk `has_indentation` flag (see lexer.h's TOK_ISTR_PART
+ * comment). Kept separate from AstStringPart because that flag has no
+ * meaning once stripping is done. */
+typedef struct {
+    int is_expr;
+    const char *text;
+    size_t text_len;
+    int has_indentation;
+    Ast *expr;
+} RawIndPart;
+
+typedef struct {
+    RawIndPart *items;
+    size_t len, cap;
+} RawIndVec;
+
+static void rawind_push(RawIndVec *v, RawIndPart item) {
+    if (v->len == v->cap) {
+        v->cap = v->cap ? v->cap * 2 : 8;
+        v->items = realloc(v->items, v->cap * sizeof(RawIndPart));
+    }
+    v->items[v->len++] = item;
+}
+
+/* Ported directly from real Nix's ParserState::stripIndentation
+ * (~/nix's src/libexpr/include/nix/expr/parser-state.hh), verified against
+ * `nix-instantiate --eval` for plain indentation, varying per-line
+ * indentation, and an all-whitespace trailing line (see tests/e2e). Two
+ * passes over the raw parts: (1) find the minimum leading-space count
+ * across every content line (a line ended by an escape or an
+ * interpolation, not just a raw newline, still ends the "start of line"
+ * run -- matching real Nix's `!str->hasIndentation` / expr handling); (2)
+ * strip exactly that many leading spaces from every content line, and (for
+ * a literal's very last raw part only) drop a final line that is entirely
+ * spaces. */
+static AstStringPart *strip_indentation(RawIndVec *raw, size_t *out_count) {
+    size_t n = raw->len;
+    if (n == 0) {
+        AstStringPart *parts = malloc(sizeof(AstStringPart));
+        parts[0] = (AstStringPart){ .is_expr = 0, .text = "", .text_len = 0 };
+        *out_count = 1;
+        return parts;
+    }
+
+    int at_start = 1;
+    size_t min_indent = 1000000;
+    size_t cur_indent = 0;
+    for (size_t idx = 0; idx < n; idx++) {
+        RawIndPart *p = &raw->items[idx];
+        if (p->is_expr || !p->has_indentation) {
+            if (at_start) {
+                at_start = 0;
+                if (cur_indent < min_indent) min_indent = cur_indent;
+            }
+            continue;
+        }
+        for (size_t j = 0; j < p->text_len; j++) {
+            char ch = p->text[j];
+            if (at_start) {
+                if (ch == ' ') cur_indent++;
+                else if (ch == '\n') cur_indent = 0;
+                else {
+                    at_start = 0;
+                    if (cur_indent < min_indent) min_indent = cur_indent;
+                }
+            } else if (ch == '\n') {
+                at_start = 1;
+                cur_indent = 0;
+            }
+        }
+    }
+
+    AstStringPart *out = malloc(n * sizeof(AstStringPart)); /* upper bound: at most one output per input part */
+    size_t result_count = 0;
+    at_start = 1;
+    size_t cur_dropped = 0;
+    for (size_t idx = 0; idx < n; idx++) {
+        RawIndPart *p = &raw->items[idx];
+        if (p->is_expr) {
+            at_start = 0;
+            cur_dropped = 0;
+            out[result_count++] = (AstStringPart){ .is_expr = 1, .expr = p->expr };
+            continue;
+        }
+
+        char *s2 = malloc(p->text_len ? p->text_len : 1);
+        size_t s2len = 0;
+        for (size_t j = 0; j < p->text_len; j++) {
+            char ch = p->text[j];
+            if (at_start) {
+                if (ch == ' ') {
+                    if (cur_dropped++ >= min_indent) s2[s2len++] = ch;
+                } else if (ch == '\n') {
+                    cur_dropped = 0;
+                    s2[s2len++] = ch;
+                } else {
+                    at_start = 0;
+                    cur_dropped = 0;
+                    s2[s2len++] = ch;
+                }
+            } else {
+                s2[s2len++] = ch;
+                if (ch == '\n') at_start = 1;
+            }
+        }
+
+        /* Drop a final line that's empty-or-spaces-only, but only for the
+         * literal's overall last raw part (matches upstream's `n == 1`
+         * check, where its `n` is "parts remaining including this one",
+         * i.e. true exactly on the last loop iteration). */
+        if (idx == n - 1) {
+            size_t last_nl = (size_t)-1;
+            for (size_t k = 0; k < s2len; k++) if (s2[k] == '\n') last_nl = k;
+            if (last_nl != (size_t)-1) {
+                int all_spaces_after = 1;
+                for (size_t k = last_nl + 1; k < s2len; k++) {
+                    if (s2[k] != ' ') { all_spaces_after = 0; break; }
+                }
+                if (all_spaces_after) s2len = last_nl + 1;
+            }
+        }
+
+        if (s2len > 0) {
+            out[result_count++] = (AstStringPart){ .is_expr = 0, .text = s2, .text_len = s2len };
+        } else {
+            free(s2);
+        }
+    }
+
+    if (result_count == 0) {
+        out[0] = (AstStringPart){ .is_expr = 0, .text = "", .text_len = 0 };
+        result_count = 1;
+    }
+    *out_count = result_count;
+    return out;
+}
+
+typedef struct {
     Token *toks;
     size_t pos;
 } Parser;
@@ -55,7 +208,8 @@ static Token *expect(Parser *p, TokKind kind, const char *what) {
 
 static int starts_atom(TokKind k) {
     return k == TOK_INT || k == TOK_IDENT || k == TOK_TRUE || k == TOK_FALSE || k == TOK_NULL ||
-           k == TOK_LPAREN || k == TOK_STRING || k == TOK_LBRACKET || k == TOK_LBRACE;
+           k == TOK_LPAREN || k == TOK_STR_START || k == TOK_ISTR_START || k == TOK_LBRACKET ||
+           k == TOK_LBRACE;
 }
 
 static Ast *parse_expr(Parser *p);
@@ -65,6 +219,72 @@ static Ast *parse_expr(Parser *p);
  * `expr` -- matching real Nix, where `[ f x ]` is a 2-element list and
  * putting a function call in a list needs parens: `[ (f x) ]`. */
 static Ast *parse_select(Parser *p);
+
+/* "foo ${expr} bar": zero or more TOK_STR_PART literal chunks interleaved
+ * with TOK_DOLLAR_LBRACE ... TOK_RBRACE interpolated expressions, parsed
+ * at full `expr` precedence (so e.g. `"${a} ${b}"` or `"${if c then x else
+ * y}"` both just work -- the lexer's mode stack is what makes re-entering
+ * parse_expr here safe, see lexer.c). */
+static Ast *parse_dquote_string(Parser *p) {
+    advance(p); /* TOK_STR_START */
+    PartVec parts = { 0 };
+    while (cur(p)->kind != TOK_STR_END) {
+        if (cur(p)->kind == TOK_STR_PART) {
+            Token *t = cur(p);
+            partvec_push(&parts, (AstStringPart){ .is_expr = 0, .text = t->start, .text_len = t->len });
+            advance(p);
+        } else if (cur(p)->kind == TOK_DOLLAR_LBRACE) {
+            advance(p);
+            Ast *e = parse_expr(p);
+            expect(p, TOK_RBRACE, "'}' closing a string interpolation");
+            partvec_push(&parts, (AstStringPart){ .is_expr = 1, .expr = e });
+        } else {
+            fprintf(stderr, "asnix: parse error: malformed string literal\n");
+            exit(1);
+        }
+    }
+    advance(p); /* TOK_STR_END */
+    Ast *n = asnix_ast_new(AST_STRING);
+    n->as.string.parts = parts.items;
+    n->as.string.count = parts.len;
+    return n;
+}
+
+/* '' ... '' indented string: same interpolation shape as above, but the
+ * literal chunks are raw (un-indentation-stripped) and get run through
+ * strip_indentation() once the whole literal is collected -- see that
+ * function's comment for why this has to happen only after collecting
+ * every part (the minimum indentation is computed across ALL of them). */
+static Ast *parse_indented_string(Parser *p) {
+    advance(p); /* TOK_ISTR_START */
+    RawIndVec raw = { 0 };
+    while (cur(p)->kind != TOK_ISTR_END) {
+        if (cur(p)->kind == TOK_ISTR_PART) {
+            Token *t = cur(p);
+            rawind_push(&raw, (RawIndPart){ .is_expr = 0, .text = t->start, .text_len = t->len,
+                                             .has_indentation = t->istr_has_indentation });
+            advance(p);
+        } else if (cur(p)->kind == TOK_DOLLAR_LBRACE) {
+            advance(p);
+            Ast *e = parse_expr(p);
+            expect(p, TOK_RBRACE, "'}' closing a string interpolation");
+            rawind_push(&raw, (RawIndPart){ .is_expr = 1, .expr = e });
+        } else {
+            fprintf(stderr, "asnix: parse error: malformed indented string literal\n");
+            exit(1);
+        }
+    }
+    advance(p); /* TOK_ISTR_END */
+
+    size_t count;
+    AstStringPart *parts = strip_indentation(&raw, &count);
+    free(raw.items);
+
+    Ast *n = asnix_ast_new(AST_STRING);
+    n->as.string.parts = parts;
+    n->as.string.count = count;
+    return n;
+}
 
 static Ast *parse_atom(Parser *p) {
     Token *t = cur(p);
@@ -91,13 +311,10 @@ static Ast *parse_atom(Parser *p) {
             advance(p);
             return asnix_ast_new(AST_NULL);
         }
-        case TOK_STRING: {
-            advance(p);
-            Ast *n = asnix_ast_new(AST_STRING);
-            n->as.string.text = t->start;
-            n->as.string.len = t->len;
-            return n;
-        }
+        case TOK_STR_START:
+            return parse_dquote_string(p);
+        case TOK_ISTR_START:
+            return parse_indented_string(p);
         case TOK_IDENT: {
             advance(p);
             Ast *n = asnix_ast_new(AST_VAR);
