@@ -50,6 +50,7 @@ typedef enum {
     TOK_BANG,    /* ! */
     TOK_SLASHSLASH, /* // */
     TOK_ARROW,   /* -> (logical implication) */
+    TOK_PLUSPLUS, /* ++ (list concatenation) */
     /* Strings: "..." and ''...'' no longer lex to one flat TOK_STRING --
      * "${" inside either kind re-enters normal expression lexing until the
      * matching "}" (TOK_RBRACE, reused -- see asnix_lex's mode-stack

@@ -505,6 +505,7 @@ Token *asnix_lex(const char *src, size_t *out_count) {
         else if (c == '|' && src[i + 1] == '|') { kind = TOK_OROR; width = 2; }
         else if (c == '/' && src[i + 1] == '/') { kind = TOK_SLASHSLASH; width = 2; }
         else if (c == '-' && src[i + 1] == '>') { kind = TOK_ARROW; width = 2; }
+        else if (c == '+' && src[i + 1] == '+') { kind = TOK_PLUSPLUS; width = 2; }
         else {
             switch (c) {
                 case '+': kind = TOK_PLUS; break;

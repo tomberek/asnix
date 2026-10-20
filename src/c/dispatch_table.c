@@ -48,6 +48,7 @@ extern void asnix_op_has_attr(void);
 extern void asnix_op_check_formals(void);
 extern void asnix_op_select_or(void);
 extern void asnix_op_select_dynamic(void);
+extern void asnix_op_concat(void);
 
 void *asnix_handler_table[OP_COUNT] = {
     [OP_PUSH_INT] = (void *)asnix_op_push_int,
@@ -90,6 +91,7 @@ void *asnix_handler_table[OP_COUNT] = {
     [OP_CHECK_FORMALS] = (void *)asnix_op_check_formals,
     [OP_SELECT_OR] = (void *)asnix_op_select_or,
     [OP_SELECT_DYNAMIC] = (void *)asnix_op_select_dynamic,
+    [OP_CONCAT] = (void *)asnix_op_concat,
 };
 
 void ir_link(IrOp *ops, size_t n) {

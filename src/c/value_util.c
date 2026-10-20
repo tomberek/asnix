@@ -171,6 +171,33 @@ Value asnix_add_values(Value lhs, Value rhs) {
     return result;
 }
 
+Value asnix_concat_lists(Value lhs, Value rhs) {
+    if (asnix_tag_of(lhs) != ASNIX_TAG_LIST) {
+        fprintf(stderr, "asnix: expected a list but found a non-list value (lhs of '++')\n");
+        exit(1);
+    }
+    if (asnix_tag_of(rhs) != ASNIX_TAG_LIST) {
+        fprintf(stderr, "asnix: expected a list but found a non-list value (rhs of '++')\n");
+        exit(1);
+    }
+    const char *lbase = (const char *)(uintptr_t)(lhs.raw & ~(uint64_t)ASNIX_TAG_MASK);
+    const char *rbase = (const char *)(uintptr_t)(rhs.raw & ~(uint64_t)ASNIX_TAG_MASK);
+    int64_t lcount = *(const int64_t *)(lbase + ASNIX_LIST_OFF_COUNT);
+    int64_t rcount = *(const int64_t *)(rbase + ASNIX_LIST_OFF_COUNT);
+    int64_t total = lcount + rcount;
+
+    void *mem = asnix_arena_alloc(8 + (uint64_t)total * sizeof(Value));
+    *(int64_t *)((char *)mem + ASNIX_LIST_OFF_COUNT) = total;
+    Value *out = (Value *)((char *)mem + ASNIX_LIST_OFF_ELEMS);
+    if (lcount > 0) {
+        memcpy(out, lbase + ASNIX_LIST_OFF_ELEMS, (size_t)lcount * sizeof(Value));
+    }
+    if (rcount > 0) {
+        memcpy(out + lcount, rbase + ASNIX_LIST_OFF_ELEMS, (size_t)rcount * sizeof(Value));
+    }
+    return (Value){ .raw = (uint64_t)(uintptr_t)mem | ASNIX_TAG_LIST };
+}
+
 char *asnix_string_value_to_cstr(Value string_val) {
     const char *s = (const char *)(string_val.raw & ~0x7ULL);
     int64_t len = *(const int64_t *)(s + ASNIX_STRING_OFF_LEN);

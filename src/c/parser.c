@@ -544,11 +544,34 @@ static Ast *parse_has_attr(Parser *p) {
     return e;
 }
 
-static Ast *parse_mul(Parser *p) {
+/* `++` list concatenation: binds tighter than `*`/`/` but looser than
+ * `?` (has-attr) and unary `-` (negate), right-associative -- cross-
+ * checked against cppnix's real grammar, `~/nix/src/libexpr/parser.y`'s
+ * precedence table (`%left '+' '-'`, `%left '*' '/'`, `%right CONCAT`,
+ * `%nonassoc '?'`, `%nonassoc NEGATE`, loosest to tightest in that
+ * declaration order). Verified against `nix-instantiate --eval`:
+ * `[1] ++ [2] ++ [3]` => `[ 1 2 3 ]` (chains), and the type error from
+ * `1 ++ [2]` names the lhs ("expected a list but found an integer: 1"),
+ * confirming no numeric-only interpretation competes here. */
+static Ast *parse_concat(Parser *p) {
     Ast *lhs = parse_has_attr(p);
+    if (cur(p)->kind == TOK_PLUSPLUS) {
+        advance(p);
+        Ast *rhs = parse_concat(p); /* right-recurse: right-associative */
+        Ast *n = asnix_ast_new(AST_BINOP);
+        n->as.binop.op = 'c';
+        n->as.binop.lhs = lhs;
+        n->as.binop.rhs = rhs;
+        return n;
+    }
+    return lhs;
+}
+
+static Ast *parse_mul(Parser *p) {
+    Ast *lhs = parse_concat(p);
     while (cur(p)->kind == TOK_STAR) {
         advance(p);
-        Ast *rhs = parse_has_attr(p);
+        Ast *rhs = parse_concat(p);
         Ast *n = asnix_ast_new(AST_BINOP);
         n->as.binop.op = '*';
         n->as.binop.lhs = lhs;
@@ -778,6 +801,29 @@ static void parse_formals(Parser *p, AstFormal **out_items, size_t *out_count, i
 static Ast *parse_expr(Parser *p) {
     if (cur(p)->kind == TOK_LET) {
         advance(p);
+        if (cur(p)->kind == TOK_LBRACE) {
+            /* Legacy `let { ..., body = ...; }` form -- real Nix desugars
+             * this directly to `(rec { ... }).body` (cppnix's parser.y:
+             * "Let expressions `let {..., body = ...}' are just desugared
+             * into `(rec {..., body = ...}).body'."). Distinct from
+             * ordinary `let <bindings> in <expr>` (no `{` immediately
+             * after `let`) handled below. */
+            advance(p); /* '{' */
+            BindingVec bindings = { 0 };
+            while (cur(p)->kind != TOK_RBRACE) parse_binding_stmt(p, &bindings);
+            advance(p); /* '}' */
+            Ast *attrs = asnix_ast_new(AST_ATTRSET);
+            attrs->as.attrset.bindings = bindings.items;
+            attrs->as.attrset.count = bindings.len;
+            attrs->as.attrset.is_rec = 1;
+            Ast *n = asnix_ast_new(AST_SELECT);
+            n->as.select.target = attrs;
+            n->as.select.attr = "body";
+            n->as.select.attr_len = 4;
+            n->as.select.attr_expr = NULL;
+            n->as.select.default_ = NULL;
+            return n;
+        }
         return parse_let_bindings(p);
     }
     if (cur(p)->kind == TOK_WITH) {

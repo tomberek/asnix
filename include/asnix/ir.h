@@ -182,6 +182,11 @@ enum {
                           * key, matching plain OP_SELECT (not OP_SELECT_OR's graceful
                           * fallthrough) -- `.${expr} or default` is rejected at parse time
                           * instead (see parser.c), so this op never needs a miss path. */
+    OP_CONCAT,     /* `++` list concatenation (M23): pops rhs,lhs (both must be TAG_LIST,
+                     * else fatal -- see asnix_concat_lists, value_util.c), pushes a fresh
+                     * list with lhs's elements followed by rhs's elements. Deferred to C
+                     * (not hand-rolled in asm) for the same reason OP_UPDATE is: not a
+                     * hot-path op, and a plain memcpy-twice is far easier to get right. */
     OP_COUNT
 };
 
