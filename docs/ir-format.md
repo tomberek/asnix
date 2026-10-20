@@ -60,6 +60,13 @@ sorted symbol ids — the compiler pushes binding values in that same
 sorted order, so the runtime fill never sorts anything), `OP_SELECT`
 (`a` = symbol id; binary-searches a popped `Attrs`' sorted entries).
 
+## Op set (M6 additions)
+
+`OP_MK_THUNK` (`b` = pool index of `{body IrOp*, body pool}`, same
+pool-pair convention as `OP_LAMBDA` — builds a deferred, memoizable
+computation over the current env/pool; see `docs/value-encoding.md`'s
+Thunk note). No new forcing op: `OP_VAR_REF`/`OP_SELECT` force inline.
+
 ## M4.5: native codegen is a parallel path, not a consumer of this IR
 
 `src/c/codegen.c` compiles the *same AST* directly to x86-64 machine code,

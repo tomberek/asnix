@@ -20,8 +20,13 @@ asnix_op_lambda:                        // a = arity, b = pool index of {body Ir
     movq %rbx, ASNIX_CLOSURE_OFF_ARITY(%rax)
     movq %r15, ASNIX_CLOSURE_OFF_POOL(%rax)
 
-    popq %rdx                           // saved ENV (pushed last, popped first)
-    movq %rdx, ASNIX_CLOSURE_OFF_UP(%rax)
+    popq %rdi                           // restore ENV (pushed last, popped first) -- %rdi is the
+                                         // live current-ENV register for whatever runs next, not
+                                         // just scratch; previously popped into %rdx and only
+                                         // written into the closure, leaving %rdi holding the
+                                         // $ASNIX_CLOSURE_SIZE size-argument garbage (a real bug,
+                                         // latent until M6 exercised a path that read it)
+    movq %rdi, ASNIX_CLOSURE_OFF_UP(%rax)
     popq %rsi                           // restore IP
 
     movq %rax, %rdx

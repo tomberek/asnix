@@ -66,6 +66,7 @@ asnix_op_call:                          // a = argc
     movq %rcx, ASNIX_RETFRAME_OFF_IP(%r14)
     movq %rdx, ASNIX_RETFRAME_OFF_ENV(%r14)
     movq %r13, ASNIX_RETFRAME_OFF_POOL(%r14) // save the caller's constant pool too (see ir.h)
+    movq $0, ASNIX_RETFRAME_OFF_FORCE_TARGET(%r14) // ordinary call: no thunk to memoize on return
     addq $ASNIX_RETFRAME_SIZE, %r14
 
     movq %rax, %rdi                     // ENV = new frame
@@ -88,6 +89,17 @@ asnix_op_call:                          // a = argc
     .type asnix_op_ret, @function
 asnix_op_ret:
     subq $ASNIX_RETFRAME_SIZE, %r14
+    movq ASNIX_RETFRAME_OFF_FORCE_TARGET(%r14), %rcx
+    testq %rcx, %rcx
+    jz .Lret_no_memo
+    // This frame was pushed to force a thunk (OP_VAR_REF/OP_SELECT), not
+    // an ordinary call -- the body's last expression already left its
+    // result on top of VALSTACK (same place an ordinary call leaves its
+    // result); memoize it into the thunk cell before resuming.
+    movq -8(%r12), %rdx
+    movq %rdx, ASNIX_THUNK_OFF_ENV(%rcx)
+    movq $ASNIX_THUNK_STATE_FORCED, ASNIX_THUNK_OFF_STATE(%rcx)
+.Lret_no_memo:
     movq ASNIX_RETFRAME_OFF_IP(%r14), %rsi
     movq ASNIX_RETFRAME_OFF_ENV(%r14), %rdi
     movq ASNIX_RETFRAME_OFF_POOL(%r14), %r13

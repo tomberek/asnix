@@ -39,11 +39,37 @@
  * machine stack, so the jmp-chain dispatch loop never grows it): where to
  * resume (return_ip), which Env to resume in (return_env), and which
  * constant pool was active in the caller (return_pool, for the same reason
- * Closure carries one -- see above). */
-#define ASNIX_RETFRAME_OFF_IP   0
-#define ASNIX_RETFRAME_OFF_ENV  8
-#define ASNIX_RETFRAME_OFF_POOL 16
-#define ASNIX_RETFRAME_SIZE     24
+ * Closure carries one -- see above). `force_target`: non-zero only when
+ * this frame was pushed to force a thunk (OP_VAR_REF/OP_SELECT, M6) rather
+ * than to make an ordinary OP_CALL -- OP_RET uses it to know which Thunk
+ * cell to memoize the result into before resuming (zero means "ordinary
+ * call, no memoization"). */
+#define ASNIX_RETFRAME_OFF_IP           0
+#define ASNIX_RETFRAME_OFF_ENV          8
+#define ASNIX_RETFRAME_OFF_POOL         16
+#define ASNIX_RETFRAME_OFF_FORCE_TARGET 24
+#define ASNIX_RETFRAME_SIZE             32
+
+/* Thunk heap object (M6): a deferred, memoized computation -- the
+ * mechanism behind Nix's laziness. `state` distinguishes:
+ *   UNFORCED:     env/body/pool are valid (the deferred computation)
+ *   IN_PROGRESS:  currently being forced -- re-entering (e.g. `let x = x;
+ *                 in x`) is a cycle, caught and aborted (blackholing)
+ *   FORCED:       `env`'s slot has been overwritten with the cached
+ *                 Value.raw instead; body/pool are no longer meaningful
+ * Forcing overwrites the cell in place (single-threaded, so no CAS claim
+ * protocol is needed the way a parallel evaluator like ~/gnix/iets
+ * requires) -- every tagged pointer to this same cell sees the memoized
+ * value after the first force, exactly once computed. */
+#define ASNIX_THUNK_OFF_STATE 0
+#define ASNIX_THUNK_OFF_ENV   8  /* UNFORCED: Env*; FORCED: cached Value.raw */
+#define ASNIX_THUNK_OFF_BODY  16
+#define ASNIX_THUNK_OFF_POOL  24
+#define ASNIX_THUNK_SIZE      32
+
+#define ASNIX_THUNK_STATE_UNFORCED    0
+#define ASNIX_THUNK_STATE_IN_PROGRESS 1
+#define ASNIX_THUNK_STATE_FORCED      2
 
 #ifndef __ASSEMBLER__
 
@@ -78,6 +104,7 @@ enum {
     OP_MK_LIST,    /* M5: a = count; pops `count` values, builds a List */
     OP_MK_ATTRS,   /* M5: a = count, b = pool index of `count` sorted symbol ids */
     OP_SELECT,     /* M5: a = symbol id; pops an Attrs, pushes the matching value or aborts */
+    OP_MK_THUNK,   /* M6: b = pool index of {body IrOp*, body pool} -- see OP_LAMBDA's note */
     OP_COUNT
 };
 
@@ -97,6 +124,11 @@ void ir_link(IrOp *ops, size_t n);
  * starting at prog->ops[0] with `root_env` as the outermost lexical scope,
  * and returns the value left on the operand stack by OP_HALT. */
 Value asnix_eval(IrProgram *prog, Env *root_env);
+
+/* M6: forces `v` if it's a thunk (returning the cached value unchanged
+ * otherwise), usable from C code with no active asnix_eval invocation --
+ * see src/asm/force.S for exactly what this does and doesn't cover. */
+Value asnix_force_for_print(Value v);
 
 #endif /* __ASSEMBLER__ */
 

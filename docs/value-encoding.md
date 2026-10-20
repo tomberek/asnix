@@ -49,3 +49,14 @@ design was based on.
   (see `docs/abi.md` and the "pool-per-closure" note in `ir.h`).
 - **IrOp** record: `{void *handler; int64_t a; int64_t b;}` — see
   `docs/ir-format.md`.
+- **String/List/Attrs** (`include/asnix/heap.h`, M5): `String{len;
+  bytes[]}` (the only `PTR`-tag kind so far), `List{count; elems[]}`,
+  `Attrs{count; entries[]}` with entries sorted by symbol id.
+- **Thunk** (`include/asnix/ir.h`, M6): `{state; env; body; pool}` — 32
+  bytes, the mechanism behind laziness. `state` is `UNFORCED`/
+  `IN_PROGRESS`/`FORCED`; once forced, the `env` field is *repurposed* to
+  hold the cached `Value.raw` directly rather than a pointer — forcing
+  overwrites the cell in place so every tagged pointer to it sees the
+  memoized value after the first force. See `docs/architecture.md`'s M6
+  scope notes for what this does and doesn't cover (not recursive bindings
+  yet).

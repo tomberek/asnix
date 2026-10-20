@@ -51,6 +51,11 @@ size_t ib_mk_list(IrBuilder *b, int64_t count);
 size_t ib_mk_attrs(IrBuilder *b, int64_t count, const uint32_t *sorted_syms);
 size_t ib_select(IrBuilder *b, uint32_t sym);
 
+/* M6: pushes a thunk wrapping body_prog (compiled like a lambda body,
+ * ending in OP_RET) captured over the *current* Env at the point this op
+ * runs -- same pool-travels-with-it rationale as ib_lambda. */
+size_t ib_mk_thunk(IrBuilder *b, IrProgram *body_prog);
+
 /* Finalizes the builder: runs ir_link() over the accumulated ops in place
  * and returns an IrProgram ready for asnix_eval(). */
 IrProgram *ib_finish(IrBuilder *b);

@@ -24,7 +24,7 @@
 #include "asnix/ir.h"
 
     .equ ASNIX_VALSTACK_BYTES, 32768   // 4096 Values
-    .equ ASNIX_RETSTACK_BYTES, 4096    // 256 call frames
+    .equ ASNIX_RETSTACK_BYTES, 4096    // 128 call frames (ASNIX_RETFRAME_SIZE=32 as of M6's force_target field)
 
     .text
 

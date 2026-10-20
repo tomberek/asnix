@@ -53,7 +53,25 @@ static void compile_expr(IrBuilder *b, Ast *node, ScopeFrame *scope) {
             exit(1);
         }
         case AST_LET: {
-            compile_expr(b, node->as.let1.value, scope);
+            /* M6: the bound value is lazy -- compiled as its own body
+             * (like a lambda's), wrapped in a thunk captured over the
+             * *current* (outer) scope, not evaluated here. Depths inside
+             * that body still resolve correctly against `scope`: at
+             * runtime the thunk's captured env is exactly whatever env is
+             * active right now, so this is identical to compiling the
+             * same expression inline, just deferred.
+             *
+             * Note (scope limitation): this makes bindings lazy but NOT
+             * recursive -- a binding cannot reference itself or sibling
+             * bindings in the same `let` (unlike real Nix, where `let` is
+             * implicitly `letrec`). Fixing that needs OP_LET restructured
+             * to allocate the frame *before* constructing the thunk(s), so
+             * they can capture it as their own scope -- not done here; see
+             * docs/architecture.md's M6 scope notes. */
+            IrBuilder *thunk_b = ib_new();
+            compile_expr(thunk_b, node->as.let1.value, scope);
+            ib_ret(thunk_b);
+            ib_mk_thunk(b, ib_finish(thunk_b));
             ib_let(b, 1);
             ScopeFrame frame = { .up = scope, .name = node->as.let1.name, .name_len = node->as.let1.name_len };
             compile_expr(b, node->as.let1.body, &frame);
@@ -130,7 +148,13 @@ static void compile_expr(IrBuilder *b, Ast *node, ScopeFrame *scope) {
             uint32_t *sorted_syms = malloc(n * sizeof(uint32_t));
             for (size_t i = 0; i < n; i++) {
                 sorted_syms[i] = syms[order[i]];
-                compile_expr(b, node->as.attrset.bindings[order[i]].value, scope);
+                /* M6: lazy, same rationale as AST_LET above -- also not
+                 * recursive, so an attrset binding can't reference `self`
+                 * or sibling keys (no `rec { ... }` support yet). */
+                IrBuilder *thunk_b = ib_new();
+                compile_expr(thunk_b, node->as.attrset.bindings[order[i]].value, scope);
+                ib_ret(thunk_b);
+                ib_mk_thunk(b, ib_finish(thunk_b));
             }
             ib_mk_attrs(b, (int64_t)n, sorted_syms);
             free(syms);

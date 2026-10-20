@@ -109,6 +109,12 @@ size_t ib_select(IrBuilder *b, uint32_t sym) {
     return ib_emit(b, OP_SELECT, (int64_t)sym, 0);
 }
 
+size_t ib_mk_thunk(IrBuilder *b, IrProgram *body_prog) {
+    size_t pool_idx = ib_pool_add(b, (int64_t)(intptr_t)body_prog->ops);
+    ib_pool_add(b, (int64_t)(intptr_t)body_prog->pool); /* always pool_idx+1, see op_mk_thunk.S */
+    return ib_emit(b, OP_MK_THUNK, 0, (int64_t)pool_idx);
+}
+
 IrProgram *ib_finish(IrBuilder *b) {
     ir_link(b->ops, b->len);
     IrProgram *prog = calloc(1, sizeof(IrProgram));

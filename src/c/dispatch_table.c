@@ -27,6 +27,7 @@ extern void asnix_op_push_const(void);
 extern void asnix_op_mk_list(void);
 extern void asnix_op_mk_attrs(void);
 extern void asnix_op_select(void);
+extern void asnix_op_mk_thunk(void);
 
 void *asnix_handler_table[OP_COUNT] = {
     [OP_PUSH_INT] = (void *)asnix_op_push_int,
@@ -48,6 +49,7 @@ void *asnix_handler_table[OP_COUNT] = {
     [OP_MK_LIST] = (void *)asnix_op_mk_list,
     [OP_MK_ATTRS] = (void *)asnix_op_mk_attrs,
     [OP_SELECT] = (void *)asnix_op_select,
+    [OP_MK_THUNK] = (void *)asnix_op_mk_thunk,
 };
 
 void ir_link(IrOp *ops, size_t n) {

@@ -29,6 +29,7 @@ static char *read_file(const char *path) {
 }
 
 static void print_value_inner(Value v) {
+    v = asnix_force_for_print(v); /* list elements and attrset values are lazy (M6) */
     switch (asnix_tag_of(v)) {
         case ASNIX_TAG_INT:
             printf("%lld", (long long)asnix_int_value(v));
