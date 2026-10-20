@@ -4,6 +4,32 @@
 #include <stdlib.h>
 
 typedef struct {
+    Ast **items;
+    size_t len, cap;
+} AstVec;
+
+static void astvec_push(AstVec *v, Ast *item) {
+    if (v->len == v->cap) {
+        v->cap = v->cap ? v->cap * 2 : 8;
+        v->items = realloc(v->items, v->cap * sizeof(Ast *));
+    }
+    v->items[v->len++] = item;
+}
+
+typedef struct {
+    AstBinding *items;
+    size_t len, cap;
+} BindingVec;
+
+static void bindingvec_push(BindingVec *v, AstBinding item) {
+    if (v->len == v->cap) {
+        v->cap = v->cap ? v->cap * 2 : 8;
+        v->items = realloc(v->items, v->cap * sizeof(AstBinding));
+    }
+    v->items[v->len++] = item;
+}
+
+typedef struct {
     Token *toks;
     size_t pos;
 } Parser;
@@ -28,11 +54,17 @@ static Token *expect(Parser *p, TokKind kind, const char *what) {
 }
 
 static int starts_atom(TokKind k) {
-    return k == TOK_INT || k == TOK_IDENT || k == TOK_TRUE || k == TOK_FALSE ||
-           k == TOK_NULL || k == TOK_LPAREN;
+    return k == TOK_INT || k == TOK_IDENT || k == TOK_TRUE || k == TOK_FALSE || k == TOK_NULL ||
+           k == TOK_LPAREN || k == TOK_STRING || k == TOK_LBRACKET || k == TOK_LBRACE;
 }
 
 static Ast *parse_expr(Parser *p);
+
+/* List elements and application arguments are parsed at this same
+ * "select" precedence (atom plus postfix `.attr` chains), not full
+ * `expr` -- matching real Nix, where `[ f x ]` is a 2-element list and
+ * putting a function call in a list needs parens: `[ (f x) ]`. */
+static Ast *parse_select(Parser *p);
 
 static Ast *parse_atom(Parser *p) {
     Token *t = cur(p);
@@ -59,6 +91,13 @@ static Ast *parse_atom(Parser *p) {
             advance(p);
             return asnix_ast_new(AST_NULL);
         }
+        case TOK_STRING: {
+            advance(p);
+            Ast *n = asnix_ast_new(AST_STRING);
+            n->as.string.text = t->start;
+            n->as.string.len = t->len;
+            return n;
+        }
         case TOK_IDENT: {
             advance(p);
             Ast *n = asnix_ast_new(AST_VAR);
@@ -72,16 +111,56 @@ static Ast *parse_atom(Parser *p) {
             expect(p, TOK_RPAREN, "')'");
             return e;
         }
+        case TOK_LBRACKET: {
+            advance(p);
+            AstVec elems = { 0 };
+            while (cur(p)->kind != TOK_RBRACKET) astvec_push(&elems, parse_select(p));
+            advance(p); /* ']' */
+            Ast *n = asnix_ast_new(AST_LIST);
+            n->as.list.elems = elems.items;
+            n->as.list.count = elems.len;
+            return n;
+        }
+        case TOK_LBRACE: {
+            advance(p);
+            BindingVec bindings = { 0 };
+            while (cur(p)->kind != TOK_RBRACE) {
+                Token *name = expect(p, TOK_IDENT, "an attribute name");
+                expect(p, TOK_EQUALS, "'='");
+                Ast *value = parse_expr(p);
+                expect(p, TOK_SEMI, "';'");
+                bindingvec_push(&bindings, (AstBinding){ .name = name->start, .name_len = name->len, .value = value });
+            }
+            advance(p); /* '}' */
+            Ast *n = asnix_ast_new(AST_ATTRSET);
+            n->as.attrset.bindings = bindings.items;
+            n->as.attrset.count = bindings.len;
+            return n;
+        }
         default:
             fprintf(stderr, "asnix: parse error: unexpected token\n");
             exit(1);
     }
 }
 
+static Ast *parse_select(Parser *p) {
+    Ast *e = parse_atom(p);
+    while (cur(p)->kind == TOK_DOT) {
+        advance(p);
+        Token *attr = expect(p, TOK_IDENT, "an attribute name");
+        Ast *n = asnix_ast_new(AST_SELECT);
+        n->as.select.target = e;
+        n->as.select.attr = attr->start;
+        n->as.select.attr_len = attr->len;
+        e = n;
+    }
+    return e;
+}
+
 static Ast *parse_app(Parser *p) {
-    Ast *fn = parse_atom(p);
+    Ast *fn = parse_select(p);
     while (starts_atom(cur(p)->kind)) {
-        Ast *arg = parse_atom(p);
+        Ast *arg = parse_select(p);
         Ast *app = asnix_ast_new(AST_APP);
         app->as.app.fn = fn;
         app->as.app.arg = arg;

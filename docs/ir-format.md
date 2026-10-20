@@ -50,6 +50,16 @@ pool: `{body IrOp*, body's own pool}` — see the Closure note in
 `docs/value-encoding.md`), `OP_CALL`/`OP_RET` (explicit call-frame stack,
 kept off the native machine stack — see `docs/abi.md`), `OP_HALT`.
 
+## Op set (M5 additions)
+
+`OP_PUSH_CONST` (`b` = pool index of a fully pre-formed `Value.raw` —
+how string literals are represented: built once at compile time, pushed
+by reference), `OP_MK_LIST` (`a` = count, pops that many values into a
+fresh `List`), `OP_MK_ATTRS` (`a` = count, `b` = pool index of `count`
+sorted symbol ids — the compiler pushes binding values in that same
+sorted order, so the runtime fill never sorts anything), `OP_SELECT`
+(`a` = symbol id; binary-searches a popped `Attrs`' sorted entries).
+
 ## M4.5: native codegen is a parallel path, not a consumer of this IR
 
 `src/c/codegen.c` compiles the *same AST* directly to x86-64 machine code,

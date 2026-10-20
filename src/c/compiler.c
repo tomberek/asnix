@@ -1,10 +1,15 @@
 #include "compiler.h"
 
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+#include "asnix/arena.h"
+#include "asnix/heap.h"
 #include "asnix/irbuild.h"
+#include "asnix/value.h"
+#include "symtab.h"
 
 /* Every scope-introducing AST node (AST_LET, AST_LAMBDA) binds exactly one
  * name at slot 0 (see ast.h), so resolution is just "how many scope links
@@ -89,6 +94,56 @@ static void compile_expr(IrBuilder *b, Ast *node, ScopeFrame *scope) {
                 case '*': ib_mul(b); return;
             }
             return;
+        case AST_STRING: {
+            size_t len = node->as.string.len;
+            void *mem = asnix_arena_alloc(8 + len);
+            *(int64_t *)((char *)mem + ASNIX_STRING_OFF_LEN) = (int64_t)len;
+            memcpy((char *)mem + ASNIX_STRING_OFF_BYTES, node->as.string.text, len);
+            Value v = { .raw = (uint64_t)(uintptr_t)mem | ASNIX_TAG_PTR };
+            ib_push_const(b, (int64_t)v.raw);
+            return;
+        }
+        case AST_LIST: {
+            for (size_t i = 0; i < node->as.list.count; i++) compile_expr(b, node->as.list.elems[i], scope);
+            ib_mk_list(b, (int64_t)node->as.list.count);
+            return;
+        }
+        case AST_ATTRSET: {
+            size_t n = node->as.attrset.count;
+            uint32_t *syms = malloc(n * sizeof(uint32_t));
+            size_t *order = malloc(n * sizeof(size_t));
+            for (size_t i = 0; i < n; i++) {
+                syms[i] = asnix_intern(node->as.attrset.bindings[i].name, node->as.attrset.bindings[i].name_len);
+                order[i] = i;
+            }
+            /* Insertion sort `order` by symbol id -- n is a source-level
+             * binding count, always tiny. */
+            for (size_t i = 1; i < n; i++) {
+                size_t j = i;
+                while (j > 0 && syms[order[j - 1]] > syms[order[j]]) {
+                    size_t tmp = order[j - 1];
+                    order[j - 1] = order[j];
+                    order[j] = tmp;
+                    j--;
+                }
+            }
+            uint32_t *sorted_syms = malloc(n * sizeof(uint32_t));
+            for (size_t i = 0; i < n; i++) {
+                sorted_syms[i] = syms[order[i]];
+                compile_expr(b, node->as.attrset.bindings[order[i]].value, scope);
+            }
+            ib_mk_attrs(b, (int64_t)n, sorted_syms);
+            free(syms);
+            free(order);
+            free(sorted_syms);
+            return;
+        }
+        case AST_SELECT: {
+            compile_expr(b, node->as.select.target, scope);
+            uint32_t sym = asnix_intern(node->as.select.attr, node->as.select.attr_len);
+            ib_select(b, sym);
+            return;
+        }
     }
 }
 

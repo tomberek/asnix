@@ -11,3 +11,5 @@ tests/asm/test_env
 tests/asm/test_value
 tests/ir/test_m3_fixtures
 tests/ir/test_m45_codegen
+tests/ir/test_m5_fixtures
+tests/c/test_symtab

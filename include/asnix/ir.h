@@ -74,6 +74,10 @@ enum {
     OP_CALL,
     OP_RET,
     OP_HALT,
+    OP_PUSH_CONST, /* M5: b = pool index of a fully-formed Value.raw (string literals) */
+    OP_MK_LIST,    /* M5: a = count; pops `count` values, builds a List */
+    OP_MK_ATTRS,   /* M5: a = count, b = pool index of `count` sorted symbol ids */
+    OP_SELECT,     /* M5: a = symbol id; pops an Attrs, pushes the matching value or aborts */
     OP_COUNT
 };
 

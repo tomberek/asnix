@@ -48,3 +48,15 @@ asnix_op_push_null:
     movq (%rsi), %rax
     jmp *%rax
     .size asnix_op_push_null, . - asnix_op_push_null
+
+    .globl asnix_op_push_const
+    .type asnix_op_push_const, @function
+asnix_op_push_const:                    // b = pool index of a pre-formed Value.raw
+    movq ASNIX_IROP_OFF_B(%rsi), %rax
+    movq (%r13, %rax, 8), %rax
+    movq %rax, (%r12)
+    addq $8, %r12
+    addq $ASNIX_IROP_SIZE, %rsi
+    movq (%rsi), %rax
+    jmp *%rax
+    .size asnix_op_push_const, . - asnix_op_push_const

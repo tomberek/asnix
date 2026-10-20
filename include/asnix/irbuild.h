@@ -40,6 +40,17 @@ size_t ib_call(IrBuilder *b, int64_t argc);
 size_t ib_ret(IrBuilder *b);
 size_t ib_halt(IrBuilder *b);
 
+/* M5: pushes a fully-formed Value.raw (e.g. a string literal) stashed in
+ * the constant pool. */
+size_t ib_push_const(IrBuilder *b, int64_t raw_value);
+size_t ib_mk_list(IrBuilder *b, int64_t count);
+/* sorted_syms must already be sorted ascending -- the compiler sorts
+ * bindings by symbol id and pushes their values in that same order before
+ * emitting this, so OP_MK_ATTRS's reverse-pop fill lines each value up
+ * with the right symbol (see op_mk_attrs.S). */
+size_t ib_mk_attrs(IrBuilder *b, int64_t count, const uint32_t *sorted_syms);
+size_t ib_select(IrBuilder *b, uint32_t sym);
+
 /* Finalizes the builder: runs ir_link() over the accumulated ops in place
  * and returns an IrProgram ready for asnix_eval(). */
 IrProgram *ib_finish(IrBuilder *b);

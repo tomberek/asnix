@@ -63,6 +63,29 @@ Token *asnix_lex(const char *src, size_t *out_count) {
             continue;
         }
 
+        if (c == '"') {
+            /* No escapes/interpolation yet -- a plain quoted run, matching
+             * what src/c/compiler.c currently does with string Values (see
+             * docs/architecture.md M5 scope notes). */
+            i++;
+            size_t start = i;
+            while (src[i] && src[i] != '"') {
+                if (src[i] == '\n') {
+                    fprintf(stderr, "asnix: unterminated string literal\n");
+                    exit(1);
+                }
+                i++;
+            }
+            if (!src[i]) {
+                fprintf(stderr, "asnix: unterminated string literal\n");
+                exit(1);
+            }
+            size_t len = i - start;
+            i++; /* closing quote */
+            push_tok(&v, (Token){ .kind = TOK_STRING, .start = src + start, .len = len });
+            continue;
+        }
+
         if (ident_start(c)) {
             size_t start = i;
             while (ident_cont(src[i])) i++;
@@ -90,6 +113,11 @@ Token *asnix_lex(const char *src, size_t *out_count) {
             case '=': single = TOK_EQUALS; break;
             case ';': single = TOK_SEMI; break;
             case ':': single = TOK_COLON; break;
+            case '.': single = TOK_DOT; break;
+            case '{': single = TOK_LBRACE; break;
+            case '}': single = TOK_RBRACE; break;
+            case '[': single = TOK_LBRACKET; break;
+            case ']': single = TOK_RBRACKET; break;
             default:
                 fprintf(stderr, "asnix: unrecognized character '%c' in source\n", c);
                 exit(1);

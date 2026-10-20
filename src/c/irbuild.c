@@ -86,6 +86,29 @@ size_t ib_halt(IrBuilder *b) {
     return ib_emit(b, OP_HALT, 0, 0);
 }
 
+size_t ib_push_const(IrBuilder *b, int64_t raw_value) {
+    size_t pool_idx = ib_pool_add(b, raw_value);
+    return ib_emit(b, OP_PUSH_CONST, 0, (int64_t)pool_idx);
+}
+
+size_t ib_mk_list(IrBuilder *b, int64_t count) {
+    return ib_emit(b, OP_MK_LIST, count, 0);
+}
+
+size_t ib_mk_attrs(IrBuilder *b, int64_t count, const uint32_t *sorted_syms) {
+    size_t pool_idx = (size_t)-1;
+    for (int64_t i = 0; i < count; i++) {
+        size_t idx = ib_pool_add(b, (int64_t)sorted_syms[i]);
+        if (i == 0) pool_idx = idx;
+    }
+    if (count == 0) pool_idx = ib_pool_add(b, 0); /* keep `b` a valid index even for {} */
+    return ib_emit(b, OP_MK_ATTRS, count, (int64_t)pool_idx);
+}
+
+size_t ib_select(IrBuilder *b, uint32_t sym) {
+    return ib_emit(b, OP_SELECT, (int64_t)sym, 0);
+}
+
 IrProgram *ib_finish(IrBuilder *b) {
     ir_link(b->ops, b->len);
     IrProgram *prog = calloc(1, sizeof(IrProgram));

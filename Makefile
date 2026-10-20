@@ -26,6 +26,9 @@ TEST_ASM_BINS := $(TEST_ASM_SRCS:.c=)
 TEST_IR_SRCS  := $(wildcard tests/ir/*.c)
 TEST_IR_BINS  := $(TEST_IR_SRCS:.c=)
 
+TEST_C_SRCS   := $(wildcard tests/c/*.c)
+TEST_C_BINS   := $(TEST_C_SRCS:.c=)
+
 E2E_NIX       := $(wildcard tests/e2e/*.nix)
 
 .PHONY: all release test test-e2e clean watch
@@ -50,13 +53,29 @@ libasnix.a: $(LIB_OBJS)
 
 # Tier-1 ("smoke") tests: in-process asm-primitive unit tests + M3 IR fixtures.
 # No subprocess spawn beyond the test binary itself; target is sub-second total.
-test: $(TEST_ASM_BINS) $(TEST_IR_BINS)
-	@set -e; for t in $(TEST_ASM_BINS) $(TEST_IR_BINS); do echo "== $$t =="; ./$$t; done
+# `make test TEST=test_value` builds+runs just that one binary (matched by
+# basename) -- handy when iterating on a single area; bare `make test` still
+# runs the full tier-1 set.
+ALL_TEST_BINS := $(TEST_ASM_BINS) $(TEST_IR_BINS) $(TEST_C_BINS)
+ifeq ($(TEST),)
+RUN_TEST_BINS := $(ALL_TEST_BINS)
+else
+RUN_TEST_BINS := $(filter %/$(TEST),$(ALL_TEST_BINS))
+endif
+
+test: $(RUN_TEST_BINS)
+	@if [ -n "$(TEST)" ] && [ -z "$(RUN_TEST_BINS)" ]; then \
+		echo "no test binary matches TEST=$(TEST) (known: $(notdir $(ALL_TEST_BINS)))" >&2; exit 1; \
+	fi
+	@set -e; for t in $(RUN_TEST_BINS); do echo "== $$t =="; ./$$t; done
 
 tests/asm/%: tests/asm/%.c libasnix.a
 	$(CC) $(CFLAGS) -o $@ $< -L. -lasnix
 
 tests/ir/%: tests/ir/%.c libasnix.a
+	$(CC) $(CFLAGS) -o $@ $< -L. -lasnix
+
+tests/c/%: tests/c/%.c libasnix.a
 	$(CC) $(CFLAGS) -o $@ $< -L. -lasnix
 
 # Tier-2: real .nix source through the full lexer/parser/compiler/evaluator,
@@ -76,8 +95,10 @@ watch:
 	find src include tests -type f | entr -c $(MAKE) test
 
 clean:
-	rm -f asnix libasnix.a $(ALL_OBJS) $(DEPS) $(TEST_ASM_BINS) $(TEST_IR_BINS)
-	rm -f $(TEST_ASM_SRCS:.c=.d) $(TEST_IR_SRCS:.c=.d)
+	rm -f asnix libasnix.a $(ALL_OBJS) $(DEPS) $(TEST_ASM_BINS) $(TEST_IR_BINS) $(TEST_C_BINS)
+	rm -f $(TEST_ASM_SRCS:.c=.d) $(TEST_IR_SRCS:.c=.d) $(TEST_C_SRCS:.c=.d)
 
 -include $(DEPS)
+-include $(TEST_ASM_SRCS:.c=.d)
 -include $(TEST_IR_SRCS:.c=.d)
+-include $(TEST_C_SRCS:.c=.d)

@@ -23,14 +23,20 @@ typedef enum {
     TOK_EQUALS,
     TOK_SEMI,
     TOK_COLON,
+    TOK_DOT,
+    TOK_LBRACE,
+    TOK_RBRACE,
+    TOK_LBRACKET,
+    TOK_RBRACKET,
+    TOK_STRING,
     TOK_EOF,
 } TokKind;
 
 typedef struct {
     TokKind kind;
     int64_t int_val;    /* TOK_INT */
-    const char *start;  /* TOK_IDENT: pointer into the source buffer */
-    size_t len;          /* TOK_IDENT: identifier length */
+    const char *start;  /* TOK_IDENT / TOK_STRING: pointer into the source buffer */
+    size_t len;          /* TOK_IDENT / TOK_STRING: length (TOK_STRING excludes the quotes) */
 } Token;
 
 /* Tokenizes the whole source in one pass into a malloc'd array terminated

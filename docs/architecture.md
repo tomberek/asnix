@@ -17,7 +17,8 @@ what's actually implemented and the scope decisions made along the way.
 | M3 — threaded-dispatch evaluator over hand-fed IR | done |
 | M4 — real lexer/parser/compiler (`src/c/{lexer,parser,compiler}.c`) | done |
 | M4.5 — copy-and-patch native codegen (`src/c/codegen.c`) | done, **scoped** (see below) |
-| M5+ | not started |
+| M5 — strings/lists/attrsets/symbol interning | done (interpreter path only; see below) |
+| M6+ | not started |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
 
@@ -76,6 +77,48 @@ simultaneously. **Not implemented**: GDB JIT registration
 (`__jit_debug_register_code`) / `perf` `jitdump` — debuggability of the
 generated buffers is an accepted gap for now (see the plan's Risk list);
 nothing about correctness depends on it.
+
+## M5 scope notes
+
+Adds strings, lists, attrsets, and symbol interning to the M3/M4
+threaded-dispatch interpreter path only (M4.5's native codegen explicitly
+rejects these node kinds with a clear error — see `codegen.c` — extending
+it is future work, not attempted here).
+
+- **Symbol table** (`src/c/symtab.c`): dense `u32` ids, open-addressed hash
+  table, FxHash-shape multiply hash finished with a splitmix64-style
+  avalanche (not SipHash — see the header comment and `docs/value-encoding.md`
+  for why). Grows via rehashing at 75% load factor; ids are stable across
+  rehashing (verified in `tests/c/test_symtab.c`).
+- **Heap layouts** (`include/asnix/heap.h`): `String{len; bytes[]}` under
+  the generic `ASNIX_TAG_PTR` (the only `PTR`-kind so far, so no in-object
+  Kind byte is needed yet), `List{count; elems[]}` under `ASNIX_TAG_LIST`,
+  `Attrs{count; entries[]}` under `ASNIX_TAG_ATTRS` with entries sorted by
+  symbol id for `OP_SELECT`'s binary search.
+- **New ops** (`src/asm/ops/op_push.S`'s `asnix_op_push_const`,
+  `op_mk_list.S`, `op_mk_attrs.S`, `op_select.S`): `OP_PUSH_CONST` pushes a
+  fully pre-formed `Value.raw` stashed in the constant pool (how string
+  literals work — built once at compile time, pushed by reference at
+  runtime); `OP_MK_LIST`/`OP_MK_ATTRS` pop N stack values into a freshly
+  arena-allocated object (same reverse-pop-into-forward-index pattern as
+  `OP_LET`'s frame-binding loop); `OP_SELECT` binary-searches sorted
+  entries, aborting cleanly (via the shared `asnix_fatal`) on a type
+  mismatch or missing key. All validated with hand-fed IR fixtures
+  (`tests/ir/test_m5_fixtures.c`) *before* the parser grammar was touched —
+  same bug-isolation strategy that caught the M3/M4 register and
+  constant-pool bugs.
+- **Compiler** (`src/c/compiler.c`): an attrset literal's bindings are
+  sorted by interned symbol id at compile time (insertion sort — binding
+  counts are always tiny) and their *values* are pushed in that same
+  sorted order, so `OP_MK_ATTRS`'s runtime fill loop never needs to sort
+  anything itself. No duplicate-key detection yet (not exercised by the
+  fixture set).
+- **Parser** (`src/c/parser.c`): list elements and function-application
+  arguments are parsed at "atom plus postfix `.attr` chain" precedence
+  (`parse_select`), not full `expr` — matching real Nix, where `[ f x ]` is
+  a 2-element list and a function call inside a list needs parens:
+  `[ (f x) ]`. String literals are plain quoted runs with no escapes or
+  interpolation yet.
 
 ## Measured: dispatch-elimination thesis (`bench/microbench_m45.c`)
 

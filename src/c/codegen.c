@@ -173,6 +173,14 @@ static void codegen_expr(CodeBuf *cb, Ast *node, ScopeFrame2 *scope, size_t dept
                     "asnix: M4.5 native codegen does not yet support lambdas/calls "
                     "(needs a heap closure + call/return protocol -- see codegen.h)\n");
             exit(1);
+        case AST_STRING:
+        case AST_LIST:
+        case AST_ATTRSET:
+        case AST_SELECT:
+            fprintf(stderr,
+                    "asnix: M4.5 native codegen does not yet support strings/lists/attrsets "
+                    "(M5 feature, interpreter-only so far -- see docs/architecture.md)\n");
+            exit(1);
     }
 }
 
