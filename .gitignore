@@ -15,3 +15,4 @@ tests/ir/test_m5_fixtures
 tests/c/test_symtab
 tests/ir/test_m6_fixtures
 tests/ir/test_m7_fixtures
+tests/c/test_hash_shim

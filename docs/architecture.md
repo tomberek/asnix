@@ -20,7 +20,7 @@ what's actually implemented and the scope decisions made along the way.
 | M5 — strings/lists/attrsets/symbol interning | done (interpreter path only; see below) |
 | M6 — lazy `let`/attrset bindings via thunks, blackholing | done, **scoped** (see below) |
 | M7 — builtins + primop dispatch (`src/c/builtins.c`) | done, **scoped** (see below) |
-| M8+ | not started |
+| M8 — derivations | `builtins.hashString` slice done, **scoped** (see below); rest not started |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
 
@@ -218,6 +218,64 @@ passed around, etc., same as a closure).
   (`tests/ir/test_m7_fixtures.c`) before `builtins.c` existed, proving
   `OP_CALL`'s primop branch (arg layout, arity checking, result handling)
   independent of any real builtin's logic.
+
+## M8 scope notes (hashString slice only)
+
+Adds `builtins.hashString algo s` (md5/sha1/sha256/sha512, hex output only
+— real Nix's `hashString` itself never produces base32/base64/SRI, so
+that's not a scope cut, just matching upstream). The rest of M8
+(derivation building/the store protocol) is not started; this slice was
+pulled forward because it's the one piece of M8 the dlopen-shim pattern
+flagged as deferred in M7's own scope notes was actually needed for.
+
+- **`src/c/hash_shim.{h,c}`**: `dlopen`/`dlsym` loads libcrypto at first
+  use rather than linking it at build time, exactly like
+  `~/gnix/nixgoose`'s `openssl_shim.h`/`blake3_shim.h` — keeps this heavy
+  C dependency out of the default `make`/`make test` graph (per the "Fast
+  iteration loop" section below), only paid for by programs that actually
+  call `hashString`. Candidate paths are tried in two tiers: `getenv
+  ("ASNIX_LIBCRYPTO_LIB")` first (set by `flake.nix`'s devShell `shellHook`
+  to the exact nixpkgs-resolved `openssl.out/lib/libcrypto.so` path, since
+  nixpkgs' openssl has no single predictable store path — same convention
+  as nixgoose's own `NIXGOOSE_LIBBLAKE3_LIB`/`NIXGOOSE_TOMLC99_LIB`), then
+  a handful of bare sonames/absolute paths (`libcrypto.so.3`, `libcrypto.so`,
+  plus a few common system locations) in case it's reachable some other
+  way. **Which libcrypto API**: confirmed with `nm -D` against both this
+  machine's system libcrypto (OpenSSL 3.6) and the nixpkgs-resolved one
+  (OpenSSL 3.5.9) that the classic one-shot wrappers `MD5()`/`SHA1()`/
+  `SHA256()`/`SHA512()` are still exported in both (deprecated only at the
+  *header* level in OpenSSL 3.x, which dlsym-based loading never sees) —
+  the same API nixgoose's `openssl_shim.h` already uses and what real
+  Nix's own `libutil/hash.cc` calls. No `EVP_MD_CTX` plumbing needed since
+  every call site already has the whole input as one contiguous buffer.
+- **Curried via two arity-1 stages, not one arity-2 `BuiltinDef`**: real
+  Nix's `hashString` is arity 2, but registering it that way here doesn't
+  work. `parser.c`'s `parse_app` always desugars multi-argument
+  application into nested single-argument `AST_APP` nodes (`f x y` =>
+  `App(App(f,x),y)`, matching real Nix's own curried grammar), and
+  `compiler.c`'s `AST_APP` case always emits `ib_call(b, 1)` — so
+  `builtins.hashString "sha256" "hello"` reaches `OP_CALL` as *two*
+  separate argc=1 calls, never one argc=2 call. `OP_CALL`'s primop branch
+  requires an exact arity match per call and hands the native function
+  nothing but `(args, argc)` (see `docs/abi.md`'s "Primop calls (M7)"
+  section) — no self/closure pointer, so there's no channel to carry data
+  (like which algorithm was picked) from a first call into a second one.
+  The fix mirrors how curried *user* lambdas already get multi-arg calls
+  to work: `prim_hashString` (`src/c/builtins.c`) is itself arity 1,
+  takes just the algorithm name, and — since only 4 algorithms are
+  supported, known statically — returns one of 4 dedicated arity-1
+  `PrimOp`s (`prim_hashString_apply_{md5,sha1,sha256,sha512}`), each with
+  its algorithm baked into *which function pointer it is* rather than any
+  captured runtime data. No mutable global, no extra-data-stashed-after-
+  the-`PrimOp`-struct trick, no `src/asm/` changes.
+- **Validated** directly against hex digests generated on this machine
+  with `md5sum`/`sha1sum`/`sha256sum`/`openssl dgst -sha512` (not
+  transcribed from memory) in `tests/c/test_hash_shim.c`, including an
+  embedded-NUL input to confirm the shim passes the `String`'s exact
+  stored byte length through rather than relying on `strlen` (asnix
+  strings are never null-terminated — see `heap.h`). End-to-end fixtures
+  (`tests/e2e/m8_hashstring_*.nix`) cover all four algorithms through the
+  real lexer/parser/compiler/evaluator path.
 
 ## Checked against numtide/nix-conformance
 

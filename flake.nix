@@ -21,6 +21,13 @@
           ];
           shellHook = ''
             export ASNIX_ROOT=$(pwd)
+            # hash_shim.c's dlopen target for builtins.hashString (M8):
+            # nixpkgs' openssl has no single predictable store path, so
+            # resolve it here and hand the shim the exact path via getenv
+            # -- same NIXGOOSE_LIBBLAKE3_LIB-style convention nixgoose's
+            # own flake.nix uses for its own not-a-system-package dlopen
+            # targets (~/gnix/flake.nix).
+            export ASNIX_LIBCRYPTO_LIB="$(ls ${pkgs.openssl.out}/lib/libcrypto.so* | head -1)"
           '';
         };
       });
