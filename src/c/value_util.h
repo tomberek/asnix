@@ -11,10 +11,32 @@
 /* Arena-allocates a String{len;bytes} heap object and returns it tagged. */
 Value asnix_make_string_value(const char *s, size_t len);
 
-/* Coerces INT/BOOL/NULL/already-a-string to a string Value, matching real
+/* Arena-allocates a Path heap object (see heap.h) and returns it tagged
+ * ASNIX_TAG_PTR. `abs_path` must already be an absolute, canonicalized
+ * path (see compiler.c's AST_PATH case) -- this helper does no resolution
+ * of its own. */
+Value asnix_make_path_value(const char *abs_path, size_t len);
+
+/* True iff `v` is an ASNIX_TAG_PTR object storing a Path rather than a
+ * String (see heap.h's ASNIX_PATH_MARKER note). False for any other tag. */
+int asnix_value_is_path(Value v);
+
+/* Returns a pointer to the raw bytes (NOT NUL-terminated either way) and
+ * length of an ASNIX_TAG_PTR value, whichever of the two kinds (String or
+ * Path) it actually is -- for callers (printing, hashing, ...) that just
+ * want "the text" regardless of which. Aborts if `v` isn't ASNIX_TAG_PTR. */
+const char *asnix_ptr_bytes(Value v, int64_t *out_len);
+
+/* Coerces INT/BOOL/NULL/string/path to a string Value, matching real
  * Nix's `toString` (this *is* `toString`'s logic -- `prim_toString` in
- * builtins.c just calls this directly). Aborts the process on an
- * uncoercible type (list/attrset/closure/etc), same as real Nix. */
+ * builtins.c just calls this directly). A Path argument is converted to a
+ * plain String of its (already-absolute) text -- matching real Nix, where
+ * `toString somePath` changes the value's type from "path" to "string"
+ * (verified against `nix-instantiate --eval`; this project does not model
+ * string "context", so unlike real Nix this never copies anything to the
+ * store -- see docs/architecture.md's import/path scope notes). Aborts
+ * the process on an uncoercible type (list/attrset/closure/etc), same as
+ * real Nix. */
 Value asnix_coerce_to_string(Value v);
 
 /* Arena-allocates a NUL-terminated copy of an asnix String's bytes.

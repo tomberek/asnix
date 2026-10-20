@@ -22,7 +22,8 @@ what's actually implemented and the scope decisions made along the way.
 | M7 — builtins + primop dispatch (`src/c/builtins.c`) | done, **scoped** (see below) |
 | M8 — derivations + store-path hashing + daemon protocol | done, **scoped** (see below): connect/handshake/`IsValidPath` only, no realization |
 | M9 — benchmark harness (`bench/`) | done (see below) |
-| M10+ | not started |
+| M10 — `import` + path literals (`src/c/eval_file.c`) | done, **scoped** (see below) |
+| M11+ | not started |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
 
@@ -521,6 +522,93 @@ registry doesn't survive that, though the worktree and its completed
 work on disk did) before it had written `bench/README.md` or this
 section — picked up and finished directly rather than re-run from
 scratch, after independently re-verifying its correctness claims.
+
+## M10 scope notes: `import` + path literals
+
+**Path literals**: a new lexer token (`src/c/lexer.c`'s `try_scan_path`),
+distinct from quoted strings — bare `./foo.nix`, `../foo.nix`, `/abs/foo`,
+and bare relative `foo/bar.nix` (all four forms checked against
+`nix-instantiate --eval`'s `builtins.typeOf`/`builtins.toString`). There's
+no division operator anywhere in this grammar, so any `/` outside a string
+is unambiguously a path — that's what lets the lexer try path-scanning
+*before* digit/ident scanning with no new lookahead machinery breaking any
+existing token. A **relative** path literal resolves (at *compile* time,
+not eval time — see `compiler.c`'s `AST_PATH` case and
+`g_compile_base_dir`) against the directory of the `.nix` file it's
+*written in*, matching real Nix exactly (confirmed with a nested-import
+fixture: `a/b.nix`'s own `./c.nix` resolves to `a/c.nix`, not wherever the
+file that `import`ed `a/b.nix` lives, and not the process's cwd) — not
+against the importing file's directory, and not the process's cwd.
+Resolution runs the result through a lexical canonicalizer (collapses
+`.`/`..`/doubled slashes, no symlink resolution) matching real Nix's
+`canonPath` for the cases checked (`./sub/../foo.nix` → `.../foo.nix`,
+verified against `nix-instantiate`). A trailing slash is rejected with the
+same message real Nix uses ("path has a trailing slash") rather than
+silently stripped.
+
+**Value representation**: no new tag — all 8 `ASNIX_TAG_*` slots are
+already spent (see `include/asnix/value.h`), so a Path reuses
+`ASNIX_TAG_PTR` exactly as `value.h`'s own comment on that tag
+anticipates ("generic heap pointer... via a header Kind byte"):
+distinguished from a String by a reserved negative sentinel in the
+leading word (a genuine String's leading word is always its own
+non-negative length) — see `include/asnix/heap.h`'s `ASNIX_PATH_MARKER`
+and `src/c/value_util.c`'s `asnix_value_is_path`/`asnix_ptr_bytes`. Every
+place that used to assume "`ASNIX_TAG_PTR` means String" (`typeOf`,
+`toString`, the printer, `hashString`) was updated to dispatch on the
+marker; `toString`ing a Path produces a plain String with the same bytes
+(real Nix changes the value's *type* from `"path"` to `"string"` here —
+checked directly), and `hashString` now rejects a Path argument instead
+of misreading the marker as a bogus length (checked against
+`nix-instantiate`: real Nix also rejects it, "expected a string but found
+a path").
+
+**Search-path literals** (`<nixpkgs>`-style): included — cheap enough
+(just `NIX_PATH` parsing + one `stat()`, no new value kind). Implements
+real Nix's `findFile` rule (checked against `nix-instantiate`, with
+`NIX_PATH` set to both `name=dir` and plain-`dir` forms): colon-separated
+`NIX_PATH` entries, `name=dir` matched by exact leading-component name
+(trusted without a filesystem check — matching real Nix), plain `dir`
+entries probed for `dir/<name>` via `stat()`; first match wins. **Not**
+added to the committed `tests/e2e` suite, unlike everything else here:
+asserting on a `NIX_PATH`-derived absolute path would bake this
+particular checkout's filesystem location into a fixture meant to run
+from any clone — manually verified against `nix-instantiate --eval
+'builtins.toString <foo>'` with `NIX_PATH=foo=<dir>` instead (see this
+milestone's session transcript).
+
+**`import`**: `src/c/main.c`'s `main()` used to inline the whole
+lex→parse→compile→eval pipeline directly; it's now `asnix_eval_file()`
+(`src/c/eval_file.c`), called by both `main()` and the new
+`builtins.import` primop (`src/c/builtins.c`'s `prim_import`) so the
+pipeline exists in exactly one place. Each call gets a brand-new root
+`Env`/`builtins` attrset — an imported file never implicitly sees the
+importing file's local scope (checked: this falls out for free from
+`asnix_env_alloc(NULL, 1)` building a parentless frame every time, not
+from any explicit "don't leak scope" logic). Accepts either a Path or an
+**absolute**-path String; a relative-path String is rejected with real
+Nix's exact wording ("string '...' doesn't represent an absolute path")
+rather than silently resolving it against cwd — there's no "containing
+file" to resolve a bare string argument against the way a path *literal*
+resolves against its own file at compile time.
+
+**Cut, deliberately**: `import` (and every other builtin) is reachable
+only as `builtins.import` — this codebase has no implicit "with builtins"
+root scope the way real Nix exposes `import`/`map`/`throw`/etc as bare
+globals (consistent with `m7_builtin_as_value.nix`'s existing
+`builtins.toString`-only pattern, not a new gap this milestone
+introduces). Path **arithmetic** (`somePath + "/file"`, path equality,
+etc.) isn't implemented — `AST_BINOP`'s `+` is still integer-only
+(`op_add.S`); giving `+` path semantics would mean touching the hot
+arithmetic op handler for a feature outside this milestone's ask. String
+**interpolation** of a path (`"${./foo}"`) isn't applicable here since
+this codebase has no string interpolation at all yet — and when it
+lands, note for whoever adds it: real Nix's interpolation of a path
+copies it to the Nix store and substitutes the resulting store path
+(checked: `"${./foo.nix}"` evaluates to a `/nix/store/...` string, not
+the plain path text) — a "string context" / content-addressing feature
+well beyond this milestone's scope (no daemon `AddToStore` is wired up —
+see M8's scope notes above), not a simple text substitution.
 
 ## Known bugs found and fixed during implementation (worth knowing about)
 

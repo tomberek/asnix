@@ -55,7 +55,8 @@ static Token *expect(Parser *p, TokKind kind, const char *what) {
 
 static int starts_atom(TokKind k) {
     return k == TOK_INT || k == TOK_IDENT || k == TOK_TRUE || k == TOK_FALSE || k == TOK_NULL ||
-           k == TOK_LPAREN || k == TOK_STRING || k == TOK_LBRACKET || k == TOK_LBRACE;
+           k == TOK_LPAREN || k == TOK_STRING || k == TOK_LBRACKET || k == TOK_LBRACE ||
+           k == TOK_PATH || k == TOK_SEARCH_PATH;
 }
 
 static Ast *parse_expr(Parser *p);
@@ -103,6 +104,22 @@ static Ast *parse_atom(Parser *p) {
             Ast *n = asnix_ast_new(AST_VAR);
             n->as.var.name = t->start;
             n->as.var.name_len = t->len;
+            return n;
+        }
+        case TOK_PATH: {
+            advance(p);
+            Ast *n = asnix_ast_new(AST_PATH);
+            n->as.path.text = t->start;
+            n->as.path.len = t->len;
+            n->as.path.is_search = 0;
+            return n;
+        }
+        case TOK_SEARCH_PATH: {
+            advance(p);
+            Ast *n = asnix_ast_new(AST_PATH);
+            n->as.path.text = t->start;
+            n->as.path.len = t->len;
+            n->as.path.is_search = 1;
             return n;
         }
         case TOK_LPAREN: {

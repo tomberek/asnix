@@ -34,7 +34,7 @@ static Ast *parse_source(const char *src) {
 static void check_fixture(const char *name, const char *src, int64_t expected) {
     Ast *ast = parse_source(src);
 
-    IrProgram *prog = asnix_compile(ast);
+    IrProgram *prog = asnix_compile(ast, "."); /* no path literals in these fixtures; base_dir is unused */
     Env *root = asnix_arena_alloc(8);
     root->up = NULL;
     Value interpreted = asnix_eval(prog, root);

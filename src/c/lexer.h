@@ -29,14 +29,17 @@ typedef enum {
     TOK_LBRACKET,
     TOK_RBRACKET,
     TOK_STRING,
+    TOK_PATH,        /* bare path literal: ./foo, ../foo, /foo, foo/bar (see lexer.c's try_scan_path) */
+    TOK_SEARCH_PATH, /* <nixpkgs>-style NIX_PATH search-path literal */
     TOK_EOF,
 } TokKind;
 
 typedef struct {
     TokKind kind;
     int64_t int_val;    /* TOK_INT */
-    const char *start;  /* TOK_IDENT / TOK_STRING: pointer into the source buffer */
-    size_t len;          /* TOK_IDENT / TOK_STRING: length (TOK_STRING excludes the quotes) */
+    const char *start;  /* TOK_IDENT / TOK_STRING / TOK_PATH / TOK_SEARCH_PATH: pointer into the source buffer */
+    size_t len;          /* TOK_IDENT / TOK_STRING / TOK_PATH / TOK_SEARCH_PATH: length (TOK_STRING excludes the
+                           * quotes, TOK_SEARCH_PATH excludes the angle brackets) */
 } Token;
 
 /* Tokenizes the whole source in one pass into a malloc'd array terminated

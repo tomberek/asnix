@@ -49,9 +49,13 @@ design was based on.
   (see `docs/abi.md` and the "pool-per-closure" note in `ir.h`).
 - **IrOp** record: `{void *handler; int64_t a; int64_t b;}` — see
   `docs/ir-format.md`.
-- **String/List/Attrs** (`include/asnix/heap.h`, M5): `String{len;
-  bytes[]}` (the only `PTR`-tag kind so far), `List{count; elems[]}`,
-  `Attrs{count; entries[]}` with entries sorted by symbol id.
+- **String/Path/List/Attrs** (`include/asnix/heap.h`, M5/M10):
+  `String{len; bytes[]}` and `Path{marker; len; bytes[]}` (two `PTR`-tag
+  kinds, told apart by a reserved negative `marker` sentinel in the
+  leading word — see heap.h's `ASNIX_PATH_MARKER`; there's no free tag bit
+  for a dedicated `ASNIX_TAG_PATH`, all 8 slots below are spent),
+  `List{count; elems[]}`, `Attrs{count; entries[]}` with entries sorted by
+  symbol id.
 - **Thunk** (`include/asnix/ir.h`, M6): `{state; env; body; pool}` — 32
   bytes, the mechanism behind laziness. `state` is `UNFORCED`/
   `IN_PROGRESS`/`FORCED`; once forced, the `env` field is *repurposed* to

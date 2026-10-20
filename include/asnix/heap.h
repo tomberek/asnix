@@ -2,16 +2,36 @@
 #define ASNIX_HEAP_H
 
 /*
- * Heap object layouts for the ASNIX_TAG_PTR (string), ASNIX_TAG_LIST, and
- * ASNIX_TAG_ATTRS value kinds (see docs/value-encoding.md). All arena-
+ * Heap object layouts for the ASNIX_TAG_PTR (string, path), ASNIX_TAG_LIST,
+ * and ASNIX_TAG_ATTRS value kinds (see docs/value-encoding.md). All arena-
  * allocated, never freed, 8-byte aligned.
  */
 
-/* String: {int64_t len; char bytes[len];} -- the only ASNIX_TAG_PTR kind
- * so far, so no in-object Kind-discriminant byte is needed yet (see the
- * note in value.h about why that tag is reserved as the generic fallback). */
+/* String: {int64_t len; char bytes[len];} -- `len` is always >= 0. */
 #define ASNIX_STRING_OFF_LEN   0
 #define ASNIX_STRING_OFF_BYTES 8
+
+/* Path (import-paths): a second ASNIX_TAG_PTR kind -- there's no free tag
+ * bit to spend on a dedicated ASNIX_TAG_PATH (all 8 slots are already
+ * assigned, see value.h), so this is exactly the "header Kind byte"
+ * extension value.h's comment on ASNIX_TAG_PTR anticipates. Told apart
+ * from a String with a single extra load: a genuine String's leading word
+ * is always its own (non-negative) byte length, so a Path reserves the
+ * negative sentinel ASNIX_PATH_MARKER there instead, pushing its own
+ * length and bytes out one slot:
+ *   Path{int64_t marker == ASNIX_PATH_MARKER (-1); int64_t len; char bytes[len];}
+ * `bytes` always holds a fully-resolved ABSOLUTE, lexically-canonicalized
+ * path (no `.`/`..`/doubled slashes, no trailing slash) -- resolution
+ * against the containing file's directory happens once, at compile time
+ * (see src/c/compiler.c's AST_PATH case), not at every use. Use
+ * asnix_value_is_path()/asnix_ptr_bytes() (src/c/value_util.h) rather than
+ * poking these offsets directly -- they dispatch on the marker so callers
+ * that don't care which PTR kind they have (printing, hashing, ...) don't
+ * have to. */
+#define ASNIX_PATH_MARKER     (-1)
+#define ASNIX_PATH_OFF_MARKER 0
+#define ASNIX_PATH_OFF_LEN    8
+#define ASNIX_PATH_OFF_BYTES  16
 
 /* List: {int64_t count; Value elems[count];} */
 #define ASNIX_LIST_OFF_COUNT 0

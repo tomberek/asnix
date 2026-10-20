@@ -4,31 +4,12 @@
 #include <string.h>
 
 #include "asnix/arena.h"
-#include "asnix/env.h"
 #include "asnix/heap.h"
 #include "asnix/ir.h"
 #include "asnix/value.h"
-#include "builtins.h"
-#include "compiler.h"
-#include "lexer.h"
-#include "parser.h"
+#include "eval_file.h"
 #include "symtab.h"
-
-static char *read_file(const char *path) {
-    FILE *f = fopen(path, "rb");
-    if (!f) {
-        fprintf(stderr, "asnix: cannot open '%s'\n", path);
-        exit(1);
-    }
-    fseek(f, 0, SEEK_END);
-    long size = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    char *buf = malloc((size_t)size + 1);
-    fread(buf, 1, (size_t)size, f);
-    buf[size] = '\0';
-    fclose(f);
-    return buf;
-}
+#include "value_util.h"
 
 static void print_value_inner(Value v) {
     v = asnix_force_for_print(v); /* list elements and attrset values are lazy (M6) */
@@ -44,9 +25,12 @@ static void print_value_inner(Value v) {
                 default: printf("<imm %d>", asnix_imm_subtag(v)); return;
             }
         case ASNIX_TAG_PTR: {
-            const char *s = (const char *)(v.raw & ~0x7ULL);
-            int64_t len = *(const int64_t *)(s + ASNIX_STRING_OFF_LEN);
-            printf("\"%.*s\"", (int)len, s + ASNIX_STRING_OFF_BYTES);
+            int64_t len;
+            const char *bytes = asnix_ptr_bytes(v, &len);
+            /* Paths print bare/unquoted (an absolute filesystem path, not
+             * string syntax) -- matches `nix-instantiate --eval`. */
+            if (asnix_value_is_path(v)) printf("%.*s", (int)len, bytes);
+            else printf("\"%.*s\"", (int)len, bytes);
             return;
         }
         case ASNIX_TAG_LIST: {
@@ -129,16 +113,7 @@ int main(int argc, char **argv) {
 
     asnix_arena_init(0);
 
-    char *src = read_file(argv[1]);
-    size_t ntoks;
-    Token *toks = asnix_lex(src, &ntoks);
-    Ast *ast = asnix_parse(toks, ntoks);
-    IrProgram *prog = asnix_compile(ast);
-
-    Env *root_env = asnix_env_alloc(NULL, 1);
-    root_env->values[0] = asnix_make_builtins_attrs();
-
-    Value result = asnix_eval(prog, root_env);
+    Value result = asnix_eval_file(argv[1]);
     print_value(result);
     return 0;
 }

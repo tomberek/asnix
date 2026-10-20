@@ -4,12 +4,158 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 #include "asnix/arena.h"
 #include "asnix/heap.h"
 #include "asnix/irbuild.h"
 #include "asnix/value.h"
 #include "symtab.h"
+#include "value_util.h"
+
+/* AST_PATH resolution (import-paths). `base_dir` is constant for one whole
+ * asnix_compile() call (every path literal in a given file resolves
+ * against that *file's* directory, not wherever the thunk/lambda body
+ * containing it happens to run later) -- threading it through every
+ * compile_expr recursive call as an explicit parameter would touch every
+ * call site for no benefit, so it's stashed here instead. Safe as a
+ * single global rather than a stack: asnix_compile() always runs to
+ * completion (there is no `call asnix_compile` while another
+ * asnix_compile() frame is still on the C stack) before asnix_eval() ever
+ * starts running the IR that might later trigger `import` (which runs a
+ * *fresh, separate* asnix_eval_file() call, well after this one
+ * returned) -- see src/c/eval_file.c. */
+static const char *g_compile_base_dir = NULL;
+
+/* Lexically canonicalizes an absolute path in place: collapses `.` and
+ * `..` components and doubled slashes, same as real Nix's `canonPath`
+ * (verified against `nix-instantiate --eval 'builtins.toString
+ * ./sub/../foo.nix'`), but -- unlike `canonPath` -- never touches the
+ * filesystem (no symlink resolution): cheap, and sufficient for every
+ * case this project's fixtures exercise. `in` must start with '/'. */
+static char *canon_path(const char *in) {
+    size_t len = strlen(in);
+    char *out = malloc(len + 2);
+    char **comps = malloc((len + 1) * sizeof(char *));
+    size_t ncomps = 0;
+
+    size_t i = 0;
+    while (i < len) {
+        while (i < len && in[i] == '/') i++;
+        size_t start = i;
+        while (i < len && in[i] != '/') i++;
+        size_t clen = i - start;
+        if (clen == 0) continue;
+        if (clen == 1 && in[start] == '.') continue; /* "." -- drop */
+        if (clen == 2 && in[start] == '.' && in[start + 1] == '.') {
+            if (ncomps > 0) ncomps--; /* ".." -- pop (no-op at root, like real Nix) */
+            continue;
+        }
+        char *c = malloc(clen + 1);
+        memcpy(c, in + start, clen);
+        c[clen] = '\0';
+        comps[ncomps++] = c;
+    }
+
+    size_t pos = 0;
+    for (size_t k = 0; k < ncomps; k++) {
+        out[pos++] = '/';
+        size_t clen = strlen(comps[k]);
+        memcpy(out + pos, comps[k], clen);
+        pos += clen;
+        free(comps[k]);
+    }
+    free(comps);
+    if (pos == 0) out[pos++] = '/';
+    out[pos] = '\0';
+    return out;
+}
+
+/* Resolves a NIX_PATH search-path entry name (the text inside `<...>`,
+ * e.g. "nixpkgs" or "nixpkgs/lib") the same way real Nix's `findFile`
+ * does: NIX_PATH is a colon-separated list of either `name=dir` (matched
+ * by exact leading-component name) or plain `dir` entries (searched by
+ * checking whether `dir/<name>` exists); first match wins. Aborts with a
+ * message matching nix-instantiate's wording if nothing matches or
+ * NIX_PATH isn't set. */
+static char *resolve_search_path(const char *name, size_t name_len) {
+    const char *nix_path = getenv("NIX_PATH");
+    const char *first_slash = memchr(name, '/', name_len);
+    size_t head_len = first_slash ? (size_t)(first_slash - name) : name_len;
+
+    if (nix_path && nix_path[0]) {
+        char *copy = malloc(strlen(nix_path) + 1);
+        memcpy(copy, nix_path, strlen(nix_path) + 1);
+        char *entry = copy;
+        while (entry) {
+            char *colon = strchr(entry, ':');
+            if (colon) *colon = '\0';
+            if (*entry) {
+                char *eq = strchr(entry, '=');
+                const char *dir;
+                int matched = 0;
+                if (eq) {
+                    size_t ename_len = (size_t)(eq - entry);
+                    if (ename_len == head_len && memcmp(entry, name, head_len) == 0) matched = 1;
+                    dir = eq + 1;
+                } else {
+                    dir = entry;
+                    matched = 1; /* plain dir entries are always probed below */
+                }
+                if (matched) {
+                    size_t dir_len = strlen(dir);
+                    size_t cand_len = dir_len + 1 + name_len;
+                    char *cand = malloc(cand_len + 1);
+                    memcpy(cand, dir, dir_len);
+                    cand[dir_len] = '/';
+                    memcpy(cand + dir_len + 1, name, name_len);
+                    cand[cand_len] = '\0';
+                    if (eq) return cand; /* exact `name=dir` match: trust it, no stat needed */
+                    struct stat st;
+                    if (stat(cand, &st) == 0) return cand;
+                    free(cand);
+                }
+            }
+            entry = colon ? colon + 1 : NULL;
+        }
+        free(copy);
+    }
+
+    fprintf(stderr, "asnix: file '%.*s' was not found in the Nix search path (set $NIX_PATH)\n",
+            (int)name_len, name);
+    exit(1);
+}
+
+/* Resolves one AST_PATH node's raw lexeme to an absolute, canonicalized
+ * path string (malloc'd, NUL-terminated). */
+static char *resolve_path_literal(Ast *node) {
+    const char *text = node->as.path.text;
+    size_t len = node->as.path.len;
+
+    if (node->as.path.is_search) return canon_path(resolve_search_path(text, len));
+
+    if (len > 0 && text[len - 1] == '/') {
+        fprintf(stderr, "asnix: path has a trailing slash\n");
+        exit(1);
+    }
+
+    char *joined;
+    if (len > 0 && text[0] == '/') {
+        joined = malloc(len + 1);
+        memcpy(joined, text, len);
+        joined[len] = '\0';
+    } else {
+        size_t base_len = strlen(g_compile_base_dir);
+        joined = malloc(base_len + 1 + len + 1);
+        memcpy(joined, g_compile_base_dir, base_len);
+        joined[base_len] = '/';
+        memcpy(joined + base_len + 1, text, len);
+        joined[base_len + 1 + len] = '\0';
+    }
+    char *canon = canon_path(joined);
+    free(joined);
+    return canon;
+}
 
 /* Every scope-introducing AST node (AST_LET, AST_LAMBDA) binds exactly one
  * name at slot 0 (see ast.h), so resolution is just "how many scope links
@@ -168,10 +314,24 @@ static void compile_expr(IrBuilder *b, Ast *node, ScopeFrame *scope) {
             ib_select(b, sym);
             return;
         }
+        case AST_PATH: {
+            /* Resolved once, here, against g_compile_base_dir -- not at
+             * eval time -- matching real Nix (a path literal's absolute
+             * form is fixed by where it's *written*, verified against
+             * nix-instantiate; see this file's top-of-file comment and
+             * resolve_path_literal()). */
+            char *abs = resolve_path_literal(node);
+            size_t len = strlen(abs);
+            Value v = asnix_make_path_value(abs, len);
+            free(abs);
+            ib_push_const(b, (int64_t)v.raw);
+            return;
+        }
     }
 }
 
-IrProgram *asnix_compile(Ast *root) {
+IrProgram *asnix_compile(Ast *root, const char *base_dir) {
+    g_compile_base_dir = base_dir;
     IrBuilder *b = ib_new();
     /* The root env (constructed by main.c) has exactly one slot: the
      * `builtins` attrset. This scope frame makes `builtins.toString 5`
