@@ -23,10 +23,19 @@
 #define ASNIX_STDERR_RESULT         0x52534c54
 
 #define ASNIX_OP_IS_VALID_PATH 1
+/* op 7, NOT the obsolete op 8 (AddTextToStore, dead since protocol 1.25)
+ * -- cross-checked against ~/nix's remote-store.cc (the >= {1,25} branch
+ * real clients take) and ~/gnix/fix's client.zig, which agree exactly. */
+#define ASNIX_OP_ADD_TO_STORE 7
+#define ASNIX_OP_BUILD_PATHS  9
+#define ASNIX_OP_SET_OPTIONS  19
+
+#define ASNIX_BUILD_MODE_NORMAL 0
 
 struct AsnixDaemonConn {
     int fd;
     uint64_t daemon_version;
+    int trusted; /* -1 = unknown/not read (daemon_minor < 35) */
 };
 
 static int write_full(int fd, const void *buf, size_t n) {
@@ -276,9 +285,11 @@ AsnixDaemonConn *asnix_daemon_connect(void) {
     if (daemon_minor >= 11 && write_u64(fd, 0) != 0) goto io_error;
 
     if (daemon_minor >= 33 && skip_string(fd) != 0) goto io_error; /* nix version string, informational */
+    int trusted = -1;
     if (daemon_minor >= 35) {
-        uint64_t trusted;
-        if (read_u64(fd, &trusted) != 0) goto io_error;
+        uint64_t trusted_raw;
+        if (read_u64(fd, &trusted_raw) != 0) goto io_error;
+        trusted = (int)trusted_raw;
     }
 
     if (process_stderr(fd) != 0) {
@@ -289,6 +300,7 @@ AsnixDaemonConn *asnix_daemon_connect(void) {
     AsnixDaemonConn *conn = malloc(sizeof(AsnixDaemonConn));
     conn->fd = fd;
     conn->daemon_version = daemon_version;
+    conn->trusted = trusted;
     return conn;
 
 io_error:
@@ -310,4 +322,126 @@ int asnix_daemon_is_valid_path(AsnixDaemonConn *conn, const char *path) {
     uint64_t result;
     if (read_u64(conn->fd, &result) != 0) return -1;
     return result != 0 ? 1 : 0;
+}
+
+int asnix_daemon_trusted(AsnixDaemonConn *conn) {
+    return conn->trusted;
+}
+
+/* Skips a length-prefixed SET of strings: u64 count, then that many
+ * length-prefixed (padded) strings -- the wire shape AddToStore's
+ * `references` request field and ValidPathInfo's `references`/`sigs`
+ * response fields both use (see daemon_client.h's AddToStore comment and
+ * ~/nix's length-prefixed-protocol-helper.hh, cross-checked against
+ * ~/gnix/fix's client.zig readStrings). */
+static int skip_string_set(int fd) {
+    uint64_t count;
+    if (read_u64(fd, &count) != 0) return -1;
+    for (uint64_t i = 0; i < count; i++) {
+        if (skip_string(fd) != 0) return -1;
+    }
+    return 0;
+}
+
+/* Reads AddToStore's response -- a full ValidPathInfo (~/nix's
+ * worker-protocol.cc UnkeyedValidPathInfo::write, cross-checked against
+ * ~/gnix/fix's client.zig readValidPathInfo): path, deriver (optional
+ * string, empty = none), narHash, references (string set),
+ * registrationTime (u64), narSize (u64), ultimate (bool-as-u64), sigs
+ * (string set), ca (string). Only `path` is useful to this client; every
+ * other field is skipped but must still be correctly walked past to stay
+ * in sync with the daemon's byte stream. Returns a malloc'd, NUL-
+ * terminated copy of `path` (caller frees), or NULL on a protocol/IO
+ * error. */
+static char *read_valid_path_info_path(int fd) {
+    char *path = read_string_alloc(fd);
+    if (!path) return NULL;
+    if (skip_string(fd) != 0 /* deriver */
+        || skip_string(fd) != 0 /* narHash */
+        || skip_string_set(fd) != 0 /* references */) {
+        free(path);
+        return NULL;
+    }
+    uint64_t registration_time, nar_size, ultimate;
+    if (read_u64(fd, &registration_time) != 0 || read_u64(fd, &nar_size) != 0 ||
+        read_u64(fd, &ultimate) != 0) {
+        free(path);
+        return NULL;
+    }
+    if (skip_string_set(fd) != 0 /* sigs */ || skip_string(fd) != 0 /* ca */) {
+        free(path);
+        return NULL;
+    }
+    return path;
+}
+
+char *asnix_daemon_add_text_to_store(AsnixDaemonConn *conn, const char *name, const char *text, size_t text_len) {
+    if (write_u64(conn->fd, ASNIX_OP_ADD_TO_STORE) != 0) return NULL;
+    if (write_cstr(conn->fd, name) != 0) return NULL;
+    if (write_cstr(conn->fd, "text:sha256") != 0) return NULL; /* content-address method -- a .drv is always this */
+    if (write_u64(conn->fd, 0) != 0) return NULL;              /* references: empty set (no input drvs/sources yet) */
+    if (write_u64(conn->fd, 0) != 0) return NULL;              /* repair = false (true is rejected for untrusted clients) */
+
+    /* FramedSink: one or more [u64 len][raw bytes, NOT padded -- distinct
+     * from write_string's length-prefixed-and-padded convention used
+     * everywhere else in this protocol] chunks, terminated by a single
+     * zero-length chunk. One chunk is enough for a .drv's text. */
+    if (write_u64(conn->fd, (uint64_t)text_len) != 0) return NULL;
+    if (text_len > 0 && write_full(conn->fd, text, text_len) != 0) return NULL;
+    if (write_u64(conn->fd, 0) != 0) return NULL; /* terminating zero-length frame */
+
+    if (process_stderr(conn->fd) != 0) return NULL;
+    return read_valid_path_info_path(conn->fd);
+}
+
+int asnix_daemon_set_options(AsnixDaemonConn *conn, int use_substitutes) {
+    if (write_u64(conn->fd, ASNIX_OP_SET_OPTIONS) != 0) return -1;
+    if (write_u64(conn->fd, 0) != 0) return -1; /* keepFailed */
+    if (write_u64(conn->fd, 0) != 0) return -1; /* keepGoing */
+    if (write_u64(conn->fd, 0) != 0) return -1; /* tryFallback */
+    if (write_u64(conn->fd, 0) != 0) return -1; /* verbosity (lvlError) */
+    if (write_u64(conn->fd, 1) != 0) return -1; /* maxBuildJobs */
+    if (write_u64(conn->fd, 0) != 0) return -1; /* maxSilentTime */
+    if (write_u64(conn->fd, 1) != 0) return -1; /* obsolete useBuildHook -- real clients always send true */
+    if (write_u64(conn->fd, 1) != 0) return -1; /* verboseBuild slot: nonzero -> daemon sees verboseBuild=false */
+    if (write_u64(conn->fd, 0) != 0) return -1; /* obsolete logType */
+    if (write_u64(conn->fd, 0) != 0) return -1; /* obsolete printBuildTrace */
+    if (write_u64(conn->fd, 1) != 0) return -1; /* buildCores */
+    if (write_u64(conn->fd, (uint64_t)(use_substitutes ? 1 : 0)) != 0) return -1; /* useSubstitutes */
+    if (write_u64(conn->fd, 0) != 0) return -1; /* settings overrides: empty set */
+    return process_stderr(conn->fd);
+}
+
+int asnix_daemon_build_drv(AsnixDaemonConn *conn, const char *drv_path) {
+    /* BuildPaths (op 9), not BuildDerivation (op 36): the .drv is already
+     * in the store (via asnix_daemon_add_text_to_store above), so this
+     * references it by path rather than re-sending the whole derivation
+     * inline -- also the only option available to an untrusted client in
+     * the first place (~/nix's daemon.cc rejects BuildDerivation outright
+     * for an input-addressed derivation from a non-trusted client,
+     * stricter than BuildPaths's own build-time check). The legacy
+     * DerivedPath encoding for "build every output of this .drv" is
+     * "<drvPath>!*" (cross-checked against ~/nix's derived-path.cc and
+     * ~/gnix/fix's client.zig, which agree exactly). */
+    char derived_path[320];
+    int n = snprintf(derived_path, sizeof(derived_path), "%s!*", drv_path);
+    if (n < 0 || (size_t)n >= sizeof(derived_path)) {
+        fprintf(stderr, "asnix: daemon: drv path too long\n");
+        return -1;
+    }
+
+    if (write_u64(conn->fd, ASNIX_OP_BUILD_PATHS) != 0) return -1;
+    if (write_u64(conn->fd, 1) != 0) return -1; /* one DerivedPath in the list */
+    if (write_cstr(conn->fd, derived_path) != 0) return -1;
+    if (write_u64(conn->fd, ASNIX_BUILD_MODE_NORMAL) != 0) return -1;
+
+    /* Real success/failure is signaled via the STDERR_ERROR sideband
+     * during this op (e.g. "you are not privileged to build input-
+     * addressed derivations" for an untrusted client -- a real, expected
+     * daemon permission boundary, not a bug in this client), not by the
+     * dummy result sentinel that follows it on success. */
+    if (process_stderr(conn->fd) != 0) return -1;
+    uint64_t dummy_result;
+    if (read_u64(conn->fd, &dummy_result) != 0) return -1;
+    return 0;
 }

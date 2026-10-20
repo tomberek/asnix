@@ -32,7 +32,8 @@ what's actually implemented and the scope decisions made along the way.
 | M17 — builtins expansion (list/attrs/string/type-predicate) | done (see below) |
 | M18 — bare globals (`import`/`map`/`abort`/`toString`) + `expr.attr or default` | done (see below) |
 | M19 — `genericClosure` + second builtins-expansion pass | done, **scoped** (see below) |
-| M20+ | not started |
+| M20 — daemon realization: `SetOptions`/`AddToStore`/`BuildPaths` (`src/c/daemon_client.c`) | done, **scoped** (see below) |
+| M21+ | not started |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
 
@@ -1518,6 +1519,72 @@ already existed per M17.
   updating (their old expected output had baked in the bug — a raw,
   unescaped embedded newline — not real Nix's actual behavior).
 
+## M20 scope notes: daemon realization (`SetOptions`/`AddToStore`/`BuildPaths`)
+
+Extends M8's connect/handshake/`IsValidPath`-only daemon client
+(`src/c/daemon_client.{h,c}`) with the three ops needed to actually
+realize a derivation against a live `nix-daemon`, run and verified
+against the real, live system daemon on this dev machine (not a mock).
+
+- **`asnix_daemon_trusted()`**: exposes the handshake's protocol-≥1.35
+  trust flag (`1`=trusted, `0`=not, `2`=unset), read but previously
+  discarded. On this dev machine, an ordinary (UID 1001, not listed in
+  any `trusted-users` this agent could find) account was unexpectedly
+  reported as `1`/trusted — not fully explained, but observed directly
+  and not load-bearing for anything below since this client never relies
+  on a specific trust verdict to behave correctly.
+- **`asnix_daemon_add_text_to_store()`** (op 7, `AddToStore` — not the
+  obsolete op 8 `AddTextToStore`, dead since protocol 1.25): adds a
+  `.drv`'s ATerm text as self-verifying `"text:sha256"` content-addressed
+  store content (no trust needed for this op itself). Uses the
+  `FramedSink` chunk encoding (`[u64 len][raw unpadded bytes]`, zero-
+  length terminator) — a distinct wire convention from the ordinary
+  length-prefixed-and-8-byte-padded strings used everywhere else in this
+  protocol. Verified end to end: the daemon's returned computed store
+  path matched this client's own independently-computed `drvPath`
+  exactly, byte for byte — strong evidence the ATerm serialization and
+  content-addressing are both implemented correctly, cross-checked
+  against a real daemon's own hash computation rather than only against
+  this project's own code.
+- **`asnix_daemon_set_options()`** (op 19, `SetOptions`): sends this
+  connection's build settings to the daemon. Every real `nix`/Lix client
+  sends this immediately after the handshake; this client previously
+  didn't, meaning `BuildPaths` ran under the daemon's own process-wide
+  defaults (loaded once from `/etc/nix/nix.conf` at daemon startup) for
+  every field, substituters included — see Known Bugs entry #16 below for
+  the real divergence this caused and how `useSubstitutes=0` fixes it.
+  Every other field this op carries is sent as an inert default (field
+  order and defaults cross-checked against `~/nix`'s own
+  `RemoteStore::setOptions`); only `useSubstitutes` does anything
+  meaningful for this client's purposes.
+- **`asnix_daemon_build_drv()`** (op 9, `BuildPaths` — not op 36
+  `BuildDerivation`, which sends the whole derivation inline instead of
+  referencing an already-`AddToStore`'d path, and which a real daemon
+  rejects outright for an untrusted client building an input-addressed
+  derivation, stricter than `BuildPaths`'s own build-time check).
+  Verified end to end against the live daemon with `tools/realize_demo.c`
+  (a trivial, harmless derivation: `builder = "/bin/sh"`,
+  `args = ["-c" "echo hi from asnix > $out"]`): `BuildPaths` was accepted,
+  and the resulting store path's content was read back and confirmed to
+  be exactly `hi from asnix`, owned by `root`, with the standard Nix
+  store read-only-permissions/epoch-timestamp normalization applied —
+  i.e. a genuine sandboxed build by the real daemon, not a substituted
+  cache hit.
+- **`tools/realize_demo.c`**: a standalone, manually-invoked tool,
+  deliberately **not** part of `make test`'s `tests/c/` glob — it writes
+  to the real, live Nix store and attempts a real build every time it
+  runs, which a routine `make test` invocation should never do by
+  default. Mirrors `derivation.c`'s `builtins.derivation` construction
+  logic independently (via `aterm.h`/`store_path.h`'s already-exported
+  helpers) rather than widening `derivation.c`'s own interface just for
+  this tool.
+- **Scope cut, deliberately**: no `QueryMissing`, no NAR transfer, no
+  structured build-activity forwarding (the `STDERR_START_ACTIVITY`/
+  `STDERR_RESULT` sideband messages are parsed just enough to stay in
+  sync with the daemon's byte stream, not surfaced to the user) — this
+  client can trigger a real build and confirm success/failure, nothing
+  richer than that yet.
+
 ## Known bugs found and fixed during implementation (worth knowing about)
 
 1. **Register corruption across `asnix_eval`** (M3): `op_let.S`/
@@ -1780,3 +1847,33 @@ already existed per M17.
    visible) and fixed it with a narrower `print_escaped_string` (`"`, `\`,
    `\n`, `\r`, `\t` only, no `${` handling) -- superseded by the more
    complete fix above when the two branches were integrated.
+16. **`BuildPaths` without ever sending `SetOptions` consults the daemon's
+   OWN process-wide settings, substituters included** (found running
+   `tools/realize_demo.c` against the real, live system `nix-daemon`): a
+   client that connects, handshakes, and goes straight to `AddToStore`/
+   `BuildPaths` -- which is what M8's original client did, and all this
+   client needs for `IsValidPath` -- gets the daemon's settings exactly as
+   loaded from `/etc/nix/nix.conf` at daemon startup, because nothing has
+   ever told it otherwise. On this dev machine that config includes a
+   private company Cachix substituter; `BuildPaths` failed on that
+   substituter's expired auth token (`HTTP 401`), not on anything wrong in
+   this client's own protocol framing -- confirmed by the `AddToStore`
+   round-trip already having verified byte-for-byte reproducibility
+   against the daemon's own computed store path. A control run of plain
+   `nix-build` on an equally trivial derivation succeeded on the same
+   machine, but via a completely different path (a remote SSH builder from
+   this user's own nix.conf) -- not evidence the substituter issue isn't
+   real, just that ordinary `nix-build` never exercises it. Every real
+   `nix`/Lix client sends `SetOptions` (op 19) immediately after the
+   handshake specifically so the daemon applies *that connection's*
+   settings instead of its own defaults for the rest of the session; this
+   client had never implemented it. Fixed by adding
+   `asnix_daemon_set_options()` (`daemon_client.c`) and calling it with
+   `useSubstitutes=0` before `BuildPaths` in `realize_demo.c`, which skips
+   substituter lookups entirely and forces a real local build -- verified
+   end to end: the daemon accepted the build, and the resulting store path
+   contains exactly the builder script's own output (`hi from asnix`),
+   owned by `root` with the standard Nix store read-only/epoch-timestamp
+   normalization, i.e. a genuine sandboxed build, not a cache hit. The
+   expired Cachix token itself is a pre-existing, unrelated infrastructure
+   issue on this machine and was not touched.
