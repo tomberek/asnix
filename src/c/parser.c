@@ -42,10 +42,14 @@ static void bindingvec_push(BindingVec *v, AstBinding item) {
  * against cppnix's own grammar, `~/nix/src/libexpr/parser.y`'s `LET
  * binds IN_KW ...` action) -- `parse_binding_stmt`'s `dyn_out` parameter
  * is NULL at the one call site (`let`) where that rejection applies.
- * Scope cut: only a single dynamic segment is supported (`${k} = v;`),
- * not a dynamic segment followed by more attrpath segments (`${k}.a =
- * v;`) or a dynamic segment after a leading static one (`a.${k} = v;`)
- * -- neither was needed by anything this project has hit yet. */
+ * A dynamic segment followed by more attrpath segments (`${k}.a = v;`)
+ * or one after a leading static segment (`a.${k} = v;`) is also
+ * supported (M41) -- see parse_binding_stmt's attrpath-sugar branch and
+ * build_dynamic_chain_value, which handle every position uniformly;
+ * this vector only ever receives the entries that end up as *this*
+ * block's own direct dynamic bindings (a dynamic chain nested under a
+ * static prefix instead becomes that prefix's leaf value via
+ * build_dynamic_chain_value, never pushed here directly). */
 typedef struct {
     Ast *name_expr;
     Ast *value;
@@ -90,15 +94,24 @@ static AstDynBinding *finalize_dyn_vec(DynBindingVec *vec) {
  * Each node is either a LEAF (name has a definitive value: an ordinary
  * `name = expr;`, or an `inherit`ed name) or a BRANCH (name was only ever
  * used as a non-final attrpath segment, so it implicitly denotes a nested
- * attrset -- never both. Scope cut, matching M22's existing documented
- * one: only plain-identifier segments are supported (`a.b.c`, the
- * overwhelmingly common real-world case); a quoted-string or `${...}`
- * segment anywhere in an attrpath still hits the same "dynamic attrset
- * key" fatal parse error as a bare `${...}` binding name always has --
- * see parse_attr_segment/parse_binding_stmt below -- a dynamic `${...}`
- * *first* segment is handled separately (DynBindingVec, below), since
- * it can't participate in this tree at all; a dynamic segment anywhere
- * else in a dotted chain (`a.${k} = v;`) still hits this same fatal. */
+ * attrset -- never both. This tree only ever holds STATIC segments
+ * (`AttrSeg.is_dynamic == 0`) -- a dynamic segment anywhere in an
+ * attrpath (`a.${k} = v;`, `${k}.b = v;`, `a.${k1}.${k2} = v;`, M41) is
+ * handled by splitting the chain at the first dynamic segment:
+ * everything before it still flows through this static tree as normal;
+ * everything from the first dynamic segment onward becomes a synthetic
+ * nested plain-attrset literal with a `${...} = ...;` dynamic binding
+ * (reusing M28's existing DynBindingVec/OP_INSERT_DYNAMIC_ATTR
+ * machinery) as that static prefix's leaf value -- see
+ * parse_binding_stmt's attrpath-sugar branch below for exactly where
+ * that split happens. */
+typedef struct {
+    int is_dynamic;
+    Ast *name_expr;      /* valid when is_dynamic */
+    const char *attr;    /* valid when !is_dynamic */
+    size_t attr_len;
+} AttrSeg;
+
 typedef struct BTNode BTNode;
 typedef struct { BTNode *items; size_t len, cap; } BTVec;
 struct BTNode {
@@ -143,7 +156,7 @@ static void fatal_dup_attr(const char *name, size_t name_len) {
     exit(1);
 }
 
-static void insert_attrpath(BTVec *vec, Token **segs, size_t seg_count, size_t idx,
+static void insert_attrpath(BTVec *vec, AttrSeg *segs, size_t seg_count, size_t idx,
                              Ast *leaf_value, int is_inherit);
 
 /* Re-opens a pre-existing, already-finalized AST_ATTRSET literal (`attrs`)
@@ -174,15 +187,15 @@ static void reopen_attrset_into(BTVec *dest, Ast *attrs) {
     }
 }
 
-static void insert_attrpath(BTVec *vec, Token **segs, size_t seg_count, size_t idx,
+static void insert_attrpath(BTVec *vec, AttrSeg *segs, size_t seg_count, size_t idx,
                              Ast *leaf_value, int is_inherit) {
-    Token *seg = segs[idx];
-    BTNode *existing = btvec_find(vec, seg->start, seg->len);
+    AttrSeg seg = segs[idx];
+    BTNode *existing = btvec_find(vec, seg.attr, seg.attr_len);
     int is_last = (idx == seg_count - 1);
     if (is_last) {
         if (!existing) {
             btvec_push(vec, (BTNode){
-                .name = seg->start, .name_len = seg->len,
+                .name = seg.attr, .name_len = seg.attr_len,
                 .is_leaf = 1, .leaf_value = leaf_value, .is_inherit = is_inherit });
             return;
         }
@@ -210,11 +223,11 @@ static void insert_attrpath(BTVec *vec, Token **segs, size_t seg_count, size_t i
             reopen_attrset_into(&existing->children, leaf_value);
             return;
         }
-        fatal_dup_attr(seg->start, seg->len);
+        fatal_dup_attr(seg.attr, seg.attr_len);
     }
     /* Not the last segment: this name must denote (or become) a branch. */
     if (!existing) {
-        BTNode node = { .name = seg->start, .name_len = seg->len, .is_leaf = 0, .rec = 0 };
+        BTNode node = { .name = seg.attr, .name_len = seg.attr_len, .is_leaf = 0, .rec = 0 };
         btvec_push(vec, node);
         existing = &vec->items[vec->len - 1];
         insert_attrpath(&existing->children, segs, seg_count, idx + 1, leaf_value, is_inherit);
@@ -225,7 +238,7 @@ static void insert_attrpath(BTVec *vec, Token **segs, size_t seg_count, size_t i
          * attrset (the "regrettable" merge path -- real Nix's addAttr
          * dynamic_casts the existing value to ExprAttrs here too). */
         if (!existing->leaf_value || existing->leaf_value->kind != AST_ATTRSET) {
-            fatal_dup_attr(seg->start, seg->len);
+            fatal_dup_attr(seg.attr, seg.attr_len);
         }
         Ast *reopened = existing->leaf_value;
         existing->is_leaf = 0;
@@ -264,17 +277,19 @@ typedef struct {
     size_t len, cap;
 } PartVec;
 
-/* A growable array of Token* -- used by parse_binding_stmt to collect an
- * attrpath's segments (`a.b.c`) before handing them to insert_attrpath. */
+/* A growable array of AttrSeg -- used by parse_binding_stmt to collect an
+ * attrpath's segments (`a.b.c`/`a.${k}.c`) before handing them to
+ * insert_attrpath (the static prefix) and/or build_dynamic_chain_value
+ * (everything from the first dynamic segment onward). */
 typedef struct {
-    Token **items;
+    AttrSeg *items;
     size_t len, cap;
-} TokenVec;
+} AttrSegVec;
 
-static void tokenvec_push(TokenVec *v, Token *item) {
+static void attrsegvec_push(AttrSegVec *v, AttrSeg item) {
     if (v->len == v->cap) {
         v->cap = v->cap ? v->cap * 2 : 4;
-        v->items = realloc(v->items, v->cap * sizeof(Token *));
+        v->items = realloc(v->items, v->cap * sizeof(AttrSeg));
     }
     v->items[v->len++] = item;
 }
@@ -470,6 +485,7 @@ static int starts_atom(TokKind k) {
 }
 
 static Ast *parse_expr(Parser *p);
+static Ast *parse_dquote_string(Parser *p);
 
 /* List elements and application arguments are parsed at this same
  * "select" precedence (atom plus postfix `.attr` chains), not full
@@ -483,40 +499,115 @@ static Ast *parse_select(Parser *p);
  * `{ ... }` -- all three use the same binding-list grammar (see ast.h's
  * note on AstBinding.is_inherit for why the desugared value differs by
  * form but `is_inherit` is attached regardless). */
-/* Parses one attrpath segment: a plain identifier, or a static quoted-
- * string key (matching real Nix's grammar, `~/nix/src/libexpr/parser.y`'s
- * `attr: IDENTIFIER | string_attr`) -- shared by both `inherit`'s
- * attribute-name list and attrpath binding sugar (`a."b c".d = val;`).
- * Needed for names that collide with a reserved keyword and so can't be
- * written bare (e.g. nixpkgs's own `lib/trivial.nix`: `"or" = x: y: x ||
- * y;`, and `lib/default.nix`: `inherit (self.trivial) ... "or" ...;`) --
- * found evaluating real nixpkgs. A dynamic `${expr}` segment is a
- * documented, separate scope cut (see M22's scope notes on dynamic
- * attrset-literal keys): rejected here with a clear, dedicated message
- * rather than silently mishandled -- real Nix rejects it unconditionally
- * for `inherit` too ("dynamic attributes not allowed in inherit",
- * confirmed in cppnix's own grammar), though it IS allowed for an
- * ordinary attrpath binding in real Nix; asnix doesn't support it in
- * either position yet. The returned Token is malloc'd for the string
- * case (never freed -- same "compile-time-only auxiliary, process exits
- * soon after" convention as TokenVec/BTVec themselves), or the lexer's
- * own stable token-array pointer for the plain-identifier case. */
-static Token *parse_attr_segment(Parser *p, const char *what) {
-    if (cur(p)->kind != TOK_STR_START) return expect(p, TOK_IDENT, what);
-    advance(p); /* TOK_STR_START */
-    Token *tok = malloc(sizeof(Token));
-    *tok = (Token){ .kind = TOK_IDENT, .start = "", .len = 0 };
-    if (cur(p)->kind == TOK_STR_PART) {
-        tok->start = cur(p)->start;
-        tok->len = cur(p)->len;
+
+/* Parses one attrpath segment -- shared by `inherit`'s attribute-name
+ * list, attrpath binding sugar (`a."b c".${k}.d = val;`), `.`-select
+ * chains, and `?`-chains. Needed for names that collide with a reserved
+ * keyword and so can't be written bare (e.g. nixpkgs's own
+ * `lib/trivial.nix`: `"or" = x: y: x || y;`, and `lib/default.nix`:
+ * `inherit (self.trivial) ... "or" ...;`) -- found evaluating real
+ * nixpkgs. A dynamic segment (bare `${expr}` or an interpolated quoted
+ * string) is likewise a real, supported case in every one of these
+ * contexts EXCEPT `inherit` -- that one rejects it unconditionally,
+ * confirmed in cppnix's own grammar (`attrs: attrs string_attr`'s
+ * visitor throws "dynamic attributes not allowed in inherit" for the
+ * `Expr*`/dynamic case specifically, not the plain-string case) -- see
+ * that call site's own dedicated rejection check, not here, since a
+ * static quoted-string segment must still be accepted for `inherit`.
+ * Found needed evaluating real nixpkgs: `lib/systems/architectures.nix`
+ * (or a sibling file reached from `d.nix`) has `"${ident}Fallback" =
+ * fallback;`-shaped bindings. */
+static AttrSeg parse_attr_segment(Parser *p, const char *what) {
+    if (cur(p)->kind == TOK_DOLLAR_LBRACE) {
         advance(p);
+        Ast *name_expr = parse_expr(p);
+        expect(p, TOK_RBRACE, "'}' closing a dynamic attribute name");
+        return (AttrSeg){ .is_dynamic = 1, .name_expr = name_expr };
     }
-    if (cur(p)->kind != TOK_STR_END) {
-        fprintf(stderr, "asnix: parse error: dynamic attributes not allowed here\n");
-        exit(1);
+    if (cur(p)->kind != TOK_STR_START) {
+        Token *t = expect(p, TOK_IDENT, what);
+        return (AttrSeg){ .is_dynamic = 0, .attr = t->start, .attr_len = t->len };
     }
-    advance(p); /* TOK_STR_END */
-    return tok;
+    /* Quoted-string segment -- reuses parse_dquote_string's own chunk-
+     * collecting loop (same TOK_STR_PART/TOK_DOLLAR_LBRACE/TOK_STR_END
+     * grammar as an ordinary string literal), then classifies the
+     * result: zero parts (`""`) or exactly one non-interpolated literal
+     * part is a compile-time-constant name (static); anything else
+     * (an interpolation chunk present) is genuinely dynamic. Verified
+     * against real `nix-instantiate --eval`: `let bar = "x"; in {
+     * "foo${bar}" = 1; }` == `{ foox = 1; }`. */
+    Ast *str = parse_dquote_string(p);
+    if (str->as.string.count == 0) {
+        return (AttrSeg){ .is_dynamic = 0, .attr = "", .attr_len = 0 };
+    }
+    if (str->as.string.count == 1 && !str->as.string.parts[0].is_expr) {
+        return (AttrSeg){ .is_dynamic = 0, .attr = str->as.string.parts[0].text,
+                           .attr_len = str->as.string.parts[0].text_len };
+    }
+    return (AttrSeg){ .is_dynamic = 1, .name_expr = str };
+}
+
+static void set_has_attr_segment(Ast *n, AttrSeg seg) {
+    if (seg.is_dynamic) {
+        n->as.has_attr.attr_expr = seg.name_expr;
+        n->as.has_attr.attr = NULL;
+        n->as.has_attr.attr_len = 0;
+    } else {
+        n->as.has_attr.attr_expr = NULL;
+        n->as.has_attr.attr = seg.attr;
+        n->as.has_attr.attr_len = seg.attr_len;
+    }
+}
+
+static void set_select_segment(Ast *n, AttrSeg seg) {
+    if (seg.is_dynamic) {
+        n->as.select.attr_expr = seg.name_expr;
+        n->as.select.attr = NULL;
+        n->as.select.attr_len = 0;
+    } else {
+        n->as.select.attr_expr = NULL;
+        n->as.select.attr = seg.attr;
+        n->as.select.attr_len = seg.attr_len;
+    }
+}
+
+/* Builds the value for an attrpath-sugar binding's segments
+ * `segs[start..start+count)`, given the final `value` expression --
+ * used for the portion of an attrpath STARTING AT the first dynamic
+ * segment (M41: `a.${k}.b = v;`, `${k}.b = v;`, `a.${k1}.${k2} = v;`).
+ * `count == 0` is the base case (the chain is exhausted; just return
+ * `value` itself). Otherwise wraps the recursively-built inner value in
+ * one more layer: a plain (non-`rec`) one-binding attrset literal, using
+ * either an ordinary static binding (`{ segs[start] = inner; }`) or
+ * M28's existing dynamic-binding machinery (`{ ${segs[start]} = inner;
+ * }`) depending on that segment's own kind -- so a chain with multiple
+ * dynamic segments (`a.${k1}.${k2} = v;`) composes correctly, each
+ * nested dynamic binding getting its own OP_INSERT_DYNAMIC_ATTR at
+ * runtime. Verified against real `nix-instantiate --eval`: `let k =
+ * "a"; in { x.${k} = 1; }` == `{ x = { a = 1; }; }` and `let k = "a"; in
+ * { ${k}.b = 1; }` == `{ a = { b = 1; }; }`. */
+static Ast *build_dynamic_chain_value(AttrSeg *segs, size_t start, size_t count, Ast *value) {
+    if (count == 0) return value;
+    AttrSeg seg = segs[start];
+    Ast *inner = build_dynamic_chain_value(segs, start + 1, count - 1, value);
+    Ast *attrs = asnix_ast_new(AST_ATTRSET);
+    attrs->as.attrset.is_rec = 0;
+    if (seg.is_dynamic) {
+        attrs->as.attrset.bindings = NULL;
+        attrs->as.attrset.count = 0;
+        AstDynBinding *dyn = malloc(sizeof(AstDynBinding));
+        dyn[0] = (AstDynBinding){ .name_expr = seg.name_expr, .value = inner };
+        attrs->as.attrset.dyn_bindings = dyn;
+        attrs->as.attrset.dyn_count = 1;
+    } else {
+        AstBinding *b = malloc(sizeof(AstBinding));
+        b[0] = (AstBinding){ .name = seg.attr, .name_len = seg.attr_len, .value = inner, .is_inherit = 0 };
+        attrs->as.attrset.bindings = b;
+        attrs->as.attrset.count = 1;
+        attrs->as.attrset.dyn_bindings = NULL;
+        attrs->as.attrset.dyn_count = 0;
+    }
+    return attrs;
 }
 
 /* `dyn_out`: NULL rejects a dynamic `${...}` key outright ("dynamic
@@ -524,20 +615,6 @@ static Token *parse_attr_segment(Parser *p, const char *what) {
  * rejection there); non-NULL (plain `{...}`/`rec {...}`) collects it
  * instead of fataling. See DynBindingVec's own comment above. */
 static void parse_binding_stmt(Parser *p, BTVec *out, DynBindingVec *dyn_out) {
-    if (cur(p)->kind == TOK_DOLLAR_LBRACE) {
-        if (!dyn_out) {
-            fprintf(stderr, "asnix: parse error: dynamic attributes not allowed in let\n");
-            exit(1);
-        }
-        advance(p); /* TOK_DOLLAR_LBRACE */
-        Ast *name_expr = parse_expr(p);
-        expect(p, TOK_RBRACE, "'}' closing a dynamic attribute name");
-        expect(p, TOK_EQUALS, "'='");
-        Ast *value = parse_expr(p);
-        expect(p, TOK_SEMI, "';'");
-        dynbindingvec_push(dyn_out, (DynBinding){ .name_expr = name_expr, .value = value });
-        return;
-    }
     if (cur(p)->kind == TOK_INHERIT) {
         advance(p);
         Ast *src_expr = NULL;
@@ -546,21 +623,33 @@ static void parse_binding_stmt(Parser *p, BTVec *out, DynBindingVec *dyn_out) {
             src_expr = parse_expr(p);
             expect(p, TOK_RPAREN, "')'");
         }
-        while (cur(p)->kind == TOK_IDENT || cur(p)->kind == TOK_STR_START) {
-            Token *name = parse_attr_segment(p, "an inherited name");
+        while (cur(p)->kind == TOK_IDENT || cur(p)->kind == TOK_STR_START || cur(p)->kind == TOK_DOLLAR_LBRACE) {
+            AttrSeg name = parse_attr_segment(p, "an inherited name");
+            /* real Nix's grammar lets a bare `${...}`/interpolated
+             * string reach this position syntactically (`attrs: attrs
+             * attr | attrs string_attr`), but rejects it unconditionally
+             * once parsed -- confirmed in cppnix's own source (the
+             * `string_attr` visitor throws "dynamic attributes not
+             * allowed in inherit" specifically for the dynamic/`Expr*`
+             * case, not the plain-string case, so `inherit (x) "or";`
+             * still works -- see parse_attr_segment's own comment). */
+            if (name.is_dynamic) {
+                fprintf(stderr, "asnix: parse error: dynamic attributes not allowed in inherit\n");
+                exit(1);
+            }
             Ast *value;
             if (src_expr) {
                 Ast *sel = asnix_ast_new(AST_SELECT);
                 sel->as.select.target = src_expr;
-                sel->as.select.attr = name->start;
-                sel->as.select.attr_len = name->len;
+                sel->as.select.attr = name.attr;
+                sel->as.select.attr_len = name.attr_len;
                 sel->as.select.attr_expr = NULL;
                 sel->as.select.default_ = NULL;
                 value = sel;
             } else {
                 Ast *v = asnix_ast_new(AST_VAR);
-                v->as.var.name = name->start;
-                v->as.var.name_len = name->len;
+                v->as.var.name = name.attr;
+                v->as.var.name_len = name.attr_len;
                 value = v;
             }
             /* `inherit (expr) x;` is sugar for an ordinary binding `x =
@@ -585,22 +674,48 @@ static void parse_binding_stmt(Parser *p, BTVec *out, DynBindingVec *dyn_out) {
     }
     /* Attrpath binding sugar (`a.b.c = val;`, real Nix's `attrpath '='
      * expr ';'`) -- see the BTNode/insert_attrpath comment above for the
-     * full merge semantics. Each segment may be a plain identifier or a
-     * static quoted-string key (see parse_attr_segment). A dynamic
-     * `${...}` *first* segment never reaches here (handled above,
-     * DynBindingVec); one anywhere else in a dotted chain (`a.${k} =
-     * v;`) still hits parse_attr_segment's fatal error -- not supported,
-     * a documented, narrower scope cut than real Nix allows. */
-    TokenVec segs = { 0 };
-    tokenvec_push(&segs, parse_attr_segment(p, "a binding name"));
+     * full merge semantics. Each segment may be a plain identifier, a
+     * static quoted-string key, or (M41) a dynamic one (bare `${expr}`
+     * or an interpolated quoted string) anywhere in the chain, including
+     * as the very first segment -- see parse_attr_segment. Collect every
+     * segment first, then split at the first dynamic one (if any): the
+     * static prefix (possibly empty) still flows through insert_attrpath
+     * as before; everything from the first dynamic segment onward
+     * becomes a synthetic value via build_dynamic_chain_value, which
+     * either becomes that static prefix's leaf value (non-empty prefix)
+     * or -- when the very first segment is itself dynamic -- a direct
+     * push to `dyn_out` (same `NULL` rejection as a bare `${expr} =
+     * value;` binding: "dynamic attributes not allowed in let"). Found
+     * needed evaluating real nixpkgs: `lib/systems/architectures.nix`
+     * has `"${ident}Fallback" = fallback;`-shaped bindings. */
+    AttrSegVec segs = { 0 };
+    attrsegvec_push(&segs, parse_attr_segment(p, "a binding name"));
     while (cur(p)->kind == TOK_DOT) {
         advance(p);
-        tokenvec_push(&segs, parse_attr_segment(p, "an attribute name"));
+        attrsegvec_push(&segs, parse_attr_segment(p, "an attribute name"));
     }
     expect(p, TOK_EQUALS, "'='");
     Ast *value = parse_expr(p);
     expect(p, TOK_SEMI, "';'");
-    insert_attrpath(out, segs.items, segs.len, 0, value, 0);
+
+    size_t first_dyn = segs.len;
+    for (size_t i = 0; i < segs.len; i++) {
+        if (segs.items[i].is_dynamic) { first_dyn = i; break; }
+    }
+    if (first_dyn == segs.len) {
+        /* Fully static -- unchanged original behavior. */
+        insert_attrpath(out, segs.items, segs.len, 0, value, 0);
+    } else if (first_dyn == 0) {
+        if (!dyn_out) {
+            fprintf(stderr, "asnix: parse error: dynamic attributes not allowed in let\n");
+            exit(1);
+        }
+        Ast *inner = build_dynamic_chain_value(segs.items, 1, segs.len - 1, value);
+        dynbindingvec_push(dyn_out, (DynBinding){ .name_expr = segs.items[0].name_expr, .value = inner });
+    } else {
+        Ast *inner = build_dynamic_chain_value(segs.items, first_dyn, segs.len - first_dyn, value);
+        insert_attrpath(out, segs.items, first_dyn, 0, inner, 0);
+    }
     free(segs.items);
 }
 
@@ -785,32 +900,20 @@ static Ast *parse_select(Parser *p) {
         Ast *n = asnix_ast_new(AST_SELECT);
         n->as.select.target = e;
         n->as.select.default_ = NULL;
-        if (cur(p)->kind == TOK_DOLLAR_LBRACE) {
-            /* Dynamic attribute name, `.${expr}` -- real Nix's grammar
-             * for a computed-at-runtime attrpath segment, e.g.
-             * `set.${name}` (found needed evaluating real nixpkgs,
-             * pkgs/top-level/default.nix). `or` after a dynamic segment
-             * (`set.${name} or default`) is a real, supported
-             * combination (M28) -- handled uniformly below by the same
-             * `had_select && TOK_OR` check a static segment uses,
-             * compiler.c's AST_SELECT case picks OP_SELECT_DYNAMIC_OR
-             * instead of the static OP_SELECT_OR when attr_expr is set. */
-            advance(p);
-            Ast *name_expr = parse_expr(p);
-            expect(p, TOK_RBRACE, "'}' closing a dynamic attribute name");
-            n->as.select.attr_expr = name_expr;
-            n->as.select.attr = NULL;
-            n->as.select.attr_len = 0;
-        } else {
-            /* Plain identifier or a static quoted-string segment (`x."a
-             * b"`) -- see parse_attr_segment's comment. Verified against
-             * `nix-instantiate --eval`: `let x = { "a b" = 5; }; in x."a
-             * b"` => `5`. */
-            Token *attr = parse_attr_segment(p, "an attribute name");
-            n->as.select.attr_expr = NULL;
-            n->as.select.attr = attr->start;
-            n->as.select.attr_len = attr->len;
-        }
+        /* Dynamic attribute name, `.${expr}` or an interpolated quoted
+         * string (real Nix's grammar for a computed-at-runtime attrpath
+         * segment, e.g. `set.${name}` -- found needed evaluating real
+         * nixpkgs, pkgs/top-level/default.nix), or a plain identifier/
+         * static quoted-string segment (`x."a b"`, verified against
+         * `nix-instantiate --eval`: `let x = { "a b" = 5; }; in x."a
+         * b"` => `5`) -- see parse_attr_segment's comment. `or` after a
+         * dynamic segment (`set.${name} or default`) is a real,
+         * supported combination (M28) -- handled uniformly below by the
+         * same `had_select && TOK_OR` check a static segment uses,
+         * compiler.c's AST_SELECT case picks OP_SELECT_DYNAMIC_OR
+         * instead of the static OP_SELECT_OR when attr_expr is set. */
+        AttrSeg seg = parse_attr_segment(p, "an attribute name");
+        set_select_segment(n, seg);
         e = n;
         had_select = 1;
     }
@@ -874,60 +977,6 @@ static Ast *parse_negate(Parser *p) {
     return parse_app(p);
 }
 
-/* One segment of a `?`-chain's attrpath: either a plain identifier/
- * static quoted-string (same as parse_attr_segment, `attr`/`attr_len`
- * valid) or a dynamic `${expr}` segment (`name_expr` valid instead) --
- * real Nix's grammar allows a dynamic `string_attr` segment anywhere in
- * an `attrpath` (`~/nix/src/libexpr/parser.y`: `attrpath: ... | attrpath
- * '.' string_attr | string_attr`, and `string_attr: ... | DOLLAR_CURLY
- * expr '}'`), including as the very first segment right after `?`.
- * Confirmed against `nix-instantiate --eval`: `let x = { a = 5; }; name =
- * "a"; in x ? ${name}` => true, and `x ? ${name}.b` / `x ? a.${name}`
- * both also work the same way a fully-static chain does. Found needed
- * evaluating real nixpkgs: `lib/systems/default.nix` has
- * `rustc-target-env ? ${final.rust.rustcTargetSpec}`. */
-typedef struct {
-    int is_dynamic;
-    Ast *name_expr;      /* valid when is_dynamic */
-    const char *attr;    /* valid when !is_dynamic */
-    size_t attr_len;
-} AttrSeg;
-
-static AttrSeg parse_attrpath_segment(Parser *p) {
-    if (cur(p)->kind == TOK_DOLLAR_LBRACE) {
-        advance(p);
-        Ast *name_expr = parse_expr(p);
-        expect(p, TOK_RBRACE, "'}' closing a dynamic attribute name");
-        return (AttrSeg){ .is_dynamic = 1, .name_expr = name_expr };
-    }
-    Token *attr = parse_attr_segment(p, "an attribute name");
-    return (AttrSeg){ .is_dynamic = 0, .attr = attr->start, .attr_len = attr->len };
-}
-
-static void set_has_attr_segment(Ast *n, AttrSeg seg) {
-    if (seg.is_dynamic) {
-        n->as.has_attr.attr_expr = seg.name_expr;
-        n->as.has_attr.attr = NULL;
-        n->as.has_attr.attr_len = 0;
-    } else {
-        n->as.has_attr.attr_expr = NULL;
-        n->as.has_attr.attr = seg.attr;
-        n->as.has_attr.attr_len = seg.attr_len;
-    }
-}
-
-static void set_select_segment(Ast *n, AttrSeg seg) {
-    if (seg.is_dynamic) {
-        n->as.select.attr_expr = seg.name_expr;
-        n->as.select.attr = NULL;
-        n->as.select.attr_len = 0;
-    } else {
-        n->as.select.attr_expr = NULL;
-        n->as.select.attr = seg.attr;
-        n->as.select.attr_len = seg.attr_len;
-    }
-}
-
 /* `expr ? attr` (has-attr): binds tighter than arithmetic but looser than
  * application, matching real Nix's precedence table. Confirmed against
  * `nix-instantiate --eval '1 ? a'` => false (not an error) -- a non-
@@ -943,7 +992,7 @@ static Ast *parse_has_attr(Parser *p) {
          * (found needed evaluating real nixpkgs: `lib/systems/
          * default.nix` has `platform ? gcc.arch`). Each segment may be a
          * plain identifier, a static quoted-string, or a dynamic
-         * `${expr}` (see parse_attrpath_segment/AttrSeg above). Desugars
+         * `${expr}` (see parse_attr_segment/AttrSeg above). Desugars
          * directly to `x ? a && (x.a or {}) ? b && ((x.a or {}).b or {})
          * ? c ...` -- reusing the already-correct AST_HAS_ATTR/
          * AST_SELECT-with-`or`/AST_AND nodes, no new AST node needed
@@ -954,7 +1003,7 @@ static Ast *parse_has_attr(Parser *p) {
          * fallback" version: a missing intermediate attr, an
          * intermediate value that exists but isn't an attrset, and a
          * fully-present chain -- all graceful (`false`), none fatal. */
-        AttrSeg seg = parse_attrpath_segment(p);
+        AttrSeg seg = parse_attr_segment(p, "an attribute name");
         Ast *n = asnix_ast_new(AST_HAS_ATTR);
         n->as.has_attr.target = e;
         set_has_attr_segment(n, seg);
@@ -974,7 +1023,7 @@ static Ast *parse_has_attr(Parser *p) {
             sel->as.select.default_ = empty_attrs;
             running_target = sel; /* == the previous target's `.attr or {}` */
 
-            seg = parse_attrpath_segment(p);
+            seg = parse_attr_segment(p, "an attribute name");
             Ast *next_check = asnix_ast_new(AST_HAS_ATTR);
             next_check->as.has_attr.target = running_target;
             set_has_attr_segment(next_check, seg);

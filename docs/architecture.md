@@ -53,7 +53,8 @@ what's actually implemented and the scope decisions made along the way.
 | M38 — `asnix_apply`'s PrimOp path never forced args/return (core evaluator fix) | done (see below) |
 | M39 — `builtins.addErrorContext` | done (see below) |
 | M40 — `${null} = value;` silently omitted, not an error | done (see below) |
-| M41+ | not started |
+| M41 — dynamic attrpath segments anywhere (`.${k}`, interpolated quoted strings) | done (see below) |
+| M42+ | not started |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
 
@@ -3629,3 +3630,77 @@ insertion entirely, same as cppnix's `continue`) when `name_val` is
 
 `make test`/`test-e2e` green (193 e2e, one new `m40_*` fixture);
 `test-conformance` 633 passed (up from 632, no regressions).
+
+## M41 scope notes: dynamic attrpath segments anywhere (`.${k}`, interpolated quoted strings)
+
+Found continuing to chase `d.nix` right after M40: a parse error
+("dynamic attributes not allowed here") inside `lib/systems/
+architectures.nix`-or-a-sibling-file. Root-caused via gdb (inspected the
+parser's own token array at the fatal site): the actual construct was
+`"${ident}Fallback" = fallback;` -- an **interpolated quoted string**
+used as an attrpath-sugar binding's name, not the bare `${expr}` form
+M28/M33 already handled. This exposed a real gap in `parse_attr_segment`
+(the shared helper used by `inherit`'s name list, attrpath binding
+sugar, `.`-select chains, and `?`-chains): it only recognized a
+*non*-interpolated quoted string (`"or"`, `"a b"`) as static and
+fatal'd on anything with a `${...}` chunk inside the quotes, never
+distinguishing that from the ordinary non-interpolated case the way
+cppnix's own grammar does (`string_attr: '"' string_parts '"' |
+DOLLAR_CURLY expr '}'` -- the quoted form can itself contain
+interpolation, since `string_parts` is literally the same grammar an
+ordinary string literal uses).
+
+This also exposed the last remaining piece of M22/M28's original scope
+cut: a dynamic segment anywhere in a dotted attrpath (`a.${k} = v;`,
+`${k}.b = v;`, `a.${k1}.${k2} = v;`) was still rejected, documented at
+the time as "not supported... not needed by anything this project has
+hit yet" -- now needed. Both gaps share one fix:
+
+- `parse_attr_segment` now returns an `AttrSeg` (a tagged
+  static-name-or-dynamic-expression union, previously a separate M33-
+  only helper `parse_attrpath_segment` layered on top of it) instead of
+  a plain `Token*`. A quoted string is parsed via the *same*
+  `parse_dquote_string` chunk-collecting loop an ordinary string
+  literal uses, then classified: zero parts or exactly one non-
+  interpolated literal part is static (unchanged behavior, including
+  `inherit (x) "or";` continuing to work); anything with an
+  interpolation chunk is dynamic. A bare `${expr}` is dynamic as before
+  (M28/M33). `inherit`'s own name-list loop explicitly rejects a
+  dynamic `AttrSeg` with "dynamic attributes not allowed in inherit"
+  (confirmed in cppnix's own grammar: the `string_attr` visitor throws
+  specifically for the `Expr*`/dynamic case, never the plain-string
+  case) -- the only context that still disallows this.
+- Attrpath-sugar binding statements (`a.b.${k}.d = val;`) now collect
+  every segment into an `AttrSegVec` (replacing the old `Token`-only
+  `TokenVec`), find the first dynamic segment (if any), and split the
+  chain there: the static prefix (possibly empty) still flows through
+  the existing `insert_attrpath`/`BTVec` merge-tree machinery unchanged
+  (now reading `AttrSeg.attr`/`attr_len` instead of `Token.start/len`);
+  everything from the first dynamic segment onward is built by a new
+  recursive helper, `build_dynamic_chain_value`, into nested plain (non-
+  `rec`) one-binding attrset literals -- using either an ordinary static
+  `AstBinding` or M28's existing dynamic-binding machinery
+  (`AstDynBinding`/`OP_INSERT_DYNAMIC_ATTR`) depending on each
+  segment's own kind, so a chain with *multiple* dynamic segments
+  composes correctly (each gets its own runtime insert). When the
+  static prefix is empty (the very first segment is itself dynamic),
+  the built value is pushed directly into the enclosing block's
+  `dyn_out` instead of through `insert_attrpath` -- same `dyn_out ==
+  NULL` rejection as a bare `${expr} = value;` binding already had
+  ("dynamic attributes not allowed in let"), which let the old,
+  narrower special-case for that exact bare form (previously handled
+  by a separate early branch at the top of `parse_binding_stmt`, unable
+  to handle `${k}.b = v;`'s trailing segments) be deleted entirely in
+  favor of this one unified path.
+
+Verified against real `nix-instantiate --eval` for every shape this
+unifies: an interpolated quoted-string key (`{ "foo${bar}" = 1; }` ==
+`{ foox = 1; }`) and the matching select form (`set."foo${bar}"`); a
+dynamic segment after a static one (`{ x.${k} = 1; }` == `{ x = { a =
+1; }; }`); a dynamic first segment followed by more (`{ ${k}.b = 1; }`
+== `{ a = { b = 1; }; }`); two dynamic segments in one chain (`{
+${k1}.${k2} = 1; }`); `inherit (x) "or";` still working; and `let
+"${k}".b = 1;`/`let ${k} = 1;` both still correctly rejected.
+
+`make test`/`test-e2e` green (198 e2e, five new `m41_*` fixtures);
+`test-conformance` still 633 passed, no regressions.
