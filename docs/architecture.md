@@ -35,7 +35,7 @@ what's actually implemented and the scope decisions made along the way.
 | M20 — daemon realization: `SetOptions`/`AddToStore`/`BuildPaths` (`src/c/daemon_client.c`) | done, **scoped** (see below) |
 | M21 — real structural `==`/`!=` + real `+` operator dispatch | done, **scoped** (see below) |
 | M22 — real-nixpkgs-evaluation sweep: block comments, `->`, more bare globals, dynamic attrs, directory-import fix | done, **in progress** (see below -- real nixpkgs still doesn't fully evaluate) |
-| M23 — conformance long-tail: `++`/`/` operators, attrpath binding sugar, hyphenated identifiers, map/mapAttrs laziness fix, builtins-expansion pass | done, **scoped** (see below) |
+| M23 — numtide/nix-conformance sweep (3 parallel passes): `++`/`/` operators, attrpath binding sugar, hyphenated identifiers, map/mapAttrs laziness fix, builtins-expansion pass, plus `builtins.match`/`builtins.split` (POSIX regex) | done, **scoped** (see below) |
 | M24+ | not started |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
@@ -2414,3 +2414,185 @@ trust this list as ground truth):**
    `eval-okay-baseNameOf.nix`, which exists specifically to pin down
    this exact edge case (with a comment crediting a decade-old upstream
    Nix PR for the same reason).
+
+## M23 scope notes: `builtins.match` / `builtins.split`
+
+Both were missing entirely -- the single biggest remaining cluster in
+numtide/nix-conformance's `lang/` suite (the differential
+`corpora/regex.nix`, 272 `(pattern, string)` pairs, generates ~270
+`eval-okay-regex-NNN.nix` cases, plus 45 more intentionally-invalid
+patterns in `corpora/regex-invalid.nix` generating ~90 `eval-fail-regex-
+invalid-NNN-{match,split}.nix` cases).
+
+Implemented in a new `builtins_regex.c`/`.h` module (added to
+`asnix_make_builtins_attrs`'s merge table in `builtins.c`, same mechanism
+every prior builtins-expansion module uses), wired directly onto glibc's
+POSIX `<regex.h>` (`regcomp`/`regexec`/`regfree`, `REG_EXTENDED`) rather
+than hand-rolling a regex engine -- real Nix's own engine (libstdc++'s
+`std::regex` built with `std::regex::extended`) already implements the
+same POSIX-ERE/leftmost-longest grammar class, so this matches real Nix
+closely for ordinary patterns without needing new infrastructure. Nix
+strings aren't NUL-terminated (`asnix_ptr_bytes`); both the pattern and
+subject get a scratch `malloc`+NUL-terminate+`free` copy per call (not
+arena-allocated -- nothing here needs to outlive one builtin call, same
+convention `builtins_compare.c`'s `replaceStrings`/`toJSON` already use).
+
+- **`match`**: real Nix implicitly anchors the whole pattern to the
+  entire string (`null` on anything less than a full match). Rather than
+  textually wrapping the pattern in `^(?:...)$` (POSIX ERE has no
+  non-capturing group -- `\(...\)` IS a capture group, which would shift
+  every real group's index by one), this relies on `regexec`'s own
+  leftmost-longest guarantee: if any match starts at offset 0, `regexec`
+  is guaranteed to find one there (nothing can be "earlier"), and that
+  match is guaranteed to be the *longest* one starting at offset 0 -- so
+  a plain, unmodified `regexec` call, checked for `rm_so==0 &&
+  rm_eo==len`, is exactly `std::regex_match`'s semantics (what real Nix's
+  `primops.cc` actually calls) with zero pattern rewriting.
+- **`split`**: a `pos`/`last_end`-tracking loop over successive `regexec`
+  calls on `subject+pos` (`REG_NOTBOL` once `pos>0`, so a literal `^`
+  only ever matches the true start of the whole subject). Zero-width
+  matches (e.g. `x*` always has one) are real and were specifically
+  handled and checked against real Nix (`split "x*" "ab"` == `[ "" [ ]
+  "a" [ ] "b" [ ] "" ]`): after recording one, `pos` advances to
+  `rm_eo+1` rather than `rm_eo` (which would just re-find the same empty
+  match forever), while `last_end` (which only moves on actual match
+  boundaries) still correctly picks up the skipped byte as part of the
+  next literal-text span.
+- A capture group that didn't participate (e.g. an untaken alternation
+  branch) becomes `null` in the result list, not `""` -- verified:
+  `match "(a)?(b)" "b"` == `[ null "b" ]`.
+
+**Verification**: every individual rule above was checked directly
+against real `nix-instantiate --eval --strict` (2.35.2) before being
+trusted (see `builtins_regex.c`'s own per-function comments for the
+specific expressions). Beyond that, this module was self-checked against
+the *entire* 272-entry `corpora/regex.nix` differential corpus directly
+(bypassing nix-conformance's own test runner -- see the scope-cut note
+below on why) by writing a one-off script that, per entry, ran
+`builtins.match`/`builtins.split` through both real `nix-instantiate` and
+this build and diffed the two: **238/272 (87.5%) match byte-for-byte**;
+the remaining 34 fall into three understood, deliberately-not-chased
+categories (see Known Bugs #29 below for the full writeup of the biggest
+one) rather than being random bugs.
+
+**Scope cuts, deliberate**:
+- **Capture-group value under a repeated subexpression** (e.g. `(a*)*`
+  matched against `"aa"`) is POSIX-unspecified, and glibc's `regexec` and
+  libstdc++'s `std::regex` make *different* implementation choices here
+  (glibc reports the union/last-nonempty span across all iterations;
+  libstdc++/most modern engines report only the final iteration, which
+  is often empty) -- this is the majority of the 34 self-check mismatches
+  above (~27 of them). Not fixable by any `regcomp`/`regexec` flag; fixing
+  it for real would mean writing a custom backtracking engine with
+  libstdc++'s specific iteration-capture convention, which is a different
+  project, not a `<regex.h>` integration. See Known Bugs #30.
+- **A handful of named collating-symbol/equivalence-class forms
+  (`[[.hyphen.]-z]`, `[[.space.][.tilde.]]`, `[[=period=]x]`) and
+  nonstandard/case-variant POSIX character-class names (`[[:w:]]`,
+  `[[:ALPHA:]]`)** that real Nix accepts but glibc's `regcomp` rejects
+  (`REG_ECOLLATE`/`REG_ECTYPE`) even with the locale explicitly set to
+  `en_US.UTF-8` (checked directly, both with and without an explicit
+  `setlocale(LC_ALL, "")` call -- no difference, since glibc's own locale
+  data simply doesn't define a collating symbol named `hyphen` et al.,
+  and `w`/`ALPHA` were never POSIX class names to begin with). libstdc++
+  is simply more lenient here than glibc's locale-driven implementation;
+  not a parseable rule to special-case, just an engine difference (6 of
+  the 34 self-check mismatches).
+- **`[é-a]+`-style ranges spanning a multi-byte UTF-8 character** are
+  already a documented, acknowledged cross-platform quirk upstream (see
+  nix-conformance's own `corpora/regex-invalid.nix` comment, "`[a-é]`
+  rejected on x86_64 only: see nix-bugs/regex-char-sign" -- the sibling
+  direction `[é-a]` in `corpora/regex.nix` is the one remaining self-check
+  mismatch, same root cause: signed-vs-unsigned byte comparison of a
+  UTF-8 continuation byte against an ASCII endpoint). Not re-litigated
+  here since nix-conformance already tracks it as inherent/platform-
+  dependent, not a asnix-specific bug.
+- **A pre-`regcomp` validity pre-check** was added (`builtins_regex.c`'s
+  `pattern_rejected_by_real_nix`) specifically because glibc's `regcomp`
+  accepts a small, enumerable family of patterns real Nix's
+  `std::regex::extended` rejects as a hard parse error (not a semantics
+  difference) -- found via `corpora/regex-invalid.nix`'s 45 entries,
+  each cross-checked directly against real `nix-instantiate`. The three
+  rules implemented (an escape-character whitelist limited to the 12 real
+  POSIX ERE metacharacters `. ( ) * + ? [ { ^ $ | \ ` -- notably
+  *excluding* `]` and `}`, confirmed asymmetric directly: `\(`/`\)`/`\[`/
+  `\{` are valid escapes but `\]`/`\}` are not; a bare digit escape like
+  `\1` falls under this same rule, which is also why POSIX ERE
+  backreferences -- not part of its grammar at all -- need no separate
+  handling; a `{` immediately followed by `,` with no lower bound, e.g.
+  `a{,2}`; and an unmatched `)` with no corresponding `(`) are bracket-
+  expression-aware (correctly skip `(`/`)`/`{`/`\`/collating-sub-
+  expression contents inside `[...]`, where none of them are special)
+  and recover 10 of the 13 regex-invalid entries glibc alone would
+  wrongly accept. The remaining 3 (`(a){24998}`'s group-repetition
+  complexity limit and the two collating-symbol-range forms,
+  `[[.-.]]`/`[a-[.c.]]`) are left as glibc-accepts/real-Nix-rejects gaps
+  for the same reason as this section's collating-symbol scope cut above
+  -- an internal-limit/grammar-leniency difference between the two
+  engines, not a describable syntax rule.
+- **nix-conformance's own `lang/` test runner for this corpus could not
+  actually be used to measure this module** (see the main pass-count
+  report for the concrete numbers): every `eval-okay-regex-NNN.nix` and
+  `eval-fail-regex-invalid-NNN-*.nix` case wraps its `match`/`split` call
+  in `builtins.tryEval`, which does not exist in asnix at all (confirmed:
+  `builtins ? tryEval` fatals with "attribute missing" immediately, found
+  while debugging why the corpus cases weren't improving) and would be a
+  genuinely large, separate undertaking to add -- every fatal error path
+  in this codebase (including ones in hand-written asm, e.g.
+  `op_select.S`'s "attribute missing") is an unconditional process
+  `exit()`, not a catchable/propagatable condition, so implementing real
+  `tryEval` semantics would mean threading a `setjmp`/`longjmp`-style (or
+  full exception-object-passing) recovery mechanism through every one of
+  those sites, an architecture change out of scope for a `match`/`split`
+  builtins pass. This is why this module's correctness was instead
+  checked against the 272-entry corpus directly, bypassing
+  nix-conformance's own runner (see Verification above) -- `match`/
+  `split` themselves are correct for the vast majority of real inputs;
+  `tryEval`'s absence is what keeps nix-conformance's own `lang/` score
+  from reflecting that.
+
+## M23's Known Bugs entries, continued (regex pass)
+
+29. **`builtins.tryEval` does not exist in asnix at all.** Found while
+   investigating why nix-conformance's `lang/` regex corpus cases
+   (`eval-okay-regex-NNN.nix`) weren't passing despite `match`/`split`
+   being correctly implemented and independently verified against real
+   `nix-instantiate`: every one of those generated test cases wraps its
+   call in `let try = v: let r = builtins.tryEval v; in ...; in try
+   (builtins.match ...)` (see `corpora/regex.nix`'s own `try` helper), and
+   `builtins ? tryEval` is simply false here -- selecting it fatals
+   ("attribute missing, aborting") before `match`/`split` are ever
+   reached. This single missing builtin gates roughly 270 otherwise-
+   reachable `lang/` test cases (the entire regex differential corpus),
+   not a gap specific to this pass's own work. Not fixed here: real
+   `tryEval` needs a catchable-exception mechanism, and every fatal path
+   in this codebase today (C `fprintf`+`exit()`, and hand-written asm
+   sites like `op_select.S`'s own "attribute missing" exit) is an
+   unconditional process exit with no unwind/recovery story at all --
+   adding one is a cross-cutting architecture change (likely
+   `setjmp`/`longjmp` at the `tryEval` call site plus converting every
+   `exit()` call site, asm included, to `longjmp` instead), well beyond
+   what a `builtins.match`/`builtins.split` pass should attempt. Left
+   here as a concretely-measured, high-value target for a future
+   milestone.
+30. **Capture-group value under a repeated subexpression differs between
+   glibc's `regexec` and real Nix's `std::regex`, with no POSIX-mandated
+   "correct" answer.** Found via this pass's own 272-entry corpus self-
+   check (see the M23 scope notes above): `builtins.match "(a*)*" "aa"`
+   on real `nix-instantiate` returns `[ "" ]` (the group captures the
+   *last* iteration, which is the trailing empty match once `a*` has
+   consumed both `a`s), while asnix/glibc returns `[ "aa" ]` (the group
+   captures the full combined span across every non-empty iteration).
+   Both agree the *overall* match succeeds and spans the whole string --
+   only the captured group text differs. This is POSIX-unspecified
+   behavior (the standard explicitly leaves subexpression-under-
+   repetition captures implementation-defined), not a bug in either
+   engine, and not fixable via any `regcomp`/`regexec` flag -- glibc's
+   regex engine and libstdc++'s `std::regex` simply made different,
+   internally-consistent design choices decades apart. Reproducing real
+   Nix's exact convention here would require a hand-written backtracking
+   regex engine with that specific "last iteration wins" capture rule,
+   which is a different, much larger project than wiring up `<regex.h>`.
+   Affects roughly 10% of the differential corpus's entries (27 of 272 in
+   the direct self-check) -- documented as a known, permanent divergence
+   rather than silently accepted.
