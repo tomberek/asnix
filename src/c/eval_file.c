@@ -116,25 +116,19 @@ static char *resolve_import_path(const char *path) {
     return canon;
 }
 
-/* Resolves `path` to its final absolute form (following the `import
- * somedir` => `somedir/default.nix` rule, and M57h's symlink-preserving
- * resolution above) and reads+lexes+parses it, writing the resolved path
- * and its containing directory out through `*resolved_out`/`*base_dir_out`
- * (both caller-owned, malloc'd -- the caller frees them once done with
- * `base_dir_out`, which asnix_compile/asnix_compile_scoped only reads
- * during the one compile call). Shared by asnix_eval_file and
- * asnix_eval_file_scoped (M54) below, which differ only in what root
- * Env/ScopeFrame they build around the parsed Ast. */
-static Ast *parse_file(const char *path, char **resolved_out, char **base_dir_out) {
+/* Resolves `path` to its final absolute form -- following the `import
+ * somedir` => `somedir/default.nix` rule (verified against
+ * `nix-instantiate --eval` -- found evaluating real nixpkgs,
+ * `pkgs/top-level/impure.nix` does `import ./.`, i.e. imports its own
+ * containing directory; previously unhandled: this directory path
+ * reached read_file() directly, which "succeeded" opening it via fopen
+ * but then corrupted the heap computing its size, see read_file's own
+ * hardening above -- a real, serious memory-safety bug, not a clean
+ * error) and M57h's symlink-preserving resolution above. Split out from
+ * parse_file below (M65) so asnix_eval_file can check the import cache
+ * BEFORE paying for a read+lex+parse+compile+eval it might not need. */
+static char *resolve_file_path(const char *path) {
     char *resolved = resolve_import_path(path);
-    /* `import somedir` means `import somedir/default.nix` in real Nix
-     * (verified against `nix-instantiate --eval`) -- found evaluating
-     * real nixpkgs (`pkgs/top-level/impure.nix` does `import ./.`, i.e.
-     * imports its own containing directory). Previously unhandled: this
-     * directory path reached read_file() directly, which "succeeded"
-     * opening it via fopen but then corrupted the heap computing its
-     * size (see read_file's own hardening above) -- a real, serious
-     * memory-safety bug, not a clean error. */
     if (is_directory(resolved)) {
         size_t len = strlen(resolved);
         char *with_default = malloc(len + strlen("/default.nix") + 1);
@@ -143,13 +137,90 @@ static Ast *parse_file(const char *path, char **resolved_out, char **base_dir_ou
         free(resolved);
         resolved = with_default;
     }
-    *resolved_out = resolved;
-    *base_dir_out = dir_of(resolved);
+    return resolved;
+}
 
+/* Reads+lexes+parses an ALREADY-RESOLVED path, writing its containing
+ * directory out through `*base_dir_out` (caller-owned, malloc'd -- freed
+ * once done with it, which asnix_compile/asnix_compile_scoped only read
+ * during the one compile call). */
+static Ast *parse_resolved_file(const char *resolved, char **base_dir_out) {
+    *base_dir_out = dir_of(resolved);
     char *src = read_file(resolved);
     size_t ntoks;
     Token *toks = asnix_lex(src, &ntoks);
     return asnix_parse(toks, ntoks);
+}
+
+/* Shared by asnix_eval_file_scoped (M54) and the pre-M65 asnix_eval_file
+ * shape -- resolves and parses in one step, also handing the resolved
+ * path back to the caller. asnix_eval_file itself (below) no longer uses
+ * this directly (it needs the resolved path BEFORE deciding whether to
+ * parse at all, for the import cache), but asnix_eval_file_scoped still
+ * does, since scopedImport results are intentionally never cached (each
+ * call's `scope` argument can differ, so the same file path can
+ * legitimately produce a different result per call -- caching by path
+ * alone would be wrong there). */
+static Ast *parse_file(const char *path, char **resolved_out, char **base_dir_out) {
+    char *resolved = resolve_file_path(path);
+    *resolved_out = resolved;
+    return parse_resolved_file(resolved, base_dir_out);
+}
+
+/* M65: real Nix memoizes `import <path>` by the resolved path -- a
+ * second `import` of the same file returns the exact same (possibly
+ * still-lazy) Value, not a fresh independent evaluation, so the file's
+ * own side effects (`builtins.trace`) and work happen at most once no
+ * matter how many places import it. asnix had no such cache at all,
+ * confirmed directly: `import X; import X;` (X containing `builtins.trace
+ * "evaluated!" 1`) printed the trace line TWICE here vs. real Nix's ONCE.
+ * Found chasing d.nix's own severe slowdown: nixpkgs' bootstrap chain
+ * re-imports the same handful of files (`<nix/fetchurl.nix>`,
+ * `lib/default.nix`, individual `pkgs/by-name` package.nix files
+ * reached through more than one alias/overlay path) over and over,
+ * each time paying a full independent read+lex+parse+compile+eval --
+ * confirmed via `strace -e trace=newfstatat`, which showed the exact
+ * same handful of paths being stat'd tens of thousands of times (NOT an
+ * infinite loop -- the process still terminates, in ~1.5s without
+ * strace's own massive per-syscall overhead -- just a severe, self-
+ * inflicted amount of genuinely redundant work).
+ *
+ * A plain linear-scan array, not a hash table: the number of distinct
+ * files a single process imports is small relative to the cost of each
+ * entry (a full parse+compile+eval), so a linear strcmp scan's cost is
+ * negligible next to what it's saving -- same "simple first" judgment
+ * call as symtab.c's own choice to use a real hash table only once
+ * *that* linear scan's cost (comparing every interned string) started
+ * to matter at a much higher call frequency. Grows by doubling, same
+ * convention as every other dynamic array in this codebase. */
+typedef struct {
+    char *path;
+    Value value;
+} ImportCacheEntry;
+static ImportCacheEntry *g_import_cache = NULL;
+static size_t g_import_cache_count = 0, g_import_cache_cap = 0;
+
+static int import_cache_find(const char *resolved, Value *out) {
+    for (size_t i = 0; i < g_import_cache_count; i++) {
+        if (strcmp(g_import_cache[i].path, resolved) == 0) {
+            *out = g_import_cache[i].value;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void import_cache_insert(const char *resolved, Value v) {
+    if (g_import_cache_count == g_import_cache_cap) {
+        g_import_cache_cap = g_import_cache_cap ? g_import_cache_cap * 2 : 64;
+        g_import_cache = realloc(g_import_cache, g_import_cache_cap * sizeof(ImportCacheEntry));
+    }
+    size_t len = strlen(resolved);
+    char *copy = malloc(len + 1);
+    memcpy(copy, resolved, len + 1);
+    g_import_cache[g_import_cache_count].path = copy;
+    g_import_cache[g_import_cache_count].value = v;
+    g_import_cache_count++;
 }
 
 /* Fresh root env/builtins every call -- an imported file does not inherit
@@ -215,16 +286,26 @@ const char *asnix_eval_top_level_file(void) {
 }
 
 Value asnix_eval_file(const char *path) {
-    char *resolved, *base_dir;
-    Ast *ast = parse_file(path, &resolved, &base_dir);
+    char *resolved = resolve_file_path(path);
+
     if (!g_top_level_file) {
         size_t len = strlen(resolved);
         g_top_level_file = malloc(len + 1);
         memcpy(g_top_level_file, resolved, len + 1);
     }
+
+    Value cached;
+    if (import_cache_find(resolved, &cached)) {
+        free(resolved);
+        return cached;
+    }
+
+    char *base_dir;
+    Ast *ast = parse_resolved_file(resolved, &base_dir);
     IrProgram *prog = asnix_compile(ast, base_dir);
     Env *root_env = make_root_env(NULL);
     Value result = asnix_eval(prog, root_env);
+    import_cache_insert(resolved, result);
     free(resolved);
     free(base_dir);
     return result;

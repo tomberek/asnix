@@ -77,7 +77,8 @@ what's actually implemented and the scope decisions made along the way.
 | M62 — `derivationStrict` generalized to real multi-output derivations (`outputs = [ "out" "bin" ... ]`), one distinct store path per declared output | done, **scoped** (see below) |
 | M63 — `asnix_apply`'s PrimOp path didn't populate `args[-1]` ("self"), crashing any of this codebase's own self-capturing curried builtins (`elemAt`, `map`, `filter`, `foldl'`) when invoked through it rather than an ordinary `OP_CALL` | done (see below) |
 | M64 — `~`-prefixed ("home") path literals, interpolated path literals (`./${foo}`, `~/${foo}`, ...); `builtins.path` | done, **scoped** (see below; `builtins.path` itself not implemented) |
-| M65+ | not started |
+| M65 — `import`-value caching (a second `import` of the same resolved path re-evaluated from scratch instead of sharing the first's result) | done (see below) |
+| M66+ | not started |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
 
@@ -6491,3 +6492,58 @@ target fixtures flip to passing, nothing else in the 806-file total
 changes (totals match exactly both times; the net shift is entirely and
 only those two files moving fail->pass). `eval-okay-path.nix` remains in
 the fail bucket, as documented above.
+
+## M65 scope notes: `import`-value caching
+
+Found investigating a user-reported concern that `./asnix d.nix` looked
+like it was stuck in an infinite loop under `strace -e trace=newfstatat`
+(the same handful of paths -- `/tmp/.asnix-corepkgs-fetchurl.nix`,
+individual `pkgs/os-specific/linux/minimal-bootstrap/*` files --
+appearing tens of thousands of times in the trace). Confirmed it's NOT
+an infinite loop (the same run without `strace` completes in ~1.5s;
+`strace`'s own enormous per-syscall overhead, applied to hundreds of
+thousands of real syscalls, is what made it look like a hang) -- but
+it IS a real, severe, self-inflicted amount of redundant work, with a
+clear root cause: asnix had no `import`-value cache at all. Real Nix
+memoizes `import <path>` by the resolved path, so re-importing the same
+file anywhere else in the program returns the exact same (possibly
+still-unforced) Value rather than re-evaluating from scratch. Minimal
+repro, verified directly against real Nix: a file containing
+`builtins.trace "evaluated!" 1`, imported twice and summed, prints
+`trace: evaluated!` exactly ONCE on real Nix, but TWICE on asnix before
+this fix (confirming the file's own top-level expression -- and
+everything reachable from forcing it -- really was being computed
+independently per import site, not shared). nixpkgs' own `pkgs/by-name`
+overlay and bootstrap chain import the same files (`lib/default.nix`,
+`<nix/fetchurl.nix>`, individual package files reached through more
+than one alias/overlay path) from many different places, so this
+compounded badly.
+
+**Fix** (`eval_file.c`): a simple path -> Value cache
+(`g_import_cache`, a plain linear-scan dynamic array -- the number of
+distinct files one process imports is small relative to the cost of
+each entry, a full parse+compile+eval, so a linear `strcmp` scan's own
+cost is negligible next to what it saves). `parse_file`'s path-
+resolution step (`resolve_import_path` + the `import somedir` =>
+`somedir/default.nix` directory rule) was split out into its own
+`resolve_file_path` helper so `asnix_eval_file` can check the cache
+*before* paying for a read+lex+parse+compile+eval it might not need --
+only a cache MISS falls through to the expensive path, which then
+populates the cache with the freshly computed result. Deliberately
+scoped to plain `import` only: `asnix_eval_file_scoped`
+(`builtins.scopedImport`) is NOT cached, since its extra `scope`
+argument can legitimately differ between calls on the same file path,
+so caching by path alone would silently return the wrong (first-caller's)
+result to a later call with a different scope -- correct per real Nix,
+which also does not cache `scopedImport`.
+
+Verified: the `builtins.trace` minimal repro above now prints the trace
+line exactly once, matching real Nix. `./asnix d.nix` wall-clock dropped
+from ~1.5s to ~0.43s (roughly 3.5x), same exact next blocker as before
+this fix (unaffected, unrelated). `make test`/`test-e2e` both green,
+zero regressions. `make test-nix-conformance`: 558/100/148 before this
+fix (M64's own final numbers), 561/97/148 after -- +3 net, zero
+regressions (verified via the failing-file list, not just the
+aggregate count) -- some of numtide/nix-conformance's own corpus
+apparently already exercises observable import-caching behavior the
+same way the `trace` repro does.
