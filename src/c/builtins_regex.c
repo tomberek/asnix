@@ -91,15 +91,27 @@ static char *nul_copy(const char *bytes, int64_t len) {
  * backslash has no special meaning inside `[...]` in POSIX ERE -- stays
  * valid, matching real Nix).
  *
- * Deliberately NOT chased (see docs/architecture.md's scope notes):
- * `(a){24998}` (real Nix rejects this specific group-repetition count as
- * "too big" at some internal complexity threshold well below glibc's own
- * much higher limit -- an inherent engine-complexity-limit mismatch, not
- * a parseable syntax rule) and `[[.-.]]`/`[a-[.c.]]` (obscure POSIX
- * collating-symbol-as-range-endpoint forms libstdc++'s collating-symbol
- * support rejects but glibc's accepts -- replicating that exactly would
- * mean reverse-engineering libstdc++'s own undocumented collating-symbol
- * grammar boundary, not deriving a rule from the POSIX spec). */
+ * `[[.-.]]`/`[a-[.c.]]`-shaped obscure POSIX collating-symbol forms
+ * (non-alphabetic single-char collating names, and any collating
+ * symbol used as a range's HIGH endpoint) WERE chased, as of M80 --
+ * see regex_engine.c's `collate_lookup`/`parse_range_endpoint`/
+ * `asnix_regex_needs_custom_engine` and docs/architecture.md's M80
+ * scope notes for the exact rules and how `asnix_regex_needs_custom_
+ * engine` routes every `[.name.]` occurrence to that engine rather
+ * than trusting glibc's more lenient `regcomp` for it.
+ *
+ * Deliberately NOT chased (see docs/architecture.md's M80 scope
+ * notes): `(a){24998}` -- real Nix rejects this specific
+ * group-repetition count as "memory limit exceeded" at libstdc++'s own
+ * internal NFA-state-count limit, well below glibc's own much higher
+ * limit (which still accepts it, so there's no existing signal to
+ * repurpose, unlike `a{99999}`-shaped bare-repetition cases where
+ * glibc's own limit happens to trip at a nearby count for unrelated
+ * reasons) -- an inherent engine-complexity-limit mismatch whose exact
+ * boundary depends on the repeated body's own shape in a way that
+ * can't be derived from a handful of probe patterns without
+ * effectively reverse-engineering libstdc++'s NFA compiler's internal
+ * state-cost accounting. */
 static int pattern_rejected_by_real_nix(const char *p, int64_t len) {
     static const char *valid_escapes = ".()*+?[{^$|\\";
     int in_bracket = 0, bracket_first = 0, paren_depth = 0;

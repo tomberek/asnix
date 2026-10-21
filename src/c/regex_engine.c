@@ -155,16 +155,20 @@ static int pk(const Parser *ps) { return ps->pos < ps->len ? (unsigned char)ps->
 static int pk2(const Parser *ps) { return ps->pos + 1 < ps->len ? (unsigned char)ps->p[ps->pos + 1] : -1; }
 
 /* Named collating symbol lookup (`[.name.]`): a single-character name is
- * always just that character (the trivial case every collating
- * database defines); anything longer is looked up in the POSIX
- * portable character set's standard symbolic names for the
- * punctuation/whitespace characters that aren't otherwise typable
- * inside a bracket expression (this is the actual POSIX-specified name
- * list, not a project-specific shortcut -- letters/digits don't need
- * entries here since they're already covered by the single-character
- * rule). */
+ * that character -- but ONLY when it's an ASCII letter. Confirmed
+ * directly against real Nix/libstdc++: `[[.a.]]`/`[[.Z.]]` are accepted,
+ * but `[[.-.]]`/`[[.1.]]`/`[[._.]]`/`[[. .]]` (any non-alphabetic single
+ * byte) are all rejected ("Invalid collate element") -- libstdc++'s
+ * collating-element table only has single-character entries for letters;
+ * every other single byte needs one of the POSIX portable character
+ * set's multi-character symbolic names below (e.g. `[.hyphen.]`, not
+ * `[.-.]`) instead. Letters/digits-as-multi-char-names don't need table
+ * entries since digits fail the single-character rule and have no
+ * standard multi-char name either (and indeed `[[.digit...]]`-shaped
+ * names aren't in the POSIX list below). */
 static int collate_lookup(const char *name, int64_t namelen, unsigned char *out) {
     if (namelen == 1) {
+        if (!isalpha((unsigned char)name[0])) return 0;
         *out = (unsigned char)name[0];
         return 1;
     }
@@ -226,21 +230,19 @@ static int class_test(const char *name, int64_t namelen, unsigned char ch, int *
     return 0;
 }
 
-/* A range endpoint inside a bracket expression is either a plain byte
- * or a named collating symbol (`[[.a.]-c]` -- confirmed directly
- * against real Nix, see M68's scope notes). */
+/* This function is only ever called for a range's HIGH endpoint (the
+ * LOW endpoint -- plain byte or `[.name.]` collating symbol -- is parsed
+ * directly in `parse_bracket` below). A named collating symbol
+ * (`[.name.]`) is valid as a range's LOW endpoint (`[[.a.]-c]` --
+ * confirmed directly against real Nix, see M68's scope notes) but is
+ * NEVER valid as its HIGH endpoint, regardless of what the low endpoint
+ * was: confirmed directly against real Nix/libstdc++, both
+ * `[a-[.c.]]` and `[[.a.]-[.c.]]` are rejected ("Invalid end of '[x-x]'
+ * range") while `[[.a.]-c]` (collating symbol as LOW, plain byte as
+ * HIGH) is accepted -- so reject the `[.name.]` form outright here
+ * rather than parsing and discarding it. */
 static int parse_range_endpoint(Parser *ps, unsigned char *out) {
-    if (pk(ps) == '[' && pk2(ps) == '.') {
-        int64_t j = ps->pos + 2;
-        while (j + 1 < ps->len && !(ps->p[j] == '.' && ps->p[j + 1] == ']')) j++;
-        if (j + 1 >= ps->len) return 0;
-        int64_t namestart = ps->pos + 2, namelen = j - namestart;
-        unsigned char ch;
-        if (!collate_lookup(ps->p + namestart, namelen, &ch)) return 0;
-        ps->pos = j + 2;
-        *out = ch;
-        return 1;
-    }
+    if (pk(ps) == '[' && pk2(ps) == '.') return 0;
     if (pk(ps) < 0) return 0;
     *out = (unsigned char)pk(ps);
     ps->pos++;
@@ -847,13 +849,17 @@ int asnix_regex_needs_custom_engine(const char *p, int64_t len) {
         if (bracket_first && c == ']') { bracket_first = 0; i++; continue; }
         bracket_first = 0;
         if (c == '[' && i + 1 < len && p[i + 1] == '.') {
-            int64_t j = i + 2;
-            while (j + 1 < len && !(p[j] == '.' && p[j + 1] == ']')) j++;
-            if (j + 1 >= len) { i = len; continue; }
-            int64_t namelen = j - (i + 2);
-            if (namelen > 1) return 1; /* multi-char named collating symbol */
-            i = j + 2;
-            continue;
+            /* Any named collating symbol (`[.name.]`), multi-char or
+             * single-char, needs the custom engine: a multi-char name
+             * (e.g. `[.hyphen.]`) is a GNU/glibc leniency libstdc++
+             * rejects outright; a single-char name is only valid in
+             * libstdc++ when the character is alphabetic AND the symbol
+             * isn't being used as a range's high endpoint (`[a-[.c.]]`,
+             * `[[.a.]-[.c.]]`) -- both narrower than glibc's own
+             * acceptance, so glibc's regcomp can't be trusted for
+             * either case (see `collate_lookup`/`parse_range_endpoint`'s
+             * own comments for the exact rules this engine enforces). */
+            return 1;
         }
         if (c == '[' && i + 1 < len && p[i + 1] == '=') {
             int64_t j = i + 2;
