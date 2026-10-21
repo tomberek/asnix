@@ -32,4 +32,11 @@ Value asnix_make_throw_primop(void);
 /* Same idea, for `toString` -- also one of real Nix's bare-global names. */
 Value asnix_make_toString_primop(void);
 
+/* Same idea, for `derivation` -- also one of real Nix's bare-global
+ * names (M23: found needed by numtide/nix-conformance's
+ * eval-okay-drv-fixed-output.nix/eval-okay-drv-structured-attrs.nix,
+ * both of which call bare `derivation {...}`, not
+ * `builtins.derivation {...}`). */
+Value asnix_make_derivation_primop(void);
+
 #endif /* ASNIX_BUILTINS_H */

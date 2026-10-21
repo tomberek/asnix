@@ -35,7 +35,8 @@ what's actually implemented and the scope decisions made along the way.
 | M20 — daemon realization: `SetOptions`/`AddToStore`/`BuildPaths` (`src/c/daemon_client.c`) | done, **scoped** (see below) |
 | M21 — real structural `==`/`!=` + real `+` operator dispatch | done, **scoped** (see below) |
 | M22 — real-nixpkgs-evaluation sweep: block comments, `->`, more bare globals, dynamic attrs, directory-import fix | done, **in progress** (see below -- real nixpkgs still doesn't fully evaluate) |
-| M23+ | not started |
+| M23 — conformance long-tail: `++`/`/` operators, attrpath binding sugar, hyphenated identifiers, map/mapAttrs laziness fix, builtins-expansion pass | done, **scoped** (see below) |
+| M24+ | not started |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
 
@@ -2133,3 +2134,283 @@ individual fix's full writeup):
    corrected wording) registered under `builtins.throw`, plus
    `asnix_make_throw_primop()` for bare-global exposure (root `Env`/
    `ScopeFrame` grew from 7 to 8 slots).
+
+## M23 scope notes: conformance long-tail (parse-error and missing-builtin gaps)
+
+A fresh, from-scratch re-triage of numtide/nix-conformance's `lang/`
+suite (not reusing a stale list from a prior pass), explicitly scoped to
+exclude `builtins.match`/`builtins.split` and `builtins.fromTOML` (two
+other agents were working those in parallel). Baseline at the start of
+this pass: 300/862 `lang/` cases passing. After this pass: 333/862 --
+but that raw delta understates the work, for two reasons explained
+below: (a) several of the biggest fixes (the `++`/`/` operators,
+attrpath binding sugar, hyphenated identifiers) are foundational
+language features whose conformance payoff is diluted by *other*,
+unrelated gaps in the same files (dynamic attrset keys, flake-refs,
+`tryEval`, floats, ...) that still block many of those same files from
+fully passing even once the targeted gap is fixed; (b) a nontrivial
+chunk of the suite's remaining fails are cases whose expected output
+embeds concrete store-path hashes (`eval-okay-drv-fixed-output.nix` and
+siblings) that can only ever text-match if asnix replicates real Nix's
+*exact* fixed-output-derivation hash algorithm bit-for-bit -- a correct,
+clean asnix evaluation of these still "fails" the harness's literal
+string comparison for reasons that have nothing to do with correctness
+of anything this pass touched. Every fix below was verified directly
+against real `nix-instantiate --eval`, not just against the harness.
+
+**Fixed, in rough order of how many files each one unblocked:**
+
+- **`++` (list concatenation) had no token or grammar rule at all** --
+  confirmed via the triage as the single biggest root cause in the long
+  tail (104 of 862 `lang/` files use it). Added `TOK_PLUSPLUS`, a new
+  `parse_concat` precedence level (right-assoc, tighter than `*`/`-`,
+  looser than `?`/unary negate -- cross-checked against cppnix's real
+  grammar), a new `OP_CONCAT` IR op deferred to C
+  (`asnix_concat_lists`, `value_util.c`) since it isn't hot-path, same
+  shape as the existing `//` (`OP_UPDATE`) handler.
+- **Plain `/` (integer division) had no operator meaning at all** -- a
+  prior M21 note had already flagged this as a known, unfixed gap.
+  Added `TOK_SLASH`, `/` at `*`'s precedence in `parse_mul`, a new
+  `OP_DIV` with its own asm handler (`asnix_op_div`, `op_arith.S` --
+  int-only, truncates toward zero via a plain `idivq`, matching real
+  Nix's int/int behavior exactly, with a clean "division by zero" fatal
+  instead of a SIGFPE crash). The path-vs-division ambiguity (`a/b` with
+  no whitespace is still a path literal) needed no lexer changes at all
+  -- `try_scan_path` already rejected every case that should be
+  division, verified against every one of `a / b`/`a /b`/`a/ b`/`a/b`'s
+  independently-different real-Nix meanings.
+- **Legacy `let { ..., body = ...; }` form** -- real Nix desugars this
+  to `(rec { ... }).body`; fixed by doing the same desugaring directly
+  in `parser.c`'s `let` handling (reuses `AST_ATTRSET`+`AST_SELECT`, no
+  new AST node or IR op).
+- **Attrpath binding sugar (`a.b.c = val;`), including real Nix's
+  merge-on-shared-prefix semantics, didn't exist at all.** This is an
+  extremely common real-world Nix construct (nixpkgs attribute names are
+  full of it) that was previously just a hard parse error. Implemented
+  as a `BTNode`/`BTVec` tree built incrementally while parsing one
+  binds-block (`parser.c`), supporting both ordinary merge
+  (`a.b = 1; a.c = 2;` => `a = { b = 1; c = 2; };`) and the
+  "regrettable" merge-into-a-pre-existing-literal-attrset quirk real Nix
+  itself documents (NixOS/nix#9020). Scope cut, matching the existing
+  M22 one: only plain-identifier segments are supported, not
+  quoted-string/`${...}` segments (`eval-okay-attrs5.nix`/
+  `eval-okay-dynamic-attrs*.nix` still fail on exactly this, same as
+  before this pass).
+- **Hyphenated identifiers** (`ident_cont` now includes `-`, matching
+  real Nix's own identifier regex and its maximal-munch tokenization of
+  `a-b` as one identifier vs. `a - b`/`a -b` as subtraction) -- a
+  deliberate M4-era scope cut, revisited because real-world attribute
+  names use hyphens constantly (found via
+  `eval-okay-drv-fixed-output.nix`'s `flat-md5` etc.). Checked that no
+  existing asnix fixture relied on whitespace-free `a-b` meaning
+  subtraction before making this change.
+- **`derivation`/`baseNameOf`/`dirOf` added as bare root-scope globals**
+  (root `Env`/`ScopeFrame` grew from 8 to 11 slots across this pass).
+  `baseNameOf`/`dirOf` didn't exist in any form before this pass (not
+  even under `builtins.*`); ported directly from real Nix's own
+  `prim_baseNameOf`/`prim_dirOf`.
+- **Real store-path name validation and outputHash/outputHashAlgo/
+  outputHashMode well-formedness validation added to `derivation {...}`**
+  (`asnix_check_store_path_name`, `store_path.c`; validation in
+  `derivation.c`) -- previously accepted any name/hash string
+  unconditionally, which became *newly observable* as a regression the
+  moment `derivation` was exposed bare (several `eval-fail-drv-*` cases
+  expect these to be hard errors). Deliberately does NOT change how the
+  derivation's store path is actually computed for a fixed-output
+  derivation (still the ordinary non-fixed-output preimage) -- see the
+  store-path-exactness caveat in this section's opening paragraph for
+  why that doesn't matter for anything this pass could actually verify.
+- **Attrsets with a `__toString`/`outPath` attribute now coerce to
+  strings** (`asnix_coerce_to_string` and the stricter string-
+  interpolation coercion, `value_util.c`) -- previously any attrset hit
+  a hard "cannot coerce" fatal, even one specifically shaped to coerce
+  (a derivation's own result, or an explicit `{ __toString = ...; }`).
+  Purely a *value*-coercion upgrade, not the separate (and deliberately
+  out-of-scope) "string context" dependency-tracking feature.
+- **New builtins** (all verified against `nix-instantiate`): `seq`,
+  `deepSeq` (with cycle detection for self-referential values, matching
+  real Nix's own `forceValueDeep`'s `seen`-set), `intersectAttrs`,
+  `groupBy`, `pathExists`, `readFile`, `readFileType`, `readDir`,
+  `toPath` (deprecated even in real Nix -- returns a plain *string*,
+  not a Path, despite the name), `getEnv`, `parseDrvName` (ported from
+  real Nix's `DrvName::DrvName`, including its "first `-` followed by a
+  non-letter" split rule), `hashFile`, and plain two-int-argument
+  `add`/`sub`/`mul`/`div` (distinct from the `+`/`-`/`*`/`/`
+  *operators*).
+- **Attrset keys that aren't valid bare identifiers now print quoted**
+  (`main.c`'s printer) -- e.g. `groupBy`'s numeric-string keys
+  previously printed as bare `1 = ...` instead of real Nix's
+  `"1" = ...`. A real, if narrow, printer gap that happened to have
+  never been exercised before `groupBy` existed.
+
+**Three real, previously-latent core-evaluator bugs found and fixed
+while testing the above (not missing features -- see the numbered Known
+Bugs entries below for the full writeup of each):** `map`/`mapAttrs`
+calling their function argument immediately instead of lazily (#25),
+thunk-of-thunk chains only ever being forced one level deep (#26), and
+`concatLists` not forcing its outer list's elements before checking
+their tag (#27) -- the second of these three is the most structurally
+significant: it was latent in the core evaluator since ~M6/M7, just
+never previously reachable, because every *other* result-producing
+mechanism already happened to force inline before leaving a value on
+VALSTACK.
+
+**Deliberately skipped, with reasons (re-verify before assuming any of
+these is still accurate -- re-derive the conformance numbers, don't
+trust this list as ground truth):**
+
+- **`builtins.tryEval`** -- would need a real exception-handling
+  mechanism (every fatal error in this codebase is an unconditional
+  `exit(1)`, with zero unwind/recovery infrastructure at any level).
+  This is a correctness-preserving, large, separate feature (likely
+  needing `setjmp`/`longjmp` or an equivalent VALSTACK/RETSP-rewind
+  protocol at the dispatch-loop level), clearly disproportionate to
+  the 2 files it would unblock in this pass. Affects
+  `eval-okay-tryeval.nix`/`eval-okay-tryeval-failed-thunk-reeval.nix`.
+- **`__curPos`, `builtins.unsafeGetAttrPos`, position-tracking in
+  general** -- asnix's AST/IR carries no source-position information
+  anywhere (tokens do, but it's discarded at parse time); implementing
+  this would mean threading position info through the compiler and IR,
+  a cross-cutting change disproportionate to the handful of
+  `*-attr-pos*`/`eval-okay-curpos.nix`/`eval-okay-getattrpos*.nix`
+  files that need it.
+- **Dynamic/quoted-string attrset-literal keys** (`${expr} = val;`,
+  `"${str}" = val;`) -- same M22-documented cut, not extended this
+  pass; still blocks `eval-okay-attrs5.nix`/`eval-okay-attrs6.nix`/
+  `eval-okay-dynamic-attrs*.nix`/`eval-okay-null-dynamic-attrs.nix`.
+- **No float type at all** -- blocks `eval-okay-float.nix`,
+  `eval-okay-builtins-add.nix`'s float cases, true float division, and
+  anything else that writes a `1.5`-shaped literal. A real, sizeable
+  feature (new tag or boxed representation, float arithmetic, float-to-
+  string formatting matching real Nix's exact precision rules) --
+  correctly out of scope for a long-tail pass.
+- **`builtins.parseFlakeRef`/flake-ref-shaped builtins in general** --
+  explicitly flagged in this pass's own task brief as a likely
+  disproportionate rabbit hole; confirmed by inspection (would need a
+  real URL-ish mini-parser plus a whole flake-ref data model) and left
+  alone. Affects the `eval-okay-parse-flake-ref*.nix`/
+  `eval-okay-flake-ref-*.nix` cluster (~9 files).
+- **`__json`/structuredAttrs validation** (`eval-fail-json-attr-not-
+  json.nix`) -- would need an actual JSON parser (`fromJSON` doesn't
+  exist in this codebase at all yet); one file, not worth building a
+  JSON parser for in isolation.
+- **Fixed-output derivation *hash computation*** (as opposed to the
+  *validation* this pass did add) -- real Nix's fixed-output
+  derivations use a different store-path preimage formula
+  (`fixed:out:algo:hash:name`) than the ordinary one asnix's
+  `derivation.c` always uses; not changed, since conformance only ever
+  checks the *shape* of these results in this environment (see this
+  section's opening paragraph), not literal hash equality with a real
+  store.
+- **60-bit (not real Nix's full 64-bit) integer range** -- a
+  structural, pre-existing limitation (`asnix_make_int`/`op_arith.S` do
+  no overflow checking at all, silently wrapping past
+  `ASNIX_INT_MIN`/`ASNIX_INT_MAX`), confirmed newly via
+  `eval-fail-overflowing-add.nix`/`eval-fail-overflowing-mul.nix`
+  (both expect a hard error; asnix currently silently wraps instead).
+  Not fixed: doing so properly would mean adding overflow checks to the
+  hottest arithmetic path in the whole evaluator (`op_arith.S`'s
+  `+`/`-`/`*`), a correctness-vs-hot-path-risk tradeoff this pass
+  judged not worth rushing under time pressure for 2 files. Flagged
+  here as a real, reproducible gap for a future pass to pick up
+  (straightforward in principle: check the native overflow flag after
+  each op, then re-check the narrower `ASNIX_INT_MIN`/`MAX` window,
+  fatal on either).
+- **Context tracking / string context** -- out of scope per this
+  pass's own brief (confirmed still blocking
+  `eval-okay-drv-masking.nix`/`eval-okay-context*.nix`/
+  `eval-okay-drv-outputs.nix` and several others: passing a derivation
+  attrset through `inherit` into another derivation's env needs it).
+- **`builtins.match`/`builtins.split`/`builtins.fromTOML`** --
+  explicitly out of scope for this pass (two other agents), confirmed
+  never touched.
+
+## M23's Known Bugs entries (continuing the numbered list above)
+
+25. **`map`/`mapAttrs` called their function argument immediately,
+   once per element, instead of deferring each call into a lazy thunk --
+   a real strictness bug, not a missing feature.** Confirmed against
+   real Nix: `builtins.length (map (x: throw "boom") [1 2 3])` => `3`
+   there (nothing ever forces the thrown elements), aborted here before
+   this fix. A prior comment in `builtins_attrs.c` (next to
+   `mapAttrs`'s implementation) had explicitly — and, it turns out,
+   incorrectly — judged eager-vs-lazy construction "unobservable" since
+   "every consumer... forces each attrset value immediately anyway";
+   numtide/nix-conformance's `eval-okay-intersectAttrs.nix` disproves
+   that directly, building `alphabetFail = builtins.mapAttrs throw
+   alphabet` specifically as a "canary" (every value throws when
+   forced) and then only ever touching its attribute *names* via
+   `intersectAttrs`, never its values -- with the old eager
+   implementation, just *constructing* `alphabetFail` aborted
+   immediately. Fixed via two new shared helpers
+   (`asnix_bshared_make_lazy_call1`/`2`, `builtins_shared.c`) that build
+   a genuine `Thunk` wrapping a deferred call, reusing this project's
+   own existing curry-via-tiny-IR-body trick
+   (`make_curried2`/`build_curry2_body`, `builtins_attrs.c`) one level
+   further: a small, singleton (built once, cached) IR body that reads
+   its captured `{f, arg...}` back out of a fresh per-call `Env` via
+   plain `OP_VAR_REF`/`OP_CALL`, wrapped in an `OP_MK_THUNK`-shaped heap
+   `Thunk` object built directly in C (same four words
+   `op_mk_thunk.S` itself writes) rather than compiled bytecode -- no
+   new IR op, no asm changes needed for this part. `builtins_list.c`'s
+   `prim_map_stage2` and `builtins_attrs.c`'s `prim_mapAttrs_apply2`
+   both updated; `tests/c/test_builtins_list.c`'s own fixture needed a
+   matching update (it read `map`'s result elements' raw ints directly
+   without forcing, which only "worked" because the old eager `map`
+   never left a thunk there).
+26. **Thunk-of-thunk chains were only ever forced one level deep -- a
+   real, latent core-evaluator bug, exposed (not caused) by #25.** A
+   "lazy passthrough" primop like `builtins.getAttr` deliberately
+   returns an attrset entry's raw value without forcing it (correct,
+   matches real Nix's own lazy attribute-access semantics) -- but every
+   *other* value producer in this evaluator (`OP_VAR_REF`, `OP_SELECT`,
+   a closure's own `OP_RET`) already forces inline before leaving a
+   result on VALSTACK, so every operator (`op_arith.S`'s `+` etc.) only
+   ever checks the raw tag directly, assuming "already forced". That
+   invariant silently didn't hold for a primop's raw-passthrough
+   result: confirmed with a completely ordinary, map-unrelated
+   expression -- `let attrs = { a = "x"; }; g = x: builtins.getAttr "a"
+   x; in (g attrs) + "y"` -- aborted with a bogus "cannot coerce this
+   value to a string" here, `"xy"` on real Nix, proving this predates
+   and is independent of #25 (found immediately after fixing #25 while
+   testing `eval-okay-attrnames.nix`, which chains `map` + `getAttr`
+   together, but the root cause is general). Fixed at the one place
+   every primop call's result passes through regardless of which
+   primop it is (`op_call.S`'s primop-call path): force the return
+   value (`asnix_force_for_print`) before it ever reaches VALSTACK.
+   Also made `asnix_force_for_print` itself (`force.S`) loop until its
+   result is no longer a `Thunk` (a tail-loop back to the top of the
+   function, safe since every register this routine owns is already
+   fully restored by that point), matching real Nix's own `forceValue`
+   (`while (v.isThunk())` in `eval.cc`) -- defense in depth for the
+   same underlying class of chain, reached from the C side (the
+   printer, or any future C-side force call) even without going
+   through `OP_CALL` at all.
+27. **`concatLists` checked its outer list's elements' tags without
+   forcing them first -- harmless before #25 (fixed), a real bug
+   after.** List elements are always lazy by design (same as attrset
+   values) -- an unforced `Thunk` sitting in a list is completely
+   ordinary, not an error condition; only *forcing* reveals whether an
+   element is actually a list. Before #25's fix, every actual producer
+   of a list (literals, `map`, ...) happened to leave already-computed
+   values in it, so `prim_concatLists`'s raw `asnix_tag_of()` check on
+   each outer element "worked" by accident. Once #25 made `map`
+   genuinely lazy per element, `builtins.concatLists (map (hash: map f
+   strings) algos)`-shaped code (numtide/nix-conformance's
+   `eval-okay-hashstring.nix`/`eval-okay-hashfile.nix`) aborted with a
+   bogus "element N is not a list" instead of forcing the inner map's
+   still-lazy result first. Fixed by forcing each outer element
+   (`asnix_force_for_print`) before checking its tag, same as any other
+   lazy-list consumer already has to.
+28. **`baseNameOf` stripped *every* trailing slash instead of at most
+   one.** Real Nix's own documented rule: "If the string ends with a
+   `/`, only this one final slash is removed" -- a prior version of
+   this new (M23) function used a `while` loop where its own adjacent
+   comment already said "at most one", silently stripping every
+   trailing slash. Confirmed wrong: `baseNameOf "a//"` produced `"a"`
+   here vs. real Nix's `""` (strip exactly one slash -> `"a/"`, then
+   the segment after *its* last `/` is empty). Changed the `while` to
+   an `if`. Found via numtide/nix-conformance's
+   `eval-okay-baseNameOf.nix`, which exists specifically to pin down
+   this exact edge case (with a comment crediting a decade-old upstream
+   Nix PR for the same reason).

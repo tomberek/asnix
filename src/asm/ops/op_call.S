@@ -49,6 +49,27 @@ asnix_op_call:                          // a = argc
     leaq 8(%r15), %rdi                   // arg1 = args ptr (straight into VALSTACK, no Env copy)
     movq %rbx, %rsi                      // arg2 = argc
     call *%rbp
+    // M23: force the primop's raw return value before it ever reaches
+    // VALSTACK. Most primops already return a forced value (nothing to
+    // do here -- asnix_force_for_print's own fast path is a single tag
+    // check), but a "lazy passthrough" primop like getAttr deliberately
+    // returns an attrset entry's raw (possibly still-unforced) Thunk
+    // unchanged, matching real Nix's own lazy `.`/getAttr semantics.
+    // Every OTHER value producer in this evaluator (OP_VAR_REF,
+    // OP_SELECT, a closure's own OP_RET) already forces inline before
+    // leaving a result on VALSTACK, so operators like `+` (op_arith.S)
+    // only ever check the raw tag directly, never re-forcing -- that
+    // invariant silently didn't hold for a primop's result, so a getAttr
+    // result flowing straight into `+`/any other operator surfaced as
+    // "cannot coerce this value to a string" instead of the real, forced
+    // value (found via numtide/nix-conformance's eval-okay-attrnames.nix,
+    // completely unrelated to any one specific primop -- any primop that
+    // returns a reference without forcing it hits this). asnix_force_for_
+    // print (src/asm/force.S) itself preserves every register this
+    // routine still needs afterward (%rbx/%rbp/%r15/%r12/%r13/%r14), so
+    // no extra save/restore is needed around this call.
+    movq %rax, %rdi
+    call asnix_force_for_print
     popq %rdi
     popq %rsi
 

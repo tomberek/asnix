@@ -125,7 +125,11 @@ struct Ast {
             /* '+' '-' '*'                  arithmetic (M4)
              * 'e' '==' 'n' '!='            equality/inequality
              * 'l' '<' 'g' '>' 'L' '<=' 'G' '>='   ordering (INT-only, see compiler.c)
-             * 'u' '//'                     attrset update/merge */
+             * 'u' '//'                     attrset update/merge
+             * 'c' '++'                     list concatenation (M23)
+             * '/' '/'                      integer division (M23) -- the char code and the
+             *                              source operator happen to coincide here, unlike
+             *                              every other op letter above */
             char op;
             Ast *lhs, *rhs;
         } binop; /* AST_BINOP */

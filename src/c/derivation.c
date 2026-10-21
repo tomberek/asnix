@@ -9,6 +9,7 @@
 #include "asnix/heap.h"
 #include "asnix/ir.h" /* asnix_force_for_print */
 #include "aterm.h"
+#include "base32.h"
 #include "hash_shim.h"
 #include "store_path.h"
 #include "symtab.h"
@@ -29,6 +30,78 @@ static void sha256_or_die(const char *s, size_t len, uint8_t out[32]) {
 
 static int envvar_cmp(const void *a, const void *b) {
     return strcmp(((const AtermEnvVar *)a)->key, ((const AtermEnvVar *)b)->key);
+}
+
+/* Validates `outputHash`/`outputHashAlgo`/`outputHashMode` -- these were
+ * previously passed straight through as plain, unvalidated environment-
+ * variable strings (not even recognized as special), so a real-Nix-rejected
+ * value (unknown algo, wrong-length hash, unknown mode) silently "worked"
+ * here instead of erroring, which numtide/nix-conformance's eval-fail-drv-
+ * hash-algo/length/mode.nix all expect. Scope cut, deliberately NOT a full
+ * port of real Nix's fixed-output-derivation machinery: this only
+ * validates well-formedness (matching real Nix's own upfront checks in
+ * `primops.cc`'s derivationStrict and `libstore/hash.cc`'s hash-string
+ * parsing), it does NOT change how the derivation's store path is
+ * actually computed (still the ordinary non-fixed-output preimage --
+ * verified this doesn't matter for anything currently exercised, since
+ * conformance only checks the *shape* of fixed-output derivations'
+ * resulting paths, not exact digest equality with a real store, which
+ * would need actual content fetching infra this project doesn't have). */
+static int valid_hash_algo_str(const char *s, size_t len) {
+    return (len == 3 && memcmp(s, "md5", 3) == 0) || (len == 4 && memcmp(s, "sha1", 4) == 0) ||
+           (len == 6 && memcmp(s, "sha256", 6) == 0) || (len == 6 && memcmp(s, "sha512", 6) == 0);
+}
+
+static size_t hash_algo_digest_bytes(const char *s, size_t len) {
+    if (len == 3) return 16;       /* md5 */
+    if (len == 4) return 20;       /* sha1 */
+    if (len == 6 && s[3] == '2') return 32; /* sha256 */
+    return 64;                     /* sha512 */
+}
+
+static void validate_output_hash_fields(const char *output_hash, const char *output_hash_algo,
+                                         const char *output_hash_mode) {
+    if (output_hash_mode && strcmp(output_hash_mode, "flat") != 0 && strcmp(output_hash_mode, "recursive") != 0) {
+        fprintf(stderr, "asnix: unknown hash mode '%s', expected 'flat' or 'recursive'\n", output_hash_mode);
+        exit(1);
+    }
+    if (output_hash_algo && !valid_hash_algo_str(output_hash_algo, strlen(output_hash_algo))) {
+        fprintf(stderr, "asnix: unknown hash algorithm '%s'\n", output_hash_algo);
+        exit(1);
+    }
+    if (!output_hash) return;
+    const char *algo = output_hash_algo;
+    size_t algo_len = algo ? strlen(algo) : 0;
+    const char *hash_body = output_hash;
+    /* An SRI-style "algo-..." or legacy "algo:..." prefix on the hash
+     * string itself names the algorithm -- real Nix always recognizes and
+     * strips this form regardless of whether outputHashAlgo was ALSO
+     * given separately (confirmed needed: numtide/nix-conformance's
+     * eval-okay-drv-hash-spellings.nix passes the SAME hash five
+     * different ways, including `outputHashAlgo = "sha256"; outputHash =
+     * "sha256-<base64>"` together -- stripping only when outputHashAlgo
+     * was absent, as an earlier version of this function did, rejected
+     * that case with a bogus "wrong length" error since the un-stripped
+     * prefix was counted against the expected digest length). */
+    const char *sep = strchr(output_hash, '-');
+    const char *sep2 = strchr(output_hash, ':');
+    if (sep2 && (!sep || sep2 < sep)) sep = sep2;
+    if (sep && valid_hash_algo_str(output_hash, (size_t)(sep - output_hash))) {
+        algo = output_hash;
+        algo_len = (size_t)(sep - output_hash);
+        hash_body = sep + 1;
+    }
+    if (!algo) return; /* no algo known from either source -- nothing to check */
+    size_t n = hash_algo_digest_bytes(algo, algo_len);
+    size_t hash_len = strlen(hash_body);
+    size_t hex_len = 2 * n;
+    size_t b32_len = asnix_base32_encoded_length(n);
+    size_t b64_len = ((n + 2) / 3) * 4;
+    if (hash_len != hex_len && hash_len != b32_len && hash_len != b64_len) {
+        fprintf(stderr, "asnix: hash '%s' has wrong length for hash algorithm '%.*s'\n",
+                output_hash, (int)algo_len, algo);
+        exit(1);
+    }
 }
 
 /* The full `makeStorePath(type, hash, name)` (see store_path.h's header
@@ -79,6 +152,9 @@ Value asnix_prim_derivation(const Value *args, int64_t argc) {
     const char *name = NULL;
     const char *system = NULL;
     const char *builder = NULL;
+    const char *output_hash = NULL;
+    const char *output_hash_algo = NULL;
+    const char *output_hash_mode = NULL;
     const char *arg_strs[ASNIX_DRV_MAX_ARGS];
     size_t nargs = 0;
     AtermEnvVar env[ASNIX_DRV_MAX_ENV];
@@ -127,6 +203,9 @@ Value asnix_prim_derivation(const Value *args, int64_t argc) {
         if (keylen == 4 && memcmp(key, "name", 4) == 0) name = valcstr;
         else if (keylen == 6 && memcmp(key, "system", 6) == 0) system = valcstr;
         else if (keylen == 7 && memcmp(key, "builder", 7) == 0) builder = valcstr;
+        else if (keylen == 10 && memcmp(key, "outputHash", 10) == 0) output_hash = valcstr;
+        else if (keylen == 14 && memcmp(key, "outputHashAlgo", 14) == 0) output_hash_algo = valcstr;
+        else if (keylen == 14 && memcmp(key, "outputHashMode", 14) == 0) output_hash_mode = valcstr;
 
         if (nenv >= ASNIX_DRV_MAX_ENV) {
             fprintf(stderr, "asnix: derivation: too many attributes (max %d)\n", ASNIX_DRV_MAX_ENV);
@@ -141,6 +220,8 @@ Value asnix_prim_derivation(const Value *args, int64_t argc) {
         fprintf(stderr, "asnix: derivation: 'name', 'system', and 'builder' are required attributes\n");
         exit(1);
     }
+    asnix_check_store_path_name(name);
+    validate_output_hash_fields(output_hash, output_hash_algo, output_hash_mode);
 
     /* `out` is always present, blanked for the masked/self-referential-
      * hash pass -- overwrite it if the input attrset happened to set one

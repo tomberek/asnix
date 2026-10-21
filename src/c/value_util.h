@@ -75,6 +75,14 @@ Value asnix_concat_strings(const Value *parts, int64_t count);
  * whenever both operands aren't already known to be ints. */
 Value asnix_add_values(Value lhs, Value rhs);
 
+/* The `++` operator (list concatenation) -- NOT the same as `+`, which has
+ * no list case at all in real Nix (`[1] + [2]` is a type error there).
+ * Fatal if either side isn't a list, matching real Nix's exact wording
+ * (verified against `nix-instantiate --eval`: `1 ++ [2]` ->
+ * "expected a list but found an integer: 1"). Used by `asnix_op_concat`
+ * (src/asm/ops/op_concat.S). */
+Value asnix_concat_lists(Value lhs, Value rhs);
+
 /* Arena-allocates a NUL-terminated copy of an asnix String's bytes.
  * asnix strings are never NUL-terminated themselves (see heap.h), but
  * code boundaries that expect plain C strings (aterm.c's API) need one;

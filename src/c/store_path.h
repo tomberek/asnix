@@ -37,4 +37,18 @@ size_t asnix_store_path_preimage(const char *type, const char *hash_with_algo, c
  * NUL), or 0 if it wouldn't fit. */
 size_t asnix_make_store_path_from_digest(const uint8_t digest[32], const char *name, char *out, size_t out_cap);
 
+/* Validates a store path `name` component against real Nix's own rules
+ * (ported from ~/nix/src/libstore/path.cc's `checkName`): non-empty, at
+ * most 211 bytes (`StorePath::MaxNameLen`), every byte one of
+ * `[0-9a-zA-Z+-._?=]`, and not literally "." or ".." or starting with
+ * "-." or "-.." (the leading-dash-separated-component special case).
+ * Fatal (prints an "invalid derivation name" message and exits) on a
+ * violation, mirroring real Nix's own `BadStorePathName` exception --
+ * found needed by `derivation {...}`, which previously built a store
+ * path from ANY name string verbatim with no validation at all, silently
+ * accepting e.g. spaces/slashes/empty names that real Nix rejects
+ * (numtide/nix-conformance's several eval-fail-drv-name-... cases and
+ * eval-fail-derivation-name.nix all expect this to be a hard error). */
+void asnix_check_store_path_name(const char *name);
+
 #endif /* ASNIX_STORE_PATH_H */

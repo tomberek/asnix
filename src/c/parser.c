@@ -31,10 +31,193 @@ static void bindingvec_push(BindingVec *v, AstBinding item) {
     v->items[v->len++] = item;
 }
 
+/* Attrpath binding sugar (`a.b.c = val;`, real Nix's `attrpath '=' expr
+ * ';'` grammar rule -- see cppnix's parser.y/parser-state.hh's addAttr):
+ * a *tree* of these is built incrementally while parsing one binds-block
+ * (one `{...}`/`rec{...}`/`let`'s immediate binding list), then flattened
+ * into ordinary nested AST_ATTRSET Ast nodes only once the whole block is
+ * done (finalize_bt_vec below) -- an attrpath statement anywhere in the
+ * block can still extend a sibling attrpath statement's nested attrset
+ * parsed earlier in the same block (`a.b = 1; a.c = 2;` => `a = { b = 1;
+ * c = 2; };`, confirmed order-independent against nix-instantiate), so
+ * nothing can be finalized to a flat Ast until the whole block is known.
+ *
+ * Each node is either a LEAF (name has a definitive value: an ordinary
+ * `name = expr;`, or an `inherit`ed name) or a BRANCH (name was only ever
+ * used as a non-final attrpath segment, so it implicitly denotes a nested
+ * attrset -- never both. Scope cut, matching M22's existing documented
+ * one: only plain-identifier segments are supported (`a.b.c`, the
+ * overwhelmingly common real-world case); a quoted-string or `${...}`
+ * segment anywhere in an attrpath still hits the same "dynamic attrset
+ * key" fatal parse error as a bare `${...}` binding name always has --
+ * see try_static_attr_name below. */
+typedef struct BTNode BTNode;
+typedef struct { BTNode *items; size_t len, cap; } BTVec;
+struct BTNode {
+    const char *name;
+    size_t name_len;
+    int is_leaf;
+    Ast *leaf_value;   /* valid iff is_leaf */
+    int is_inherit;    /* valid iff is_leaf */
+    int rec;           /* valid iff !is_leaf: whether the attrset this branch finalizes
+                         * into should be `rec`. Always 0 for a branch created purely by
+                         * attrpath-sugar descent (`a.b = 1;` makes an ordinary, non-rec
+                         * nested `a`, confirmed against nix-instantiate: ExprAttrs
+                         * defaults non-recursive and addAttr's own intermediate-node
+                         * creation never sets ->recursive). Only set to 1 when a branch
+                         * was instead "reopened" from a pre-existing literal `rec {...}`
+                         * value below (the regrettable-merge path) -- it then keeps that
+                         * literal's original rec-ness, per real Nix's own documented
+                         * quirk (NixOS/nix#9020: "any rec marker on [the earlier value]
+                         * will apply to the attributes in [the later one]"). */
+    BTVec children;    /* valid iff !is_leaf */
+};
+
+static void btvec_push(BTVec *v, BTNode item) {
+    if (v->len == v->cap) {
+        v->cap = v->cap ? v->cap * 2 : 8;
+        v->items = realloc(v->items, v->cap * sizeof(BTNode));
+    }
+    v->items[v->len++] = item;
+}
+
+static BTNode *btvec_find(BTVec *v, const char *name, size_t name_len) {
+    for (size_t i = 0; i < v->len; i++) {
+        if (v->items[i].name_len == name_len && memcmp(v->items[i].name, name, name_len) == 0) {
+            return &v->items[i];
+        }
+    }
+    return NULL;
+}
+
+static void fatal_dup_attr(const char *name, size_t name_len) {
+    fprintf(stderr, "asnix: attribute '%.*s' already defined, aborting\n", (int)name_len, name);
+    exit(1);
+}
+
+static void insert_attrpath(BTVec *vec, Token **segs, size_t seg_count, size_t idx,
+                             Ast *leaf_value, int is_inherit);
+
+/* Re-opens a pre-existing, already-finalized AST_ATTRSET literal (`attrs`)
+ * as a mutable BTVec of leaf nodes, so a later attrpath statement in the
+ * same binds-block can still extend or merge into it -- the mechanism
+ * behind both the plain "same name, both attrset-literal values" dup-key
+ * merge (`inner = {...}; inner = {...};`) and the "regrettable" attrpath-
+ * into-a-literal merge (`a = rec {...}; a.c = ...;`, NixOS/nix#9020) via
+ * the exact same code path real Nix's addAttr uses for both. */
+static void reopen_attrset_into(BTVec *dest, Ast *attrs) {
+    for (size_t i = 0; i < attrs->as.attrset.count; i++) {
+        AstBinding *b = &attrs->as.attrset.bindings[i];
+        btvec_push(dest, (BTNode){
+            .name = b->name, .name_len = b->name_len,
+            .is_leaf = 1, .leaf_value = b->value, .is_inherit = b->is_inherit });
+    }
+}
+
+static void insert_attrpath(BTVec *vec, Token **segs, size_t seg_count, size_t idx,
+                             Ast *leaf_value, int is_inherit) {
+    Token *seg = segs[idx];
+    BTNode *existing = btvec_find(vec, seg->start, seg->len);
+    int is_last = (idx == seg_count - 1);
+    if (is_last) {
+        if (!existing) {
+            btvec_push(vec, (BTNode){
+                .name = seg->start, .name_len = seg->len,
+                .is_leaf = 1, .leaf_value = leaf_value, .is_inherit = is_inherit });
+            return;
+        }
+        /* Collision at the final segment: only mergeable if BOTH the
+         * existing value and the new value are themselves literal
+         * attrsets (real Nix's exact condition -- see addAttr's
+         * `jAttrs && ae` check) -- anything else is a hard dup-attr
+         * error, matching real Nix. */
+        Ast *existing_attrs_val = existing->is_leaf ? existing->leaf_value : NULL;
+        int existing_is_attrs_literal = existing->is_leaf && existing_attrs_val &&
+                                         existing_attrs_val->kind == AST_ATTRSET;
+        int new_is_attrs_literal = !is_inherit && leaf_value && leaf_value->kind == AST_ATTRSET;
+        if (!existing->is_leaf && new_is_attrs_literal) {
+            /* existing is already a branch (from earlier attrpath sugar) -- merge the
+             * new literal attrset's own bindings into it. */
+            reopen_attrset_into(&existing->children, leaf_value);
+            return;
+        }
+        if (existing_is_attrs_literal && new_is_attrs_literal) {
+            BTVec merged = { 0 };
+            reopen_attrset_into(&merged, existing_attrs_val);
+            existing->is_leaf = 0;
+            existing->rec = existing_attrs_val->as.attrset.is_rec;
+            existing->children = merged;
+            reopen_attrset_into(&existing->children, leaf_value);
+            return;
+        }
+        fatal_dup_attr(seg->start, seg->len);
+    }
+    /* Not the last segment: this name must denote (or become) a branch. */
+    if (!existing) {
+        BTNode node = { .name = seg->start, .name_len = seg->len, .is_leaf = 0, .rec = 0 };
+        btvec_push(vec, node);
+        existing = &vec->items[vec->len - 1];
+        insert_attrpath(&existing->children, segs, seg_count, idx + 1, leaf_value, is_inherit);
+        return;
+    }
+    if (existing->is_leaf) {
+        /* Only mergeable if the existing leaf's value is itself a literal
+         * attrset (the "regrettable" merge path -- real Nix's addAttr
+         * dynamic_casts the existing value to ExprAttrs here too). */
+        if (!existing->leaf_value || existing->leaf_value->kind != AST_ATTRSET) {
+            fatal_dup_attr(seg->start, seg->len);
+        }
+        Ast *reopened = existing->leaf_value;
+        existing->is_leaf = 0;
+        existing->rec = reopened->as.attrset.is_rec;
+        existing->children = (BTVec){ 0 };
+        reopen_attrset_into(&existing->children, reopened);
+    }
+    insert_attrpath(&existing->children, segs, seg_count, idx + 1, leaf_value, is_inherit);
+}
+
+static AstBinding finalize_bt_node(BTNode *node) {
+    if (node->is_leaf) {
+        return (AstBinding){
+            .name = node->name, .name_len = node->name_len,
+            .value = node->leaf_value, .is_inherit = node->is_inherit };
+    }
+    BindingVec out = { 0 };
+    for (size_t i = 0; i < node->children.len; i++) {
+        bindingvec_push(&out, finalize_bt_node(&node->children.items[i]));
+    }
+    Ast *attrs = asnix_ast_new(AST_ATTRSET);
+    attrs->as.attrset.bindings = out.items;
+    attrs->as.attrset.count = out.len;
+    attrs->as.attrset.is_rec = node->rec;
+    return (AstBinding){ .name = node->name, .name_len = node->name_len, .value = attrs, .is_inherit = 0 };
+}
+
+static void finalize_bt_vec(BTVec *vec, BindingVec *out) {
+    for (size_t i = 0; i < vec->len; i++) {
+        bindingvec_push(out, finalize_bt_node(&vec->items[i]));
+    }
+}
+
 typedef struct {
     AstStringPart *items;
     size_t len, cap;
 } PartVec;
+
+/* A growable array of Token* -- used by parse_binding_stmt to collect an
+ * attrpath's segments (`a.b.c`) before handing them to insert_attrpath. */
+typedef struct {
+    Token **items;
+    size_t len, cap;
+} TokenVec;
+
+static void tokenvec_push(TokenVec *v, Token *item) {
+    if (v->len == v->cap) {
+        v->cap = v->cap ? v->cap * 2 : 4;
+        v->items = realloc(v->items, v->cap * sizeof(Token *));
+    }
+    v->items[v->len++] = item;
+}
 
 static void partvec_push(PartVec *v, AstStringPart item) {
     if (v->len == v->cap) {
@@ -240,7 +423,7 @@ static Ast *parse_select(Parser *p);
  * `{ ... }` -- all three use the same binding-list grammar (see ast.h's
  * note on AstBinding.is_inherit for why the desugared value differs by
  * form but `is_inherit` is attached regardless). */
-static void parse_binding_stmt(Parser *p, BindingVec *out) {
+static void parse_binding_stmt(Parser *p, BTVec *out) {
     if (cur(p)->kind == TOK_INHERIT) {
         advance(p);
         Ast *src_expr = NULL;
@@ -276,20 +459,35 @@ static void parse_binding_stmt(Parser *p, BindingVec *out) {
              * outer-scope treatment below (see ast.h) -- real Nix
              * resolves a bare inherited name against the scope
              * *enclosing* this block, not the block's own recursive
-             * scope, even though plain `x` would otherwise self-match. */
-            bindingvec_push(out, (AstBinding){
-                .name = name->start, .name_len = name->len, .value = value,
-                .is_inherit = (src_expr == NULL) });
+             * scope, even though plain `x` would otherwise self-match.
+             * An inherited name is always a single segment in real Nix's
+             * own grammar (`attrs: attrs attr | ...`, never `attrpath`),
+             * so it always goes through insert_attrpath as a length-1
+             * path -- still subject to the same dup-attr/merge rules as
+             * an ordinary binding if it collides with one. */
+            insert_attrpath(out, &name, 1, 0, value, (src_expr == NULL));
         }
         expect(p, TOK_SEMI, "';'");
         return;
     }
-    Token *name = expect(p, TOK_IDENT, "a binding name");
+    /* Attrpath binding sugar (`a.b.c = val;`, real Nix's `attrpath '='
+     * expr ';'`) -- see the BTNode/insert_attrpath comment above for the
+     * full merge semantics. Scope cut: only plain-identifier segments are
+     * supported (the overwhelmingly common case); a quoted-string or
+     * `${...}` segment anywhere, including the first, still hits the
+     * pre-existing "a binding name"/"an attribute name" fatal parse
+     * error below, same as before this feature existed. */
+    TokenVec segs = { 0 };
+    tokenvec_push(&segs, expect(p, TOK_IDENT, "a binding name"));
+    while (cur(p)->kind == TOK_DOT) {
+        advance(p);
+        tokenvec_push(&segs, expect(p, TOK_IDENT, "an attribute name"));
+    }
     expect(p, TOK_EQUALS, "'='");
     Ast *value = parse_expr(p);
     expect(p, TOK_SEMI, "';'");
-    bindingvec_push(out, (AstBinding){
-        .name = name->start, .name_len = name->len, .value = value, .is_inherit = 0 });
+    insert_attrpath(out, segs.items, segs.len, 0, value, 0);
+    free(segs.items);
 }
 
 /* "foo ${expr} bar": zero or more TOK_STR_PART literal chunks interleaved
@@ -428,9 +626,11 @@ static Ast *parse_atom(Parser *p) {
         }
         case TOK_LBRACE: {
             advance(p);
-            BindingVec bindings = { 0 };
-            while (cur(p)->kind != TOK_RBRACE) parse_binding_stmt(p, &bindings);
+            BTVec bt = { 0 };
+            while (cur(p)->kind != TOK_RBRACE) parse_binding_stmt(p, &bt);
             advance(p); /* '}' */
+            BindingVec bindings = { 0 };
+            finalize_bt_vec(&bt, &bindings);
             Ast *n = asnix_ast_new(AST_ATTRSET);
             n->as.attrset.bindings = bindings.items;
             n->as.attrset.count = bindings.len;
@@ -440,9 +640,11 @@ static Ast *parse_atom(Parser *p) {
         case TOK_REC: {
             advance(p);
             expect(p, TOK_LBRACE, "'{'");
-            BindingVec bindings = { 0 };
-            while (cur(p)->kind != TOK_RBRACE) parse_binding_stmt(p, &bindings);
+            BTVec bt = { 0 };
+            while (cur(p)->kind != TOK_RBRACE) parse_binding_stmt(p, &bt);
             advance(p); /* '}' */
+            BindingVec bindings = { 0 };
+            finalize_bt_vec(&bt, &bindings);
             Ast *n = asnix_ast_new(AST_ATTRSET);
             n->as.attrset.bindings = bindings.items;
             n->as.attrset.count = bindings.len;
@@ -544,13 +746,37 @@ static Ast *parse_has_attr(Parser *p) {
     return e;
 }
 
-static Ast *parse_mul(Parser *p) {
+/* `++` list concatenation: binds tighter than `*`/`/` but looser than
+ * `?` (has-attr) and unary `-` (negate), right-associative -- cross-
+ * checked against cppnix's real grammar, `~/nix/src/libexpr/parser.y`'s
+ * precedence table (`%left '+' '-'`, `%left '*' '/'`, `%right CONCAT`,
+ * `%nonassoc '?'`, `%nonassoc NEGATE`, loosest to tightest in that
+ * declaration order). Verified against `nix-instantiate --eval`:
+ * `[1] ++ [2] ++ [3]` => `[ 1 2 3 ]` (chains), and the type error from
+ * `1 ++ [2]` names the lhs ("expected a list but found an integer: 1"),
+ * confirming no numeric-only interpretation competes here. */
+static Ast *parse_concat(Parser *p) {
     Ast *lhs = parse_has_attr(p);
-    while (cur(p)->kind == TOK_STAR) {
+    if (cur(p)->kind == TOK_PLUSPLUS) {
         advance(p);
-        Ast *rhs = parse_has_attr(p);
+        Ast *rhs = parse_concat(p); /* right-recurse: right-associative */
         Ast *n = asnix_ast_new(AST_BINOP);
-        n->as.binop.op = '*';
+        n->as.binop.op = 'c';
+        n->as.binop.lhs = lhs;
+        n->as.binop.rhs = rhs;
+        return n;
+    }
+    return lhs;
+}
+
+static Ast *parse_mul(Parser *p) {
+    Ast *lhs = parse_concat(p);
+    while (cur(p)->kind == TOK_STAR || cur(p)->kind == TOK_SLASH) {
+        char op = cur(p)->kind == TOK_STAR ? '*' : '/';
+        advance(p);
+        Ast *rhs = parse_concat(p);
+        Ast *n = asnix_ast_new(AST_BINOP);
+        n->as.binop.op = op;
         n->as.binop.lhs = lhs;
         n->as.binop.rhs = rhs;
         lhs = n;
@@ -703,10 +929,13 @@ static Ast *parse_impl(Parser *p) {
  * `let ... in` is always implicitly `letrec`: every binding sees itself
  * and every sibling regardless of source order -- see ast.h/compiler.c). */
 static Ast *parse_let_bindings(Parser *p) {
-    BindingVec bindings = { 0 };
-    while (cur(p)->kind != TOK_IN) parse_binding_stmt(p, &bindings);
+    BTVec bt = { 0 };
+    while (cur(p)->kind != TOK_IN) parse_binding_stmt(p, &bt);
     advance(p); /* 'in' */
     Ast *body = parse_expr(p);
+
+    BindingVec bindings = { 0 };
+    finalize_bt_vec(&bt, &bindings);
 
     Ast *n = asnix_ast_new(AST_LET);
     n->as.let1.bindings = bindings.items;
@@ -778,6 +1007,31 @@ static void parse_formals(Parser *p, AstFormal **out_items, size_t *out_count, i
 static Ast *parse_expr(Parser *p) {
     if (cur(p)->kind == TOK_LET) {
         advance(p);
+        if (cur(p)->kind == TOK_LBRACE) {
+            /* Legacy `let { ..., body = ...; }` form -- real Nix desugars
+             * this directly to `(rec { ... }).body` (cppnix's parser.y:
+             * "Let expressions `let {..., body = ...}' are just desugared
+             * into `(rec {..., body = ...}).body'."). Distinct from
+             * ordinary `let <bindings> in <expr>` (no `{` immediately
+             * after `let`) handled below. */
+            advance(p); /* '{' */
+            BTVec bt = { 0 };
+            while (cur(p)->kind != TOK_RBRACE) parse_binding_stmt(p, &bt);
+            advance(p); /* '}' */
+            BindingVec bindings = { 0 };
+            finalize_bt_vec(&bt, &bindings);
+            Ast *attrs = asnix_ast_new(AST_ATTRSET);
+            attrs->as.attrset.bindings = bindings.items;
+            attrs->as.attrset.count = bindings.len;
+            attrs->as.attrset.is_rec = 1;
+            Ast *n = asnix_ast_new(AST_SELECT);
+            n->as.select.target = attrs;
+            n->as.select.attr = "body";
+            n->as.select.attr_len = 4;
+            n->as.select.attr_expr = NULL;
+            n->as.select.default_ = NULL;
+            return n;
+        }
         return parse_let_bindings(p);
     }
     if (cur(p)->kind == TOK_WITH) {

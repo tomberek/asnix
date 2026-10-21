@@ -50,6 +50,10 @@ typedef enum {
     TOK_BANG,    /* ! */
     TOK_SLASHSLASH, /* // */
     TOK_ARROW,   /* -> (logical implication) */
+    TOK_PLUSPLUS, /* ++ (list concatenation) */
+    TOK_SLASH,   /* / (integer division) -- only reached when try_scan_path (lexer.c)
+                  * already determined this '/' isn't part of a path literal and it's
+                  * not the first of a '//' pair either (see lexer.c's main loop). */
     /* Strings: "..." and ''...'' no longer lex to one flat TOK_STRING --
      * "${" inside either kind re-enters normal expression lexing until the
      * matching "}" (TOK_RBRACE, reused -- see asnix_lex's mode-stack

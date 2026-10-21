@@ -272,6 +272,78 @@ static Value prim_isBool(const Value *args, int64_t argc) {
     return asnix_make_imm(sub == ASNIX_IMM_TRUE || sub == ASNIX_IMM_FALSE ? ASNIX_IMM_TRUE : ASNIX_IMM_FALSE);
 }
 
+/* `baseNameOf`/`dirOf` (M23) -- two of real Nix's bare root-scope globals
+ * (see builtins.h's asnix_make_import_primop comment for the full
+ * curated list), found needed by numtide/nix-conformance's
+ * eval-okay-baseNameOf.nix/eval-okay-builtins-dirOf.nix/eval-okay-path.nix
+ * and others, all of which call these bare, not `builtins.X`. Ported
+ * directly from real Nix's own `prim_baseNameOf`/`prim_dirOf`
+ * (~/nix/src/libexpr/primops.cc), verified against `nix-instantiate
+ * --eval` for every edge case below:
+ *   baseNameOf "/foo/bar.nix"  -> "bar.nix"      (always a plain string,
+ *   baseNameOf ./foo/bar.nix   -> "bar.nix"       regardless of whether
+ *   baseNameOf "foo/"          -> "foo"           the input was a path)
+ *   dirOf "/foo/bar.nix"       -> "/foo"          (type-preserving: a
+ *   dirOf ./foo/bar.nix        -> /foo (a Path)    Path in, Path out;
+ *   dirOf "foo"                -> "."              a String in,
+ *   dirOf "/"                  -> "/"              String out)
+ * Scope cut: real Nix accepts (and coerces) any string-coercible type
+ * here (further erroring with real Nix's own wording on int/bool/null);
+ * asnix only accepts an actual TAG_PTR (String or Path) argument, fatal
+ * otherwise -- narrower, but every real caller found so far only ever
+ * passes an actual path/string. */
+static Value prim_baseNameOf(const Value *args, int64_t argc) {
+    (void)argc;
+    int64_t len;
+    const char *bytes = asnix_ptr_bytes(args[0], &len);
+    if (len > 0 && bytes[len - 1] == '/') len--; /* AT MOST ONE trailing slash stripped (an
+                                                    * `if`, not a `while`) -- matching real
+                                                    * Nix's legacyBaseNameOf exactly (NOT GNU
+                                                    * basename's "any number"): verified
+                                                    * `baseNameOf "a//"` => "" (strip one
+                                                    * slash -> "a/", then the segment after
+                                                    * ITS last '/' is empty), not "a" -- a
+                                                    * prior version of this line used `while`,
+                                                    * silently stripping every trailing slash
+                                                    * instead of just one, found via
+                                                    * numtide/nix-conformance's
+                                                    * eval-okay-baseNameOf.nix. */
+    int64_t start = len;
+    while (start > 0 && bytes[start - 1] != '/') start--;
+    return asnix_make_string_value(bytes + start, (size_t)(len - start));
+}
+
+static Value prim_dirOf(const Value *args, int64_t argc) {
+    (void)argc;
+    Value v = args[0];
+    int64_t len;
+    const char *bytes = asnix_ptr_bytes(v, &len);
+    int is_path = asnix_value_is_path(v);
+    /* asnix Paths are always already-resolved absolute paths with no
+     * trailing slash (see compiler.c's AST_PATH/resolve_path_literal),
+     * so "/" is the only case needing the real-Nix "isRoot, keep as-is"
+     * special case -- everything else always contains a '/' to split on. */
+    if (is_path) {
+        if (len == 1 && bytes[0] == '/') return asnix_make_path_value("/", 1);
+        int64_t pos = len;
+        while (pos > 0 && bytes[pos - 1] != '/') pos--;
+        pos--; /* back up onto the '/' itself */
+        if (pos <= 0) return asnix_make_path_value("/", 1);
+        return asnix_make_path_value(bytes, (size_t)pos);
+    }
+    int64_t pos = len;
+    while (pos > 0 && bytes[pos - 1] != '/') pos--;
+    if (pos == 0) return asnix_make_string_value(".", 1);
+    pos--; /* back up onto the '/' itself */
+    if (pos == 0) return asnix_make_string_value("/", 1);
+    return asnix_make_string_value(bytes, (size_t)pos);
+}
+
+static Value build_baseNameOf(void) { return make_primop_value((void *)prim_baseNameOf, 1); }
+static Value build_dirOf(void) { return make_primop_value((void *)prim_dirOf, 1); }
+Value asnix_make_baseNameOf_primop(void) { return make_primop_value((void *)prim_baseNameOf, 1); }
+Value asnix_make_dirOf_primop(void) { return make_primop_value((void *)prim_dirOf, 1); }
+
 static Value build_isNull(void) { return make_primop_value((void *)prim_isNull, 1); }
 
 /* `isNull` is one of real Nix's bare root-scope globals (verified against
@@ -308,6 +380,8 @@ const AsnixBuiltinMiscDef ASNIX_BUILTINS_MISC[] = {
     { "isInt", build_isInt },
     { "isBool", build_isBool },
     { "nixVersion", build_nixVersion },
+    { "baseNameOf", build_baseNameOf },
+    { "dirOf", build_dirOf },
 };
 
 const size_t ASNIX_BUILTINS_MISC_COUNT = sizeof(ASNIX_BUILTINS_MISC) / sizeof(ASNIX_BUILTINS_MISC[0]);

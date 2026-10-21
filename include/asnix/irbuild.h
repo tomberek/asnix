@@ -81,6 +81,8 @@ size_t ib_le(IrBuilder *b);
 size_t ib_ge(IrBuilder *b);
 size_t ib_not(IrBuilder *b);
 size_t ib_update(IrBuilder *b);
+size_t ib_concat(IrBuilder *b);
+size_t ib_div(IrBuilder *b);
 /* Emits OP_ASSERT_FAIL over a {msg, len} pool pair; `msg` must outlive the
  * resulting IrProgram (compiler.c arena-allocates it, which is never
  * freed, exactly like string literals -- see AST_STRING). */

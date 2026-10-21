@@ -7,6 +7,9 @@
 
 #include "asnix/arena.h"
 #include "asnix/heap.h"
+#include "asnix/ir.h" /* asnix_force_for_print, asnix_apply */
+#include "builtins_shared.h"
+#include "symtab.h"
 
 Value asnix_make_string_value(const char *s, size_t len) {
     void *mem = asnix_arena_alloc(8 + len);
@@ -66,6 +69,39 @@ Value asnix_coerce_to_string(Value v) {
             const char *bytes = asnix_ptr_bytes(v, &len);
             return asnix_make_string_value(bytes, (size_t)len); /* path -> string, see value_util.h */
         }
+        case ASNIX_TAG_ATTRS: {
+            /* An attrset with a `__toString` or `outPath` attribute
+             * coerces to a string via that attribute (M23) -- real Nix's
+             * own `coerceToString` checks exactly these two, in this
+             * order, before giving up (e.g. a derivation attrset's
+             * `outPath` is exactly how `"${someDerivation}"` and
+             * `toString someDerivation` work) -- found needed by
+             * numtide/nix-conformance's eval-okay-pathexists.nix
+             * (`builtins.toPath { __toString = x: ...; }` and
+             * `{ outPath = ...; }`), verified against `nix-instantiate
+             * --eval`. `__toString` is called with the attrset itself as
+             * its one argument, matching real Nix; its result (and a
+             * plain `outPath`'s value) is coerced recursively, since
+             * either could itself be a path or another such object.
+             * Scope cut: this is purely a *value*-coercion upgrade, not
+             * the separate, larger "string context" feature (dependency
+             * tracking through string ops) this project deliberately
+             * doesn't implement -- a derivation's `outPath` still works
+             * here as a plain string, just without any attached context. */
+            uint32_t sym_tostring = asnix_intern("__toString", 10);
+            int64_t idx = asnix_bshared_attrs_find(v, sym_tostring);
+            if (idx >= 0) {
+                Value fn = asnix_force_for_print(asnix_bshared_attrs_value(v, idx));
+                Value result = asnix_apply(fn, &v, 1);
+                return asnix_coerce_to_string(asnix_force_for_print(result));
+            }
+            uint32_t sym_outpath = asnix_intern("outPath", 7);
+            idx = asnix_bshared_attrs_find(v, sym_outpath);
+            if (idx >= 0) {
+                return asnix_coerce_to_string(asnix_force_for_print(asnix_bshared_attrs_value(v, idx)));
+            }
+            break;
+        }
         default: break;
     }
     fprintf(stderr, "asnix: cannot coerce this value to a string\n");
@@ -105,6 +141,25 @@ static Value coerce_to_string_for_interp(Value v) {
          * a known, documented behavioral gap, not a crash. */
         if (asnix_value_is_path(v)) return asnix_coerce_to_string(v);
         return v;
+    }
+    if (asnix_tag_of(v) == ASNIX_TAG_ATTRS) {
+        /* An attrset with `__toString`/`outPath` IS accepted here even
+         * though int/bool/null/list/plain-attrset aren't (M23) --
+         * real Nix's own `coerceMore=false` path still special-cases
+         * exactly this (verified: `"${derivation {...}}"` interpolates
+         * fine via its `outPath`, while `"${{}}""` -- a plain attrset
+         * with neither attribute -- still fails the same as any other
+         * disallowed type). Delegate to asnix_coerce_to_string, which
+         * already implements the __toString/outPath lookup -- if
+         * neither is present it fatals with its own (slightly
+         * differently worded, but equally clear) "cannot coerce"
+         * message, which is fine since that's the "a plain set" case
+         * real Nix also rejects here regardless of wording. */
+        uint32_t sym_tostring = asnix_intern("__toString", 10);
+        uint32_t sym_outpath = asnix_intern("outPath", 7);
+        if (asnix_bshared_attrs_find(v, sym_tostring) >= 0 || asnix_bshared_attrs_find(v, sym_outpath) >= 0) {
+            return asnix_coerce_to_string(v);
+        }
     }
     const char *kind = "this value";
     switch (asnix_tag_of(v)) {
@@ -169,6 +224,33 @@ Value asnix_add_values(Value lhs, Value rhs) {
         return asnix_make_path_value(bytes, (size_t)len);
     }
     return result;
+}
+
+Value asnix_concat_lists(Value lhs, Value rhs) {
+    if (asnix_tag_of(lhs) != ASNIX_TAG_LIST) {
+        fprintf(stderr, "asnix: expected a list but found a non-list value (lhs of '++')\n");
+        exit(1);
+    }
+    if (asnix_tag_of(rhs) != ASNIX_TAG_LIST) {
+        fprintf(stderr, "asnix: expected a list but found a non-list value (rhs of '++')\n");
+        exit(1);
+    }
+    const char *lbase = (const char *)(uintptr_t)(lhs.raw & ~(uint64_t)ASNIX_TAG_MASK);
+    const char *rbase = (const char *)(uintptr_t)(rhs.raw & ~(uint64_t)ASNIX_TAG_MASK);
+    int64_t lcount = *(const int64_t *)(lbase + ASNIX_LIST_OFF_COUNT);
+    int64_t rcount = *(const int64_t *)(rbase + ASNIX_LIST_OFF_COUNT);
+    int64_t total = lcount + rcount;
+
+    void *mem = asnix_arena_alloc(8 + (uint64_t)total * sizeof(Value));
+    *(int64_t *)((char *)mem + ASNIX_LIST_OFF_COUNT) = total;
+    Value *out = (Value *)((char *)mem + ASNIX_LIST_OFF_ELEMS);
+    if (lcount > 0) {
+        memcpy(out, lbase + ASNIX_LIST_OFF_ELEMS, (size_t)lcount * sizeof(Value));
+    }
+    if (rcount > 0) {
+        memcpy(out + lcount, rbase + ASNIX_LIST_OFF_ELEMS, (size_t)rcount * sizeof(Value));
+    }
+    return (Value){ .raw = (uint64_t)(uintptr_t)mem | ASNIX_TAG_LIST };
 }
 
 char *asnix_string_value_to_cstr(Value string_val) {

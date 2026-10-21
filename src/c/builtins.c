@@ -13,6 +13,7 @@
 #include "builtins_compare.h"
 #include "builtins_list.h"
 #include "builtins_list2.h"
+#include "builtins_m23.h"
 #include "builtins_misc.h"
 #include "derivation.h"
 #include "eval_file.h"
@@ -245,6 +246,13 @@ static const BuiltinDef BUILTINS[] = {
     { "import", prim_import, 1 },
     { "abort", prim_abort, 1 },
     { "throw", prim_throw, 1 },
+    { "pathExists", asnix_prim_pathExists, 1 },
+    { "readFile", asnix_prim_readFile, 1 },
+    { "readFileType", asnix_prim_readFileType, 1 },
+    { "readDir", asnix_prim_readDir, 1 },
+    { "toPath", asnix_prim_toPath, 1 },
+    { "getEnv", asnix_prim_getEnv, 1 },
+    { "parseDrvName", asnix_prim_parseDrvName, 1 },
 };
 
 Value asnix_make_import_primop(void) {
@@ -261,6 +269,10 @@ Value asnix_make_throw_primop(void) {
 
 Value asnix_make_toString_primop(void) {
     return make_primop_value((void *)prim_toString, 1);
+}
+
+Value asnix_make_derivation_primop(void) {
+    return make_primop_value((void *)asnix_prim_derivation, 1);
 }
 
 /* Merges this file's own BUILTINS[] with the builtins-expansion modules
@@ -289,10 +301,11 @@ Value asnix_make_builtins_attrs(void) {
     const size_t list_shaped_counts[] = { asnix_builtins_list_count, ASNIX_ATTRS_BUILTINS_COUNT };
     const AsnixBuiltinMiscDef *const build_tables[] = {
         ASNIX_BUILTINS_MISC, ASNIX_CLOSURE_BUILTINS, ASNIX_LIST2_BUILTINS, ASNIX_ATTRS2_BUILTINS, ASNIX_COMPARE_BUILTINS,
+        ASNIX_M23_BUILTINS,
     };
     const size_t build_counts[] = {
         ASNIX_BUILTINS_MISC_COUNT, ASNIX_CLOSURE_BUILTINS_COUNT, ASNIX_LIST2_BUILTINS_COUNT,
-        ASNIX_ATTRS2_BUILTINS_COUNT, ASNIX_COMPARE_BUILTINS_COUNT,
+        ASNIX_ATTRS2_BUILTINS_COUNT, ASNIX_COMPARE_BUILTINS_COUNT, ASNIX_M23_BUILTINS_COUNT,
     };
 
     size_t n = 0;
