@@ -18,21 +18,19 @@
 //       field's symbol id, sorted ascending (only present/read when `...`
 //       is absent)
 //
-// No heap allocation and no nested `call` happens anywhere in this handler,
-// so (unlike op_let.S/op_call.S/op_mk_thunk.S) there is no need to save/
-// restore IP(%rsi)/ENV(%rdi) around anything -- every register other than
-// %rsi/%rdi/%r12/%r13/%r14 is free scratch for the whole handler body.
+// No heap allocation and no nested `call` happens anywhere in the
+// success path of this handler, so (unlike op_let.S/op_call.S/
+// op_mk_thunk.S) there is no need to save/restore IP(%rsi)/ENV(%rdi)
+// around anything -- every register other than %rsi/%rdi/%r12/%r13/%r14
+// is free scratch for the whole handler body. (M50: the two fatal-only
+// miss paths below now `call` into C to name the specific field -- safe
+// without any IP/ENV save, same as every other fatal-only `call` in this
+// codebase, since the process exits before ever returning.)
 
     .section .rodata
 .Lmsg_cf_type:
     .ascii "asnix: lambda pattern argument is not a set, aborting\n"
     .equ ASNIX_MSG_CF_TYPE_LEN, . - .Lmsg_cf_type
-.Lmsg_cf_missing:
-    .ascii "asnix: lambda called without a required argument, aborting\n"
-    .equ ASNIX_MSG_CF_MISSING_LEN, . - .Lmsg_cf_missing
-.Lmsg_cf_extra:
-    .ascii "asnix: lambda called with an unexpected argument, aborting\n"
-    .equ ASNIX_MSG_CF_EXTRA_LEN, . - .Lmsg_cf_extra
 
     .text
 
@@ -136,11 +134,20 @@ asnix_op_check_formals:                 // a = required_count; b = pool_idx
     movq $ASNIX_MSG_CF_TYPE_LEN, %rsi
     jmp asnix_fatal
 .Lcf_missing_error:
-    leaq .Lmsg_cf_missing(%rip), %rdi
-    movq $ASNIX_MSG_CF_MISSING_LEN, %rsi
-    jmp asnix_fatal
+    // M50: names the specific required field (real `call` into C, same
+    // reasoning as op_select.S's .Lselect_missing/M36: %rsp is already
+    // 16-byte aligned entering this handler -- see this file's own header
+    // comment confirming no other push/call happens anywhere above --
+    // and asnix_bshared_cf_missing_fatal is _Noreturn, so the pushed
+    // return address is never used). %r15 still holds the required sym
+    // that the binary search just failed to find (set above, persists
+    // through the search per its own comment).
+    movq %r15, %rdi
+    call asnix_bshared_cf_missing_fatal
 .Lcf_extra_error:
-    leaq .Lmsg_cf_extra(%rip), %rdi
-    movq $ASNIX_MSG_CF_EXTRA_LEN, %rsi
-    jmp asnix_fatal
+    // M50: same idea, for the specific unexpected given field. %r11
+    // still holds the given entry's sym (set above, persists through the
+    // search per its own comment).
+    movq %r11, %rdi
+    call asnix_bshared_cf_extra_fatal
     .size asnix_op_check_formals, . - asnix_op_check_formals

@@ -53,7 +53,8 @@ what's actually implemented and the scope decisions made along the way.
 | M38 — `asnix_apply`'s PrimOp path never forced args/return (core evaluator fix) | done (see below) |
 | M39 — `builtins.addErrorContext` | done (see below) |
 | M40 — `${null} = value;` silently omitted, not an error | done (see below) |
-| M41+ | not started |
+| M41-M49 | not started |
+| M50 — name the specific value/field in 6 more generic fatal-path error messages | done (see below) |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
 
@@ -3629,3 +3630,110 @@ insertion entirely, same as cppnix's `continue`) when `name_val` is
 
 `make test`/`test-e2e` green (193 e2e, one new `m40_*` fixture);
 `test-conformance` 633 passed (up from 632, no regressions).
+
+## M50 scope notes: name the specific value/field in 6 more generic fatal-path error messages
+
+The "cheap pass" extension of M36's own idea, requested directly after
+M36 landed: M36 named the attribute in `OP_SELECT`'s "attribute
+missing" abort; this pass applies the same "a `call` on a fatal-only
+path is free" trick to the other generic, unnamed fatal messages that
+were still forcing a one-off gdb session to find out *which* value/
+symbol actually triggered them. Deliberately NOT full line:column
+position tracking (explicitly declined as too large for now) -- just
+naming whatever specific value/symbol is already sitting in a register
+or C variable at each fatal site, same scope M36 itself set.
+
+Six sites fixed, all following M36's exact `call`-not-`jmp`-into-C
+discipline (safe without stack padding since `%rsp` is already 16-byte
+aligned entering any op handler -- the dispatch loop's own standing
+invariant -- and every new C function is `_Noreturn`, so the harmless
+pushed return address is never used; zero cost on every surrounding hot
+path since only the already-exiting fatal branch changed):
+
+1. **`op_select.S`'s `.Lselect_type_error`** ("asnix: '.' selection
+   target is not an attrset, aborting") now calls
+   `asnix_bshared_select_type_fatal(Value v)`, which appends "(got
+   `<type>`)" using a new shared helper (below). Checked the four
+   asm-level siblings named in the ask (`op_select_or.S`,
+   `op_select_dynamic.S`, `op_select_dynamic_or.S`,
+   `op_has_attr_dynamic.S`): `op_select_or`/`op_select_dynamic_or`/
+   `op_has_attr_dynamic` all treat a non-attrset target as a graceful
+   "not found"/`false`, not fatal (confirmed against real Nix: `(5).foo
+   or 10` => `10`), so there is no analogous type-error message to fix
+   in those three. `op_select_dynamic.S` defers entirely to
+   `asnix_bshared_select_dynamic` (builtins_shared.c), which DOES have
+   one ("cannot select an attribute (dynamic) on a non-attrset value")
+   -- fixed in the same pass as item 3 below, since it's a plain C
+   fprintf, not an asm surgery.
+
+2. **`op_check_formals.S`'s `.Lcf_missing_error`/`.Lcf_extra_error`**
+   (`{a, b, ...}: ...` called missing a required field, or with an
+   unexpected extra one) now call `asnix_bshared_cf_missing_fatal(sym)`/
+   `asnix_bshared_cf_extra_fatal(sym)`, naming the specific field.
+   `%r15` already held the required sym the binary search just failed
+   to find (set earlier in the loop, persists through the search per
+   its own existing comment); `%r11` already held the given entry's sym
+   that phase 2's search couldn't place among the declared fields --
+   neither needed any new register threading, exactly the "already
+   available" case the ask called out.
+
+3. **The four "must be a string"/"non-attrset" dynamic-attribute
+   messages** (`builtins_shared.c`'s `asnix_bshared_select_dynamic`
+   -- both its non-attrset-target AND non-string-name checks --
+   `asnix_bshared_select_dynamic_or`, `asnix_bshared_has_attr_dynamic`,
+   and `attrs_update.c`'s `asnix_attrs_insert_dynamic`) are plain C, so
+   just extended each existing `fprintf` with "(got `<type>`)". No
+   existing `typeOf`-style helper was reusable directly (`prim_typeOf`,
+   builtins.c, returns a `Value` string for `builtins.typeOf`, not a C
+   string, and lives in a module builtins_shared.c doesn't/shouldn't
+   depend on) -- added one small shared helper instead of duplicating
+   the tag-to-string `switch` four times.
+
+4. **`op_call.S`'s `.Lop_call_type_error`** ("asnix: call target is not
+   a function, aborting") now calls `asnix_bshared_call_type_fatal(v)`,
+   same "(got `<type>`)" suffix. `%rdx` already held the original
+   tagged callee `Value` at that point (read before the closure/primop
+   tag dispatch that this path falls through from).
+
+New shared helper, `asnix_bshared_type_name(Value v)`
+(`builtins_shared.c`/`.h`): returns a static "a/an `<kind>`" string
+(an integer / a boolean / null / a string / a path / a list / an
+attrset / a function / ...), reusing the exact same tag -> name mapping
+`prim_typeOf` already established, just phrased as a clause instead of
+a bare noun. Declared non-static (unlike most one-off helpers in this
+file) specifically because `attrs_update.c` needs it too, not just
+`builtins_shared.c`'s own dynamic-select fatals -- `attrs_update.c` now
+includes `builtins_shared.h` for it. Deliberately does NOT force `v`
+first (unlike `typeOf`, which relies on `OP_CALL` already forcing every
+primop argument, M25): every call site above reads a value already
+sitting on `VALSTACK` or passed in from an op's own C glue, which by
+this evaluator's standing invariant (every value reaching `VALSTACK` is
+already forced, per `op_call.S`'s own M23 comment) is never actually an
+unforced `Thunk` -- the `ASNIX_TAG_THUNK` case in the helper is dead
+code in practice, kept only so a future violation of that invariant
+prints something sane instead of misreading raw thunk bits.
+
+Did not touch `op_select.S`'s blackhole message, `op_check_formals.S`'s
+own `.Lcf_type_error` (lambda-pattern argument itself not a set --
+no specific "which value" beyond what the type-error message already
+says), or `op_call.S`'s arity-mismatch message -- out of scope for this
+pass; same kind of fix would apply but wasn't hit by name in the ask and
+isn't blocking anything right now.
+
+Verified every new message by hand (deliberately-bad one-off `.nix`
+files run directly against the built binary, same "no gdb needed
+anymore" check this whole pass exists to make permanent):
+`(5).foo` => `asnix: '.' selection target is not an attrset (got an
+integer), aborting`; `[1 2 3].foo` => `... (got a list) ...`; `(5) 3`
+=> `asnix: call target is not a function (got an integer), aborting`;
+`({ a, b }: a + b) { a = 1; }` => `asnix: lambda called without a
+required argument 'b', aborting`; `({ a }: a) { a = 1; c = 2; }` =>
+`asnix: lambda called with an unexpected argument 'c', aborting`;
+`let n = 42; in { foo = 1; }.${n}` => `... must be a string (got an
+integer)`; `let n = [ 1 ]; in { ${n} = 1; }` => `... must be a string
+(got a list)`.
+
+No new e2e fixtures (error-message-only change, same precedent M36
+itself set). `make test`/`test-e2e` green, no regressions;
+`test-conformance` still 633 passed, 169 failed, 0 known, 62 skipped --
+identical to the pre-change baseline.

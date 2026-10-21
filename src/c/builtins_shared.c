@@ -94,6 +94,92 @@ _Noreturn void asnix_bshared_select_missing_fatal(uint32_t sym) {
     exit(1);
 }
 
+/* M50: the "cheap pass" extension of M36's idea -- name the actual VALUE
+ * (its type/kind) at every other fatal path that previously said nothing
+ * more specific than "is not an attrset"/"is not a function". Reuses the
+ * exact same tag -> name mapping builtins.c's `prim_typeOf` already
+ * established (int/bool/null/string/path/list/set/lambda), just phrased
+ * as a full "a/an X" clause instead of typeOf's bare noun, since every
+ * call site below wants to say "...(got X), aborting". Deliberately does
+ * NOT force `v` first (unlike typeOf, which relies on OP_CALL having
+ * already forced every primop argument, M25): every call site below reads
+ * a value already sitting on VALSTACK or passed in from an asm op's own
+ * C glue, which by this evaluator's standing invariant (op_call.S's own
+ * M23 comment: every value reaching VALSTACK is already forced) is never
+ * an unforced Thunk in practice -- the ASNIX_TAG_THUNK case is dead code,
+ * kept only so a future violation of that invariant prints something sane
+ * instead of misreading raw thunk bits. Declared non-static (in
+ * builtins_shared.h) because attrs_update.c's asnix_attrs_insert_dynamic
+ * needs it too, not just this file's own dynamic-select fatals below. */
+const char *asnix_bshared_type_name(Value v) {
+    switch (asnix_tag_of(v)) {
+        case ASNIX_TAG_INT: return "an integer";
+        case ASNIX_TAG_IMM:
+            switch (asnix_imm_subtag(v)) {
+                case ASNIX_IMM_TRUE:
+                case ASNIX_IMM_FALSE: return "a boolean";
+                case ASNIX_IMM_NULL: return "null";
+                default: return "an immediate value";
+            }
+        case ASNIX_TAG_PTR: return asnix_value_is_path(v) ? "a path" : "a string";
+        case ASNIX_TAG_LIST: return "a list";
+        case ASNIX_TAG_ATTRS: return "an attrset";
+        case ASNIX_TAG_CLOSURE:
+        case ASNIX_TAG_PRIMOP: return "a function";
+        case ASNIX_TAG_THUNK: return "an unforced thunk"; /* see comment above: dead in practice */
+        default: return "a value of unknown type";
+    }
+}
+
+/* OP_SELECT's (op_select.S) type-error fatal path -- names the actual
+ * type of the non-attrset select target, same motivation as
+ * asnix_bshared_select_missing_fatal above (M36) applied to the sibling
+ * fatal one op up: "asnix: '.' selection target is not an attrset,
+ * aborting" gave no indication of what the value actually WAS, forcing
+ * the same kind of one-off gdb session M36's own commit message
+ * complains about. `v` arrives still tagged (the raw Value popped off
+ * VALSTACK, before op_select.S's own `andq $-8` untagging) -- exactly
+ * what asnix_bshared_type_name above wants. */
+_Noreturn void asnix_bshared_select_type_fatal(Value v) {
+    fprintf(stderr, "asnix: '.' selection target is not an attrset (got %s), aborting\n",
+            asnix_bshared_type_name(v));
+    exit(1);
+}
+
+/* OP_CALL's (op_call.S) "call target is not a function" fatal path --
+ * same idea, one op over: names the actual type of whatever was called.
+ * `v` arrives still tagged (read out of the callee's VALSTACK slot
+ * before op_call.S's own closure/primop dispatch, which is exactly the
+ * point this path is reached from -- neither tag matched). */
+_Noreturn void asnix_bshared_call_type_fatal(Value v) {
+    fprintf(stderr, "asnix: call target is not a function (got %s), aborting\n",
+            asnix_bshared_type_name(v));
+    exit(1);
+}
+
+/* OP_CHECK_FORMALS's (op_check_formals.S) two lambda-pattern-mismatch
+ * fatal paths -- same idea as the attribute-missing case above (M36),
+ * applied to `{a, b, ...}: ...`'s own argument-validation errors: neither
+ * "lambda called without a required argument" nor "lambda called with an
+ * unexpected argument" said *which* field, which is exactly the
+ * information a human needs to fix the call site. `sym` arrives already
+ * resolved out of the IR constant pool (missing case, op_check_formals.S's
+ * %r15) or out of the given attrset's own entries (extra case, %r11) --
+ * both already-interned symbol ids, same asnix_sym_name lookup M36 used. */
+_Noreturn void asnix_bshared_cf_missing_fatal(uint32_t sym) {
+    size_t len;
+    const char *name = asnix_sym_name(sym, &len);
+    fprintf(stderr, "asnix: lambda called without a required argument '%.*s', aborting\n", (int)len, name);
+    exit(1);
+}
+
+_Noreturn void asnix_bshared_cf_extra_fatal(uint32_t sym) {
+    size_t len;
+    const char *name = asnix_sym_name(sym, &len);
+    fprintf(stderr, "asnix: lambda called with an unexpected argument '%.*s', aborting\n", (int)len, name);
+    exit(1);
+}
+
 void asnix_bshared_require_tag(Value v, int tag, const char *who, const char *what) {
     if (asnix_tag_of(v) != tag) {
         fprintf(stderr, "asnix: %s: argument is not %s\n", who, what);
@@ -211,11 +297,13 @@ int asnix_bshared_value_eq(Value a, Value b) {
 
 Value asnix_bshared_select_dynamic(Value target, Value name_val) {
     if (asnix_tag_of(target) != ASNIX_TAG_ATTRS) {
-        fprintf(stderr, "asnix: cannot select an attribute (dynamic) on a non-attrset value\n");
+        fprintf(stderr, "asnix: cannot select an attribute (dynamic) on a non-attrset value (got %s)\n",
+                asnix_bshared_type_name(target));
         exit(1);
     }
     if (asnix_tag_of(name_val) != ASNIX_TAG_PTR || asnix_value_is_path(name_val)) {
-        fprintf(stderr, "asnix: a dynamic '.${...}' attribute name must be a string\n");
+        fprintf(stderr, "asnix: a dynamic '.${...}' attribute name must be a string (got %s)\n",
+                asnix_bshared_type_name(name_val));
         exit(1);
     }
     int64_t len;
@@ -243,7 +331,8 @@ Value asnix_bshared_select_dynamic(Value target, Value name_val) {
 int asnix_bshared_select_dynamic_or(Value target, Value name_val, Value *out) {
     if (asnix_tag_of(target) != ASNIX_TAG_ATTRS) return 0;
     if (asnix_tag_of(name_val) != ASNIX_TAG_PTR || asnix_value_is_path(name_val)) {
-        fprintf(stderr, "asnix: a dynamic '.${...}' attribute name must be a string\n");
+        fprintf(stderr, "asnix: a dynamic '.${...}' attribute name must be a string (got %s)\n",
+                asnix_bshared_type_name(name_val));
         exit(1);
     }
     int64_t len;
@@ -258,7 +347,8 @@ int asnix_bshared_select_dynamic_or(Value target, Value name_val, Value *out) {
 int asnix_bshared_has_attr_dynamic(Value target, Value name_val) {
     if (asnix_tag_of(target) != ASNIX_TAG_ATTRS) return 0;
     if (asnix_tag_of(name_val) != ASNIX_TAG_PTR || asnix_value_is_path(name_val)) {
-        fprintf(stderr, "asnix: a dynamic '${...}' attribute name must be a string\n");
+        fprintf(stderr, "asnix: a dynamic '${...}' attribute name must be a string (got %s)\n",
+                asnix_bshared_type_name(name_val));
         exit(1);
     }
     int64_t len;
