@@ -77,6 +77,14 @@ _Noreturn void asnix_bshared_select_type_fatal(Value v);
  * same idea. `v` is the still-tagged callee Value. */
 _Noreturn void asnix_bshared_call_type_fatal(Value v);
 
+/* `__functor` protocol (M42) -- see the full comment in
+ * builtins_shared.c. Called from both OP_CALL (op_call.S) and
+ * asnix_apply (apply.S) only after their own Closure/PrimOp dispatch
+ * has already failed to match an attrset with a `__functor` attribute.
+ * Fatal (reusing asnix_bshared_call_type_fatal) if `__functor` is
+ * absent. */
+Value asnix_bshared_call_functor(Value attrs_val, Value arg);
+
 /* OP_CHECK_FORMALS's (op_check_formals.S) two lambda-pattern-mismatch
  * fatal paths -- names the specific required/unexpected field, mirroring
  * asnix_bshared_select_missing_fatal's M36 precedent. `sym` is an

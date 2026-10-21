@@ -86,7 +86,29 @@ asnix_apply:                            // Value asnix_apply(Value fn, const Val
     je .Lapply_is_closure
     cmpq $ASNIX_TAG_PRIMOP, %rcx
     je .Lapply_is_primop
+    cmpq $ASNIX_TAG_ATTRS, %rcx
+    je .Lapply_is_attrs
     jmp .Lapply_type_error
+
+    // `__functor` protocol (M42): an attrset can be "called" if it has a
+    // `__functor` attribute -- see asnix_bshared_call_functor's own
+    // comment (builtins_shared.c) for the full mechanism. Only a single
+    // argument is supported here (argc must be 1, matching every other
+    // call site's one-arg-at-a-time convention in this project); falls
+    // through to the ordinary type error otherwise. Tail-`jmp` (not
+    // `call`), same reasoning the original (pre-M38) primop branch
+    // relied on: %rsp is still exactly as aligned here as it was at
+    // this function's own entry (nothing pushed yet), which is exactly
+    // what a real `call` into `asnix_bshared_call_functor` would expect
+    // to see -- the eventual `ret` inside it pops OUR caller's return
+    // address directly, skipping back past this frame entirely. `%rdi`
+    // (fn/attrs_val) is already in the right place; `%rsi` just needs
+    // to become `args[0]` instead of the args pointer.
+.Lapply_is_attrs:
+    cmpq $1, %rdx
+    jne .Lapply_type_error
+    movq (%rsi), %rsi
+    jmp asnix_bshared_call_functor
 
     // PrimOp: a plain C function, Value (*)(const Value *args, int64_t
     // argc) -- same convention op_call.S's primop path calls it with (see

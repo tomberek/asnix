@@ -54,9 +54,10 @@ what's actually implemented and the scope decisions made along the way.
 | M39 — `builtins.addErrorContext` | done (see below) |
 | M40 — `${null} = value;` silently omitted, not an error | done (see below) |
 | M41 — dynamic attrpath segments anywhere (`.${k}`, interpolated quoted strings) | done (see below) |
-| M42-M49 | not started |
+| M42 — `__functor` protocol (calling an attrset via a `__functor` attribute) | done (see below) |
+| M43-M49 | not started |
 | M50 — name the specific value/field in 6 more generic fatal-path error messages | done (see below) |
-| M51+ | not started |
+| M51+ | in progress (parallel agents: floats, with-scoping bug, foldl'/replaceStrings laziness, missing builtins, regex, fromTOML/overflow, misc backlog) |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
 
@@ -3813,3 +3814,59 @@ No new e2e fixtures (error-message-only change, same precedent M36
 itself set). `make test`/`test-e2e` green, no regressions;
 `test-conformance` still 633 passed, 169 failed, 0 known, 62 skipped --
 identical to the pre-change baseline.
+
+## M42 scope notes: `__functor` protocol (calling an attrset via a `__functor` attribute)
+
+Found via conformance triage: `eval-okay-callable-attrs.nix` and
+`eval-okay-functor-args.nix` both call an attrset directly as if it
+were a function. Real Nix supports this when the attrset has a
+`__functor` attribute (confirmed in `~/nix/src/libexpr/eval.cc`'s
+`callFunction`: `vCur.type() == nAttrs && (functor = ...get(s.functor))`
+-> `callFunction(*functor->value, {self_copy, args[0]}, ...)`) -- i.e.
+`f arg` desugars to `f.__functor f arg` (the attrset itself as
+`__functor`'s first argument, the real argument second), looping so a
+`__functor` that itself returns another attrset-with-`__functor` keeps
+working through successive arguments. A plain attrset with no
+`__functor` at all still gets the ordinary "not a function" error.
+
+Added `asnix_bshared_call_functor(Value attrs_val, Value arg)`
+(builtins_shared.c): looks up `__functor`, forces it, then chains two
+ordinary `asnix_apply` calls (`apply(functor, self)` then
+`apply(step1, arg)`) -- reusing existing call machinery rather than
+duplicating it, and getting the "returns another functor" recursive
+case for free, since `asnix_apply`'s own ATTRS branch (below) re-enters
+this same check. Wired into both call paths that can reach a non-
+Closure/non-PrimOp callee:
+- `OP_CALL` (`op_call.S`): a new `.Lop_call_is_attrs` branch, reached
+  only after the existing Closure/PrimOp checks fail (zero cost on the
+  ordinary-function-call hot path). Requires `argc == 1` (every
+  ordinary Nix-level call site is arity-1 by construction, per
+  `parser.c`'s `parse_app` always desugaring multi-arg application into
+  nested arity-1 calls) -- falls through to the ordinary type-error
+  fatal otherwise. A real `call` (not a tail `jmp`), since this handler
+  needs control back afterward to push the result onto VALSTACK and
+  continue the dispatch loop, same shape every other op handler here
+  already uses.
+- `asnix_apply` (`apply.S`, the generic "call this Value from C" entry
+  point used by `any`/`all`/`map`'s lazy-call thunks/etc.): a new
+  `.Lapply_is_attrs` branch, also `argc == 1`-only. Uses a tail `jmp`
+  into `asnix_bshared_call_functor` instead of `call`+`ret` -- safe and
+  correct because `%rsp` is still exactly as aligned at this point as
+  it was at `asnix_apply`'s own entry (nothing pushed yet on this
+  path), which is exactly what the callee expects to see as if it had
+  been `call`'d directly; its eventual `ret` pops straight back to
+  `asnix_apply`'s *own* caller, skipping this frame entirely (same
+  reasoning the original, pre-M38 primop branch relied on for its own
+  tail-jmp).
+
+Verified against real `nix-instantiate --eval`: the exact
+`eval-okay-callable-attrs.nix` expression (chained `__functor` plus a
+`//`-updated attrset) and a `map (self: self 1) [ { __functor = ...; } ]`
+case specifically exercising the `asnix_apply` path, not just `OP_CALL`;
+also confirmed a plain attrset with no `__functor` still gets "call
+target is not a function (got an attrset), aborting" (M50's message,
+unchanged).
+
+`make test`/`test-e2e` green (200 e2e, two new `m42_*` fixtures, one
+per call path); `test-conformance` 635 passed (up from 633, +2 as
+expected, no regressions).

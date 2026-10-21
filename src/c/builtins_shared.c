@@ -157,6 +157,37 @@ _Noreturn void asnix_bshared_call_type_fatal(Value v) {
     exit(1);
 }
 
+/* `__functor` protocol (M42): calling an attrset `s` with argument `arg`
+ * (`s arg`) is sugar for `s.__functor s arg` when `s` has a `__functor`
+ * attribute -- real Nix's exact mechanism, confirmed in
+ * `~/nix/src/libexpr/eval.cc`'s `callFunction`: `callFunction(functor,
+ * {self_copy, args[0]}, ...)`, i.e. `__functor` is called with the
+ * attrset itself as its first argument, then the real argument second
+ * (a curried 2-arg function in Nix terms, which this project already
+ * represents as two nested arity-1 Closures, so this is just two
+ * ordinary `asnix_apply` calls chained). Reached from both `OP_CALL`
+ * (op_call.S) and `asnix_apply` (apply.S) ONLY after their own Closure/
+ * PrimOp dispatch has already failed to match -- so this never costs
+ * anything on the common (plain function call) path. Does not special-
+ * case a `__functor` that itself returns another attrset-with-
+ * `__functor`; `asnix_apply`'s own ATTRS branch (which this function's
+ * second `asnix_apply` call re-enters) already handles that
+ * recursively for free, matching real Nix's own `while` loop over
+ * `args` in `callFunction`, which re-checks `vCur`'s type after every
+ * step. Fatal (same "not a function" message as a plain attrset) if
+ * `attrs_val` has no `__functor` attribute at all -- confirmed against
+ * real Nix: `{ a = 1; } 5` and `{ __functor = ...; }`-less attrsets
+ * both get the identical "attempt to call something which is not a
+ * function" error. */
+Value asnix_bshared_call_functor(Value attrs_val, Value arg) {
+    uint32_t sym = asnix_intern("__functor", 9);
+    int64_t idx = asnix_bshared_attrs_find(attrs_val, sym);
+    if (idx < 0) asnix_bshared_call_type_fatal(attrs_val);
+    Value functor_fn = asnix_force_for_print(asnix_bshared_attrs_value(attrs_val, idx));
+    Value step1 = asnix_apply(functor_fn, &attrs_val, 1);
+    return asnix_apply(step1, &arg, 1);
+}
+
 /* OP_CHECK_FORMALS's (op_check_formals.S) two lambda-pattern-mismatch
  * fatal paths -- same idea as the attribute-missing case above (M36),
  * applied to `{a, b, ...}: ...`'s own argument-validation errors: neither

@@ -30,7 +30,44 @@ asnix_op_call:                          // a = argc
     je .Lop_call_is_closure
     cmpq $ASNIX_TAG_PRIMOP, %r8
     je .Lop_call_is_primop
+    cmpq $ASNIX_TAG_ATTRS, %r8
+    je .Lop_call_is_attrs
     jmp .Lop_call_type_error
+
+    // `__functor` protocol (M42): `f arg` where `f` is an attrset with a
+    // `__functor` attribute -- see asnix_bshared_call_functor's own
+    // comment (builtins_shared.c) for the full mechanism. Only argc==1
+    // is supported (every ordinary Nix-level call site is arity-1
+    // anyway, per parser.c's parse_app always desugaring multi-arg
+    // application into nested arity-1 calls); falls through to the
+    // ordinary type error otherwise. A real `call` (not a tail `jmp`),
+    // since -- unlike apply.S's own version of this check, which can
+    // tail-call straight back to ITS caller -- this handler needs
+    // control back afterward to push the result onto VALSTACK and
+    // continue the dispatch loop.
+.Lop_call_is_attrs:
+    cmpq $1, %rbx
+    jne .Lop_call_type_error
+    movq %rcx, %rbx                      // rbx = callee slot addr (callee-saved, survives the call;
+                                          // argc check is already done, so rbx is free to reuse)
+    movq 8(%rbx), %r9                    // r9 = the single argument's Value (caller-saved, but only
+                                          // needs to survive up to the `movq %r9, %rsi` just below)
+
+    pushq %rsi                           // save IP
+    pushq %rdi                           // save ENV (2 pushes, stays 16-byte aligned)
+    movq %rdx, %rdi                      // arg1 = attrs_val (still tagged, loaded above)
+    movq %r9, %rsi                       // arg2 = the argument
+    call asnix_bshared_call_functor
+    popq %rdi                            // restore ENV
+    popq %rsi                            // restore IP
+
+    movq %rbx, %r12                      // pop callee+arg off VALSTACK in one shot
+    ASNIX_CHECK_VALSTACK %r8             // %r8 dead (held the tag-mask copy, unused since)
+    movq %rax, (%r12)
+    addq $8, %r12
+    addq $ASNIX_IROP_SIZE, %rsi
+    movq (%rsi), %rax
+    jmp *%rax
 
 .Lop_call_is_primop:
     andq $-8, %rdx                      // rdx = real PrimOp*
