@@ -45,6 +45,7 @@ extern void asnix_op_str_concat(void);
 extern void asnix_op_with(void);
 extern void asnix_op_with_try(void);
 extern void asnix_op_with_miss(void);
+extern void asnix_op_with_exit(void);
 extern void asnix_op_has_attr(void);
 extern void asnix_op_check_formals(void);
 extern void asnix_op_select_or(void);
@@ -94,6 +95,7 @@ void *asnix_handler_table[OP_COUNT] = {
     [OP_WITH] = (void *)asnix_op_with,
     [OP_WITH_TRY] = (void *)asnix_op_with_try,
     [OP_WITH_MISS] = (void *)asnix_op_with_miss,
+    [OP_WITH_EXIT] = (void *)asnix_op_with_exit,
     [OP_HAS_ATTR] = (void *)asnix_op_has_attr,
     [OP_CHECK_FORMALS] = (void *)asnix_op_check_formals,
     [OP_SELECT_OR] = (void *)asnix_op_select_or,

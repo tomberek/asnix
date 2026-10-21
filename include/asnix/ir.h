@@ -171,6 +171,15 @@ enum {
     OP_WITH_MISS,  /* All enclosing `with`s were tried and none had the symbol: aborts with
                      * "undefined variable" (mirrors the compile-time error raised when no
                      * `with` is in scope at all -- see compiler.c's AST_VAR case). */
+    OP_WITH_EXIT,  /* M52: no operands; ENV = ENV->up with ASNIX_ENV_WITH_TAG masked off --
+                     * the `with`-frame counterpart of OP_FRAME_EXIT, undoing exactly one
+                     * OP_WITH so a non-tail `with ...; body` (e.g. one list/attrset element
+                     * among siblings) doesn't leak its frame into whatever depth-relative
+                     * OP_VAR_REF the compiler emits next, assuming the *original*
+                     * (pre-`with`) scope depths. Plain OP_FRAME_EXIT can't be reused here:
+                     * a with-frame's own `up` field has the tag bit OR'd in (see env.h), so
+                     * blindly chasing it without masking would leave ENV holding a tagged
+                     * (odd) pointer. See compiler.c's AST_WITH case and op_with.S. */
     OP_HAS_ATTR,   /* lambda-patterns: a = symbol id; pops a value, pushes TRUE/FALSE --
                      * FALSE (not a fatal error) if the value isn't even an Attrs, matching
                      * real Nix's `expr ? attr` operator. Never forces the matched entry's

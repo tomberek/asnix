@@ -119,6 +119,11 @@ size_t ib_with_try(IrBuilder *b, uint32_t sym);
 /* Every enclosing `with` was tried and none had the symbol: aborts with
  * "undefined variable", same error class as the compile-time check. */
 size_t ib_with_miss(IrBuilder *b);
+/* M52: the with-frame counterpart of ib_frame_exit() -- restores ENV to the
+ * with-frame's `up` (tag bit masked off) once the `with` body is fully
+ * compiled, so a non-tail `with` doesn't leak its frame into a sibling's
+ * compiled depths. See OP_WITH_EXIT in ir.h. */
+size_t ib_with_exit(IrBuilder *b);
 
 /* Lambda-patterns: pops a value, pushes TRUE/FALSE -- see op_has_attr.S. */
 size_t ib_has_attr(IrBuilder *b, uint32_t sym);

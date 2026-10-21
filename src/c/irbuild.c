@@ -198,6 +198,10 @@ size_t ib_with_miss(IrBuilder *b) {
     return ib_emit(b, OP_WITH_MISS, 0, 0);
 }
 
+size_t ib_with_exit(IrBuilder *b) {
+    return ib_emit(b, OP_WITH_EXIT, 0, 0);
+}
+
 size_t ib_has_attr(IrBuilder *b, uint32_t sym) {
     return ib_emit(b, OP_HAS_ATTR, (int64_t)sym, 0);
 }
