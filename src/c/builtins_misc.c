@@ -13,6 +13,7 @@
 #include "builtins_shared.h"
 #include "hash_shim.h"
 #include "store_path.h"
+#include "string_context.h" /* M76 */
 #include "value_util.h"
 
 /* ---------------------------------------------------------------------
@@ -576,7 +577,24 @@ static Value prim_toFile(const Value *args, int64_t argc) {
         fprintf(stderr, "asnix: toFile: computed store path too long\n");
         exit(1);
     }
-    return asnix_make_string_value(out_path, strlen(out_path));
+    Value out = asnix_make_string_value(out_path, strlen(out_path));
+    /* M76: real Nix's own `toFile` (`mkStorePathString`,
+     * `~/nix/src/libexpr/eval.cc`) attaches `Opaque(storePath)` --
+     * ITS OWN output path -- as the result string's context, NOT any
+     * context collected from `contents` (that's folded into the type
+     * string / NAR references instead, a separate, still out-of-scope
+     * nuance this project doesn't implement -- see this function's own
+     * header comment). Found needed chasing d.nix past M76's core
+     * mechanism: `<nix/fetchurl.nix>`'s own `mirrorsListFile = toFile
+     * ...;` is exactly this pattern -- without this, the resulting
+     * path reaches `derivation {...}` as a plain opaque string with no
+     * trace of being a store reference at all, so it never made it
+     * into `inputSrcs`. */
+    AsnixStringContext ctx;
+    asnix_ctx_init(&ctx);
+    asnix_ctx_add_opaque(&ctx, out_path);
+    asnix_string_attach_context(out, &ctx);
+    return out;
 }
 static Value build_toFile(void) { return make_curried_native((void *)prim_toFile, 2); }
 

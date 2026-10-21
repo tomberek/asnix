@@ -89,7 +89,8 @@ what's actually implemented and the scope decisions made along the way.
 | M74 — real `hashDerivationModulo`: input derivations' own hashes are now substituted into a dependent derivation's `InputDrvs` before hashing, instead of every output/drvPath being computed from each derivation's own attributes in isolation | done, **scoped** (see below; `./asnix d.nix`'s `hello.outPath` still doesn't match real Nix bit-for-bit — a separately tracked, still-open gap, see below) |
 | M75 — real store-copying (NAR-hash + content-addressed path) for local (non-`/nix/store`) Path literals coerced via genuine string interpolation or inside a `derivation {...}` attribute | done, **scoped** (see below; `./asnix d.nix`'s `hello.outPath` STILL doesn't match real Nix — the remaining gap is real Nix's *string context*, a materially larger feature, see below) |
 | M76 — real string context: an invisible dependency-provenance set attached to string Values, surviving concatenation/coercion, so a derivation reference reaching an attribute only through prior string interpolation (not a bare attrset/Path) is now tracked in `inputDrvs`/`inputSrcs` too; also fixed `__ignoreNulls` (found while verifying) | done, **scoped** (see below; `./asnix d.nix`'s `hello.outPath` now has the exact right `inputDrvs`/`inputSrcs`/`__json` *shape*, but still doesn't match bit-for-bit — the remaining gap is the FULL nixpkgs bootstrap chain's own hash parity, a much larger, open-ended undertaking, see below) |
-| M77+ | not started |
+| M77 — `make test-nixpkgs-hash`: a real-nixpkgs derivation-hash correctness regression test (non-gating, like `test-nix-conformance`), filling a gap the user flagged directly — M58-M76's entire bug-chase had zero automated coverage of its own actual target; found and fixed `builtins.toFile` never attaching self-referential string context (a second, independent M76-class gap) and a `curl.outPath` crash (registered as a known-failing case, not yet root-caused) | done (see below) |
+| M78+ | not started |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
 
@@ -8139,3 +8140,78 @@ byte-for-byte against real `nix-instantiate --eval --strict` before being
 written). `make test-nix-conformance`: `pass=628 fail=30 skip=148` --
 unchanged from M75 (this corpus doesn't exercise multi-derivation
 hashing), zero regressions.
+
+## M77 scope notes: a real-nixpkgs correctness regression test, plus two bugs it found
+
+The user pointed out, correctly, that M58-M76's entire `d.nix` bug-chase
+had zero automated regression coverage of its own actual target --
+`hello.outPath` parity against real Nix -- only small, synthetic,
+hand-written fixtures (`tests/e2e/m74_input_*`/`m75_*`/`m76_*`). Every
+check against the real target was a one-off manual `nix-instantiate`
+comparison, re-done by hand each session, with no way to notice a
+regression (or measure forward progress) automatically.
+
+New `make test-nixpkgs-hash` (`tests/nixpkgs-hash/attrs.txt` +
+`pkgs.nix`): for every nixpkgs attribute path listed, checks
+`.outPath`/`.drvPath` byte-for-byte against real `nix-instantiate --eval
+--strict`, using `-A` (both tools already support dotted attribute-path
+selection -- `main.c`'s own `select_attrpath`, added for exactly this
+kind of use, ported from real Nix's own `-A`). Deliberately
+**non-gating**, same convention as `test-nix-conformance`: this corpus
+is EXPECTED to have real failures for a long time (the standing bug-chase
+being open-ended), so a hard-fail-the-build gate would make the target
+useless the moment any single upstream package doesn't fully match --
+reports pass/fail, a crash and a hash MISMATCH both counted as failures
+but labeled distinctly (`(crash)`/`(mismatch)`), a real-Nix eval failure
+for a listed attribute silently skipped (typo/doesn't-exist, not an
+asnix correctness question).
+
+Building the corpus immediately found two real, fixable bugs, both
+before even reaching the harness's final form:
+
+1. **`builtins.toFile`'s result never carried its own store-path as
+   context.** `hello.src.drvPath` didn't match real Nix even though
+   `hello.src.outPath` did and `hello.src` is a near-leaf fixed-output
+   derivation (not deep in the bootstrap chain) -- diffing asnix's own
+   computed ATerm against real `hello-2.12.3.tar.gz.drv` found asnix's
+   `inputSrcs` was missing a `mirrors-list` entry that WAS correctly
+   present (same computed path!) inside the `__json` blob's
+   `mirrorsListFile` field. Root cause: `<nix/fetchurl.nix>`'s own
+   `mirrorsListFile = toFile "mirrors-list" (...)`-- real Nix's
+   `builtins.toFile` (`mkStorePathString`, `~/nix/src/libexpr/eval.cc`)
+   attaches `Opaque(selfStorePath)` as the RESULT string's own context
+   (NOT forwarded from its `contents` argument, a separate, still-
+   unimplemented nuance -- see `prim_toFile`'s own header comment);
+   `asnix`'s M45-era `prim_toFile` never attached any context to its
+   result at all, so by the time this path reached M76's
+   `asnix_collect_input_refs`, it was already an opaque string with no
+   trace of being a store reference. Fixed by attaching the same
+   `Opaque(out_path)` context `asnix_prim_derivation`'s own M76 origin
+   point already does. Verified: `hello.src.drvPath`'s `inputDrvs`/
+   `inputSrcs`/`__json` now match real Nix's shape exactly (output
+   PATHS still differ -- `bash`/`curl`/`stdenv-linux-no-cc` are
+   themselves unresolved bootstrap-chain packages, expected).
+2. **`curl.outPath` crashes** (`concatStringsSep: expected a string
+   argument`, confirmed via gdb to be a bare ~93-attribute derivation-
+   shaped attrset reaching `concatStringsSep` where real Nix would have
+   a plain string) -- traced to `pkgs/stdenv/generic/problems.nix`'s
+   meta-validation machinery (`concatMapStringsSep ", " (el: el.name)
+   kindGroup`-shaped code), several layers into nixpkgs' own
+   `checkMeta`/problem-reporting system. NOT root-caused or fixed this
+   milestone -- registered in the new corpus as a known-failing
+   `(crash)` case instead of silently working around or hiding it,
+   since making it VISIBLE or, is the entire point of this milestone;
+   a real, separate bug to chase as its own follow-up.
+
+Current `make test-nixpkgs-hash` baseline: `pass=1 fail=7` (`hello`,
+`hello.src`, `bash`, `curl`, each `.outPath`/`.drvPath` --
+`hello.src.outPath` is the only pass; everything else is either a
+genuine upstream-bootstrap-chain hash mismatch, already expected and
+documented in M76's own scope notes, or `curl`'s crash above). This
+number is the actual, truthful state of the standing bug-chase's own
+goal -- expected to only improve from here as the bootstrap-chain work
+continues, and any future regression in what little passes now will be
+caught immediately instead of discovered by accident.
+
+`make test`/`test-e2e`/`test-conformance`/`test-nix-conformance` all
+green, zero regressions (the new target is additive and non-gating).

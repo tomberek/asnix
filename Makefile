@@ -36,7 +36,7 @@ TEST_C_BINS   := $(TEST_C_SRCS:.c=)
 E2E_NIX         := $(wildcard tests/e2e/*.nix)
 CONFORMANCE_NIX := $(wildcard tests/conformance/*.nix)
 
-.PHONY: all release test test-e2e test-conformance test-nix-conformance clean watch
+.PHONY: all release test test-e2e test-conformance test-nix-conformance test-nixpkgs-hash clean watch
 all: asnix
 
 release: OPT := -O2
@@ -192,6 +192,43 @@ test-nix-conformance: asnix
 		else fail=$$((fail+1)); failed="$$failed $$f"; fi; \
 	done; \
 	echo "pass=$$pass fail=$$fail skip=$$skip"; \
+	if [ -n "$$failed" ]; then \
+		echo "failed:"; \
+		for f in $$failed; do echo "  $$f"; done; \
+	fi
+
+# Real-nixpkgs derivation-hash correctness sweep (added post-M76, see
+# tests/nixpkgs-hash/attrs.txt's own header comment for why): every
+# attribute path listed there gets its `.outPath`/`.drvPath` checked
+# byte-for-byte against real `nix-instantiate --eval --strict` --
+# non-gating, like test-nix-conformance above, since this corpus is
+# expected to have real failures for a long time (the standing d.nix
+# bug-chase's own open-ended goal, full nixpkgs bootstrap-chain hash
+# parity) and a hard-fail-the-build gate would make this target useless
+# the moment ANY package's upstream dependency doesn't fully match yet.
+# Both a crash (nonzero asnix exit) and a hash MISMATCH count as
+# failures, reported distinguished (`(crash)`/`(mismatch)`) -- both are
+# real bugs, just different symptoms; a real-Nix eval failure for a
+# listed attribute (typo, doesn't exist) is silently skipped rather than
+# counted either way, matching test-nix-conformance's own `.flags`-style
+# "we can't judge this one" convention.
+test-nixpkgs-hash: asnix
+	@pkgsfile="tests/nixpkgs-hash/pkgs.nix"; \
+	bin="$(CURDIR)/asnix"; \
+	pass=0; fail=0; failed=""; \
+	while IFS= read -r attr || [ -n "$$attr" ]; do \
+		case "$$attr" in ""|\#*) continue;; esac; \
+		for field in outPath drvPath; do \
+			path="$$attr.$$field"; \
+			want=$$(timeout 120 nix-instantiate --eval --strict -A "$$path" "$$pkgsfile" 2>/dev/null); \
+			[ $$? -ne 0 ] && continue; \
+			got=$$(timeout 120 "$$bin" -A "$$path" "$$pkgsfile" 2>/dev/null); rc=$$?; \
+			if [ "$$rc" -eq 0 ] && [ "$$got" = "$$want" ]; then pass=$$((pass+1)); \
+			elif [ "$$rc" -ne 0 ]; then fail=$$((fail+1)); failed="$$failed $$path(crash)"; \
+			else fail=$$((fail+1)); failed="$$failed $$path(mismatch)"; fi; \
+		done; \
+	done < tests/nixpkgs-hash/attrs.txt; \
+	echo "pass=$$pass fail=$$fail"; \
 	if [ -n "$$failed" ]; then \
 		echo "failed:"; \
 		for f in $$failed; do echo "  $$f"; done; \

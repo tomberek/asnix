@@ -1,0 +1,22 @@
+# Correctness corpus for `make test-nixpkgs-hash` (see Makefile) -- real
+# nixpkgs attribute paths whose `outPath`/`drvPath` are checked against
+# real `nix-instantiate --eval --strict`, byte-for-byte, non-gating (like
+# test-nix-conformance: reports pass/fail, never fails the build on its
+# own). Added after M76 (real string context) when the user asked for
+# the standing d.nix bug-chase to have an actual regression test, not
+# just ad hoc manual comparisons each session -- the project had gone
+# through M58-M76 chasing `hello.outPath` parity with zero automated
+# checks of the real, large-scale target itself, only small synthetic
+# fixtures (tests/e2e/m74_input_*/m75_*/m76_*).
+#
+# One attribute path per line (resolved against tests/nixpkgs-hash/pkgs.nix,
+# `import /home/tbereknyei/nixpkgs/default.nix {}` -- same hardcoded path
+# convention as the repo root's own d.nix/e.nix). Both `.outPath` and
+# `.drvPath` are checked for each. Lines starting with `#` are comments.
+# A crash (nonzero asnix exit) and a hash MISMATCH are both reported as
+# failures, distinguished in the output -- both are real correctness bugs,
+# just different symptoms.
+hello
+hello.src
+bash
+curl
