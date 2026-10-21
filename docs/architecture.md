@@ -57,7 +57,7 @@ what's actually implemented and the scope decisions made along the way.
 | M42-M49 | not started |
 | M50 — name the specific value/field in 6 more generic fatal-path error messages | done (see below) |
 | M51-M56 | not started |
-| M57 — conformance grab-bag: `lessThan`/`sort` on lists, `genericClosure` key-comparability checks, `__overrides` propagation, `import`'s `__toString` coercion, `toJSON` UTF-8 validation, `compareVersions`' int-overflow-to-string quirk | done, **in progress** (sub-items, see below) |
+| M57 — conformance grab-bag (9 sub-items a-i): `lessThan`/`sort` on lists, `genericClosure` key-comparability, `__overrides` propagation, `toJSON` UTF-8 validation, `import`'s `__toString` coercion, `compareVersions`' int-overflow quirk, path-concat canonicalization, import symlink resolution, CLI `--arg`/`--argstr`/`-A` | done, **scoped** (see below; function/derivation-equality, `-I`, and context-attr-name skipped) |
 | M58+ | not started |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
@@ -4127,6 +4127,91 @@ own fixture shape). `make test`/`test-e2e` green (209 e2e);
 `test-conformance` 646 passed (+1), 156 failed (-1), 0 known, 62
 skipped.
 
+### M57i: CLI flags -- `--arg`/`--argstr`/`-A`
+
+`src/c/main.c` had zero flag parsing at all (hard-required exactly one
+argument, the file path). Added real Nix's `nix-instantiate --eval`
+three most load-bearing flags:
+
+- **`--argstr name str`**: builds a plain String Value directly, no
+  parsing needed.
+- **`--arg name EXPR`**: `EXPR` is an arbitrary Nix expression (real
+  Nix's own CLI treats it as one too, not a literal string) -- run
+  through the exact same lex/parse/compile/eval pipeline a top-level
+  file gets, via a new `asnix_eval_expr_source` (eval_file.c, factored
+  out of `asnix_eval_file`'s existing `eval_source` so both share one
+  fresh-root-env/`builtins` setup), with the process's cwd as the base
+  directory any relative path literal INSIDE the expression resolves
+  against (confirmed against real Nix: a `--arg`/`--argstr` value has
+  no "containing file" of its own the way an ordinary import does).
+- **`-A attrpath`**: force-and-select one dotted segment at a time into
+  the final result after evaluation (and after any `--arg`/`--argstr`
+  auto-call below), same semantics as a chain of plain `.` selections
+  written in source, fatal on a non-attrset or missing key partway
+  through (naming the specific segment).
+- **`--arg`/`--argstr` also trigger real Nix's `autoCallFunction`**
+  (`eval.cc`): if the evaluated file is a lambda-PATTERN function
+  (`{a, b ? d, ...}: ...` -- introspected via the same `functionArgs`-
+  shaped `ASNIX_CLOSURE_OFF_FORMALS` M37 already precomputes per
+  closure, not new machinery), build an argument attrset containing
+  only the formals a CLI arg actually matched by name, calling the
+  closure with it; an unmatched formal is fine if it has a default
+  (the lambda's own `OP_CHECK_FORMALS` default machinery supplies it,
+  exactly as if that formal were simply omitted from an ordinary call
+  site) but fatal ("you must specify a value for the argument 'X'") if
+  required. A plain single-identifier lambda (`functionArgs` == `{}`)
+  is left uncalled, matching real Nix.
+
+Deliberately NOT implemented: **`-I`** (search-path entries feeding
+`<name>` resolution) -- would need a first-class `builtins.findFile`/
+`builtins.nixPath` (real Nix represents the search path as an actual
+Nix-level list of `{prefix;path;}` attrsets queryable from source),
+which is a separate, much larger feature this pass doesn't build; and
+no generic "skip any other flag real `nix-instantiate` accepts" logic
+-- an unrecognized flag is a hard usage error in `main.c`, by design
+(see below for why).
+
+Also updated `/tmp/nix-conformance/adapters/asnix` (a scratch file
+outside this repo, no commit needed for it) to actually forward a
+case's `.flags` sidecar -- it previously ignored `.flags` entirely, so
+nothing in the whole corpus ever exercised any CLI flag regardless of
+what asnix itself supported. Critically, it does NOT forward `.flags`
+blindly: a corpus-wide scan found 12 distinct flag names across ~140
+`.flags` files, only 3 of which asnix implements -- the rest
+(`--extra-experimental-features X`, three different `--lint-*-
+literals X` variants, `--max-call-depth N`, and bare boolean
+`--eval`/`--strict`/`--no-show-trace`/`--impure`) are real-Nix-only
+concepts (experimental-features gating, path-literal linting) asnix
+has no notion of at all. Since `main.c` treats any unrecognized flag
+as a hard usage error (by design, see above), blindly forwarding
+these would have turned every one of those ~140 OTHER cases (mostly
+`eval-{okay,fail}-fromTOML-*`, previously passing on their own merits
+since the adapter never even looked at `.flags` before) into a crash
+instead of a pass -- the adapter's flag-forwarding loop explicitly
+whitelists `--arg`/`--argstr`/`-A` (forwarded) and explicitly,
+individually drops every other flag name found in this exact corpus
+(both the value-taking ones, consuming their one argument, and the
+bare boolean ones, consuming none) -- a `*) shift ;;` catch-all at the
+end is pure defense-in-depth for any single-token flag not already
+named above, not the primary mechanism.
+
+Verified against real `nix-instantiate --eval`: `eval-okay-autoargs.
+nix` with its exact `.flags` string (`--arg lib import(lang/lib.nix)
+--argstr xyzzy xyzzy! -A result`) now produces `"xyzzy!xyzzy!foobar"`,
+matching its `.exp` byte-for-byte; a hand-run missing-required-argument
+case (`{a}: a` with only `--argstr b x` supplied) fatals with "you must
+specify a value for the argument 'a'", matching real Nix's own
+rejection class. Diffed the full conformance fail list before/after
+this adapter change: only `eval-okay-autoargs.nix` moved from fail to
+pass, confirming the other ~140 `.flags`-having cases were correctly
+unaffected by now actually reading (and selectively dropping from)
+their `.flags` file. No new e2e fixture: `test-e2e`'s harness
+(Makefile) invokes `./asnix "$f"` with no flags at all, so it
+structurally can't exercise `--arg`/`--argstr`/`-A` -- covered by the
+manual verification above and the conformance fixture instead. `make
+test`/`test-e2e` green (209 e2e, unchanged); `test-conformance` 647
+passed (+1 over M57h's 646), 155 failed (-1), 0 known, 62 skipped.
+
 ### M57: items investigated and explicitly skipped
 
 - **Function/derivation equality quirks** (item 3 in the original
@@ -4152,13 +4237,22 @@ skipped.
   equality's `isDerivation`-style eager `type`-forcing during `==` was
   not investigated in depth given the above; left for a future pass.
 
-- **CLI flag plumbing** (item 8, `--arg`/`--argstr`/`-A`/`-I`): not
-  reached in this pass -- time went to the higher-priority items above
-  instead, per the task's own suggested ordering (items 3's
-  `compareVersions` half, 6, and 7 WERE all reached -- see M57f/M57g/
-  M57h above). Not investigated beyond reading the task description,
-  so there's no "turned out to be harder than expected" verdict for
-  it; simply undone, left for a follow-up M58+.
+- **CLI flag plumbing** (item 8): `--arg`/`--argstr`/`-A` WERE
+  implemented (see M57i above); `-I` specifically was not, since it
+  needs a first-class `builtins.findFile`/`builtins.nixPath` this pass
+  doesn't build (a separate, much larger feature -- see M57i's own
+  scope note). Both conformance fixtures that need `-I`
+  (`eval-okay-search-path.nix`, `eval-okay-search-path-prefix-slash.
+  nix`) also depend on things well beyond just the flag itself:
+  `eval-okay-search-path.nix` asserts against `<nix/fetchurl.nix>`
+  (real Nix's bundled `corepkgs`, which doesn't exist in asnix's world
+  at all) and `length __nixPath == 5`; `eval-okay-search-path-prefix-
+  slash.nix` needs `builtins.findFile`/`builtins.nixPath` directly as
+  first-class builtins, not just `<name>` literal resolution. Neither
+  would pass even with `-I` itself wired up, so building just the flag
+  without the builtins it feeds would have had zero conformance payoff
+  -- left undone for a future pass that tackles the search-path
+  builtins properly.
 
 - **Context-attr-name throwing on a string-with-context dynamic
   attribute name** (item 5's third sub-item): confirmed string-context

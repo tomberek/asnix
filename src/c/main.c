@@ -8,6 +8,7 @@
 #include "asnix/heap.h"
 #include "asnix/ir.h"
 #include "asnix/value.h"
+#include "builtins_shared.h" /* M57i: asnix_bshared_attrs_* / make_attrs, CLI --arg/-A support */
 #include "eval_file.h"
 #include "symtab.h"
 #include "value_util.h"
@@ -208,15 +209,146 @@ static void print_value(Value v) {
     printf("\n");
 }
 
+/* M57i: `--arg name EXPR` / `--argstr name STR` / `-A attrpath` CLI flag
+ * support (real Nix's `nix-instantiate --eval` has all three). Scoped to
+ * exactly these three -- no `-I` (search-path entries feeding `<name>`
+ * resolution: would need a first-class `builtins.findFile`/`nixPath`,
+ * a separate, much larger feature this pass doesn't build; see
+ * docs/architecture.md's M57 scope notes) and no generic flag-skipping
+ * for anything else real `nix-instantiate` accepts -- an unrecognized
+ * flag is a hard usage error here, not silently ignored (the external
+ * nix-conformance adapter script is the one responsible for filtering
+ * a `.flags` sidecar's other, unrelated flags -- e.g.
+ * `--extra-experimental-features`, `--lint-*` -- down to just these
+ * three before ever invoking this binary; see that script's own
+ * comment). */
+typedef struct {
+    const char *name;
+    Value value;
+} CliArg;
+
+/* `-A a.b.c`: force-and-select one dotted attrpath segment at a time
+ * into the final result, same semantics as a chain of plain `.`
+ * selections in the source itself (fatal on a non-attrset or a missing
+ * key partway through, naming the specific segment that failed). */
+static Value select_attrpath(Value v, const char *attrpath) {
+    const char *p = attrpath;
+    while (*p) {
+        const char *dot = strchr(p, '.');
+        size_t seglen = dot ? (size_t)(dot - p) : strlen(p);
+        v = asnix_force_for_print(v);
+        if (asnix_tag_of(v) != ASNIX_TAG_ATTRS) {
+            fprintf(stderr, "asnix: -A: '%.*s' is not a set\n", (int)seglen, p);
+            exit(1);
+        }
+        uint32_t sym = asnix_intern(p, seglen);
+        int64_t idx = asnix_bshared_attrs_find(v, sym);
+        if (idx < 0) {
+            fprintf(stderr, "asnix: -A: attribute '%.*s' missing\n", (int)seglen, p);
+            exit(1);
+        }
+        v = asnix_bshared_attrs_value(v, idx);
+        p = dot ? dot + 1 : p + seglen;
+    }
+    return asnix_force_for_print(v);
+}
+
+/* `--arg`/`--argstr`: real Nix's `autoCallFunction` (eval.cc) -- if the
+ * loaded expression is a lambda-PATTERN function (`{a, b ? d, ...}:
+ * ...`; a plain single-identifier lambda has no named formals to match
+ * against, so it's left alone, same as real Nix), build an argument
+ * attrset containing only the formals a CLI arg actually matched by
+ * name; a formal left unmatched is fine if it has a default (the
+ * lambda's own OP_CHECK_FORMALS/default machinery supplies it when
+ * called, exactly as if that formal were simply omitted from the call
+ * site in ordinary source) but fatal if it's required. Extra CLI args
+ * that don't match any formal are simply unused, matching real Nix. */
+static Value auto_call(Value fn, const CliArg *args, size_t nargs) {
+    if (asnix_tag_of(fn) != ASNIX_TAG_CLOSURE) return fn;
+    const char *base = (const char *)(uintptr_t)(fn.raw & ~(uint64_t)0x7);
+    Value formals = *(const Value *)(base + ASNIX_CLOSURE_OFF_FORMALS);
+    int64_t nformals = asnix_bshared_attrs_count(formals);
+    if (nformals == 0) return fn; /* not a formals-pattern function */
+
+    uint32_t *syms = malloc((size_t)nformals * sizeof(uint32_t));
+    Value *vals = malloc((size_t)nformals * sizeof(Value));
+    int64_t total = 0;
+    for (int64_t i = 0; i < nformals; i++) {
+        uint32_t fsym = asnix_bshared_attrs_sym(formals, i);
+        size_t flen;
+        const char *fname = asnix_sym_name(fsym, &flen);
+        int64_t matched = -1;
+        for (size_t j = 0; j < nargs; j++) {
+            if (strlen(args[j].name) == flen && memcmp(args[j].name, fname, flen) == 0) {
+                matched = (int64_t)j;
+                break;
+            }
+        }
+        if (matched >= 0) {
+            syms[total] = fsym;
+            vals[total] = args[matched].value;
+            total++;
+        } else if (asnix_imm_subtag(asnix_bshared_attrs_value(formals, i)) != ASNIX_IMM_TRUE) {
+            fprintf(stderr, "asnix: you must specify a value for the argument '%.*s'\n", (int)flen, fname);
+            exit(1);
+        }
+        /* else: has a default -- leave it out, same as an ordinary
+         * call site that omits an optional formal. */
+    }
+    Value args_attrs = asnix_bshared_make_attrs(syms, vals, total);
+    free(syms);
+    free(vals);
+    return asnix_apply(fn, &args_attrs, 1);
+}
+
 int main(int argc, char **argv) {
-    if (argc != 2) {
-        fprintf(stderr, "usage: %s <file.nix>\n", argv[0]);
+    asnix_arena_init(0);
+
+    const char *file_path = NULL;
+    const char *attrpath = NULL;
+    CliArg *cli_args = NULL;
+    size_t n_cli_args = 0, cap_cli_args = 0;
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--arg") == 0 && i + 2 < argc) {
+            if (n_cli_args == cap_cli_args) {
+                cap_cli_args = cap_cli_args ? cap_cli_args * 2 : 4;
+                cli_args = realloc(cli_args, cap_cli_args * sizeof(CliArg));
+            }
+            cli_args[n_cli_args].name = argv[i + 1];
+            cli_args[n_cli_args].value = asnix_eval_expr_source(argv[i + 2]);
+            n_cli_args++;
+            i += 2;
+        } else if (strcmp(argv[i], "--argstr") == 0 && i + 2 < argc) {
+            if (n_cli_args == cap_cli_args) {
+                cap_cli_args = cap_cli_args ? cap_cli_args * 2 : 4;
+                cli_args = realloc(cli_args, cap_cli_args * sizeof(CliArg));
+            }
+            cli_args[n_cli_args].name = argv[i + 1];
+            cli_args[n_cli_args].value = asnix_make_string_value(argv[i + 2], strlen(argv[i + 2]));
+            n_cli_args++;
+            i += 2;
+        } else if (strcmp(argv[i], "-A") == 0 && i + 1 < argc) {
+            attrpath = argv[i + 1];
+            i += 1;
+        } else if (argv[i][0] == '-') {
+            fprintf(stderr, "asnix: unrecognized flag '%s' (only --arg/--argstr/-A are supported)\n", argv[i]);
+            return 1;
+        } else if (file_path) {
+            fprintf(stderr, "usage: %s [--arg name expr] [--argstr name str] [-A attrpath] <file.nix>\n", argv[0]);
+            return 1;
+        } else {
+            file_path = argv[i];
+        }
+    }
+    if (!file_path) {
+        fprintf(stderr, "usage: %s [--arg name expr] [--argstr name str] [-A attrpath] <file.nix>\n", argv[0]);
         return 1;
     }
 
-    asnix_arena_init(0);
-
-    Value result = asnix_eval_file(argv[1]);
+    Value result = asnix_eval_file(file_path);
+    if (n_cli_args > 0) result = auto_call(result, cli_args, n_cli_args);
+    if (attrpath) result = select_attrpath(result, attrpath);
     print_value(result);
     return 0;
 }

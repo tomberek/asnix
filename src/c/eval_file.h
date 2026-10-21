@@ -23,4 +23,12 @@
  * opened or resolved to an absolute path. */
 Value asnix_eval_file(const char *path);
 
+/* M57i: runs the same lex -> parse -> compile -> eval pipeline over a
+ * source STRING (not a file) -- used by main.c's `--arg name EXPR` CLI
+ * flag, whose EXPR is an arbitrary Nix expression, not a plain value.
+ * Relative path literals inside `src` resolve against the process's
+ * current working directory (matching real Nix: a `--arg`/`--argstr`
+ * value has no "containing file" of its own to resolve against). */
+Value asnix_eval_expr_source(const char *src);
+
 #endif /* ASNIX_EVAL_FILE_H */

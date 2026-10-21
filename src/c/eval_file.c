@@ -112,27 +112,19 @@ static char *resolve_import_path(const char *path) {
     return canon;
 }
 
-Value asnix_eval_file(const char *path) {
-    char *resolved = resolve_import_path(path);
-    /* `import somedir` means `import somedir/default.nix` in real Nix
-     * (verified against `nix-instantiate --eval`) -- found evaluating
-     * real nixpkgs (`pkgs/top-level/impure.nix` does `import ./.`, i.e.
-     * imports its own containing directory). Previously unhandled: this
-     * directory path reached read_file() directly, which "succeeded"
-     * opening it via fopen but then corrupted the heap computing its
-     * size (see read_file's own hardening above) -- a real, serious
-     * memory-safety bug, not a clean error. */
-    if (is_directory(resolved)) {
-        size_t len = strlen(resolved);
-        char *with_default = malloc(len + strlen("/default.nix") + 1);
-        memcpy(with_default, resolved, len);
-        memcpy(with_default + len, "/default.nix", strlen("/default.nix") + 1);
-        free(resolved);
-        resolved = with_default;
-    }
-    char *base_dir = dir_of(resolved);
-
-    char *src = read_file(resolved);
+/* M57i: factored out of asnix_eval_file so `--arg name EXPR` (main.c)
+ * can run the exact same lex/parse/compile/fresh-root-env/eval pipeline
+ * over a CLI-supplied expression string, not just a file's contents --
+ * every root global (`import`, `builtins`, ...) an ordinary top-level
+ * file sees must be visible to a `--arg` expression too (real Nix's own
+ * `--arg`/`--argstr` values are parsed as ordinary top-level
+ * expressions). `base_dir` is where THIS source's own relative path
+ * literals resolve against -- the containing file's directory for
+ * asnix_eval_file's call below, or the process's cwd for a `--arg`
+ * expression (matching real Nix: confirmed `--arg x ./foo.nix` resolves
+ * `./foo.nix` against the invoking shell's cwd, not any particular
+ * file's directory, since a CLI expression has no file of its own). */
+static Value eval_source(const char *src, const char *base_dir) {
     size_t ntoks;
     Token *toks = asnix_lex(src, &ntoks);
     Ast *ast = asnix_parse(toks, ntoks);
@@ -166,9 +158,42 @@ Value asnix_eval_file(const char *path) {
     root_env->values[10] = asnix_make_dirOf_primop();
     root_env->values[11] = asnix_make_fromTOML_primop();
 
-    Value result = asnix_eval(prog, root_env);
+    return asnix_eval(prog, root_env);
+}
+
+Value asnix_eval_file(const char *path) {
+    char *resolved = resolve_import_path(path);
+    /* `import somedir` means `import somedir/default.nix` in real Nix
+     * (verified against `nix-instantiate --eval`) -- found evaluating
+     * real nixpkgs (`pkgs/top-level/impure.nix` does `import ./.`, i.e.
+     * imports its own containing directory). Previously unhandled: this
+     * directory path reached read_file() directly, which "succeeded"
+     * opening it via fopen but then corrupted the heap computing its
+     * size (see read_file's own hardening above) -- a real, serious
+     * memory-safety bug, not a clean error. */
+    if (is_directory(resolved)) {
+        size_t len = strlen(resolved);
+        char *with_default = malloc(len + strlen("/default.nix") + 1);
+        memcpy(with_default, resolved, len);
+        memcpy(with_default + len, "/default.nix", strlen("/default.nix") + 1);
+        free(resolved);
+        resolved = with_default;
+    }
+    char *base_dir = dir_of(resolved);
+    char *src = read_file(resolved);
+
+    Value result = eval_source(src, base_dir);
 
     free(resolved);
     free(base_dir);
     return result;
+}
+
+Value asnix_eval_expr_source(const char *src) {
+    char cwd[4096];
+    if (!getcwd(cwd, sizeof cwd)) {
+        fprintf(stderr, "asnix: cannot determine the current directory\n");
+        exit(1);
+    }
+    return eval_source(src, cwd);
 }
