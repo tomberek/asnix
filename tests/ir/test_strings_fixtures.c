@@ -4,6 +4,7 @@
  * on it. */
 #include <fcntl.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -108,30 +109,49 @@ static void fixture_concat_empty(void) {
     CHECK(string_eq(v, ""), "OP_STR_CONCAT with count=0 yields an empty string, not a crash");
 }
 
-/* "p=" ++ <a Path value> ++ "!" == "p=/!" -- regression for a real
- * integration bug (docs/architecture.md's Known bugs #13): Path is a
- * second, differently-shaped ASNIX_TAG_PTR kind (added by the separately-
- * landed path-literals milestone), and the interpolation coercion path
- * used to treat every ASNIX_TAG_PTR as an already-valid String and return
- * it unchanged -- reading a Path's marker field as a bogus string length
- * and segfaulting. Uses "/" (not the originally-fixed "/abs/foo.nix",
- * which deliberately didn't exist on disk) since M67 added a real
- * existence check to this exact coercion path (string interpolation of a
- * Path requires the path to exist, confirmed against real
- * `nix-instantiate --eval`: `"${./nonexistent}"` fails "path '...' does
- * not exist" while `builtins.toString ./nonexistent` does not) -- "/" is
- * portable (exists on every POSIX system this runs on) and still
- * exercises the actual coercion logic this fixture is about. */
+/* "p=" ++ <a Path value> ++ "!" == "p=<selfpath>!" -- regression for a
+ * real integration bug (docs/architecture.md's Known bugs #13): Path is
+ * a second, differently-shaped ASNIX_TAG_PTR kind (added by the
+ * separately-landed path-literals milestone), and the interpolation
+ * coercion path used to treat every ASNIX_TAG_PTR as an already-valid
+ * String and return it unchanged -- reading a Path's marker field as a
+ * bogus string length and segfaulting. Originally used the portable,
+ * always-exists "/" here (M67 added a real existence check to this
+ * coercion path, so the path needs to exist) -- M75 made this coercion
+ * ALSO copy the path to the store (not just check existence), and "/"
+ * being the actual store-copy input tries to NAR-serialize the entire
+ * filesystem root, which fails even on real Nix on this machine
+ * (permission denied under /boot, confirmed directly) -- same bug M75
+ * already found and fixed in tests/e2e/m67_path_interp_exists.nix.
+ * Self-references this very source file instead (via `getcwd()`,
+ * since `make test` always runs test binaries from the repo root) --
+ * small, always exists, no permission issues. */
 static void fixture_concat_coerces_path(void) {
+    char cwd[4096];
+    if (!getcwd(cwd, sizeof(cwd))) {
+        fprintf(stderr, "getcwd failed\n");
+        exit(1);
+    }
+    char self_path[4096 + 64];
+    snprintf(self_path, sizeof(self_path), "%s/tests/ir/test_strings_fixtures.c", cwd);
+
     IrBuilder *b = ib_new();
     ib_push_const(b, (int64_t)asnix_make_string_value("p=", 2).raw);
-    ib_push_const(b, (int64_t)asnix_make_path_value("/", 1).raw);
+    ib_push_const(b, (int64_t)asnix_make_path_value(self_path, strlen(self_path)).raw);
     ib_push_const(b, (int64_t)asnix_make_string_value("!", 1).raw);
     ib_str_concat(b, 3);
     ib_halt(b);
     IrProgram *prog = ib_finish(b);
     Value v = asnix_eval(prog, NULL);
-    CHECK(string_eq(v, "p=/!"), "interpolating a Path coerces it to its text, not a crash");
+
+    const char *prefix = "p=/nix/store/";
+    const char *suffix = "test_strings_fixtures.c!";
+    int64_t vlen;
+    const char *vbytes = asnix_ptr_bytes(v, &vlen);
+    int matches = vlen > (int64_t)(strlen(prefix) + strlen(suffix)) &&
+                  memcmp(vbytes, prefix, strlen(prefix)) == 0 &&
+                  memcmp(vbytes + vlen - (int64_t)strlen(suffix), suffix, strlen(suffix)) == 0;
+    CHECK(matches, "interpolating a Path copies it to the store, not a crash");
 }
 
 int main(void) {
