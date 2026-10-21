@@ -8,24 +8,47 @@
 
 /*
  * `derivationStrict { ... }` (M8's minimal slice, see
- * docs/architecture.md): a single fixed output named "out", zero input
- * derivations, zero input sources. Required attrs: `name`, `system`,
- * `builder`. Optional: `args` (list of strings). Every other attr
- * becomes an environment variable (coerced to a string via
- * `asnix_coerce_to_string`, i.e. the same rules as `builtins.toString`).
+ * docs/architecture.md; a later milestone generalized it to arbitrary
+ * named outputs, see below): zero input derivations, zero input
+ * sources. Required attrs: `name`, `system`, `builder`. Optional:
+ * `args` (list of strings), `outputs` (list of strings, default
+ * `["out"]`, same default the Nix-level `derivation` wrapper below
+ * assumes). Every other attr becomes an environment variable (coerced
+ * to a string via `asnix_coerce_to_string`, i.e. the same rules as
+ * `builtins.toString`) -- including `outputs` itself, which is ALSO
+ * parsed into the actual set of declared output names (matching real
+ * Nix: a multi-output `.drv`'s env genuinely has an `outputs = "out
+ * bin ..."` string var, consumed by build-time setup hooks, alongside
+ * the structured per-output info in the ATerm's own `Outputs` section).
  *
- * Returns `{ outPath; drvPath; type = "derivation"; out = outPath; }` --
- * does NOT merge the original input attrs back into the result or build
- * the self-referential multi-output object (`drv.out.outPath`, etc.) --
- * that's exactly what real Nix's OWN `derivation` does on top of this
- * primop, via a Nix-level wrapper (`~/nix/src/libexpr/primops/
- * derivation.nix`) that this project now ports verbatim (M58, see
+ * One distinct store path is computed per declared output name (the
+ * masked/self-referential-hash two-pass scheme generalizes directly:
+ * ONE masked hash covers every output's blanked entry at once, then
+ * each output's own real path is `makeOutputPath(outputName,
+ * maskedHash, outputPathName(name, outputName))` -- see derivation.c's
+ * `output_path_name`/`atermoutput_cmp`, ported from real Nix's
+ * `~/nix/src/libstore/derivations.cc`).
+ *
+ * Returns `{ drvPath; <outputName> = <that output's outPath>; ... }`
+ * for every declared output -- exactly real Nix's own
+ * `derivationStrict` shape (`~/nix/src/libexpr/primops.cc`'s
+ * `mkOutputString`: a plain string per output, NOT a nested attrset,
+ * and no separate top-level `outPath`/`type`/`out` keys). Does NOT
+ * merge the original input attrs back into the result or build the
+ * self-referential per-output "nice" object (`drv.out.outPath`, etc.)
+ * -- that's exactly what real Nix's OWN `derivation` does on top of
+ * this primop, via a Nix-level wrapper (`~/nix/src/libexpr/primops/
+ * derivation.nix`) that this project ports verbatim (M58, see
  * asnix_make_derivation_wrapper_value below) rather than reimplementing
  * in C. Does not track string context (so a derivation's outPath can't
  * yet be used as another derivation's input -- that needs the recursive
  * `hashDerivationModulo` masking real Nix does for input derivations,
- * out of scope here along with `rec`/multiple real outputs/fixed-output
- * (content-addressed) derivations).
+ * out of scope here), and fixed-output (content-addressed) derivations
+ * remain restricted to a single "out" output, matching real Nix's own
+ * restriction there -- multi-output fixed-output/CA derivations are
+ * out of scope (see derivation.c's header comment on
+ * `validate_output_hash_fields` for the pre-existing fixed-output scope
+ * cut this builds on).
  */
 Value asnix_prim_derivation(const Value *args, int64_t argc);
 
