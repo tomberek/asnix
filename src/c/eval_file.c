@@ -14,11 +14,14 @@
 #include "builtins.h"
 #include "builtins_attrs.h"
 #include "builtins_list.h"
+#include "builtins_m54.h"
 #include "builtins_misc.h"
+#include "builtins_shared.h"
 #include "builtins_toml.h"
 #include "compiler.h"
 #include "lexer.h"
 #include "parser.h"
+#include "symtab.h"
 
 static char *read_file(const char *path) {
     FILE *f = fopen(path, "rb");
@@ -68,7 +71,15 @@ static char *dir_of(const char *abs_path) {
     return dir;
 }
 
-Value asnix_eval_file(const char *path) {
+/* Resolves `path` to its final absolute form (following the `import
+ * somedir` => `somedir/default.nix` rule) and reads+lexes+parses it,
+ * writing the resolved path and its containing directory out through
+ * `*resolved_out`/`*base_dir_out` (both caller-owned, malloc'd -- the
+ * caller frees them once done with `base_dir_out`, which asnix_compile/
+ * asnix_compile_scoped only reads during the one compile call). Shared by
+ * asnix_eval_file and asnix_eval_file_scoped (M54) below, which differ
+ * only in what root Env/ScopeFrame they build around the parsed Ast. */
+static Ast *parse_file(const char *path, char **resolved_out, char **base_dir_out) {
     char *resolved = realpath(path, NULL);
     if (!resolved) {
         fprintf(stderr, "asnix: cannot resolve path '%s'\n", path);
@@ -90,29 +101,31 @@ Value asnix_eval_file(const char *path) {
         free(resolved);
         resolved = with_default;
     }
-    char *base_dir = dir_of(resolved);
+    *resolved_out = resolved;
+    *base_dir_out = dir_of(resolved);
 
     char *src = read_file(resolved);
     size_t ntoks;
     Token *toks = asnix_lex(src, &ntoks);
-    Ast *ast = asnix_parse(toks, ntoks);
-    IrProgram *prog = asnix_compile(ast, base_dir);
+    return asnix_parse(toks, ntoks);
+}
 
-    /* Fresh root env/builtins every call -- an imported file does not
-     * inherit the importing file's local scope (see eval_file.h). Slots
-     * 1-11 (`import`, `map`, `abort`, `toString`, `removeAttrs`, `isNull`,
-     * `throw`, `derivation`, `baseNameOf`, `dirOf`, `fromTOML`) are the
-     * names real Nix exposes as bare globals in addition to `builtins.X`
-     * -- every primop cppnix registers WITHOUT a `__` prefix gets this
-     * treatment automatically (`EvalState::addPrimOp`, `eval.cc`); see
-     * builtins.h's asnix_make_import_primop comment and
-     * builtins_toml.c's asnix_make_fromTOML_primop comment for the fuller
-     * picture (including real ones not yet implemented at all:
-     * `fetchTarball`/`fetchGit`/`fetchMercurial`/`fetchTree`/
-     * `scopedImport`/`placeholder`/`derivationStrict`/`break`).
-     * compiler.c's root ScopeFrame must list the same names in the same
-     * order. */
-    Env *root_env = asnix_env_alloc(NULL, 12);
+/* Fresh root env/builtins every call -- an imported file does not inherit
+ * the importing file's local scope (see eval_file.h). Slots 1-12
+ * (`import`, `map`, `abort`, `toString`, `removeAttrs`, `isNull`, `throw`,
+ * `derivation`, `baseNameOf`, `dirOf`, `fromTOML`, `scopedImport`) are the
+ * names real Nix exposes as bare globals in addition to `builtins.X` --
+ * every primop cppnix registers WITHOUT a `__` prefix gets this treatment
+ * automatically (`EvalState::addPrimOp`, `eval.cc`); see builtins.h's
+ * asnix_make_import_primop comment and builtins_toml.c's
+ * asnix_make_fromTOML_primop comment for the fuller picture (including
+ * real ones not yet implemented at all: `fetchTarball`/`fetchGit`/
+ * `fetchMercurial`/`fetchTree`/`placeholder`/`derivationStrict`/`break`).
+ * compiler.c's root ScopeFrame (init_builtins_frame) must list the same
+ * names in the same order. `up` is the caller's choice (NULL for the
+ * ordinary case, or scopedImport's own extra scope-attrs frame). */
+static Env *make_root_env(Env *up) {
+    Env *root_env = asnix_env_alloc(up, 13);
     root_env->values[0] = asnix_make_builtins_attrs();
     root_env->values[1] = asnix_make_import_primop();
     root_env->values[2] = asnix_make_map_primop();
@@ -125,9 +138,50 @@ Value asnix_eval_file(const char *path) {
     root_env->values[9] = asnix_make_baseNameOf_primop();
     root_env->values[10] = asnix_make_dirOf_primop();
     root_env->values[11] = asnix_make_fromTOML_primop();
+    root_env->values[12] = asnix_make_scopedImport_primop();
+    return root_env;
+}
 
+Value asnix_eval_file(const char *path) {
+    char *resolved, *base_dir;
+    Ast *ast = parse_file(path, &resolved, &base_dir);
+    IrProgram *prog = asnix_compile(ast, base_dir);
+    Env *root_env = make_root_env(NULL);
     Value result = asnix_eval(prog, root_env);
+    free(resolved);
+    free(base_dir);
+    return result;
+}
 
+/* M54: see eval_file.h/compiler.c's asnix_compile_scoped for the full
+ * rationale. `scope`'s attribute NAMES (not values -- those stay lazy,
+ * same as any other attrset field) become an extra, innermost lexical
+ * ScopeFrame, resolved at compile time; at runtime that frame is one more
+ * Env hop (`scope_env`, holding `scope`'s own field values in the same
+ * order its names were listed) wrapped around the ordinary 13-slot root
+ * env (`up = scope_env`'s own `up`). */
+Value asnix_eval_file_scoped(const char *path, Value scope) {
+    char *resolved, *base_dir;
+    Ast *ast = parse_file(path, &resolved, &base_dir);
+
+    int64_t n = asnix_bshared_attrs_count(scope);
+    const char **names = malloc((size_t)(n > 0 ? n : 1) * sizeof(const char *));
+    size_t *lens = malloc((size_t)(n > 0 ? n : 1) * sizeof(size_t));
+    for (int64_t i = 0; i < n; i++) {
+        uint32_t sym = asnix_bshared_attrs_sym(scope, i);
+        names[i] = asnix_sym_name(sym, &lens[i]);
+    }
+
+    IrProgram *prog = asnix_compile_scoped(ast, base_dir, names, lens, (size_t)n);
+
+    Env *root_env = make_root_env(NULL);
+    Env *scope_env = asnix_env_alloc(root_env, n);
+    for (int64_t i = 0; i < n; i++) scope_env->values[i] = asnix_bshared_attrs_value(scope, i);
+
+    Value result = asnix_eval(prog, scope_env);
+
+    free(names);
+    free(lens);
     free(resolved);
     free(base_dir);
     return result;

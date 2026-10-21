@@ -14,6 +14,7 @@
 #include "builtins_list.h"
 #include "builtins_list2.h"
 #include "builtins_m23.h"
+#include "builtins_m54.h"
 #include "builtins_misc.h"
 #include "builtins_regex.h"
 #include "builtins_toml.h"
@@ -323,11 +324,19 @@ Value asnix_make_builtins_attrs(void) {
         ASNIX_ATTRS2_BUILTINS_COUNT, ASNIX_COMPARE_BUILTINS_COUNT, ASNIX_M23_BUILTINS_COUNT, ASNIX_REGEX_BUILTINS_COUNT,
         ASNIX_TOML_BUILTINS_COUNT, ASNIX_TRYEVAL_BUILTINS_COUNT,
     };
+    /* M54: a further builtins-expansion pass (bitAnd/bitOr/bitXor/trace/
+     * zipAttrsWith/toXML/convertHash/getContext/appendContext/
+     * scopedImport) -- same {name,build()} shape, kept as its own table
+     * (builtins_m54.h) rather than threaded through the arrays above, so
+     * it's visually obvious which pass added what. */
+    const AsnixBuiltinM54Def *const m54_tables[] = { ASNIX_M54_BUILTINS };
+    const size_t m54_counts[] = { ASNIX_M54_BUILTINS_COUNT };
 
     size_t n = 0;
     for (size_t t = 0; t < sizeof(plain_counts) / sizeof(plain_counts[0]); t++) n += plain_counts[t];
     for (size_t t = 0; t < sizeof(list_shaped_counts) / sizeof(list_shaped_counts[0]); t++) n += list_shaped_counts[t];
     for (size_t t = 0; t < sizeof(build_counts) / sizeof(build_counts[0]); t++) n += build_counts[t];
+    for (size_t t = 0; t < sizeof(m54_counts) / sizeof(m54_counts[0]); t++) n += m54_counts[t];
 
     uint32_t *syms = malloc(n * sizeof(uint32_t));
     Value *vals = malloc(n * sizeof(Value));
@@ -350,6 +359,12 @@ Value asnix_make_builtins_attrs(void) {
         for (size_t i = 0; i < build_counts[t]; i++, k++) {
             syms[k] = asnix_intern(build_tables[t][i].name, strlen(build_tables[t][i].name));
             vals[k] = build_tables[t][i].build();
+        }
+    }
+    for (size_t t = 0; t < sizeof(m54_counts) / sizeof(m54_counts[0]); t++) {
+        for (size_t i = 0; i < m54_counts[t]; i++, k++) {
+            syms[k] = asnix_intern(m54_tables[t][i].name, strlen(m54_tables[t][i].name));
+            vals[k] = m54_tables[t][i].build();
         }
     }
 

@@ -23,4 +23,17 @@
  * opened or resolved to an absolute path. */
 Value asnix_eval_file(const char *path);
 
+/* M54: `builtins.scopedImport scope path` -- same pipeline as
+ * asnix_eval_file above, except `scope` (an already-forced Attrs Value)
+ * supplies an extra, innermost lexical scope level for the imported
+ * file: each of `scope`'s attribute names becomes directly resolvable as
+ * a bare identifier inside `path`'s own source (compiler.c's
+ * asnix_compile_scoped), taking priority over (shadowing) the ordinary
+ * bare globals/`builtins.X` of the same name -- exactly matching real
+ * Nix's own `scopedImport` (see compiler.c's asnix_compile_scoped for
+ * the full rationale). `scope`'s field VALUES are not forced here (same
+ * laziness as any other attrset field, M6) -- only its NAMES are needed
+ * up front, to build the compile-time ScopeFrame. */
+Value asnix_eval_file_scoped(const char *path, Value scope);
+
 #endif /* ASNIX_EVAL_FILE_H */
