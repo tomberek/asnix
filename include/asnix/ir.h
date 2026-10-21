@@ -187,6 +187,9 @@ enum {
                      * list with lhs's elements followed by rhs's elements. Deferred to C
                      * (not hand-rolled in asm) for the same reason OP_UPDATE is: not a
                      * hot-path op, and a plain memcpy-twice is far easier to get right. */
+    OP_DIV,        /* `/` integer division (M23): pops rhs,lhs (both must be TAG_INT, else
+                     * fatal; rhs == 0 is also fatal, "division by zero"), pushes the
+                     * truncated-toward-zero quotient -- see op_arith.S's asnix_op_div. */
     OP_COUNT
 };
 

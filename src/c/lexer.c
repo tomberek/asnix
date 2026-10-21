@@ -527,6 +527,11 @@ Token *asnix_lex(const char *src, size_t *out_count) {
                 case '+': kind = TOK_PLUS; break;
                 case '-': kind = TOK_MINUS; break;
                 case '*': kind = TOK_STAR; break;
+                case '/': kind = TOK_SLASH; break; /* reached only when both try_scan_path
+                                                     * (above) and the '//' two-char check
+                                                     * just above already ruled this '/' out
+                                                     * as a path literal or update operator --
+                                                     * see TOK_SLASH's own comment (lexer.h). */
                 case '(': kind = TOK_LPAREN; break;
                 case ')': kind = TOK_RPAREN; break;
                 case '=': kind = TOK_EQUALS; break;

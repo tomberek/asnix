@@ -771,11 +771,12 @@ static Ast *parse_concat(Parser *p) {
 
 static Ast *parse_mul(Parser *p) {
     Ast *lhs = parse_concat(p);
-    while (cur(p)->kind == TOK_STAR) {
+    while (cur(p)->kind == TOK_STAR || cur(p)->kind == TOK_SLASH) {
+        char op = cur(p)->kind == TOK_STAR ? '*' : '/';
         advance(p);
         Ast *rhs = parse_concat(p);
         Ast *n = asnix_ast_new(AST_BINOP);
-        n->as.binop.op = '*';
+        n->as.binop.op = op;
         n->as.binop.lhs = lhs;
         n->as.binop.rhs = rhs;
         lhs = n;

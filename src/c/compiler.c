@@ -506,6 +506,7 @@ static void compile_expr(IrBuilder *b, Ast *node, ScopeFrame *scope) {
                 case 'G': ib_ge(b); return;
                 case 'u': ib_update(b); return;
                 case 'c': ib_concat(b); return;
+                case '/': ib_div(b); return;
             }
             return;
         case AST_AND: {

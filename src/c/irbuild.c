@@ -158,6 +158,9 @@ size_t ib_update(IrBuilder *b) {
 size_t ib_concat(IrBuilder *b) {
     return ib_emit(b, OP_CONCAT, 0, 0);
 }
+size_t ib_div(IrBuilder *b) {
+    return ib_emit(b, OP_DIV, 0, 0);
+}
 
 size_t ib_assert_fail(IrBuilder *b, const char *msg, size_t len) {
     size_t pool_idx = ib_pool_add(b, (int64_t)(intptr_t)msg);
