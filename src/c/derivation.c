@@ -74,18 +74,22 @@ static void validate_output_hash_fields(const char *output_hash, const char *out
     size_t algo_len = algo ? strlen(algo) : 0;
     const char *hash_body = output_hash;
     /* An SRI-style "algo-..." or legacy "algo:..." prefix on the hash
-     * string itself names the algorithm when outputHashAlgo wasn't given
-     * separately (real Nix accepts either form) -- only recognized when
-     * outputHashAlgo is absent, matching real Nix's own precedence. */
-    if (!algo) {
-        const char *sep = strchr(output_hash, '-');
-        const char *sep2 = strchr(output_hash, ':');
-        if (sep2 && (!sep || sep2 < sep)) sep = sep2;
-        if (sep && valid_hash_algo_str(output_hash, (size_t)(sep - output_hash))) {
-            algo = output_hash;
-            algo_len = (size_t)(sep - output_hash);
-            hash_body = sep + 1;
-        }
+     * string itself names the algorithm -- real Nix always recognizes and
+     * strips this form regardless of whether outputHashAlgo was ALSO
+     * given separately (confirmed needed: numtide/nix-conformance's
+     * eval-okay-drv-hash-spellings.nix passes the SAME hash five
+     * different ways, including `outputHashAlgo = "sha256"; outputHash =
+     * "sha256-<base64>"` together -- stripping only when outputHashAlgo
+     * was absent, as an earlier version of this function did, rejected
+     * that case with a bogus "wrong length" error since the un-stripped
+     * prefix was counted against the expected digest length). */
+    const char *sep = strchr(output_hash, '-');
+    const char *sep2 = strchr(output_hash, ':');
+    if (sep2 && (!sep || sep2 < sep)) sep = sep2;
+    if (sep && valid_hash_algo_str(output_hash, (size_t)(sep - output_hash))) {
+        algo = output_hash;
+        algo_len = (size_t)(sep - output_hash);
+        hash_body = sep + 1;
     }
     if (!algo) return; /* no algo known from either source -- nothing to check */
     size_t n = hash_algo_digest_bytes(algo, algo_len);
