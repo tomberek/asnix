@@ -179,7 +179,24 @@ static void decode_output_hash(const char *output_hash, const char *output_hash_
     size_t hex_len = 2 * n;
     size_t b32_len = asnix_base32_encoded_length(n);
     size_t b64_len = ((n + 2) / 3) * 4;
-    if (hash_len != hex_len && hash_len != b32_len && hash_len != b64_len) {
+    /* real Nix's SRI hashes are routinely UNPADDED base64 (no trailing
+     * '='s) -- confirmed needed chasing d.nix past `ffmpeg`'s own fetcher
+     * chain: nixpkgs's standard `sha256-<base64>` spelling (used by
+     * `fetchgit`/every other modern fetcher) produces exactly this
+     * 43-char form for a 32-byte sha256 digest, one character shorter
+     * than the 44-char padded form this check previously required --
+     * confirmed directly: real `derivation { ...; outputHash =
+     * "sha256-UlI+6OMUj5F6uVAw+Mg2wOZrjfdRq73d1qufaXVI/go"; }` (43
+     * chars) evaluates fine against real `nix-instantiate`.
+     * `asnix_base64_decode` (base64.c) already handles an unpadded tail
+     * correctly on its own (it just stops accumulating once the input
+     * runs out, same as real Nix's own decoder) -- this length
+     * pre-check was the only place rejecting it. General formula for
+     * the unpadded length of `n` bytes: `ceil(n*8/6)`, i.e. every 6 bits
+     * of input need one more output character, with no padding up to a
+     * multiple of 4. */
+    size_t b64_unpadded_len = (n * 8 + 5) / 6;
+    if (hash_len != hex_len && hash_len != b32_len && hash_len != b64_len && hash_len != b64_unpadded_len) {
         fprintf(stderr, "asnix: hash '%s' has wrong length for hash algorithm '%.*s'\n",
                 output_hash, (int)algo_len, algo);
         exit(1);
