@@ -31,8 +31,7 @@
  * same underlying bug -- its narrower `print_escaped_string` handled
  * `" \ \n \r \t` but not the `${` case; this version was kept as the more
  * complete of the two.) */
-static void print_string_bytes(const char *bytes, int64_t len) {
-    putchar('"');
+static void print_string_contents(const char *bytes, int64_t len) {
     for (int64_t i = 0; i < len; i++) {
         char c = bytes[i];
         switch (c) {
@@ -52,27 +51,66 @@ static void print_string_bytes(const char *bytes, int64_t len) {
             default: putchar(c); break;
         }
     }
+}
+
+static void print_string_bytes(const char *bytes, int64_t len) {
+    putchar('"');
+    print_string_contents(bytes, len);
     putchar('"');
 }
 
-/* Real Nix's printer quotes an attrset key that isn't a valid bare
- * identifier (`[a-zA-Z_][a-zA-Z0-9_'-]*`, matching lexer.c's own
- * ident_start/ident_cont rules post-M23's hyphen fix) -- e.g. a purely
- * numeric key like "1" prints as `"1" = ...` not `1 = ...` (confirmed:
- * `nix-instantiate --eval -E 'builtins.groupBy (x: toString x) [1]'`
- * => `{ "1" = [ 1 ]; }`). Previously unconditionally bare (M9's original
- * printer never had a reason to hit a non-bare key until M23's groupBy
- * started producing numeric-string keys) -- found via
- * numtide/nix-conformance's eval-okay-groupBy.nix. */
-static int is_bare_ident(const char *s, int64_t len) {
-    if (len == 0) return 0;
-    char c0 = s[0];
-    if (!(isalpha((unsigned char)c0) || c0 == '_')) return 0;
-    for (int64_t i = 1; i < len; i++) {
-        char c = s[i];
-        if (!(isalnum((unsigned char)c) || c == '_' || c == '\'' || c == '-')) return 0;
+/* Real Nix's attrset printer only prints an attribute name bare
+ * (unquoted) when it's a syntactically valid identifier (matches
+ * `[A-Za-z_][A-Za-z0-9_'-]*`) AND isn't one of a small set of reserved
+ * keywords that would otherwise parse as something else entirely if
+ * pasted back in bare (`let`, `if`, ...) -- confirmed directly against
+ * `nix-instantiate --eval` (`builtins.listToAttrs [{name="rec";...}]`
+ * prints `"rec" = ...` quoted, but `{name="true";...}` prints `true =
+ * ...` bare: `true`/`false`/`null` are literal tokens, not identifiers,
+ * so they're not in this reserved set even though they're keywords
+ * elsewhere in the grammar). Every *other* name -- empty, digit-leading
+ * (`"1234"`), containing a space, non-ASCII (`"café"`), anything produced
+ * by an arbitrary TOML/JSON quoted key -- must be printed quoted exactly
+ * like a string literal (same escaping as print_string_bytes).
+ *
+ * Before this fix, `print_value_inner`'s ASNIX_TAG_ATTRS case printed
+ * every attribute name bare, unconditionally (`printf("%.*s = ", ...)`)
+ * -- found via `builtins.fromTOML`, whose corpus deliberately includes
+ * quoted/literal-string TOML keys (`"quoted key"`, `""`, `"1234"`,
+ * `"café"`) that must round-trip through Nix's own attrset printer, but
+ * this is a general attrset-printing bug, not specific to TOML: any
+ * builtin that can construct an attrset with an arbitrary-string key
+ * (`listToAttrs`, `fromJSON` if it existed, `builtins.attrNames`-and-
+ * reconstruct, ...) was already affected. See docs/architecture.md's
+ * Known Bugs list. */
+static int attr_name_needs_quoting(const char *name, size_t len) {
+    static const struct { const char *kw; size_t len; } RESERVED[] = {
+        { "let", 3 }, { "in", 2 }, { "if", 2 }, { "then", 4 }, { "else", 4 },
+        { "rec", 3 }, { "inherit", 7 }, { "assert", 6 }, { "with", 4 }, { "or", 2 },
+    };
+    if (len == 0) return 1;
+    char c0 = name[0];
+    if (!((c0 >= 'a' && c0 <= 'z') || (c0 >= 'A' && c0 <= 'Z') || c0 == '_')) return 1;
+    for (size_t i = 1; i < len; i++) {
+        char c = name[i];
+        int ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+            || c == '_' || c == '\'' || c == '-';
+        if (!ok) return 1;
     }
-    return 1;
+    for (size_t k = 0; k < sizeof(RESERVED) / sizeof(RESERVED[0]); k++) {
+        if (len == RESERVED[k].len && memcmp(name, RESERVED[k].kw, len) == 0) return 1;
+    }
+    return 0;
+}
+
+static void print_attr_name(const char *name, size_t len) {
+    if (attr_name_needs_quoting(name, (size_t)len)) {
+        putchar('"');
+        print_string_contents(name, (int64_t)len);
+        putchar('"');
+    } else {
+        fwrite(name, 1, len, stdout);
+    }
 }
 
 static void print_value_inner(Value v) {
@@ -151,12 +189,8 @@ static void print_value_inner(Value v) {
             }
             printf("{ ");
             for (int64_t i = 0; i < n; i++) {
-                if (is_bare_ident(names[i], (int64_t)name_lens[i])) {
-                    printf("%.*s = ", (int)name_lens[i], names[i]);
-                } else {
-                    print_string_bytes(names[i], (int64_t)name_lens[i]);
-                    printf(" = ");
-                }
+                print_attr_name(names[i], name_lens[i]);
+                printf(" = ");
                 print_value_inner(vals[i]);
                 printf("; ");
             }

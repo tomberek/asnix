@@ -35,7 +35,7 @@ what's actually implemented and the scope decisions made along the way.
 | M20 — daemon realization: `SetOptions`/`AddToStore`/`BuildPaths` (`src/c/daemon_client.c`) | done, **scoped** (see below) |
 | M21 — real structural `==`/`!=` + real `+` operator dispatch | done, **scoped** (see below) |
 | M22 — real-nixpkgs-evaluation sweep: block comments, `->`, more bare globals, dynamic attrs, directory-import fix | done, **in progress** (see below -- real nixpkgs still doesn't fully evaluate) |
-| M23 — numtide/nix-conformance sweep (3 parallel passes): `++`/`/` operators, attrpath binding sugar, hyphenated identifiers, map/mapAttrs laziness fix, builtins-expansion pass, plus `builtins.match`/`builtins.split` (POSIX regex) | done, **scoped** (see below) |
+| M23 — numtide/nix-conformance sweep (3 parallel passes): `++`/`/` operators, attrpath binding sugar, hyphenated identifiers, map/mapAttrs laziness fix, builtins-expansion pass, `builtins.match`/`builtins.split` (POSIX regex), `builtins.fromTOML` (hand-written TOML parser) | done, **scoped** (see below) |
 | M24+ | not started |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
@@ -2596,3 +2596,143 @@ one) rather than being random bugs.
    Affects roughly 10% of the differential corpus's entries (27 of 272 in
    the direct self-check) -- documented as a known, permanent divergence
    rather than silently accepted.
+
+## M23 scope notes: `builtins.fromTOML`
+
+Driven by numtide/nix-conformance's `lang/` corpus: `builtins.fromTOML`'s
+own differential corpus (`lang/corpora/toml.nix`, 77 documents, each
+backing one `lang/eval-okay-fromTOML-NNN.nix`/`.exp` pair) was the
+second-biggest single cluster of conformance failures after this
+milestone's predecessors, entirely because the builtin didn't exist at
+all.
+
+**What's implemented** (`src/c/toml.c`/`toml.h`, a hand-written
+recursive-descent parser in the same plain-index-into-buffer style as
+`lexer.c`/`parser.c`, no external TOML library vendored): `key = value`
+pairs (bare/quoted/dotted keys), `[table]` and `[[array of tables]]`
+headers (including the "a later `[[x.y]]` nests under the *last* element
+of an already-open `[[x]]`" stepping rule), inline tables
+(`{ a = 1, b = 2 }`), arrays (`[ 1, 2, 3 ]`, free comment/newline
+placement), basic strings with `\b \t \n \f \r \" \\ \uXXXX \UXXXXXXXX`
+escapes, literal strings (no escapes), multi-line basic/literal strings
+(`"""..."""`/`'''...'''`, including the opening-newline-trim and
+line-ending-backslash-splice rules), integers (decimal, `0x`/`0o`/`0b`,
+underscore separators, leading `+`/`-`), booleans, and comments/CRLF/blank
+lines between statements. Registered as `builtins.fromTOML` only (a
+plain arity-1 PrimOp, `builtins_toml.c`) -- real Nix doesn't expose it as
+a bare root-scope global either.
+
+**TOML date/time literals are implemented, not cut**, despite asnix
+having no native date/time *or* float type: real Nix's own `fromTOML`
+represents every TOML date/time kind (local date, local time, local
+date-time, offset date-time) identically as
+`{ _type = "timestamp"; value = "<normalized text>"; }` (confirmed
+directly against `lang/eval-okay-fromTOML-062` through `-076.exp`) --
+just a string wrapped in a 2-field attrset, fully representable here.
+`classify_date_or_time`/`normalize_time` (`toml.c`) reproduce the exact
+normalization real Nix's toml11-backed implementation applies: the `T`/`t`/
+space date-time separator and lowercase `t`/`z` offset marker are both
+normalized to uppercase `T`/`Z`, and fractional seconds are padded with
+trailing zeros to a 3-digit (millisecond) minimum, left as-is between 3
+and 9 digits, and would be truncated beyond 9 (TOML's own nanosecond
+ceiling) -- verified against `-064.exp` (`.5` -> `.500`) and `-065`/
+`-066.exp` (6- and 9-digit fractions kept exactly as given).
+
+**What's deliberately cut, and why (the actual scope boundary):** TOML
+*floats* and `inf`/`nan` -- asnix's `Value` representation has no float/
+double tag at all (`include/asnix/value.h`: only `TAG_INT`, a 61-bit
+immediate integer). There is no honest way to represent a TOML float
+without either (a) silently truncating it to an int -- a genuinely wrong
+value, not a smaller one, and strictly worse than a clear error, since
+`3.0` truncated to `3` happens to print identically to real Nix's float
+`3.0` in that one specific whole-number case but would be badly wrong for
+`1.5`, `6.626e-34`, etc -- or (b) faking a string, which would change the
+result's `builtins.typeOf` and break any arithmetic a real caller does on
+it. `classify_bare_token` therefore detects a float-shaped token (contains
+`.`/`e`/`E` outside a date/time position, or is `inf`/`nan`) and calls
+`toml_fatal_float()`, which `fprintf`s a clear "not supported" message and
+exits -- matching every other fatal error's convention in this codebase
+(no `tryEval`/exception mechanism exists to catch it with anyway, and the
+corpus's own `toml-invalid.nix` comment notes this explicitly: "invalid
+... documents live in toml-invalid.nix, because builtins.tryEval cannot
+catch a fromTOML error"). This is a parser-level, not spec-level,
+decision: nothing here claims TOML floats are invalid syntax, only that
+asnix cannot represent the resulting *value*.
+
+Exact corpus accounting (verified by generating `{ d = <doc>; v =
+builtins.fromTOML <doc>; }` for all 77 `lang/corpora/toml.nix` entries and
+diffing the printed result against the corresponding
+`lang/eval-okay-fromTOML-NNN.exp` byte-for-byte, then re-confirmed through
+the real `./run adapters/asnix lang` conformance runner):
+
+- **73 of 77 pass** (entries 000-005, 009-059, 061-076).
+- **4 of 77 remain unsupported, all for the same float reason**: entry
+  006 (`a = 1.5\nb = -0.0\nc = 1e10\nd = 1E-3\ne = 6.626e-34`), entry 007
+  (`a = inf\nb = -inf\nc = +inf`), entry 008 (`a = nan`), and entry 060
+  (`a = [1, "two", true, 3.0]` -- the lone float `3.0` embedded inside an
+  otherwise-fine mixed-type array). These map to
+  `lang/eval-okay-fromTOML-006/-007/-008/-060.nix`.
+- `lang/eval-okay-fromTOML-timestamps.nix` and the un-numbered
+  `lang/eval-okay-fromTOML.nix` are both separately out of scope for the
+  same reason: each bundles several TOML documents together (one `nix`
+  list / `fromTOML` call per file), and at least one of the bundled
+  documents in each contains `flt1 = 3.1415`-style float fields, so the
+  *whole* file fails regardless of how correct the rest of the document's
+  parsing is -- not a new or different gap, just the same float cut hit
+  from a different test-file shape.
+- `lang/eval-fail-fromTOML-invalid-*.nix` (46 cases) and the four
+  `lang/eval-fail-fromTOML-{keyWithNullByte,overflow,underflow,
+  valueWithNullByte}.nix` cases are a different cluster entirely (TOML
+  documents real Nix's toml11 *rejects*, where the test only checks that
+  *some* error occurs) and were never this milestone's target -- this
+  parser is intentionally not a strict validator (e.g. it doesn't enforce
+  "no newline inside an inline table", integer overflow/underflow
+  bounds-checking, or null-byte rejection in keys/values), so roughly a
+  third of that cluster (as of this writing) incorrectly *succeeds*
+  parsing a document real Nix rejects. Documented here as a known,
+  accepted gap rather than silently ignored: tightening this would mean
+  adding validation this milestone's actual target (the 77-entry
+  eval-okay cluster) never needed.
+
+**A real, previously undiscovered, unrelated bug found along the way**:
+see Known Bugs #31 below -- the attrset printer never quoted attribute
+names at all (affecting any builtin that can produce an arbitrary-string
+key, not just `fromTOML`). Also independently rediscovered here (fixed
+already, see M23's first scope-notes section above and this milestone's
+Status row): `++` (list concatenation) didn't exist in asnix at all,
+which blocked *every single* `fromTOML` conformance case from even
+parsing, independent of whether the TOML parser itself was correct
+(numtide/nix-conformance's own `lang/corpora/toml.nix` builds its test
+list with `docs ++ times`) -- two of this milestone's three parallel
+passes hit this exact same gap from different directions; the surviving
+implementation is the one described earlier in this document (`OP_CONCAT`/
+`op_concat.S`/`asnix_concat_lists`), not a second, separate one.
+
+## M23's Known Bugs entries, continued (TOML pass)
+
+31. **The attrset printer never quoted attribute names, under any
+   circumstances -- a real, general bug, not fromTOML-specific, just
+   found through it.** `main.c`'s `ASNIX_TAG_ATTRS` print case always did
+   `printf("%.*s = ", ...)` on the raw attribute name bytes, unconditionally.
+   Real Nix's printer only prints a name bare when it's a syntactically
+   valid identifier (`[A-Za-z_][A-Za-z0-9_'-]*`) and isn't one of a small
+   reserved-keyword set (`let`/`in`/`if`/`then`/`else`/`rec`/`inherit`/
+   `assert`/`or` -- but *not* `true`/`false`/`null`, which print bare
+   despite being lexer keywords too, confirmed directly: `nix-instantiate
+   --eval -E 'builtins.listToAttrs [{name="true";value=1;}]'` prints
+   `{ true = 1; }`, not `{ "true" = 1; }`; and confirmed the reserved-
+   keyword case too: `{ let = 1; }` as *source* is a syntax error, but
+   `builtins.listToAttrs [{name="let";value=1;}]` prints `{ "let" = 1;
+   }`); every other name (empty, digit-leading, containing a space,
+   non-ASCII, a reserved keyword) must print quoted exactly like a string
+   literal, with the same escaping. Found via `builtins.fromTOML`'s own
+   corpus, which deliberately includes keys like `""`, `"1234"`,
+   `"quoted key"`, and `"café"` that must round-trip through this
+   printer -- but any *other* builtin able to construct an attrset with
+   an arbitrary-string key (confirmed independently with
+   `builtins.listToAttrs`) was already affected; this was never
+   TOML-specific. A second, independent pass in this same milestone also
+   found and fixed a narrower version of this bug (character-shape only,
+   missing the reserved-keyword case) -- the more complete fix
+   (`attr_name_needs_quoting`/`print_attr_name`, `main.c`) is the one that
+   survived integration.

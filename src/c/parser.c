@@ -818,7 +818,12 @@ static Ast *parse_add(Parser *p) {
  *   parse_update //             right-assoc, chainable
  *   parse_not   ! (prefix)      binds the rest of this chain down to parse_add
  *   parse_add   + -             (already existed, M4)
+ *   parse_mul   * /             (already existed, M4)
+ *   parse_concat ++             right-assoc, chainable -- binds TIGHTER than
+ *                                * / + -, looser than ? and application (M23,
+ *                                see parse_concat's own comment above parse_mul)
  *
+
  * `->`'s precedence/associativity (lowest, right-assoc) cross-checked
  * against cppnix's real grammar (~/nix/src/libexpr/parser.y: `%right
  * IMPL`, declared before `%left OR`, i.e. binding looser).

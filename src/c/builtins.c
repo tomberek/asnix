@@ -16,6 +16,7 @@
 #include "builtins_m23.h"
 #include "builtins_misc.h"
 #include "builtins_regex.h"
+#include "builtins_toml.h"
 #include "derivation.h"
 #include "eval_file.h"
 #include "hash_shim.h"
@@ -303,11 +304,12 @@ Value asnix_make_builtins_attrs(void) {
     const size_t list_shaped_counts[] = { asnix_builtins_list_count, ASNIX_ATTRS_BUILTINS_COUNT };
     const AsnixBuiltinMiscDef *const build_tables[] = {
         ASNIX_BUILTINS_MISC, ASNIX_CLOSURE_BUILTINS, ASNIX_LIST2_BUILTINS, ASNIX_ATTRS2_BUILTINS, ASNIX_COMPARE_BUILTINS,
-        ASNIX_M23_BUILTINS, ASNIX_REGEX_BUILTINS,
+        ASNIX_M23_BUILTINS, ASNIX_REGEX_BUILTINS, ASNIX_TOML_BUILTINS,
     };
     const size_t build_counts[] = {
         ASNIX_BUILTINS_MISC_COUNT, ASNIX_CLOSURE_BUILTINS_COUNT, ASNIX_LIST2_BUILTINS_COUNT,
         ASNIX_ATTRS2_BUILTINS_COUNT, ASNIX_COMPARE_BUILTINS_COUNT, ASNIX_M23_BUILTINS_COUNT, ASNIX_REGEX_BUILTINS_COUNT,
+        ASNIX_TOML_BUILTINS_COUNT,
     };
 
     size_t n = 0;
