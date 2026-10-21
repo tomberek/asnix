@@ -710,7 +710,42 @@ static void compile_expr(IrBuilder *b, Ast *node, ScopeFrame *scope) {
             return;
         }
         case AST_LIST: {
-            for (size_t i = 0; i < node->as.list.count; i++) compile_expr(b, node->as.list.elems[i], scope);
+            /* M53: each element is wrapped in its own thunk (captured over
+             * the enclosing scope), mirroring the *exact* pattern the
+             * non-rec AST_ATTRSET branch above already uses for binding
+             * values, and AST_APP uses for call arguments (M25) -- real
+             * Nix list elements are genuinely lazy per-element
+             * (`builtins.elemAt [(abort "x") 1] 1` must NOT abort; a list
+             * literal's own construction must not force any element,
+             * only actually selecting/using one does). Previously this
+             * called compile_expr directly inline, so the literal's own
+             * construction bytecode unconditionally ran every element's
+             * code (including calling `throw`/`abort` if an element was
+             * such a call) the moment the list value itself was forced to
+             * WHNF (e.g. by any consumer needing its ASNIX_TAG_LIST tag/
+             * count/elems pointer) -- a real, previously-documented-but-
+             * deliberately-unfixed gap (see M34's scope notes) that
+             * surfaced as a conformance failure once a list literal
+             * holding a canary `throw` was passed through `builtins.
+             * foldl'` (eval-okay-foldlStrict-lazy-elements.nix): forcing
+             * the list argument's own thunk (needed just to read its
+             * tag) ran the old inline bytecode for *every* element,
+             * firing the canary regardless of which elements the fold
+             * ever touched. OP_MK_LIST (op_mk_list.S) itself is unchanged
+             * -- it already just moves `count` already-evaluated Values
+             * off VALSTACK into a list object, oblivious to whether each
+             * one is a forced Value or (now) a Thunk; element consumers
+             * were already audited in M34 to force-before-read where
+             * needed (map/mapAttrs already produced genuine Thunk
+             * elements before this change), so this doesn't introduce a
+             * new element shape, just a new *producer* of the same
+             * already-handled shape. */
+            for (size_t i = 0; i < node->as.list.count; i++) {
+                IrBuilder *elem_b = ib_new();
+                compile_expr(elem_b, node->as.list.elems[i], scope);
+                ib_ret(elem_b);
+                ib_mk_thunk(b, ib_finish(elem_b));
+            }
             ib_mk_list(b, (int64_t)node->as.list.count);
             return;
         }
