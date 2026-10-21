@@ -23,6 +23,7 @@
 #include "hash_shim.h"
 #include "symtab.h"
 #include "tryeval.h"
+#include "value_util.h" /* asnix_coerce_to_string, M57e import __toString fallback */
 #include "value_util.h"
 
 static Value make_string(const char *s, size_t len) {
@@ -219,10 +220,22 @@ static Value prim_hashString(const Value *args, int64_t argc) {
  * absolute path") rather than silently resolving it against cwd --
  * there's no "current file" to resolve a bare string against here the
  * way a path *literal* resolves against its own file at compile time.
+ *
+ * M57e: before rejecting an argument that's neither a path nor a string,
+ * try the `__toString`/`outPath` coercion protocol (asnix_coerce_to_string,
+ * value_util.c) first -- real Nix's `import` goes through the same
+ * general `coerceToString` every other path/string consumer does
+ * (`eval.cc`), so `import { __toString = _: toString ./foo.nix; }` is
+ * valid (confirmed against real Nix, which tries `__toString` even
+ * before `outPath` -- same order asnix_coerce_to_string already uses for
+ * every other caller).
  */
 static Value prim_import(const Value *args, int64_t argc) {
     (void)argc;
     Value target = args[0];
+    if (!asnix_value_is_path(target) && asnix_tag_of(target) != ASNIX_TAG_PTR) {
+        target = asnix_coerce_to_string(target); /* fatal itself if this also fails */
+    }
     int64_t len;
     const char *bytes;
     if (asnix_value_is_path(target)) {

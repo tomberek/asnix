@@ -368,6 +368,37 @@ static void jb_escape_string(JsonBuf *out, const char *bytes, int64_t len) {
     jb_putc(out, '"');
 }
 
+/* M57d: real Nix's toJSON goes through nlohmann::json, which validates
+ * every string byte-for-byte and throws ("JSON serialization error: ...
+ * invalid UTF-8 byte at index N") rather than silently emitting whatever
+ * garbage bytes it was given -- confirmed: `builtins.toJSON "...\xff..."`
+ * (a single invalid 0xFF byte, eval-fail-toJSON-non-utf-8.nix's exact
+ * fixture) throws in real Nix. Structural check only (leading-byte class
+ * + the right count of 0x80-0xBF continuation bytes, truncation-safe) --
+ * doesn't additionally reject overlong encodings or out-of-range/
+ * surrogate codepoints the way nlohmann's stricter decoder does, but
+ * that's just extra strictness this project's test doesn't exercise; a
+ * genuinely malformed byte (a lone continuation byte, or 0xF8-0xFF, which
+ * are never valid UTF-8 leading bytes at all) is still always caught. */
+static int utf8_is_valid(const char *bytes, int64_t len) {
+    int64_t i = 0;
+    while (i < len) {
+        unsigned char c = (unsigned char)bytes[i];
+        int extra;
+        if (c < 0x80) extra = 0;
+        else if ((c & 0xE0) == 0xC0) extra = 1;
+        else if ((c & 0xF0) == 0xE0) extra = 2;
+        else if ((c & 0xF8) == 0xF0) extra = 3;
+        else return 0;
+        if (i + extra >= len) return 0;
+        for (int k = 1; k <= extra; k++) {
+            if (((unsigned char)bytes[i + k] & 0xC0) != 0x80) return 0;
+        }
+        i += extra + 1;
+    }
+    return 1;
+}
+
 static int json_name_cmp(const char *an, size_t al, const char *bn, size_t bl) {
     size_t n = al < bl ? al : bl;
     int c = n > 0 ? memcmp(an, bn, n) : 0;
@@ -427,6 +458,9 @@ static void json_encode(Value v, JsonBuf *out) {
         case ASNIX_TAG_PTR: {
             int64_t len;
             const char *bytes = asnix_ptr_bytes(v, &len); /* string or path, see header comment */
+            if (!utf8_is_valid(bytes, len)) {
+                asnix_bshared_fatal("toJSON", "string is not valid UTF-8");
+            }
             jb_escape_string(out, bytes, len);
             break;
         }

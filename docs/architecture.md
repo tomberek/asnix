@@ -3958,3 +3958,106 @@ for anything override/rec-attrset-related; none).
 comment in builtins_shared.h, which had gone stale after M57a added
 list ordering to it but before this M57c commit -- a documentation-
 only fix, no behavior change.)
+
+### M57d: `toJSON` rejects invalid UTF-8
+
+`builtins_compare.c`'s `json_encode`'s string case passed raw bytes
+straight through unescaped/unvalidated (its own header comment even
+documented this as deliberate for *valid* UTF-8: "this project has no
+Unicode awareness anywhere else either"). Real Nix's `toJSON` goes
+through `nlohmann::json`, which validates every string byte-for-byte
+and throws (confirmed: a single stray `0xFF` byte, `eval-fail-toJSON-
+non-utf-8.nix`'s exact fixture, throws "JSON serialization error: ...
+invalid UTF-8 byte at index 16: 0xFF"). Added a structural UTF-8
+validator (`utf8_is_valid`: leading-byte class + the right count of
+`0x80`-`0xBF` continuation bytes, truncation-safe) called on every
+string value `json_encode` emits, fatal on a hit -- deliberately not
+as strict as nlohmann's decoder (doesn't additionally reject overlong
+encodings or out-of-range/surrogate codepoints), but every genuinely
+malformed byte (a lone continuation byte, or `0xF8`-`0xFF`, never valid
+UTF-8 leading bytes at all) is still always caught, which is what the
+one real test here exercises.
+
+Verified: real fixture now exits non-zero; valid multi-byte UTF-8
+(`builtins.toJSON { s = "héllo"; }`) still round-trips byte-for-byte
+identically to real Nix's own output. One new e2e fixture
+(`m57d_tojson_unicode_ok.nix`, a regression check for the valid-UTF-8
+path -- no fixture for the fail case itself, same `test-e2e`-can't-
+check-exit-codes reason as M57b). `make test`/`test-e2e` green (205
+e2e, see M57e below too); `test-conformance` 642 passed (+1), 160
+failed (-1), 0 known, 62 skipped.
+
+### M57e: `import` tries `__toString` before rejecting
+
+Real Nix's `import` argument goes through the same general
+`coerceToString` every other path/string consumer does (`eval.cc`),
+trying `__toString` (then `outPath`) on an attrset before giving up --
+confirmed: `import { __toString = _: toString ./foo.nix; }` works in
+real Nix. asnix's `prim_import` (builtins.c) only ever accepted a Path
+or an absolute-path String, rejecting everything else outright. Fixed
+by falling back to the project's own existing `asnix_coerce_to_string`
+(value_util.c -- already implements the identical `__toString`-then-
+`outPath` protocol for `toString`/string interpolation/`toJSON`'s Path
+case) whenever the argument is neither already a path nor a string,
+before the absolute-path check runs; `asnix_coerce_to_string` always
+either returns a string/path or exits(1) itself on a genuinely
+incoercible value, so the old "argument must be a path or an absolute-
+path string" branch stays as an now-unreachable-but-harmless fallback.
+
+Verified against real Nix: `eval-okay-import-tostring.nix` (both the
+plain-`__toString` case and the `__toString`-before-`outPath`-priority
+case) now matches its `.exp` byte-for-byte. One new e2e fixture pair
+(`m57e_import_tostring.nix` + a helper target under the new
+`m57e_import_fixtures/` subdirectory -- NOT directly glob-matched by
+`test-e2e`'s `tests/e2e/*.nix`, same "helper file, not a standalone
+case" pattern M11's own `m11_import_fixtures/` already established).
+`make test`/`test-e2e` green (205 e2e); `test-conformance` 643 passed
+(+1 over M57d's 642), 159 failed (-1), 0 known, 62 skipped -- no other
+test's result moved across either of these two sub-items.
+
+### M57: items investigated and explicitly skipped
+
+- **Function/derivation equality quirks** (item 3 in the original
+  ask): confirmed real Nix's surprising `let f = x: x; in f == f` =>
+  `false` is genuine (`EvalState::eqValues`, eval.cc: functions are
+  unconditionally incomparable, `case nFunction: return false;`), BUT
+  also confirmed the reason `eval-okay-eq-slot-sort.nix` (M57a) still
+  passes without this fix is a SEPARATE, unrelated quirk: `eqValues`
+  short-circuits on C++ pointer identity (`if (&v1 == &v2) return
+  true;`, a documented-as-a-hack fast path) BEFORE the type switch,
+  and `ExprOpEq::eval` evaluates each side into a fresh *stack-local*
+  `Value v1; Value v2;`, so `f == f` never actually hits that fast
+  path (two different stack addresses) even though a shared heap
+  object (e.g. the same closure referenced from two different list
+  elements) does. Implementing real function-non-self-equality in
+  asnix would require replicating this exact "was this Value freshly
+  copied into a fresh temporary, or dereferenced from existing
+  storage" distinction, which has no clean analog in asnix's
+  architecture (variable references return the underlying heap Value
+  directly, never a fresh copy) -- skipped as genuinely more involved
+  than the task's own "skip if more involved than expected" allowance
+  anticipated, not from lack of trying to understand it. Derivation-
+  equality's `isDerivation`-style eager `type`-forcing during `==` was
+  not investigated in depth given the above; left for a future pass.
+
+- **`compareVersions`'s int-overflow-to-string quirk** (item 3's other
+  half) and **path normalization for `path + string`** (item 6) and
+  **symlink resolution** (item 7) and **CLI flag plumbing** (item 8):
+  not reached in this pass -- time went to the higher-priority items
+  above instead, per the task's own suggested ordering. None of these
+  were investigated beyond reading the task description, so there's no
+  "turned out to be harder than expected" verdict for them; they're
+  simply undone, left for a follow-up M58+.
+
+- **Context-attr-name throwing on a string-with-context dynamic
+  attribute name** (item 5's third sub-item): confirmed string-context
+  tracking does not exist in this codebase at all -- `value_util.c`'s
+  own `asnix_coerce_to_string` comment is explicit about it ("the
+  separate, larger 'string context' feature (dependency tracking
+  through string ops) this project deliberately doesn't implement"),
+  and a repo-wide grep for any context-tracking data structure turned
+  up nothing beyond that one acknowledging comment and unrelated
+  daemon-protocol/error-context mentions. Not fixable without that
+  missing infrastructure, which is well out of this grab-bag's scope --
+  skipped per the task's own explicit "skip if the infrastructure
+  doesn't exist" instruction.
