@@ -103,7 +103,7 @@ static void fixture_lambda_call(void) {
     IrProgram *body_prog = ib_finish(body);
 
     IrBuilder *b = ib_new();
-    ib_lambda(b, 2, body_prog);
+    ib_lambda(b, 2, body_prog, 0); /* formals: unused by this test */
     ib_let(b, 1);
     ib_var_ref(b, 0, 0); /* push f */
     ib_push_int(b, 3);

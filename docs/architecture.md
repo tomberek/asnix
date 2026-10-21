@@ -49,7 +49,8 @@ what's actually implemented and the scope decisions made along the way.
 | M34 — unforced list elements reaching 6 builtins as raw scalars | done (see below) |
 | M35 — `builtins.currentSystem`, `builtins.isPath` + `isString` path bug | done (see below) |
 | M36 — name the attribute in `.` selection's "attribute missing" error | done (see below) |
-| M37+ | not started |
+| M37 — `builtins.functionArgs` | done (see below) |
+| M38+ | not started |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
 
@@ -3453,3 +3454,65 @@ three times in a row (M33/M35's `currentSystem`/`isPath`/
 `make test`/`test-e2e` green (no new fixtures -- this is an error-
 message-only change, verified by hand against `nix-instantiate --eval`);
 `test-conformance` still 632 passed, no regressions.
+
+## M37 scope notes: `builtins.functionArgs`
+
+Found continuing to chase `d.nix` right after M36 (and the new named-
+attribute error message paid off immediately -- no gdb session needed
+this time): `builtins.functionArgs` was entirely missing. Confirmed via
+cppnix source (`~/nix/src/libexpr/primops.cc`: `.name =
+"__functionArgs"`) that it's builtins-only, not a bare global.
+
+`functionArgs f` returns `{name: hasDefault}` for a lambda-pattern
+(`{a, b ? d, ...}: ...`), or `{}` for every other function shape (a
+plain `a: body` lambda -- even nested/curried, since only the
+*outermost* lambda is inspected -- or a PrimOp). Verified against real
+`nix-instantiate --eval` across five cases before trusting it: a
+pattern with a default and `...` (`{a, b ? 1, ...}: a` ==
+`{ a = false; b = true; }`), a plain lambda (`{}`), a pattern with an
+`@`-alias (`{a}@args: a` == `{ a = false; }`), a curried plain lambda
+(`a: b: a` == `{}`), and a PrimOp (`builtins.add` == `{}`).
+
+The needed data (per-field name + has-default) isn't retrievable from
+`OP_CHECK_FORMALS`'s existing IR-pool layout in every case (specifically:
+when a pattern has `...`, that pool region only stores the *required*
+fields' syms, not the full field list, since the "unexpected argument"
+check it exists for is skipped entirely and the total list was never
+needed before now) -- rather than extend that pool format and risk the
+well-exercised `OP_CHECK_FORMALS` asm, built a separate, purpose-made
+mechanism: closures now carry a 5th field, `ASNIX_CLOSURE_OFF_FORMALS`
+(`ir.h`, `ASNIX_CLOSURE_SIZE` grew 32 -> 40 bytes), holding the
+*already-built* `functionArgs` result `Value` -- computed ONCE at
+compile time (`compiler.c`'s `AST_LAMBDA` case, which has every formal's
+name/default info on hand before freeing it) and carried through
+`ib_lambda`'s new `formals_raw` parameter into `OP_LAMBDA`
+(`op_lambda.S`, which now reloads it fresh from the closure's own pool
+after the `asnix_arena_alloc` call rather than trying to carry it in a
+register across that call -- `%rbx`/`%rbp`/`%r15` are already the only
+free callee-saved scratch registers this handler has, so a 4th would
+have required stack-pushing instead; recomputing the pool index from
+the just-restored `%rsi`/the untouched `%r13` was simpler). Every other
+Closure-construction site in the codebase (`builtins_shared.c`'s
+curried-native wrapper, `builtins_misc.c`'s copy of the same, and
+`builtins_attrs.c`'s `make_curried2` self-curry trick for `hasAttr`/
+`getAttr`/`removeAttrs`/`mapAttrs`) had to be updated too, since each
+builds a `Closure` object by hand (bypassing `OP_LAMBDA` entirely) --
+all three now explicitly write the shared empty-attrset `Value` into
+the new field (never a lambda-pattern, so always `{}`, matching real
+Nix's own `functionArgs builtins.add`). Left as zeroed/unset would have
+decoded as `Value{raw=0}` = a null `ASNIX_TAG_PTR` -- not merely wrong,
+but a genuine crash risk if `functionArgs` were ever called on one of
+these closures and then printed/used.
+
+`prim_functionArgs` itself (`builtins_misc.c`) is a direct field read
+for a `ASNIX_TAG_CLOSURE` value, or the empty-attrset constant for
+anything else (matching real Nix's permissive-on-non-functions
+behavior here, rather than erroring).
+
+`make test`/`test-e2e` green (189 e2e, two new `m37_functionArgs_*`
+fixtures) -- also had to update 8 pre-existing `ib_lambda(...)` call
+sites across `tests/c/`/`tests/ir/` (synthetic closures built directly
+via the IrBuilder API in test scaffolding) to pass the new required
+`formals_raw` argument, `0` in every case since none of those tests
+exercise `functionArgs`; `test-conformance` still 632 passed, no
+regressions.

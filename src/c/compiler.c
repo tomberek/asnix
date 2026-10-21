@@ -10,6 +10,7 @@
 #include "asnix/heap.h"
 #include "asnix/irbuild.h"
 #include "asnix/value.h"
+#include "builtins_shared.h"
 #include "symtab.h"
 #include "tryeval.h"
 #include "value_util.h"
@@ -388,7 +389,12 @@ static void compile_expr(IrBuilder *b, Ast *node, ScopeFrame *scope) {
                 compile_expr(body_b, node->as.lambda.body, &frame);
                 ib_ret(body_b);
                 IrProgram *body_prog = ib_finish(body_b);
-                ib_lambda(b, 1, body_prog);
+                /* Not a lambda-pattern -- `builtins.functionArgs` is `{}`
+                 * here, matching real Nix (confirmed: `functionArgs (a:
+                 * a)` == `{}`; a curried `a: b: a` is just two nested
+                 * non-pattern lambdas, so this applies at every level --
+                 * M37). */
+                ib_lambda(b, 1, body_prog, (int64_t)asnix_bshared_make_attrs(NULL, NULL, 0).raw);
                 return;
             }
 
@@ -513,7 +519,25 @@ static void compile_expr(IrBuilder *b, Ast *node, ScopeFrame *scope) {
             IrProgram *body_prog = ib_finish(body_b);
             free(field_names);
             free(field_name_lens);
-            ib_lambda(b, 1, body_prog);
+
+            /* `builtins.functionArgs` (M37): `{name: hasDefault}` for
+             * every declared field, built once here (straight from
+             * `node->as.lambda.formals`, still live) and stashed on the
+             * closure -- confirmed against real Nix: `functionArgs ({a,
+             * b ? 1, ...}: a)` == `{ a = false; b = true; }` (the `...`
+             * ellipsis itself doesn't add an entry or change any field's
+             * reported default-ness). */
+            uint32_t *fa_syms = malloc((nf ? nf : 1) * sizeof(uint32_t));
+            Value *fa_vals = malloc((nf ? nf : 1) * sizeof(Value));
+            for (size_t i = 0; i < nf; i++) {
+                fa_syms[i] = asnix_intern(node->as.lambda.formals[i].name, node->as.lambda.formals[i].name_len);
+                fa_vals[i] = node->as.lambda.formals[i].default_ ? ASNIX_TRUE : ASNIX_FALSE;
+            }
+            Value function_args = asnix_bshared_make_attrs(fa_syms, fa_vals, (int64_t)nf);
+            free(fa_syms);
+            free(fa_vals);
+
+            ib_lambda(b, 1, body_prog, (int64_t)function_args.raw);
             return;
         }
         case AST_HAS_ATTR: {

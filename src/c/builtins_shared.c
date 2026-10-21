@@ -38,6 +38,10 @@ Value asnix_bshared_make_primop_noforce(void *fn, int64_t arity) {
  * lambdas). */
 Value asnix_bshared_make_curried_native(void *native_fn, int64_t arity) {
     Value native_primop = asnix_bshared_make_primop(native_fn, arity);
+    /* Never a lambda-pattern -- `builtins.functionArgs` on any of these
+     * closures is `{}`, same as real Nix's `functionArgs builtins.add`
+     * (M37). */
+    Value empty_formals = asnix_bshared_make_attrs(NULL, NULL, 0);
 
     IrBuilder *b = ib_new();
     ib_push_const(b, (int64_t)native_primop.raw);
@@ -48,7 +52,7 @@ Value asnix_bshared_make_curried_native(void *native_fn, int64_t arity) {
 
     for (int64_t i = arity - 1; i >= 1; i--) {
         IrBuilder *wrap_b = ib_new();
-        ib_lambda(wrap_b, 1, prog);
+        ib_lambda(wrap_b, 1, prog, (int64_t)empty_formals.raw);
         ib_ret(wrap_b);
         prog = ib_finish(wrap_b);
     }
@@ -58,6 +62,7 @@ Value asnix_bshared_make_curried_native(void *native_fn, int64_t arity) {
     *(void **)((char *)mem + ASNIX_CLOSURE_OFF_BODY) = prog->ops;
     *(int64_t *)((char *)mem + ASNIX_CLOSURE_OFF_ARITY) = 1;
     *(void **)((char *)mem + ASNIX_CLOSURE_OFF_POOL) = prog->pool;
+    *(uint64_t *)((char *)mem + ASNIX_CLOSURE_OFF_FORMALS) = empty_formals.raw;
     return (Value){ .raw = (uint64_t)(uintptr_t)mem | ASNIX_TAG_CLOSURE };
 }
 

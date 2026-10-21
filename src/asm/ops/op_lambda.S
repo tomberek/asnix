@@ -30,6 +30,21 @@ asnix_op_lambda:                        // a = arity, b = pool index of {body Ir
     movq %rdi, ASNIX_CLOSURE_OFF_UP(%rax)
     popq %rsi                           // restore IP
 
+    // M37: the pre-built `builtins.functionArgs` Value lives in this
+    // closure's OWN pool (pool_idx+2, see ib_lambda/irbuild.c) -- reload
+    // it fresh here rather than trying to carry it in a register across
+    // the `call` above: %rcx (pool index) and %rdx are caller-saved
+    // (not guaranteed to survive asnix_arena_alloc), while every
+    // register that genuinely needs to survive the call (arity/body/
+    // pool/IP/ENV) already has a callee-saved home or an explicit
+    // push/pop above -- recomputing from %rsi (just restored) and %r13
+    // (POOL, callee-saved, untouched by the call) is simpler and avoids
+    // needing a 4th callee-saved scratch register (%rbx/%rbp/%r15 are
+    // already spoken for) or extra stack padding.
+    movq ASNIX_IROP_OFF_B(%rsi), %rcx
+    movq 16(%r13, %rcx, 8), %rdx
+    movq %rdx, ASNIX_CLOSURE_OFF_FORMALS(%rax)
+
     movq %rax, %rdx
     orq $ASNIX_TAG_CLOSURE, %rdx
     ASNIX_CHECK_VALSTACK %rcx           // %rcx dead (held the pool index, unused since)

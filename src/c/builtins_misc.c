@@ -9,6 +9,7 @@
 #include "asnix/heap.h"
 #include "asnix/ir.h"
 #include "asnix/irbuild.h"
+#include "builtins_shared.h"
 #include "value_util.h"
 
 /* ---------------------------------------------------------------------
@@ -89,6 +90,10 @@ static void as_string(Value v, const char **bytes_out, int64_t *len_out, const c
  */
 static Value make_curried_native(void *native_fn, int64_t arity) {
     Value native_primop = make_primop_value(native_fn, arity);
+    /* Never a lambda-pattern -- `builtins.functionArgs` on any of these
+     * closures is `{}`, same as real Nix's `functionArgs builtins.add`
+     * (M37). */
+    Value empty_formals = asnix_bshared_make_attrs(NULL, NULL, 0);
 
     /* Innermost program: runs once the *last* curried argument has been
      * supplied, in the Env chain built up by `arity` nested single-slot
@@ -109,7 +114,7 @@ static Value make_curried_native(void *native_fn, int64_t arity) {
      * in a real curried `a: b: c: ...` user lambda. */
     for (int64_t i = arity - 1; i >= 1; i--) {
         IrBuilder *wrap_b = ib_new();
-        ib_lambda(wrap_b, 1, prog);
+        ib_lambda(wrap_b, 1, prog, (int64_t)empty_formals.raw);
         ib_ret(wrap_b);
         prog = ib_finish(wrap_b);
     }
@@ -121,6 +126,7 @@ static Value make_curried_native(void *native_fn, int64_t arity) {
     *(void **)((char *)mem + ASNIX_CLOSURE_OFF_BODY) = prog->ops;
     *(int64_t *)((char *)mem + ASNIX_CLOSURE_OFF_ARITY) = 1;
     *(void **)((char *)mem + ASNIX_CLOSURE_OFF_POOL) = prog->pool;
+    *(uint64_t *)((char *)mem + ASNIX_CLOSURE_OFF_FORMALS) = empty_formals.raw;
     return (Value){ .raw = (uint64_t)(uintptr_t)mem | ASNIX_TAG_CLOSURE };
 }
 
@@ -274,6 +280,22 @@ static Value prim_isFunction(const Value *args, int64_t argc) {
     int tag = asnix_tag_of(args[0]);
     return asnix_make_imm(tag == ASNIX_TAG_CLOSURE || tag == ASNIX_TAG_PRIMOP ? ASNIX_IMM_TRUE : ASNIX_IMM_FALSE);
 }
+
+/* `builtins.functionArgs` (M37, `__functionArgs` in real Nix -- builtins-
+ * only, confirmed in ~/nix/src/libexpr/primops.cc): every Closure already
+ * carries its pre-built result as ASNIX_CLOSURE_OFF_FORMALS (set once at
+ * compile time, compiler.c's AST_LAMBDA case -- see ir.h's comment on
+ * that field for why it's precomputed rather than derived here). A
+ * PrimOp (or anything else -- real Nix's own version just requires a
+ * function argument, but asnix hasn't implemented argument-type
+ * checking that strictly here) has no such field at all; matching real
+ * Nix's `functionArgs builtins.add` == `{}`. */
+static Value prim_functionArgs(const Value *args, int64_t argc) {
+    (void)argc;
+    if (asnix_tag_of(args[0]) != ASNIX_TAG_CLOSURE) return asnix_bshared_make_attrs(NULL, NULL, 0);
+    const char *base = (const char *)(args[0].raw & ~0x7ULL);
+    return *(const Value *)(base + ASNIX_CLOSURE_OFF_FORMALS);
+}
 static Value prim_isInt(const Value *args, int64_t argc) {
     (void)argc;
     return asnix_make_imm(asnix_tag_of(args[0]) == ASNIX_TAG_INT ? ASNIX_IMM_TRUE : ASNIX_IMM_FALSE);
@@ -366,6 +388,7 @@ static Value build_isNull(void) { return make_primop_value((void *)prim_isNull, 
 Value asnix_make_isNull_primop(void) { return make_primop_value((void *)prim_isNull, 1); }
 static Value build_isString(void) { return make_primop_value((void *)prim_isString, 1); }
 static Value build_isPath(void) { return make_primop_value((void *)prim_isPath, 1); }
+static Value build_functionArgs(void) { return make_primop_value((void *)prim_functionArgs, 1); }
 static Value build_isList(void) { return make_primop_value((void *)prim_isList, 1); }
 static Value build_isAttrs(void) { return make_primop_value((void *)prim_isAttrs, 1); }
 static Value build_isFunction(void) { return make_primop_value((void *)prim_isFunction, 1); }
@@ -402,6 +425,7 @@ const AsnixBuiltinMiscDef ASNIX_BUILTINS_MISC[] = {
     { "isNull", build_isNull },
     { "isString", build_isString },
     { "isPath", build_isPath },
+    { "functionArgs", build_functionArgs },
     { "isList", build_isList },
     { "isAttrs", build_isAttrs },
     { "isFunction", build_isFunction },

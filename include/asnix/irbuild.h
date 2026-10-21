@@ -34,8 +34,13 @@ size_t ib_let(IrBuilder *b, int64_t nslots);
 /* body_prog must come from this same translation's ib_finish() -- its
  * `pool` travels with the resulting closure (see ASNIX_CLOSURE_OFF_POOL in
  * ir.h) so a lambda body containing its own nested OP_LAMBDA resolves
- * against the right constant pool at call time, not the caller's. */
-size_t ib_lambda(IrBuilder *b, int64_t arity, IrProgram *body_prog);
+ * against the right constant pool at call time, not the caller's.
+ * `formals_raw`: this closure's pre-built `builtins.functionArgs` result
+ * Value.raw (M37) -- the caller must build it (a real `{name:
+ * hasDefault}` attrset for a lambda-pattern, or any empty-attrset Value
+ * otherwise) and pass it through here; see ASNIX_CLOSURE_OFF_FORMALS,
+ * ir.h. */
+size_t ib_lambda(IrBuilder *b, int64_t arity, IrProgram *body_prog, int64_t formals_raw);
 size_t ib_call(IrBuilder *b, int64_t argc);
 size_t ib_ret(IrBuilder *b);
 size_t ib_halt(IrBuilder *b);

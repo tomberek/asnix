@@ -154,6 +154,9 @@ static Value make_curried2(Value captured, IrProgram *inner_prog) {
     *(void **)((char *)mem + ASNIX_CLOSURE_OFF_BODY) = inner_prog->ops;
     *(int64_t *)((char *)mem + ASNIX_CLOSURE_OFF_ARITY) = 1;
     *(void **)((char *)mem + ASNIX_CLOSURE_OFF_POOL) = inner_prog->pool;
+    /* Never a lambda-pattern -- `builtins.functionArgs` on any of these
+     * closures is `{}`, same as real Nix (M37). */
+    *(uint64_t *)((char *)mem + ASNIX_CLOSURE_OFF_FORMALS) = asnix_bshared_make_attrs(NULL, NULL, 0).raw;
     return (Value){ .raw = (uint64_t)(uintptr_t)mem | ASNIX_TAG_CLOSURE };
 }
 

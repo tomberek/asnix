@@ -33,7 +33,18 @@
 #define ASNIX_CLOSURE_OFF_BODY  8
 #define ASNIX_CLOSURE_OFF_ARITY 16
 #define ASNIX_CLOSURE_OFF_POOL  24
-#define ASNIX_CLOSURE_SIZE      32
+/* `builtins.functionArgs`'s pre-built result Value for this closure (M37)
+ * -- a plain attrset {name: hasDefault} for a lambda-pattern (`{a, b ?
+ * d, ...}: ...`), or the shared empty-attrset Value for every other
+ * lambda shape (matching real Nix: `builtins.functionArgs (a: a)` ==
+ * `{}`). Built ONCE at compile time (compiler.c's AST_LAMBDA case, which
+ * already has every formal's name/has-default info on hand before
+ * freeing it) and stashed in the closure's own pool, same mechanism
+ * OP_PUSH_CONST uses for any other constant Value -- not computed at
+ * OP_LAMBDA-execution time, since it never varies per-call the way the
+ * `up`/`pool` fields (capturing the *current* call's environment) do. */
+#define ASNIX_CLOSURE_OFF_FORMALS 32
+#define ASNIX_CLOSURE_SIZE      40
 
 /* Call-frame record on the explicit RETSP stack (kept off the native
  * machine stack, so the jmp-chain dispatch loop never grows it): where to

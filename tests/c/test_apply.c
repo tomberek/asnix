@@ -49,7 +49,7 @@ static Value make_add_one_closure(void) {
     IrProgram *body_prog = ib_finish(body);
 
     IrBuilder *b = ib_new();
-    ib_lambda(b, 1, body_prog);
+    ib_lambda(b, 1, body_prog, 0); /* formals: unused by this test */
     ib_halt(b);
     IrProgram *prog = ib_finish(b);
     return asnix_eval(prog, root_env());
@@ -67,7 +67,7 @@ static Value make_sub_closure(void) {
     IrProgram *body_prog = ib_finish(body);
 
     IrBuilder *b = ib_new();
-    ib_lambda(b, 2, body_prog);
+    ib_lambda(b, 2, body_prog, 0); /* formals: unused by this test */
     ib_halt(b);
     IrProgram *prog = ib_finish(b);
     return asnix_eval(prog, root_env());
@@ -150,7 +150,7 @@ static void fixture_apply_nested(void) {
     IrProgram *body_prog = ib_finish(body);
 
     IrBuilder *b = ib_new();
-    ib_lambda(b, 1, body_prog);
+    ib_lambda(b, 1, body_prog, 0); /* formals: unused by this test */
     ib_halt(b);
     IrProgram *prog = ib_finish(b);
     Value identity = asnix_eval(prog, root_env());

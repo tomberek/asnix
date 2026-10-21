@@ -70,9 +70,10 @@ static size_t ib_pool_add(IrBuilder *b, int64_t v) {
     return b->pool_len++;
 }
 
-size_t ib_lambda(IrBuilder *b, int64_t arity, IrProgram *body_prog) {
+size_t ib_lambda(IrBuilder *b, int64_t arity, IrProgram *body_prog, int64_t formals_raw) {
     size_t pool_idx = ib_pool_add(b, (int64_t)(intptr_t)body_prog->ops);
     ib_pool_add(b, (int64_t)(intptr_t)body_prog->pool); /* always pool_idx+1, see op_lambda.S */
+    ib_pool_add(b, formals_raw); /* always pool_idx+2, see op_lambda.S */
     return ib_emit(b, OP_LAMBDA, arity, (int64_t)pool_idx);
 }
 

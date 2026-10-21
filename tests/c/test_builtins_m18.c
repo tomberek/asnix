@@ -131,12 +131,12 @@ static Value make_sub_op(void) {
     IrProgram *inner_prog = ib_finish(inner);
 
     IrBuilder *outer = ib_new();
-    ib_lambda(outer, 1, inner_prog);
+    ib_lambda(outer, 1, inner_prog, 0); /* formals: unused by this test */
     ib_ret(outer);
     IrProgram *outer_prog = ib_finish(outer);
 
     IrBuilder *top = ib_new();
-    ib_lambda(top, 1, outer_prog);
+    ib_lambda(top, 1, outer_prog, 0); /* formals: unused by this test */
     ib_halt(top);
     return asnix_eval(ib_finish(top), root_env());
 }
