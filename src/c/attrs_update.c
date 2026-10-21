@@ -60,6 +60,17 @@ Value asnix_attrs_update(Value lhs, Value rhs) {
 }
 
 Value asnix_attrs_insert_dynamic(Value attrs, Value name_val, Value value) {
+    /* `${null} = value;` is silently omitted, not an error -- a real,
+     * deliberate nixpkgs idiom for a conditionally-present key
+     * (`${if cond then "key" else null} = value;`), confirmed against
+     * both real `nix-instantiate --eval` (`{ ${null} = 1; }` == `{}`,
+     * while `{ ${1} = 1; }` IS a hard error) and cppnix's own source
+     * (`~/nix/src/libexpr/eval.cc`'s attrset-construction loop: `if
+     * (nameVal.type() == nNull) continue;`, checked *before* the
+     * string-force/type-check below). Found via d.nix. */
+    if (asnix_tag_of(name_val) == ASNIX_TAG_IMM && asnix_imm_subtag(name_val) == ASNIX_IMM_NULL) {
+        return attrs;
+    }
     if (asnix_tag_of(name_val) != ASNIX_TAG_PTR || asnix_value_is_path(name_val)) {
         fprintf(stderr, "asnix: a dynamic '${...}' attribute name must be a string\n");
         exit(1);

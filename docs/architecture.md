@@ -52,7 +52,8 @@ what's actually implemented and the scope decisions made along the way.
 | M37 — `builtins.functionArgs` | done (see below) |
 | M38 — `asnix_apply`'s PrimOp path never forced args/return (core evaluator fix) | done (see below) |
 | M39 — `builtins.addErrorContext` | done (see below) |
-| M40+ | not started |
+| M40 — `${null} = value;` silently omitted, not an error | done (see below) |
+| M41+ | not started |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
 
@@ -3598,3 +3599,33 @@ forces that call to run at all) -- exactly matching real Nix's timing.
 `make test`/`test-e2e` green (192 e2e, one new `m39_*` fixture covering
 both the success and the lazy-unused cases); `test-conformance` still
 632 passed, no regressions.
+
+## M40 scope notes: `${null} = value;` silently omitted, not an error
+
+Found continuing to chase `d.nix` right after M39: a dynamic attrset-
+literal key evaluating to `null` fatal'd with "a dynamic '${...}'
+attribute name must be a string" (via gdb: the actual `name_val` tag
+was `ASNIX_TAG_IMM`/`ASNIX_IMM_NULL`). Root-caused via cppnix's own
+source: `~/nix/src/libexpr/eval.cc`'s dynamic-attrs construction loop
+checks `if (nameVal.type() == nNull) continue;` *before* the
+string-force/type-check -- a deliberate special case, not an oversight,
+matching a real nixpkgs idiom for a conditionally-present key
+(`${if cond then "key" else null} = value;`). Confirmed directly:
+`{ ${null} = 1; }` == `{}` (silently empty) while `{ ${1} = 1; }` is
+still a hard error ("while evaluating the name of a dynamic
+attribute") -- so this is narrowly about `null` specifically, not a
+general "anything goes" relaxation.
+
+Also checked whether the *other* dynamic-attribute-name call sites
+(`x ? ${expr}` from M33, `.${expr}` select) share this special case --
+confirmed they do NOT: `{ a = 1; } ? ${null}` is a hard error in real
+Nix too ("while evaluating an attribute name"), matching cppnix's
+separate `getNameValue` helper for `string_attr`/attrpath contexts,
+which has no null check at all. So the fix is scoped to exactly one
+function, `asnix_attrs_insert_dynamic` (`attrs_update.c`, M28's dynamic-
+attrset-literal-key machinery): returns `attrs` unchanged (skipping
+insertion entirely, same as cppnix's `continue`) when `name_val` is
+`null`, before the existing type/duplicate checks.
+
+`make test`/`test-e2e` green (193 e2e, one new `m40_*` fixture);
+`test-conformance` 633 passed (up from 632, no regressions).
