@@ -36,7 +36,7 @@ TEST_C_BINS   := $(TEST_C_SRCS:.c=)
 E2E_NIX         := $(wildcard tests/e2e/*.nix)
 CONFORMANCE_NIX := $(wildcard tests/conformance/*.nix)
 
-.PHONY: all release test test-e2e test-conformance clean watch
+.PHONY: all release test test-e2e test-conformance test-nix-conformance clean watch
 all: asnix
 
 release: OPT := -O2
@@ -107,6 +107,62 @@ test-conformance: asnix
 		if [ "$$got" = "$$want" ]; then echo "== $$f == OK"; \
 		else echo "== $$f == FAIL (got '$$got', want '$$want')"; exit 1; fi; \
 	done
+
+# Tier-4: sweeps the FULL numtide/nix-conformance corpus (`lang/eval-okay-
+# *.nix`/`eval-fail-*.nix`, ~800 files), not just the handful of cases
+# mined into tests/conformance/ above. This is an external, un-checked-in
+# dependency -- clone https://github.com/numtide/nix-conformance to
+# NIX_CONFORMANCE_DIR first (default /tmp/nix-conformance), or pass
+# NIX_CONFORMANCE_DIR=/path/to/it on the command line. Does NOT `exit 1`
+# on failure (unlike test-e2e/test-conformance above) -- this corpus has
+# known, documented gaps (see docs/architecture.md's M5x scope-notes
+# sections), so a nonzero fail count is the expected steady state, not a
+# build-breaking regression; this target's job is to report the count and
+# the failing-file list, not to gate the build.
+#
+# A `.flags` sidecar marks a case needing CLI flags/features this target
+# doesn't attempt to pass (counted as skipped, not failed). `eval-okay-*`
+# cases compare stdout against the `.exp` sidecar exactly, same as
+# test-e2e/test-conformance. `eval-fail-*` cases only check for a nonzero
+# exit (not the exact error text, matching this project's standing
+# convention of matching an error's *class*, not its wording) -- a crash
+# (signal, e.g. a segfault) also counts as "pass" here, same coincidental-
+# pass caveat already documented for a few mined fixtures in
+# tests/conformance/, not a true clean-error pass.
+NIX_CONFORMANCE_DIR ?= /tmp/nix-conformance
+test-nix-conformance: asnix
+	@dir="$(NIX_CONFORMANCE_DIR)/lang"; \
+	bin="$(CURDIR)/asnix"; \
+	if [ ! -d "$$dir" ]; then \
+		echo "test-nix-conformance: '$$dir' not found -- clone" \
+		     "https://github.com/numtide/nix-conformance to $(NIX_CONFORMANCE_DIR)" \
+		     "(or pass NIX_CONFORMANCE_DIR=/path/to/it) first" >&2; \
+		exit 1; \
+	fi; \
+	pass=0; fail=0; skip=0; failed=""; \
+	cd "$$dir" && \
+	for f in eval-okay-*.nix; do \
+		base="$${f%.nix}"; \
+		if [ -f "$$base.flags" ]; then skip=$$((skip+1)); continue; fi; \
+		exp="$$base.exp"; \
+		if [ ! -f "$$exp" ]; then skip=$$((skip+1)); continue; fi; \
+		got=$$(timeout 10 "$$bin" "$$f" 2>/dev/null); \
+		want=$$(cat "$$exp"); \
+		if [ "$$got" = "$$want" ]; then pass=$$((pass+1)); \
+		else fail=$$((fail+1)); failed="$$failed $$f"; fi; \
+	done; \
+	for f in eval-fail-*.nix; do \
+		base="$${f%.nix}"; \
+		if [ -f "$$base.flags" ]; then skip=$$((skip+1)); continue; fi; \
+		timeout 10 "$$bin" "$$f" >/dev/null 2>/dev/null; rc=$$?; \
+		if [ "$$rc" -ne 0 ] && [ "$$rc" -ne 124 ]; then pass=$$((pass+1)); \
+		else fail=$$((fail+1)); failed="$$failed $$f"; fi; \
+	done; \
+	echo "pass=$$pass fail=$$fail skip=$$skip"; \
+	if [ -n "$$failed" ]; then \
+		echo "failed:"; \
+		for f in $$failed; do echo "  $$f"; done; \
+	fi
 
 watch:
 	command -v entr >/dev/null || { echo "entr not found -- enter the flake devShell"; exit 1; }
