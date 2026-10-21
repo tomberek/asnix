@@ -74,7 +74,8 @@ what's actually implemented and the scope decisions made along the way.
 | M59 — `builtins.unsafeGetAttrPos`: a deliberately narrow, approximate implementation (no Attr-record growth, no lexer changes) | done, **scoped** (see below) |
 | M60 — `builtins.unsafeDiscardStringContext` (no-op, matching M54's getContext/appendContext scope cut) | done (see below) |
 | M61 — real string-context tracking (`getContext`/`appendContext`/derivation-input propagation) | investigated, **no fix** (see below) |
-| M62+ | not started |
+| M62 — `derivationStrict` generalized to real multi-output derivations (`outputs = [ "out" "bin" ... ]`), one distinct store path per declared output | done, **scoped** (see below) |
+| M63+ | not started |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
 
@@ -6139,3 +6140,116 @@ name.nix` and `eval-fail-drv-tofile-output-reference.nix` remain
 exactly the documented, accepted gaps M57/M45 already called out.
 `make test`/`test-e2e`/`test-nix-conformance` all unchanged (no code
 touched).
+## M62 scope notes: `derivationStrict` generalized to real multi-output derivations
+
+Found continuing to chase `d.nix` right after M60: the next blocker was
+"attribute 'bin' missing, aborting". Root-caused directly with gdb
+(breaking on `asnix_bshared_select_dynamic`'s fatal path, dumping the
+target attrset's keys): some package deep in nixpkgs' dependency graph
+declares `outputs = [ "out" "bin" ... ]` (an ordinary multi-output
+derivation -- most compilers/libraries split `out`/`bin`/`dev`/`lib`/
+`man`). The failing lookup was `strict.${outputName}` inside M58's
+`derivation.nix` wrapper, with `outputName = "bin"`, and `strict` (the
+result of `asnix_prim_derivation`) ALWAYS had exactly 4 keys
+(`outPath`, `drvPath`, `type`, `out`) regardless of the caller's
+`outputs` -- confirmed `asnix_prim_derivation` never even read the
+`outputs` attribute at all, it hardcoded a single output named `"out"`.
+
+Verified real Nix's actual behavior first, directly (not just from
+reading `primops.cc`/`derivations.cc`):
+`nix-instantiate --eval --strict` on `derivation { ...; outputs =
+["out" "bin"]; }` confirms `d.bin.outPath` is a genuinely different
+store path from `d.outPath`/`d.out.outPath`, and that
+`derivationStrict`'s own result (not the `derivation` wrapper's) is
+just `{ drvPath; <outputName> = <that output's outPath string>; ... }`
+-- a plain string per output, no nested attrset, no separate
+`outPath`/`type`/`out` keys (confirmed via
+`~/nix/src/libexpr/primops.cc`'s `mkOutputString`). Also confirmed the
+output-path `name` component rule directly: output `"out"` uses the
+derivation's own `name` verbatim, every other output uses
+`name + "-" + outputName` (`outputPathName` in
+`~/nix/src/libstore/derivations.cc`) -- e.g. `x` and `x-bin` for the
+two outputs above.
+
+**Algorithm, read directly from real Nix's
+`derivationStrictInternal`/`processDerivationOutputPaths`
+(`primops.cc`/`derivations.cc`) before implementing**: the existing
+masked/real two-pass hashing scheme generalizes with exactly ONE
+masked hash shared across every declared output (not one per output):
+pass 1 blanks every output's own env var to `""` AND lists every
+output in the ATerm's `Outputs` section as `(name,"","","")`, hashes
+that once; pass 2 computes each output's own distinct store path as
+`makeStorePath("output:"+outputName, maskedHash,
+outputPathName(drvName, outputName))` -- same masked digest, only the
+preimage `type` string and store-path `name` component vary per
+output -- fills every output's env var in with its own real path, and
+re-hashes the now-fully-filled-in ATerm once for the `.drv` itself
+(unchanged from M8: `type = "text"`, name `<drvName>.drv"`).
+
+**Implementation**: `derivation.c`'s `asnix_prim_derivation` now parses
+an optional `outputs` attribute (list of strings, default `["out"]` --
+same default `ASNIX_DERIVATION_NIX_SOURCE`'s own `outputs ? [ "out" ]`
+already assumed) into a small fixed-size array
+(`ASNIX_DRV_MAX_OUTPUTS`, 16, same "small bounded array, fatal if
+exceeded" convention as `ASNIX_DRV_MAX_ARGS`/`ASNIX_DRV_MAX_ENV`) --
+rejecting duplicates and the reserved name `"drvPath"`, matching real
+Nix's own `handleOutputs`. Unlike `args`, parsing `outputs` does NOT
+skip the generic env-var path: real Nix's own multi-output `.drv`
+files genuinely have an `outputs = "out bin"` space-joined env var too
+(the existing list-to-string coercion from M47 already produces this
+for free), consumed separately by build-time setup hooks. The masked/
+real two-pass hashing loop generalized directly per the algorithm
+above (new `output_path_name` and `atermoutput_cmp` helpers); the
+result attrset now has `1 + noutputs` keys (`drvPath` plus one string
+per output) instead of the old hardcoded 4, matching real Nix's
+`derivationStrict` shape exactly (the old `outPath`/`type`/`out` keys
+were dropped -- re-confirmed by re-reading `ASNIX_DERIVATION_NIX_SOURCE`
+that the wrapper only ever reads `strict.drvPath` and
+`strict.${outputName}`, never `strict.outPath`/`strict.type`).
+Fixed-output derivations (`outputHash` given) remain restricted to a
+single `"out"` output, explicitly rejected otherwise, matching real
+Nix's own restriction there -- multi-output fixed-output/content-
+addressed derivations are out of scope (same pre-existing scope cut
+`validate_output_hash_fields`'s header comment already documents).
+
+`aterm.c`'s `asnix_build_derivation_aterm` previously hardcoded a
+single `"out"` entry in the ATerm's `Outputs` section; generalized to
+take a caller-supplied, pre-sorted `AtermOutput{name,path}` array of
+arbitrary length (new type in `aterm.h`), writing one `(name,path,"",
+"")` tuple per entry -- the other two call sites (`tests/c/
+test_aterm.c`, `tools/realize_demo.c`) updated to the new signature
+(both single-output; a new `test_multi_output` case added to
+`test_aterm.c` covering the 2-output case, verified shape against real
+Nix's `~/nix/src/libstore/derivation/aterm.cc` unparse logic directly).
+
+Verified directly against real Nix (`nix-instantiate --eval --strict`
+on the exact repro above): `d.bin.outPath` and `d.outPath` are
+different store paths, `d.out.outPath == d.outPath` still holds (M58's
+self-reference property, specifically for the `"out"` output), both
+captured byte-for-byte in two new `tests/e2e/m61_derivation_multi_
+output*.nix` fixtures (one boolean-property check, one exact-store-
+path check against the real paths `nix-instantiate` computed for `x`/
+`x-bin`).
+
+`./asnix d.nix`: confirmed the exact "attribute 'bin' missing,
+aborting" blocker is gone (baseline reproduced first: dies in ~1.3s
+with that message; after this fix, runs ~1.7s longer before hitting a
+new, unrelated segfault deep in `foldl'`/`elemAt` -- a later blocker in
+this same standing chase, not chased further here per this task's
+explicit scope).
+
+`make test`/`test-e2e` both green, zero regressions (two new `m61_*`
+e2e fixtures, one new `test_aterm` case). `make test-nix-conformance`
+(full numtide/nix-conformance `/tmp/nix-conformance/lang` sweep):
+557 passed/101 failed/148 skipped before this fix, 562/96/148 after --
++5 net, zero regressions. The five newly-passing cases: `eval-okay-drv-
+outputs.nix`, `eval-okay-drv-output-named-drv.nix`, `eval-okay-drv-
+placeholder.nix`, `eval-fail-drv-outputs-duplicate.nix`, `eval-fail-
+drv-fixed-two-outputs.nix`. Explicitly out of scope, still failing,
+and needing other infrastructure this task doesn't cover:
+`eval-okay-drv-masking.nix` (derivation-to-derivation input masking --
+needs real string-context tracking, a `hashDerivationModulo` over
+actual input derivations, not just blanked outputs of the SAME
+derivation) and `eval-okay-derivation-legacy.nix`/`eval-okay-drv-
+structured-attrs.nix` (`__structuredAttrs`, a wholly separate JSON-
+based attribute-passing mode this project has no support for at all).

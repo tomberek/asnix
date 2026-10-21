@@ -74,7 +74,8 @@ int main(void) {
     AtermEnvVar env[1] = { { "out", "" } };
 
     /* Pass 1: masked (out="") -- computes the output path. */
-    char *masked = asnix_build_derivation_aterm("", system, builder, args, 2, env, 1);
+    AtermOutput outs[1] = { { "out", "" } };
+    char *masked = asnix_build_derivation_aterm(outs, 1, system, builder, args, 2, env, 1);
     uint8_t masked_digest[32];
     sha256_or_die(masked, strlen(masked), masked_digest);
     free(masked);
@@ -82,10 +83,11 @@ int main(void) {
     char out_path[300];
     compute_store_path("output:out", masked_digest, name, out_path, sizeof(out_path));
     env[0].value = out_path;
+    outs[0].path = out_path;
 
     /* Pass 2: real ATerm text with the output path substituted in --
      * this is the actual .drv content to add to the store. */
-    char *real_aterm = asnix_build_derivation_aterm(out_path, system, builder, args, 2, env, 1);
+    char *real_aterm = asnix_build_derivation_aterm(outs, 1, system, builder, args, 2, env, 1);
     uint8_t real_digest[32];
     sha256_or_die(real_aterm, strlen(real_aterm), real_digest);
 

@@ -45,13 +45,21 @@ static void buf_put_escaped(Buf *b, const char *s) {
     buf_putc(b, '"');
 }
 
-char *asnix_build_derivation_aterm(const char *out_path, const char *system, const char *builder, const char **args,
-                                    size_t nargs, const AtermEnvVar *env, size_t nenv) {
+char *asnix_build_derivation_aterm(const AtermOutput *outputs, size_t noutputs, const char *system,
+                                    const char *builder, const char **args, size_t nargs, const AtermEnvVar *env,
+                                    size_t nenv) {
     Buf b = { 0 };
 
-    buf_puts(&b, "Derive([(\"out\",");
-    buf_put_escaped(&b, out_path);
-    buf_puts(&b, ",\"\",\"\")],[],[],");
+    buf_puts(&b, "Derive([");
+    for (size_t i = 0; i < noutputs; i++) {
+        if (i > 0) buf_putc(&b, ',');
+        buf_putc(&b, '(');
+        buf_put_escaped(&b, outputs[i].name);
+        buf_putc(&b, ',');
+        buf_put_escaped(&b, outputs[i].path);
+        buf_puts(&b, ",\"\",\"\")");
+    }
+    buf_puts(&b, "],[],[],");
     buf_put_escaped(&b, system);
     buf_putc(&b, ',');
     buf_put_escaped(&b, builder);

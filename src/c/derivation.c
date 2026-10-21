@@ -17,8 +17,13 @@
 #include "symtab.h"
 #include "value_util.h"
 
-#define ASNIX_DRV_MAX_ARGS 64
-#define ASNIX_DRV_MAX_ENV  64
+#define ASNIX_DRV_MAX_ARGS    64
+#define ASNIX_DRV_MAX_ENV     64
+/* Real nixpkgs derivations rarely declare more than ~6 outputs
+ * (out/bin/dev/lib/man/doc/debug being the usual full set); 16 is a
+ * generous cap matching this file's existing "small bounded arrays,
+ * fatal if exceeded" convention (see ASNIX_DRV_MAX_ARGS/ENV above). */
+#define ASNIX_DRV_MAX_OUTPUTS 16
 
 static void sha256_or_die(const char *s, size_t len, uint8_t out[32]) {
     int64_t rc = asnix_hash_sha256(s, len, out);
@@ -32,6 +37,25 @@ static void sha256_or_die(const char *s, size_t len, uint8_t out[32]) {
 
 static int envvar_cmp(const void *a, const void *b) {
     return strcmp(((const AtermEnvVar *)a)->key, ((const AtermEnvVar *)b)->key);
+}
+
+static int atermoutput_cmp(const void *a, const void *b) {
+    return strcmp(((const AtermOutput *)a)->name, ((const AtermOutput *)b)->name);
+}
+
+/* Ported from ~/nix/src/libstore/derivations.cc's `outputPathName`: the
+ * `name` component of an output's own store path is the derivation's
+ * `name` attribute verbatim for the "out" output, and `name + "-" +
+ * outputName` for every other output (e.g. "hello" -> "hello" for "out"
+ * but "hello-bin" for "bin") -- confirmed directly against real Nix
+ * (`nix-instantiate --eval --strict` on a 2-output `derivation {...}`,
+ * see this milestone's scope notes in docs/architecture.md). */
+static void output_path_name(const char *drv_name, const char *output_name, char *out, size_t out_cap) {
+    if (strcmp(output_name, "out") == 0) {
+        snprintf(out, out_cap, "%s", drv_name);
+    } else {
+        snprintf(out, out_cap, "%s-%s", drv_name, output_name);
+    }
 }
 
 /* Validates `outputHash`/`outputHashAlgo`/`outputHashMode` -- these were
@@ -174,6 +198,9 @@ Value asnix_prim_derivation(const Value *args, int64_t argc) {
     size_t nargs = 0;
     AtermEnvVar env[ASNIX_DRV_MAX_ENV];
     size_t nenv = 0;
+    const char *output_names[ASNIX_DRV_MAX_OUTPUTS];
+    size_t noutputs = 0;
+    int saw_outputs_attr = 0;
 
     for (int64_t i = 0; i < count; i++) {
         const char *entry = base + ASNIX_ATTRS_OFF_ENTRIES + i * ASNIX_ATTR_SIZE;
@@ -209,6 +236,51 @@ Value asnix_prim_derivation(const Value *args, int64_t argc) {
             continue;
         }
 
+        /* `outputs` (default ["out"], see ASNIX_DERIVATION_NIX_SOURCE's
+         * own `outputs ? [ "out" ]` default) is special but, unlike
+         * `args`, does NOT `continue`: real Nix's derivationStrict both
+         * parses it into the set of output names below AND still coerces
+         * it to a plain space-joined string and stores it as an ordinary
+         * `outputs` environment variable (confirmed: real multi-output
+         * .drv files have an `outputs = "out bin ..."` env var, consumed
+         * by the generic build-time setup machinery) -- that part falls
+         * through to the generic handling right below unchanged. */
+        if (keylen == 7 && memcmp(key, "outputs", 7) == 0) {
+            if (asnix_tag_of(val) != ASNIX_TAG_LIST) {
+                fprintf(stderr, "asnix: derivation: 'outputs' must be a list of strings\n");
+                exit(1);
+            }
+            const char *lbase = (const char *)(val.raw & ~0x7ULL);
+            int64_t lcount = *(const int64_t *)(lbase + ASNIX_LIST_OFF_COUNT);
+            const Value *elems = (const Value *)(lbase + ASNIX_LIST_OFF_ELEMS);
+            saw_outputs_attr = 1;
+            noutputs = 0;
+            for (int64_t j = 0; j < lcount; j++) {
+                Value ev = asnix_force_for_print(elems[j]);
+                Value osv = asnix_coerce_to_string(ev);
+                const char *oname = asnix_string_value_to_cstr(osv);
+                if (strcmp(oname, "drvPath") == 0) {
+                    fprintf(stderr, "asnix: derivation: invalid derivation output name 'drvPath'\n");
+                    exit(1);
+                }
+                for (size_t k = 0; k < noutputs; k++) {
+                    if (strcmp(output_names[k], oname) == 0) {
+                        fprintf(stderr, "asnix: derivation: duplicate derivation output '%s'\n", oname);
+                        exit(1);
+                    }
+                }
+                if (noutputs >= ASNIX_DRV_MAX_OUTPUTS) {
+                    fprintf(stderr, "asnix: derivation: too many outputs (max %d)\n", ASNIX_DRV_MAX_OUTPUTS);
+                    exit(1);
+                }
+                output_names[noutputs++] = oname;
+            }
+            if (noutputs == 0) {
+                fprintf(stderr, "asnix: derivation: derivation cannot have an empty set of outputs\n");
+                exit(1);
+            }
+        }
+
         Value sv = asnix_coerce_to_string(val);
         char *valcstr = asnix_string_value_to_cstr(sv);
         char *keycstr = asnix_arena_alloc(keylen + 1);
@@ -238,40 +310,95 @@ Value asnix_prim_derivation(const Value *args, int64_t argc) {
     asnix_check_store_path_name(name);
     validate_output_hash_fields(output_hash, output_hash_algo, output_hash_mode);
 
-    /* `out` is always present, blanked for the masked/self-referential-
-     * hash pass -- overwrite it if the input attrset happened to set one
-     * itself (real Nix's derivationStrict does the same: the output path
-     * it computes always wins). */
-    size_t out_idx = ASNIX_DRV_MAX_ENV;
-    for (size_t i = 0; i < nenv; i++)
-        if (strcmp(env[i].key, "out") == 0) {
-            out_idx = i;
-            break;
-        }
-    if (out_idx == ASNIX_DRV_MAX_ENV) {
-        if (nenv >= ASNIX_DRV_MAX_ENV) {
-            fprintf(stderr, "asnix: derivation: too many attributes (max %d)\n", ASNIX_DRV_MAX_ENV);
-            exit(1);
-        }
-        out_idx = nenv++;
+    /* `outputs` defaults to `["out"]` -- same default
+     * ASNIX_DERIVATION_NIX_SOURCE's own `outputs ? [ "out" ]` already
+     * assumes at the Nix level (M58). Fixed-output derivations (an
+     * `outputHash` given) are restricted to a single "out" output by
+     * real Nix too (~/nix/src/libexpr/primops.cc's
+     * derivationStrictInternal: "multiple outputs are not supported in
+     * fixed-output derivations") -- out of scope here to generalize
+     * (see this file's header comment), so reject the combination
+     * explicitly rather than silently computing something wrong. */
+    if (!saw_outputs_attr) {
+        output_names[0] = "out";
+        noutputs = 1;
     }
-    env[out_idx].key = "out";
-    env[out_idx].value = "";
+    if (output_hash && (noutputs != 1 || strcmp(output_names[0], "out") != 0)) {
+        fprintf(stderr, "asnix: derivation: multiple outputs are not supported in fixed-output derivations\n");
+        exit(1);
+    }
+
+    /* Every declared output name gets its own env var, blanked for the
+     * masked/self-referential-hash pass -- overwrite it if the input
+     * attrset happened to set one itself (real Nix's derivationStrict
+     * does the same: the output path it computes always wins). */
+    for (size_t o = 0; o < noutputs; o++) {
+        size_t idx = ASNIX_DRV_MAX_ENV;
+        for (size_t i = 0; i < nenv; i++)
+            if (strcmp(env[i].key, output_names[o]) == 0) {
+                idx = i;
+                break;
+            }
+        if (idx == ASNIX_DRV_MAX_ENV) {
+            if (nenv >= ASNIX_DRV_MAX_ENV) {
+                fprintf(stderr, "asnix: derivation: too many attributes (max %d)\n", ASNIX_DRV_MAX_ENV);
+                exit(1);
+            }
+            idx = nenv++;
+        }
+        env[idx].key = output_names[o];
+        env[idx].value = "";
+    }
 
     qsort(env, nenv, sizeof(env[0]), envvar_cmp);
 
-    char *masked_aterm = asnix_build_derivation_aterm("", system, builder, arg_strs, nargs, env, nenv);
+    /* Masked pass: ONE hash covers every declared output at once (all
+     * blanked to "" in both the Outputs section and their env vars) --
+     * ported from real Nix's `processDerivationOutputPaths`
+     * (~/nix/src/libstore/derivations.cc): a single `maskHash()` is
+     * computed once and then reused, with only the per-output `type`
+     * string ("output:<name>") and store-path `name` component
+     * (`outputPathName`) varying per output below. This is the key
+     * generalization from M8's single-output version: still exactly one
+     * masked ATerm/hash, just with N (name,"") entries in its Outputs
+     * section instead of one. */
+    AtermOutput masked_outs[ASNIX_DRV_MAX_OUTPUTS];
+    for (size_t o = 0; o < noutputs; o++) {
+        masked_outs[o].name = output_names[o];
+        masked_outs[o].path = "";
+    }
+    qsort(masked_outs, noutputs, sizeof(masked_outs[0]), atermoutput_cmp);
+
+    char *masked_aterm = asnix_build_derivation_aterm(masked_outs, noutputs, system, builder, arg_strs, nargs, env, nenv);
     uint8_t masked_digest[32];
     sha256_or_die(masked_aterm, strlen(masked_aterm), masked_digest);
     free(masked_aterm);
 
-    char out_path[300];
-    compute_store_path("output:out", masked_digest, name, out_path, sizeof(out_path));
+    /* One distinct store path per output: same masked digest, but a
+     * different preimage `type` ("output:<name>") and store-path `name`
+     * component (`outputPathName`) for each -- exactly
+     * `store.makeOutputPath(outputName, *drvHash, drvName)` in real
+     * Nix's `derivations.cc`. */
+    char out_paths[ASNIX_DRV_MAX_OUTPUTS][300];
+    for (size_t o = 0; o < noutputs; o++) {
+        char type_str[32 + 7];
+        snprintf(type_str, sizeof(type_str), "output:%s", output_names[o]);
+        char path_name[256];
+        output_path_name(name, output_names[o], path_name, sizeof(path_name));
+        compute_store_path(type_str, masked_digest, path_name, out_paths[o], sizeof(out_paths[o]));
 
-    for (size_t i = 0; i < nenv; i++)
-        if (strcmp(env[i].key, "out") == 0) env[i].value = out_path;
+        for (size_t i = 0; i < nenv; i++)
+            if (strcmp(env[i].key, output_names[o]) == 0) env[i].value = out_paths[o];
+    }
 
-    char *real_aterm = asnix_build_derivation_aterm(out_path, system, builder, arg_strs, nargs, env, nenv);
+    AtermOutput real_outs[ASNIX_DRV_MAX_OUTPUTS];
+    for (size_t o = 0; o < noutputs; o++) {
+        real_outs[o].name = output_names[o];
+        real_outs[o].path = out_paths[o];
+    }
+    qsort(real_outs, noutputs, sizeof(real_outs[0]), atermoutput_cmp);
+
+    char *real_aterm = asnix_build_derivation_aterm(real_outs, noutputs, system, builder, arg_strs, nargs, env, nenv);
     uint8_t real_digest[32];
     sha256_or_die(real_aterm, strlen(real_aterm), real_digest);
     free(real_aterm);
@@ -281,20 +408,25 @@ Value asnix_prim_derivation(const Value *args, int64_t argc) {
     char drv_path[300];
     compute_store_path("text", real_digest, drv_name, drv_path, sizeof(drv_path));
 
-    uint32_t syms[4] = {
-        asnix_intern("outPath", 7),
-        asnix_intern("drvPath", 7),
-        asnix_intern("type", 4),
-        asnix_intern("out", 3),
-    };
-    Value vals[4] = {
-        asnix_make_string_value(out_path, strlen(out_path)),
-        asnix_make_string_value(drv_path, strlen(drv_path)),
-        asnix_make_string_value("derivation", 10),
-        asnix_make_string_value(out_path, strlen(out_path)),
-    };
-    for (int i = 1; i < 4; i++) {
-        int j = i;
+    /* `strict`'s own shape, matching real Nix's derivationStrict exactly
+     * (~/nix/src/libexpr/primops.cc's `mkOutputString`): `drvPath` plus
+     * one key per declared output name, each a plain string (that
+     * output's own outPath) -- NOT a nested attrset, and no separate
+     * top-level `outPath`/`type`/`out` keys (M58's wrapper,
+     * ASNIX_DERIVATION_NIX_SOURCE, only ever reads `strict.drvPath` and
+     * `strict.${outputName}`, confirmed by re-reading it above; it
+     * builds the self-referential "nice" per-output attrsets itself). */
+    size_t nkeys = 1 + noutputs;
+    uint32_t syms[1 + ASNIX_DRV_MAX_OUTPUTS];
+    Value vals[1 + ASNIX_DRV_MAX_OUTPUTS];
+    syms[0] = asnix_intern("drvPath", 7);
+    vals[0] = asnix_make_string_value(drv_path, strlen(drv_path));
+    for (size_t o = 0; o < noutputs; o++) {
+        syms[1 + o] = asnix_intern(output_names[o], strlen(output_names[o]));
+        vals[1 + o] = asnix_make_string_value(out_paths[o], strlen(out_paths[o]));
+    }
+    for (size_t i = 1; i < nkeys; i++) {
+        size_t j = i;
         while (j > 0 && syms[j - 1] > syms[j]) {
             uint32_t ts = syms[j - 1];
             syms[j - 1] = syms[j];
@@ -306,9 +438,9 @@ Value asnix_prim_derivation(const Value *args, int64_t argc) {
         }
     }
 
-    void *mem = asnix_arena_alloc(8 + 4 * ASNIX_ATTR_SIZE);
-    *(int64_t *)((char *)mem + ASNIX_ATTRS_OFF_COUNT) = 4;
-    for (int i = 0; i < 4; i++) {
+    void *mem = asnix_arena_alloc(8 + nkeys * ASNIX_ATTR_SIZE);
+    *(int64_t *)((char *)mem + ASNIX_ATTRS_OFF_COUNT) = (int64_t)nkeys;
+    for (size_t i = 0; i < nkeys; i++) {
         char *e = (char *)mem + ASNIX_ATTRS_OFF_ENTRIES + i * ASNIX_ATTR_SIZE;
         *(int64_t *)(e + ASNIX_ATTR_OFF_SYM) = (int64_t)syms[i];
         *(Value *)(e + ASNIX_ATTR_OFF_VALUE) = vals[i];
