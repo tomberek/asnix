@@ -766,12 +766,40 @@ static Ast *parse_app(Parser *p) {
     return fn;
 }
 
+/* Unary `-` (negate): binds tighter than every binary/`?`/`++` operator
+ * but looser than application/select -- `-f 3` == `-(f 3)` (not `(-f)
+ * 3`), `-x ? "a"` == `(-x) ? "a"` (not `-(x ? "a")`), `-2 + 3` == `(-2) +
+ * 3` == `1` -- all cross-checked against `nix-instantiate --eval` before
+ * writing this (found entirely missing while chasing real nixpkgs:
+ * `lib/trivial.nix` has `bitNot = builtins.sub (-1);`). Matches real
+ * Nix's grammar (`~/nix/src/libexpr/parser.y`: `'-' expr_op %prec
+ * NEGATE` desugars to `sub 0 $2`, i.e. `0 - expr_op` -- NEGATE is the
+ * single tightest-declared operator in the whole table, but still
+ * looser than implicit application/select, which aren't part of that
+ * table at all). Reuses the existing binary `-` (AST_BINOP op='-') with
+ * a literal `0` lhs, same desugaring real Nix itself uses -- no new AST
+ * node or IR op needed. */
+static Ast *parse_negate(Parser *p) {
+    if (cur(p)->kind == TOK_MINUS) {
+        advance(p);
+        Ast *operand = parse_negate(p); /* right-recurse: allows `--x`, harmless */
+        Ast *zero = asnix_ast_new(AST_INT);
+        zero->as.int_val = 0;
+        Ast *n = asnix_ast_new(AST_BINOP);
+        n->as.binop.op = '-';
+        n->as.binop.lhs = zero;
+        n->as.binop.rhs = operand;
+        return n;
+    }
+    return parse_app(p);
+}
+
 /* `expr ? attr` (has-attr): binds tighter than arithmetic but looser than
  * application, matching real Nix's precedence table. Confirmed against
  * `nix-instantiate --eval '1 ? a'` => false (not an error) -- a non-
  * attrset left-hand side is simply "no", see op_has_attr.S. */
 static Ast *parse_has_attr(Parser *p) {
-    Ast *e = parse_app(p);
+    Ast *e = parse_negate(p);
     while (cur(p)->kind == TOK_QUESTION) {
         advance(p);
         /* Plain identifier or a static quoted-string segment, same as

@@ -38,7 +38,8 @@ what's actually implemented and the scope decisions made along the way.
 | M23 — numtide/nix-conformance sweep (3 parallel passes): `++`/`/` operators, attrpath binding sugar, hyphenated identifiers, map/mapAttrs laziness fix, builtins-expansion pass, `builtins.match`/`builtins.split` (POSIX regex), `builtins.fromTOML` (hand-written TOML parser) | done, **scoped** (see below) |
 | M24 — quoted-string attrpath segments (`"a b"` as a binding/select/has-attr key) | done, **scoped** (see below) |
 | M25 — real call-by-need for function arguments (core evaluator fix) | done (see below) |
-| M26+ | not started |
+| M26 — unary `-` (negate) | done (see below) |
+| M27+ | not started |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
 
@@ -2847,3 +2848,41 @@ real Nix implementations typically avoid via a "this argument is already
 in WHNF, don't bother thunking it" fast path. Correctness came first;
 this is a legitimate target for a future profiling-driven pass, not
 attempted here.
+
+## M26 scope notes: unary `-` (negate)
+
+Found continuing to chase `d.nix`: `lib/trivial.nix` has `bitNot =
+builtins.sub (-1);` -- a bare `(-1)` literal, which asnix had **no**
+support for at all (not even as a parenthesized standalone expression,
+let alone as a general prefix operator) -- `(-1)` hit "parse error:
+unexpected token" since `parse_add`'s loop only ever recognized `-` as a
+*binary* infix operator, with nothing handling a leading `-` at the
+start of an operand.
+
+Precedence cross-checked against real `nix-instantiate --eval` with four
+targeted cases before writing any code (each disambiguates against a
+different adjacent operator, since several naive test expressions give
+the same answer under either precedence and prove nothing):
+- `-f 3` == `-(f 3)` == `-3` (not `(-f) 3`) -- negate binds looser than
+  application.
+- `-x ? "a"` == `(-x) ? "a"` == `false` (not `-(x ? "a")`, which would be
+  a type error negating a boolean) -- negate binds tighter than `?`.
+- `-2 + 3` == `(-2) + 3` == `1` (not `-(2+3)` == `-5`) -- negate binds
+  tighter than binary `+`.
+- `3 - -4` == `7` -- a binary `-` followed immediately by a unary `-` on
+  its own RHS parses unambiguously (no grammar conflict with the
+  existing binary-operator loop in `parse_add`).
+
+This matches real Nix's own grammar exactly (`~/nix/src/libexpr/
+parser.y`: `'-' expr_op %prec NEGATE`, the single tightest-declared
+operator in the whole precedence table, but still looser than implicit
+application/select, which aren't part of that table at all -- bison
+resolves this structurally, not via the precedence declaration, since
+`expr_op`'s own grammar already nests application/select arbitrarily
+tightly). Fixed with a new `parse_negate` (`parser.c`), spliced between
+`parse_app` (tighter) and `parse_has_attr` (looser, now calling
+`parse_negate` instead of `parse_app` directly for its operand) --
+right-recursive (allows `--x`, harmless) and desugars directly to the
+existing binary `-` (`AST_BINOP` op `'-'`) with a literal `0` as the
+left-hand side, exactly the same `sub 0 $2` desugaring real Nix's own
+grammar action uses -- no new AST node or IR op needed.
