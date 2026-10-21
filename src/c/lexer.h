@@ -6,6 +6,9 @@
 
 typedef enum {
     TOK_INT,
+    TOK_FLOAT, /* M51: a decimal-point-or-exponent numeric literal -- see lexer.c's
+                * scan_float_literal for the exact grammar (matches real Nix's
+                * lexer.l FLOAT regex precisely, verified against nix-instantiate). */
     TOK_IDENT,
     TOK_TRUE,
     TOK_FALSE,
@@ -83,6 +86,7 @@ typedef enum {
 typedef struct {
     TokKind kind;
     int64_t int_val;    /* TOK_INT */
+    double float_val;   /* TOK_FLOAT (M51) */
     const char *start;  /* TOK_IDENT / TOK_STR_PART / TOK_ISTR_PART / TOK_PATH / TOK_SEARCH_PATH: pointer
                           * into a buffer (TOK_IDENT/TOK_PATH/TOK_SEARCH_PATH point into the original
                           * source, TOK_SEARCH_PATH excluding the angle brackets; TOK_STR_PART/

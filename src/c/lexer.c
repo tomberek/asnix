@@ -1,6 +1,7 @@
 #include "lexer.h"
 
 #include <ctype.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -327,6 +328,45 @@ static void lex_indented_run(const char *src, size_t *i, ModeStack *modes, TokVe
     }
 }
 
+/* Shared tail-scan + strtod for a float literal already known to match
+ * (either a digit run followed by '.', or a bare '.' followed by a
+ * digit) -- see asnix_lex's two call sites above. `*i` arrives already
+ * positioned just past the decisive '.'; this scans the fractional
+ * digits and an optional exponent, then hands the whole [tok_start, *i)
+ * span to strtod, mirroring real Nix's own lexer.l exactly ("errno = 0;
+ * strtod(yytext, 0); if (errno != 0) throw ParseError"). Checked
+ * directly against glibc: "1.0e-400" sets ERANGE (underflows to exactly
+ * 0.0), "5.0e-324" sets ERANGE too (a nonzero subnormal result still
+ * counts as underflow), "1.0e400" sets ERANGE (overflows to +-HUGE_VAL),
+ * while "0.0e-400" does NOT (the mantissa is already exactly zero, so
+ * there's no actual underflow to report) -- all four cross-checked
+ * against numtide/nix-conformance's parse-fail-float-{overflow,
+ * underflow,subnormal}.nix fixtures (and eval-okay-float-range.nix's own
+ * `0.0e-400`/`0.0e5` cases) before trusting this. */
+static double scan_float_tail_and_parse(const char *src, size_t tok_start, size_t *i) {
+    while (isdigit((unsigned char)src[*i])) (*i)++;
+    if (src[*i] == 'e' || src[*i] == 'E') {
+        size_t k = *i + 1;
+        if (src[k] == '+' || src[k] == '-') k++;
+        if (isdigit((unsigned char)src[k])) {
+            *i = k;
+            while (isdigit((unsigned char)src[*i])) (*i)++;
+        } /* else: 'e'/'E' not actually followed by a valid exponent -- leave *i unchanged, unconsumed */
+    }
+    size_t len = *i - tok_start;
+    char *buf = malloc(len + 1);
+    memcpy(buf, src + tok_start, len);
+    buf[len] = '\0';
+    errno = 0;
+    double d = strtod(buf, NULL);
+    if (errno == ERANGE) {
+        fprintf(stderr, "asnix: invalid float '%s'\n", buf);
+        exit(1);
+    }
+    free(buf);
+    return d;
+}
+
 Token *asnix_lex(const char *src, size_t *out_count) {
     TokVec v = { 0 };
     ModeStack modes = { 0 };
@@ -416,8 +456,56 @@ Token *asnix_lex(const char *src, size_t *out_count) {
         if (isdigit((unsigned char)c)) {
             size_t start = i;
             while (isdigit((unsigned char)src[i])) i++;
+            size_t int_len = i - start;
+            /* M51: real Nix's FLOAT grammar (grepped directly from
+             * ~/nix's src/libexpr/lexer.l):
+             *   (([1-9][0-9]*\.[0-9]*)|(0?\.[0-9]+))([Ee][+-]?[0-9]+)?
+             * i.e. a float literal ALWAYS needs a literal '.' somewhere --
+             * there is no bare-exponent float like "1e10" (confirmed:
+             * `nix-instantiate --eval` on that input errors "undefined
+             * variable 'e10'", i.e. it lexes as INT 1 then IDENT e10, NOT
+             * a float). Applied to the digit run just scanned: a run
+             * starting with a nonzero digit may be followed by '.' and
+             * ANY number (including zero) of further digits ("10." is a
+             * valid float with zero fractional digits -- verified
+             * against nix-instantiate); a run that's the single digit
+             * "0" may be followed by '.' only if at least one digit
+             * follows the dot ("0." is NOT a float -- verified: that
+             * lexes as INT 0 then DOT, same as before this milestone); a
+             * multi-digit run starting with '0' (e.g. "00.5") matches
+             * neither alternative and is left as plain INT "00" followed
+             * by ordinary DOT/INT lexing, an edge case no sane digit
+             * literal hits anyway. */
+            int is_float = 0;
+            if (src[i] == '.') {
+                if (int_len == 1 && src[start] == '0') {
+                    if (isdigit((unsigned char)src[i + 1])) is_float = 1;
+                } else if (src[start] != '0') {
+                    is_float = 1;
+                }
+            }
+            if (is_float) {
+                i++; /* consume '.' */
+                double d = scan_float_tail_and_parse(src, start, &i);
+                push_tok(&v, (Token){ .kind = TOK_FLOAT, .float_val = d, .pos = src + tok_start });
+                continue;
+            }
             Token t = { .kind = TOK_INT, .int_val = strtoll(src + start, NULL, 10), .pos = src + tok_start };
             push_tok(&v, t);
+            continue;
+        }
+
+        /* M51: a float literal with no leading digit at all -- the
+         * `\.[0-9]+` shape of real Nix's `0?\.[0-9]+` alternative (the
+         * "0?" is optional, so a bare ".5" is valid, verified against
+         * nix-instantiate: `.5` == `0.5`). Checked before the ELLIPSIS/
+         * plain-DOT handling below, since this starts with the same '.'
+         * character. */
+        if (c == '.' && isdigit((unsigned char)src[i + 1])) {
+            size_t start = i;
+            i++; /* consume '.' */
+            double d = scan_float_tail_and_parse(src, start, &i);
+            push_tok(&v, (Token){ .kind = TOK_FLOAT, .float_val = d, .pos = src + tok_start });
             continue;
         }
 

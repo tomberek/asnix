@@ -1,0 +1,421 @@
+/*
+ * builtins.fromJSON -- M51. A scoped, hand-written recursive-descent JSON
+ * parser (RFC 8259), modeled on this project's existing toml.c/lexer.c
+ * style: plain index-into-buffer scanning, no external dependency, fatal
+ * on malformed input.
+ *
+ * Previously this builtin didn't exist in this codebase AT ALL (flagged
+ * explicitly in docs/architecture.md's long-tail-pass notes: "`fromJSON`
+ * doesn't exist in this codebase at all yet... not worth building a JSON
+ * parser for in isolation" for the sake of a single conformance file).
+ * That calculus changes here: numtide/nix-conformance's
+ * eval-okay-fromjson.nix is one of the files this milestone's float
+ * support was specifically asked to unblock (it contains a handful of
+ * ordinary Nix float literals in the comparison value on its RHS, which
+ * is what kept it a parse failure before this milestone) -- but getting
+ * past that parse error reveals `fromJSON` is ALSO needed to actually
+ * evaluate the file, since it calls `builtins.fromJSON` on a literal
+ * JSON document and compares the result against a literal Nix value.
+ * Writing a real (if deliberately small) JSON parser is the only honest
+ * way to pass that file, so it's in scope here rather than out of scope
+ * the way it was before.
+ *
+ * Implemented: objects, arrays, strings (\" \\ \/ \b \f \n \r \t \uXXXX
+ * escapes, including UTF-16 surrogate pairs), numbers (JSON's number
+ * grammar: optional leading '-', an int part, an optional '.'-fraction,
+ * an optional [eE][+-]?digits exponent -- a '.' or exponent makes it a
+ * Float Value, otherwise an Int, matching the same int/float split real
+ * Nix's own fromJSON makes, confirmed directly against
+ * eval-okay-fromjson.nix's own expected output: `23493`/`116`/`-10`
+ * stay plain ints, `3.14159` becomes a float), true/false/null.
+ *
+ * NOT implemented: JSON5-isms (comments, trailing commas, unquoted
+ * keys), duplicate-key "last wins" vs "error" policy choice (this parser
+ * does last-wins via plain attrset-overwrite semantics, falling out for
+ * free from how the entries array is built -- not verified against real
+ * Nix's own choice here since no corpus case exercises it, same "not
+ * pursued speculatively" convention as every other untested edge in this
+ * codebase). */
+#include "builtins_json.h"
+
+#include <ctype.h>
+#include <errno.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "asnix/value.h"
+#include "builtins_shared.h"
+#include "symtab.h"
+#include "value_util.h"
+
+typedef struct {
+    const char *src;
+    size_t len;
+    size_t i;
+} JsonParser;
+
+static void json_fatal(const char *msg) {
+    fprintf(stderr, "asnix: fromJSON: %s\n", msg);
+    exit(1);
+}
+
+static char jp_cur(JsonParser *p) {
+    return p->i < p->len ? p->src[p->i] : '\0';
+}
+
+static void jp_skip_ws(JsonParser *p) {
+    while (p->i < p->len) {
+        char c = p->src[p->i];
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r') p->i++;
+        else break;
+    }
+}
+
+static void jp_expect(JsonParser *p, char c) {
+    if (jp_cur(p) != c) json_fatal("malformed JSON (unexpected character)");
+    p->i++;
+}
+
+/* Growable byte buffer, same shape as lexer.c's ByteBuf -- re-declared
+ * here rather than shared, same "no textual coupling between unrelated
+ * modules" convention this project already uses (see builtins_misc.c's
+ * own header comment on this). */
+typedef struct {
+    char *buf;
+    size_t len, cap;
+} ByteBuf;
+
+static void bb_ensure(ByteBuf *bb, size_t extra) {
+    if (bb->len + extra <= bb->cap) return;
+    size_t ncap = bb->cap ? bb->cap * 2 : 32;
+    while (ncap < bb->len + extra) ncap *= 2;
+    bb->buf = realloc(bb->buf, ncap);
+    bb->cap = ncap;
+}
+
+static void bb_push(ByteBuf *bb, char c) {
+    bb_ensure(bb, 1);
+    bb->buf[bb->len++] = c;
+}
+
+static int hex_digit_value(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    json_fatal("invalid hex digit in \\u escape");
+    return 0;
+}
+
+static uint32_t parse_hex4(JsonParser *p) {
+    if (p->i + 4 > p->len) json_fatal("truncated \\u escape");
+    uint32_t v = 0;
+    for (int k = 0; k < 4; k++) v = (v << 4) | (uint32_t)hex_digit_value(p->src[p->i + (size_t)k]);
+    p->i += 4;
+    return v;
+}
+
+/* Standard UTF-8 encoding of a Unicode code point -- returns the byte
+ * count written (1..4). Ported from the same algorithm toml.c's own
+ * utf8_encode uses (static to that file, so reimplemented here rather
+ * than shared -- see this file's header comment). */
+static size_t utf8_encode(uint32_t cp, char *out) {
+    if (cp <= 0x7F) {
+        out[0] = (char)cp;
+        return 1;
+    }
+    if (cp <= 0x7FF) {
+        out[0] = (char)(0xC0 | (cp >> 6));
+        out[1] = (char)(0x80 | (cp & 0x3F));
+        return 2;
+    }
+    if (cp <= 0xFFFF) {
+        out[0] = (char)(0xE0 | (cp >> 12));
+        out[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
+        out[2] = (char)(0x80 | (cp & 0x3F));
+        return 3;
+    }
+    out[0] = (char)(0xF0 | (cp >> 18));
+    out[1] = (char)(0x80 | ((cp >> 12) & 0x3F));
+    out[2] = (char)(0x80 | ((cp >> 6) & 0x3F));
+    out[3] = (char)(0x80 | (cp & 0x3F));
+    return 4;
+}
+
+/* Parses a JSON string, `p->i` already positioned just past the opening
+ * '"'. Decodes \" \\ \/ \b \f \n \r \t directly and \uXXXX via
+ * utf8_encode, including the UTF-16 surrogate-pair case (a high
+ * surrogate 0xD800-0xDBFF must be immediately followed by a low
+ * surrogate 0xDC00-0xDFFF, combined per the standard formula into one
+ * codepoint above U+FFFF -- an unpaired surrogate is rejected rather
+ * than silently mis-encoded). Returns an asnix String Value. */
+static Value parse_json_string(JsonParser *p) {
+    ByteBuf bb = { 0 };
+    for (;;) {
+        if (p->i >= p->len) json_fatal("unterminated string");
+        char c = p->src[p->i];
+        if (c == '"') {
+            p->i++;
+            break;
+        }
+        if ((unsigned char)c < 0x20) json_fatal("control character in string");
+        if (c != '\\') {
+            bb_push(&bb, c);
+            p->i++;
+            continue;
+        }
+        p->i++;
+        if (p->i >= p->len) json_fatal("unterminated escape");
+        char e = p->src[p->i++];
+        switch (e) {
+            case '"': bb_push(&bb, '"'); break;
+            case '\\': bb_push(&bb, '\\'); break;
+            case '/': bb_push(&bb, '/'); break;
+            case 'b': bb_push(&bb, '\b'); break;
+            case 'f': bb_push(&bb, '\f'); break;
+            case 'n': bb_push(&bb, '\n'); break;
+            case 'r': bb_push(&bb, '\r'); break;
+            case 't': bb_push(&bb, '\t'); break;
+            case 'u': {
+                uint32_t cp = parse_hex4(p);
+                if (cp >= 0xD800 && cp <= 0xDBFF) {
+                    if (p->i + 2 > p->len || p->src[p->i] != '\\' || p->src[p->i + 1] != 'u') {
+                        json_fatal("unpaired UTF-16 surrogate in \\u escape");
+                    }
+                    p->i += 2;
+                    uint32_t lo = parse_hex4(p);
+                    if (lo < 0xDC00 || lo > 0xDFFF) json_fatal("invalid UTF-16 surrogate pair");
+                    cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                } else if (cp >= 0xDC00 && cp <= 0xDFFF) {
+                    json_fatal("unpaired UTF-16 surrogate in \\u escape");
+                }
+                char utf8[4];
+                size_t n = utf8_encode(cp, utf8);
+                for (size_t k = 0; k < n; k++) bb_push(&bb, utf8[k]);
+                break;
+            }
+            default: json_fatal("invalid escape sequence");
+        }
+    }
+    /* A JSON string's \u0000 escape (or, in principle, a literal NUL
+     * byte) can produce an embedded NUL -- real Nix rejects this outright
+     * for any string value it builds this way (confirmed directly
+     * against `nix-instantiate --eval`: `builtins.fromJSON ''"a\u0000b"''`
+     * errors "input string 'a\0b' cannot be represented as Nix string
+     * because it contains null bytes", for both JSON string VALUES and
+     * object KEYS -- found via numtide/nix-conformance's
+     * eval-fail-fromJSON-keyWithNullByte.nix/-valueWithNullByte.nix,
+     * both of which this parser silently accepted before this check was
+     * added, since asnix's own String representation tracks length
+     * explicitly rather than relying on NUL-termination and so has no
+     * structural reason to reject this on its own). Checked once here,
+     * in the one shared string-decoding function both keys and values
+     * go through, rather than at each of parse_json_object/
+     * parse_json_value's two call sites. */
+    for (size_t k = 0; k < bb.len; k++) {
+        if (bb.buf[k] == '\0') json_fatal("input string cannot be represented as Nix string because it contains null bytes");
+    }
+    Value out = asnix_make_string_value(bb.buf ? bb.buf : "", bb.len);
+    free(bb.buf);
+    return out;
+}
+
+/* JSON number grammar: `-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?`.
+ * A '.' or exponent present makes this a Float Value (strtod); otherwise
+ * it's an Int Value (strtoll) -- matching real Nix's own fromJSON int/
+ * float split (confirmed against eval-okay-fromjson.nix's own expected
+ * output: `23493`/`116`/`-10` stay ints, `3.14159` becomes a float). */
+static Value parse_json_number(JsonParser *p) {
+    size_t start = p->i;
+    if (jp_cur(p) == '-') p->i++;
+    if (!isdigit((unsigned char)jp_cur(p))) json_fatal("invalid number");
+    while (isdigit((unsigned char)jp_cur(p))) p->i++;
+    int is_float = 0;
+    if (jp_cur(p) == '.') {
+        is_float = 1;
+        p->i++;
+        if (!isdigit((unsigned char)jp_cur(p))) json_fatal("invalid number (digits required after '.')");
+        while (isdigit((unsigned char)jp_cur(p))) p->i++;
+    }
+    if (jp_cur(p) == 'e' || jp_cur(p) == 'E') {
+        is_float = 1;
+        p->i++;
+        if (jp_cur(p) == '+' || jp_cur(p) == '-') p->i++;
+        if (!isdigit((unsigned char)jp_cur(p))) json_fatal("invalid number (digits required in exponent)");
+        while (isdigit((unsigned char)jp_cur(p))) p->i++;
+    }
+    size_t len = p->i - start;
+    char *buf = malloc(len + 1);
+    memcpy(buf, p->src + start, len);
+    buf[len] = '\0';
+    Value out;
+    if (is_float) {
+        out = asnix_make_float_value(strtod(buf, NULL));
+    } else {
+        /* An integer JSON number that overflows even a real int64_t (let
+         * alone asnix's own narrower 60-bit range, ASNIX_INT_MIN/MAX --
+         * see include/asnix/value.h) must fail loudly, not silently wrap
+         * or saturate -- found via numtide/nix-conformance's
+         * eval-fail-fromJSON-overflowing.nix (`{"attr":
+         * 18446744073709551615}`, 2^64-1, which doesn't fit in ANY
+         * signed 64-bit integer), checked against `nix-instantiate
+         * --eval`: "unsigned json number 18446744073709551615 outside
+         * of Nix integer range". `errno` catches strtoll's own
+         * ERANGE (set for anything past INT64_MIN/MAX); the explicit
+         * ASNIX_INT_MIN/MAX bounds check on top of that catches the
+         * narrower band asnix itself actually supports (a value that
+         * fits in a real int64_t but not asnix's 60-bit one would
+         * otherwise silently truncate when shifted into the tagged
+         * word, same class of bug this check exists to prevent). */
+        errno = 0;
+        long long val = strtoll(buf, NULL, 10);
+        if (errno == ERANGE || val < ASNIX_INT_MIN || val > ASNIX_INT_MAX) {
+            json_fatal("number outside of Nix integer range");
+        }
+        out = asnix_make_int((int64_t)val);
+    }
+    free(buf);
+    return out;
+}
+
+static Value parse_json_value(JsonParser *p);
+
+static Value parse_json_array(JsonParser *p) {
+    jp_expect(p, '[');
+    jp_skip_ws(p);
+    size_t cap = 4, n = 0;
+    Value *items = malloc(cap * sizeof(Value));
+    if (jp_cur(p) == ']') {
+        p->i++;
+        Value out = asnix_bshared_make_list(items, 0);
+        free(items);
+        return out;
+    }
+    for (;;) {
+        jp_skip_ws(p);
+        if (n == cap) {
+            cap *= 2;
+            items = realloc(items, cap * sizeof(Value));
+        }
+        items[n++] = parse_json_value(p);
+        jp_skip_ws(p);
+        char c = jp_cur(p);
+        if (c == ',') {
+            p->i++;
+            continue;
+        }
+        if (c == ']') {
+            p->i++;
+            break;
+        }
+        json_fatal("expected ',' or ']' in array");
+    }
+    Value out = asnix_bshared_make_list(items, (int64_t)n);
+    free(items);
+    return out;
+}
+
+static Value parse_json_object(JsonParser *p) {
+    jp_expect(p, '{');
+    jp_skip_ws(p);
+    size_t cap = 4, n = 0;
+    uint32_t *syms = malloc(cap * sizeof(uint32_t));
+    Value *vals = malloc(cap * sizeof(Value));
+    if (jp_cur(p) == '}') {
+        p->i++;
+        Value out = asnix_bshared_make_attrs(syms, vals, 0);
+        free(syms);
+        free(vals);
+        return out;
+    }
+    for (;;) {
+        jp_skip_ws(p);
+        if (jp_cur(p) != '"') json_fatal("expected a string key in object");
+        p->i++;
+        Value key = parse_json_string(p);
+        int64_t klen;
+        const char *kbytes = asnix_ptr_bytes(key, &klen);
+        uint32_t sym = asnix_intern(kbytes, (size_t)klen);
+        jp_skip_ws(p);
+        jp_expect(p, ':');
+        jp_skip_ws(p);
+        Value val = parse_json_value(p);
+        if (n == cap) {
+            cap *= 2;
+            syms = realloc(syms, cap * sizeof(uint32_t));
+            vals = realloc(vals, cap * sizeof(Value));
+        }
+        syms[n] = sym;
+        vals[n] = val;
+        n++;
+        jp_skip_ws(p);
+        char c = jp_cur(p);
+        if (c == ',') {
+            p->i++;
+            continue;
+        }
+        if (c == '}') {
+            p->i++;
+            break;
+        }
+        json_fatal("expected ',' or '}' in object");
+    }
+    Value out = asnix_bshared_make_attrs(syms, vals, (int64_t)n);
+    free(syms);
+    free(vals);
+    return out;
+}
+
+static Value parse_json_value(JsonParser *p) {
+    jp_skip_ws(p);
+    char c = jp_cur(p);
+    if (c == '{') return parse_json_object(p);
+    if (c == '[') return parse_json_array(p);
+    if (c == '"') {
+        p->i++;
+        return parse_json_string(p);
+    }
+    if (c == 't') {
+        if (p->i + 4 > p->len || memcmp(p->src + p->i, "true", 4) != 0) json_fatal("invalid literal");
+        p->i += 4;
+        return asnix_make_imm(ASNIX_IMM_TRUE);
+    }
+    if (c == 'f') {
+        if (p->i + 5 > p->len || memcmp(p->src + p->i, "false", 5) != 0) json_fatal("invalid literal");
+        p->i += 5;
+        return asnix_make_imm(ASNIX_IMM_FALSE);
+    }
+    if (c == 'n') {
+        if (p->i + 4 > p->len || memcmp(p->src + p->i, "null", 4) != 0) json_fatal("invalid literal");
+        p->i += 4;
+        return asnix_make_imm(ASNIX_IMM_NULL);
+    }
+    if (c == '-' || isdigit((unsigned char)c)) return parse_json_number(p);
+    json_fatal("unexpected character");
+    return asnix_make_imm(ASNIX_IMM_NULL); /* unreachable -- json_fatal exits */
+}
+
+static Value asnix_json_parse(const char *src, size_t len) {
+    JsonParser p = { src, len, 0 };
+    Value out = parse_json_value(&p);
+    jp_skip_ws(&p);
+    if (p.i != p.len) json_fatal("trailing data after JSON value");
+    return out;
+}
+
+static Value prim_fromJSON(const Value *args, int64_t argc) {
+    (void)argc;
+    const char *bytes;
+    int64_t len;
+    asnix_bshared_string_bytes(args[0], &bytes, &len, "fromJSON");
+    return asnix_json_parse(bytes, (size_t)len);
+}
+
+static Value build_fromJSON(void) { return asnix_bshared_make_primop((void *)prim_fromJSON, 1); }
+
+const AsnixBuiltinMiscDef ASNIX_JSON_BUILTINS[] = {
+    { "fromJSON", build_fromJSON },
+};
+
+const size_t ASNIX_JSON_BUILTINS_COUNT = sizeof(ASNIX_JSON_BUILTINS) / sizeof(ASNIX_JSON_BUILTINS[0]);

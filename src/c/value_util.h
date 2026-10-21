@@ -22,6 +22,23 @@ Value asnix_make_path_value(const char *abs_path, size_t len);
  * String (see heap.h's ASNIX_PATH_MARKER note). False for any other tag. */
 int asnix_value_is_path(Value v);
 
+/* Float (M51): a third ASNIX_TAG_PTR kind alongside String/Path -- see
+ * heap.h's ASNIX_FLOAT_MARKER note for the full rationale. Arena-allocates
+ * a Float{marker;value} heap object and returns it tagged ASNIX_TAG_PTR. */
+Value asnix_make_float_value(double d);
+
+/* True iff `v` is an ASNIX_TAG_PTR object storing a Float (see heap.h's
+ * ASNIX_FLOAT_MARKER note). False for any other tag, including String and
+ * Path -- callers that already know `v` is ASNIX_TAG_PTR and need "is this
+ * specifically a string" should check `!asnix_value_is_path(v) &&
+ * !asnix_value_is_float(v)`. */
+int asnix_value_is_float(Value v);
+
+/* Unboxes a Float Value's double payload. Aborts if `v` isn't one (same
+ * "trust the caller already checked the tag" convention as
+ * asnix_int_value) -- callers must asnix_value_is_float() first. */
+double asnix_float_value(Value v);
+
 /* Returns a pointer to the raw bytes (NOT NUL-terminated either way) and
  * length of an ASNIX_TAG_PTR value, whichever of the two kinds (String or
  * Path) it actually is -- for callers (printing, hashing, ...) that just
@@ -74,6 +91,40 @@ Value asnix_concat_strings(const Value *parts, int64_t count);
  * docs/architecture.md). Used by `asnix_op_add` (src/asm/ops/op_arith.S)
  * whenever both operands aren't already known to be ints. */
 Value asnix_add_values(Value lhs, Value rhs);
+
+/* `-`/`*`/`/`'s slow-path fallback (M51): asnix_op_sub/mul/div
+ * (src/asm/ops/op_arith.S) only call these when the all-int fast path
+ * didn't match -- i.e. at least one operand isn't a plain int. Handles
+ * every int/float and float/float combination (promoting an int operand
+ * to double, matching real Nix's own mixed-arithmetic promotion rule --
+ * verified against `nix-instantiate --eval`: `1 - 2.0`, `2.0 * 3`, `1 /
+ * 2.0` all produce a float), fatal for anything else (matches the
+ * existing int-only fatal's error *class*, not its exact wording, same
+ * convention as every other fatal message in this codebase). Division
+ * additionally fatals on a zero divisor the same way the all-int fast
+ * path already does (checked against real Nix: even `1.0 / 0.0` is a
+ * hard "division by zero" error there, not an IEEE-754 infinity --
+ * confirmed directly, `~/nix/src/libexpr/primops.cc`'s `prim_div` checks
+ * the float-coerced divisor against zero unconditionally, before ever
+ * looking at whether either operand is actually a float). */
+Value asnix_sub_values(Value lhs, Value rhs);
+Value asnix_mul_values(Value lhs, Value rhs);
+Value asnix_div_values(Value lhs, Value rhs);
+
+/* `<`/`>`/`<=`/`>=`'s slow-path fallback (M51): asnix_op_lt/gt/le/ge
+ * (src/asm/ops/op_cmp.S) only call these when the all-int fast path
+ * didn't match. Each returns an already-tagged ASNIX_TRUE/ASNIX_FALSE
+ * Value (not a plain C bool) -- same immediate-result convention the
+ * asm callers already store straight to VALSTACK. Promotes int<->float
+ * the same way the arithmetic fallbacks above do; fatal for any operand
+ * that isn't numeric (int or float). A NaN operand falls out correctly
+ * for free: a plain C `<`/`>`/`<=`/`>=` on a NaN double is false by
+ * IEEE-754 definition, matching real Nix (which does the same plain C++
+ * double comparison, `~/nix/src/libexpr/primops.cc`'s `CompareValues`). */
+Value asnix_cmp_lt_values(Value lhs, Value rhs);
+Value asnix_cmp_gt_values(Value lhs, Value rhs);
+Value asnix_cmp_le_values(Value lhs, Value rhs);
+Value asnix_cmp_ge_values(Value lhs, Value rhs);
 
 /* The `++` operator (list concatenation) -- NOT the same as `+`, which has
  * no list case at all in real Nix (`[1] + [2]` is a type error there).

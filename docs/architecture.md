@@ -56,7 +56,8 @@ what's actually implemented and the scope decisions made along the way.
 | M41 — dynamic attrpath segments anywhere (`.${k}`, interpolated quoted strings) | done (see below) |
 | M42-M49 | not started |
 | M50 — name the specific value/field in 6 more generic fatal-path error messages | done (see below) |
-| M51+ | not started |
+| M51 — float literals: lexer, heap-boxed Value kind, `+`/`-`/`*`/`/`/comparison promotion, printer, `floor`/`ceil`/`isFloat`, `toJSON`/`fromJSON`/`fromTOML` float support | done, **scoped** (see below) |
+| M52+ | not started |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
 
@@ -3813,3 +3814,306 @@ No new e2e fixtures (error-message-only change, same precedent M36
 itself set). `make test`/`test-e2e` green, no regressions;
 `test-conformance` still 633 passed, 169 failed, 0 known, 62 skipped --
 identical to the pre-change baseline.
+
+## M51 scope notes: float literals (lexer through builtins)
+
+**Root cause, minimal repro**: `echo '1.5 + 2' > /tmp/t.nix && ./asnix
+/tmp/t.nix` -> `asnix: parse error: expected an attribute name`. asnix's
+lexer had no `FLOAT` token at all (`src/c/lexer.c`'s digit-scanning
+branch only ever produced `TOK_INT`), so `1.5` lexed as `TOK_INT(1)
+TOK_DOT TOK_INT(5)` and the parser tried (and failed) to treat `.5` as
+attribute selection on `1`. This single gap was blocking at least 9
+numtide/nix-conformance files (every one contains a bare decimal
+literal somewhere, including several whose OWN right-hand side comparison
+value is a plain Nix float, not just their `builtins.fromJSON`/
+`fromTOML` argument string): `eval-okay-float.nix`,
+`eval-okay-float-range.nix`, `eval-okay-floor-ceil.nix`,
+`eval-okay-types.nix`, `eval-okay-tojson.nix`,
+`eval-okay-builtins-add.nix`, `eval-okay-compare-operand-order.nix`,
+`eval-okay-fromjson.nix`, `eval-okay-nan-to-string.nix`.
+
+**Lexer**: a new `TOK_FLOAT` (`src/c/lexer.c`/`lexer.h`), matching real
+Nix's exact grammar (grepped directly from `~/nix/src/libexpr/lexer.l`):
+`(([1-9][0-9]*\.[0-9]*)|(0?\.[0-9]+))([Ee][+-]?[0-9]+)?` -- a float
+literal always needs a literal `.` somewhere (there is no bare-exponent
+float like `1e10`; confirmed directly, `nix-instantiate --eval` on that
+input errors "undefined variable 'e10'", i.e. it lexes as `INT 1` then
+`IDENT e10`). Two call sites share one tail-scan+`strtod` helper
+(`scan_float_tail_and_parse`): the ordinary digit-leading case (extended
+into the existing digit-scanning branch, since `10.`/`0.5`/`00.5` all
+need slightly different leading-digit-run rules to match the grammar's
+two alternatives exactly) and a new bare-`.`-leading case (`.5`, the
+`0?` in `0?\.[0-9]+` being genuinely optional). `strtod`'s `errno`
+(`ERANGE`) is checked exactly the way real Nix's own lexer.l does,
+which turned out to matter for conformance: `0.0e-400` parses to
+`0.0` with no error (mantissa already exactly zero, no real underflow),
+while `1.0e-400` (genuine underflow), `5.0e-324` (nonzero subnormal
+result, glibc's `strtod` still sets `ERANGE` for this), and `1.0e400`
+(overflow to `HUGE_VAL`) all correctly remain parse failures --
+verified against conformance's own `parse-fail-float-{overflow,
+underflow,subnormal}.nix` and `eval-okay-float-range.nix`'s `0.0e-400`/
+`0.0e5` cases, all of which still pass after this change.
+
+**Value representation**: the task brief's own suggested starting point
+(check whether `ASNIX_TAG_RESERVED`/`0x7` is genuinely free) turned out
+to be a dead end on inspection -- `include/asnix/value.h` already spends
+all 8 tag slots, `0x7` having been claimed back in M7 as
+`ASNIX_TAG_PRIMOP`. So there is no spare tag bit at all, and a double
+needs its full 64 bits regardless (no immediate encoding can hold one
+losslessly in the 61 payload bits an `INT`-shaped tag would offer). The
+only honest option, and the one this project already has a direct,
+working precedent for, is heap-boxing: a Float is a THIRD kind sharing
+`ASNIX_TAG_PTR` with String and Path (`include/asnix/heap.h`), told
+apart by its own reserved negative marker in the leading word, exactly
+mirroring M15's Path-vs-String precedent:
+`Float{int64_t marker == ASNIX_FLOAT_MARKER (-2); double value;}`.
+Unlike Path (which just shifts its own same-shape payload out one slot
+after the marker, no extra allocation), this is a genuine new 2-word
+heap object, since a double can't share a word with anything else
+losslessly. `asnix_make_float_value`/`asnix_value_is_float`/
+`asnix_float_value` (`value_util.h`/`.c`) are the only sanctioned way to
+touch one. A compile-time float literal is heap-allocated once, at
+compile time, by `compiler.c`'s new `AST_FLOAT` case, and referenced via
+`ib_push_const` -- the exact same "resolve once, not per-eval" mechanism
+`AST_PATH`/`AST_STRING` constants already use.
+
+Every existing place that assumed "`ASNIX_TAG_PTR` means String-or-Path"
+and would misread a Float's marker+double bytes as a bogus string
+length needed the same kind of dispatch update M15 made for Path:
+`asnix_coerce_to_string`/`toString`, the string-interpolation coercion
+(a bare float in `"${...}"` is correctly REJECTED, same as a bare int --
+verified: `"${1.5}"` errors "cannot coerce a float to a string" on real
+Nix, `"${toString 1.5}"` works), the top-level value printer
+(`main.c`), `typeOf`, `isString`/`isPath`/new `isFloat`,
+`asnix_bshared_type_name` (M50's error-message helper), structural
+`==`/`!=` (`asnix_bshared_value_eq`), `toJSON`, and every "this dynamic
+attribute name/key must be a string" check that already explicitly
+excluded Path (`attrs_update.c`, `builtins_shared.c` x3,
+`builtins_m23.c`'s `groupBy`/`pathExists`, `builtins.c`'s
+`hashString`) -- each extended with `|| asnix_value_is_float(...)`
+alongside its existing `|| asnix_value_is_path(...)` check, same
+mechanical, non-speculative extension of an already-established pattern.
+
+**Arithmetic (`+`/`-`/`*`/`/`)**: real Nix promotes int to float
+whenever the OTHER operand is already a float, for all four operators
+AND for the separate `builtins.add`/`sub`/`mul`/`div` primops (verified
+directly in `~/nix/src/libexpr/primops.cc`'s `prim_add`/`sub`/`mul`/
+`div` -- these are not independently-scoped features, the operators and
+the builtins share the identical promotion rule and, for `/`, the
+identical zero-divisor check). A C fallback per operator
+(`asnix_add_values` extended, plus new `asnix_sub_values`/
+`asnix_mul_values`/`asnix_div_values`, `value_util.c`) handles every
+int/float and float/float combination; the existing all-int fast path in
+`op_arith.S` is completely unchanged and still never calls into C, so
+plain-int arithmetic pays zero cost for this milestone. One genuine
+real-Nix quirk replicated exactly rather than "fixed": `1.0 / 0.0` is
+STILL a hard "division by zero" error on real Nix, not an IEEE-754
+infinity -- `prim_div` checks the float-coerced divisor against zero
+unconditionally, before ever looking at whether either operand is
+actually a float (confirmed directly against `nix-instantiate --eval`).
+`builtins.add`/`sub`/`mul`/`div` (`builtins_m23.c`, previously
+INT-only -- a documented scope cut from before this milestone, when
+there was genuinely no honest way to do otherwise) now delegate to the
+exact same value_util.c helpers.
+
+**Comparisons (`<`/`>`/`<=`/`>=`)**: same promotion rule, verified via
+real Nix's `CompareValues` (`primops.cc`). While chasing
+`eval-okay-compare-operand-order.nix` (one of the 9 target files, and
+NOT actually about floats at its core -- see below), found and fixed a
+second, genuinely separate pre-existing bug this file also happened to
+exercise: real Nix's parser desugars `a > b` to `__lessThan b a` and `a
+<= b` to `!(__lessThan b a)` (`~/nix/src/libexpr/parser.y`), meaning the
+RIGHT operand is always forced first for exactly these two operators
+(`lessThan`'s curried application forces its first-applied argument
+first) -- `<` and `>=` desugar to the plain, unswapped `__lessThan a b`
+/ `!(__lessThan a b)`, so they need no such swap. asnix's compiler
+previously compiled every `AST_BINOP`'s operands left-to-right
+unconditionally, for every comparison operator alike (verified directly
+against `nix-instantiate --eval` with `abort`/`throw` canaries on both
+sides of `>` and `<=`: real Nix's right-operand-first order lets a
+`tryEval`-caught `throw` on the right short-circuit before ever forcing
+a never-catchable `abort` on the left; asnix's old left-to-right order
+hit the left side's `abort` immediately instead). Fixed in
+`compiler.c`'s `AST_BINOP` case: `>` now compiles as "push rhs, push
+lhs, `OP_LT`" (computing `rhs < lhs`, i.e. exactly `lhs > rhs`, while
+forcing rhs first) and `<=` as the same swap plus `OP_NOT` -- reusing
+the existing `OP_LT`/`OP_NOT` IR ops rather than adding a new one.
+`OP_GT`/`OP_LE` (`ib_gt`/`ib_le`, `op_cmp.S`'s `asnix_op_gt`/
+`asnix_op_le`) are consequently never emitted by the compiler anymore --
+left in place as harmless dead code (no unit test exercised them
+directly) rather than ripped out, out of scope for this pass. Discovered
+in the SAME file: `eval-okay-compare-operand-order.nix` also has
+`("a" > "b")` in its expected-`false` list, which exposed a THIRD
+pre-existing gap -- the comparison *operators* (unlike the separate
+`lessThan`/`sort` builtins, which already supported `string<string` via
+`asnix_bshared_value_lt`) were scoped to `TAG_INT` only, with no string
+case at all. Extended `asnix_cmp_lt_values`/`gt`/`le`/`ge_values`
+(`value_util.c`) to also accept a `string<string` pair (same
+lexicographic-byte-comparison rule `asnix_bshared_value_lt` already
+uses, reimplemented locally rather than shared -- no existing import
+path between the two files) -- a real, if narrow, correctness fix
+*found via* this milestone's float work but not actually a float
+feature itself.
+
+**Printer, `toString`, `toJSON` -- three genuinely different float
+formatting rules, all verified independently against `nix-instantiate
+--eval`**:
+- The top-level value printer (`main.c`'s `print_value_inner`) uses
+  `"%.6g"` -- real Nix's own `print.cc` just does `ostream << double`,
+  which is bit-for-bit glibc's `%.6g` (6 significant digits, "general"
+  notation, no forced trailing `.0`): `1.5` -> `"1.5"`,
+  `2.2250738585072014e-308` -> `"2.22507e-308"`, `0.0` -> `"0"`,
+  `builtins.add 2.0 2` -> `"4"` (not `"4.0"`). `nan`/`-nan`/`inf`/`-inf`
+  fall out of glibc's `%g` for free, no special-casing needed (checked
+  directly: `printf("%.6g", -NAN)` prints `"-nan"`).
+- `toString`/`"${...}"`-after-`toString` (`asnix_coerce_to_string`) uses
+  `"%f"` -- real Nix's `coerceToString` does `std::to_string(v.fpoint())`
+  for a float, which is glibc's `%f`: always 6 digits after the decimal
+  point (`toString 1.5` -> `"1.500000"`), and nan/inf still spell
+  correctly (no fractional part to pad).
+- `toJSON` (`builtins_compare.c`'s `json_encode`) approximates
+  `nlohmann::json`'s shortest-round-trip double formatting: try `"%.*g"`
+  at increasing precision until the result `strtod`s back to the exact
+  same bit pattern, then append `".0"` if the match has neither a `.`
+  nor an `e`/`E` (nlohmann always keeps a float's JSON text
+  distinguishable from an int's, even for an integral value) --
+  verified against `builtins.toJSON 1.0` == `"1.0"` (not `"1"` the
+  printer's way, not `"1.000000"` toString's way) and
+  `builtins.toJSON 1.7976931348623157e308` == full-precision
+  `"1.7976931348623157e+308"`.
+
+**`builtins.floor`/`builtins.ceil`** (`builtins_misc.c`, previously
+entirely absent from this codebase): accept int or float, always return
+an INT -- an int argument passes through completely unmodified (never
+round-tripped through a double); a float is floored/ceiled via plain
+casts (`(int64_t)d` truncates toward zero; floor/ceil are that plus a
+one-off adjustment for the sign that needs it), not libm's `floor()`/
+`ceil()`, so this needed no new link dependency.
+
+**`toJSON`'s `__toString`/`outPath` attrset coercion** (found needed by
+`eval-okay-tojson.nix`, NOT itself a float feature -- a second
+pre-existing gap this pass's float fix unmasked by getting the file
+past its earlier parse failure): real Nix's `printValueAsJSON`
+"peels" an attrset via `__toString`/`outPath` BEFORE ever treating it as
+a JSON object (confirmed: `builtins.toJSON { outPath.foo = true; }` ==
+`"{\"foo\":true}"` there -- the whole peeled value, not a nested
+object). `json_encode`'s `ASNIX_TAG_ATTRS` case now checks for either
+attribute first and, if present, recurses on `asnix_coerce_to_string`'s
+result instead of calling `json_encode_attrs`.
+
+**`builtins.fromJSON`** (`src/c/builtins_json.{c,h}`, new file):
+previously didn't exist in this codebase AT ALL -- explicitly flagged in
+this doc's own long-tail-pass notes as "not worth building a JSON
+parser for in isolation" for the sake of one unrelated conformance file
+(`eval-fail-json-attr-not-json.nix`). That calculus changes here:
+`eval-okay-fromjson.nix` is one of the 9 files THIS milestone's float
+work was asked to unblock, and getting past its parse failure reveals
+`fromJSON` is also needed to actually evaluate it (it calls
+`builtins.fromJSON` on a literal document and compares the result
+against a literal Nix value containing floats) -- so writing a real,
+if deliberately small, hand-written recursive-descent JSON parser (same
+style as the existing `toml.c`: plain index-into-buffer scanning, no
+external dependency, fatal on malformed input) became in-scope rather
+than out. Not exposed as a bare global (confirmed against
+`nix-instantiate --eval`: unlike `fromTOML`, `fromJSON` is
+`builtins.fromJSON`-only). Implements objects, arrays, strings (`\"
+\\ \/ \b \f \n \r \t \uXXXX` escapes including UTF-16 surrogate pairs),
+numbers (a `.` or exponent makes a Float Value, matching real Nix's own
+int/float split, confirmed against the target file's own expected
+output), `true`/`false`/`null`. Two correctness bugs found and fixed
+while checking adjacent `eval-fail-fromJSON-*.nix` conformance cases
+hadn't flipped from "trivially fails because `fromJSON` didn't exist"
+to "wrongly succeeds now that it does": an embedded NUL byte from a
+`\u0000` escape (in either an object key or a string value) is rejected
+outright, matching real Nix's "cannot be represented as Nix string
+because it contains null bytes"; an integer literal that overflows
+either a real `int64_t` (checked via `strtoll`'s `ERANGE`) or asnix's
+own narrower 60-bit range (`ASNIX_INT_MIN`/`ASNIX_INT_MAX`) is rejected
+rather than silently wrapping/saturating.
+
+**`builtins.fromTOML` float/inf/nan support** (`toml.c`): this parser
+previously detected and REJECTED any TOML float or `inf`/`nan` on
+purpose, with an explicit comment explaining why ("asnix's Value
+representation is integer-only... this parser detects them and fails
+loudly rather than guessing an approximation") -- a deliberate, now-
+obsolete scope cut from before this milestone gave asnix an honest way
+to represent one. `eval-okay-nan-to-string.nix` (one of the 9 target
+files) specifically needs this: it calls `builtins.fromTOML "nan =
+nan\nneg = -nan\ninf = inf"` and checks the sign of the resulting NaN is
+preserved from how it was WRITTEN (unlike a NaN produced by arithmetic,
+which takes the host's default sign -- negative on x86-64). glibc's own
+`strtod` already gets this exactly right (`strtod("nan",0)` has a
+positive sign bit, `strtod("-nan",0)` negative), so `parse_float_token`
+just forwards the whole sign-prefixed token straight to `strtod` rather
+than negating a magnitude afterward. General TOML float literals
+(`1.0`, `3.1415`, `5e+22`, etc., with underscore separators stripped the
+same way the existing integer parser already does) are supported too,
+not just the one `nan`/`inf` case the target test needed -- cheap reuse
+of the same `classify_bare_token` dispatch point, not a half-fix.
+
+**Deliberately NOT extended, scope cuts made during this pass**:
+- `asnix_bshared_value_lt` (the `sort`/`lessThan` BUILTIN's ordering,
+  distinct from the `<`/`>`/`<=`/`>=` OPERATORS fixed above) is still
+  `INT<INT` or `string<string` only -- a Float now safely falls through
+  to that function's existing generic fatal ("cannot compare these two
+  values...") instead of being misread as string bytes, but isn't
+  specially supported there. Not needed by any of the 9 target files;
+  real Nix's own `lessThan`/`sort` DO support float ordering, so this is
+  a known, narrower gap than real Nix, consistent with this function's
+  pre-existing, already-documented int/string-only scope.
+- Path-plus-float arithmetic/ordering, and float support in
+  `builtins.toString`-adjacent path-specific code, were not touched --
+  no target file exercises them, and real Nix doesn't give floats any
+  special path-related behavior either.
+- `eval-okay-compare-operand-order.nix`'s FINAL list element,
+  `(let __curPos = 42; in __curPos)`, still does not match (expects
+  real Nix's actual `__curPos` position-tracking magic value; asnix
+  has no source-position information anywhere in its AST/IR at all,
+  and threading it through would be the same disproportionate,
+  cross-cutting change this doc's Known-Gaps list already excludes for
+  `builtins.unsafeGetAttrPos`/`eval-okay-curpos.nix`). This one file
+  therefore remains failing even after every float- and evaluation-
+  order-related fix above -- a known, pre-existing, unrelated gap, not
+  a regression from this milestone and not attempted here.
+- One conformance file flipped from an accidental pass to a genuine,
+  unrelated fail: `eval-fail-fromTOML-timestamps.nix` previously
+  "passed" only because its document also contains TOML floats, which
+  used to abort the whole parse before ever reaching its date/time
+  literals -- coincidental, not because asnix's actual (working,
+  M23-documented, still fully covered by `eval-okay-fromTOML-062`
+  through `-076`) timestamp support agreed with the file's expectation.
+  With floats fixed, asnix now parses the ENTIRE document successfully
+  (dates included), but real Nix's installed `nix-instantiate`
+  (2.35.2) actually rejects TOML date/time literals outright
+  ("Dates and times are not supported") -- directly reproduced
+  (`builtins.fromTOML "a = 1979-05-27T07:32:00Z"` errors on this
+  machine's real Nix). This is a genuine, pre-existing inconsistency
+  between asnix's M23 timestamp feature (built against, and still
+  matching, a documented differential corpus) and this one file's
+  expectation, unmasked rather than caused by this milestone -- fixing
+  it would mean ripping out working, separately-tested timestamp
+  support and regressing the entire `-062`..`-076` cluster, so it was
+  left alone and is flagged here rather than silently absorbed.
+
+**Verified against `nix-instantiate --eval` throughout** (not just
+trusted from reading `~/nix`'s source): every arithmetic/comparison
+promotion case, every formatting rule (printer/`toString`/`toJSON`,
+each independently, since they genuinely differ), `floor`/`ceil`'s
+negative-number rounding direction, the `>`/`<=` operand-evaluation-
+order fix (via `abort`/`throw` canaries), and the TOML nan-sign-
+preservation rule.
+
+**Regression**: `make test` (22 unit binaries, including a rewritten
+`test_toml.c` float/inf/nan assertion that replaces the now-obsolete
+"a TOML float is fatal" check it superseded) and `make test-e2e` (four
+new `m51_*` fixtures: float arithmetic, float/string comparisons,
+`floor`/`ceil`/`isFloat`/`typeOf`, and `toJSON`/`fromJSON`/`toString`
+float formatting, each generated via `nix-instantiate --eval --strict`)
+both green, no regressions. `test-conformance` (`lang/`): 646 passed,
+156 failed, 0 known, 62 skipped, up from a 633/169 baseline measured on
+this exact worktree before this milestone's changes (+13 net: the 8 of
+9 target files that don't need `__curPos`, plus 6 bonus files this
+pass's `fromTOML`/`fromJSON` fixes also happened to unblock
+(`eval-okay-fromTOML-006/-007/-008/-060.nix`, the main
+`eval-okay-fromTOML.nix`, and `eval-okay-fromjson-escapes.nix`), minus
+the one `eval-fail-fromTOML-timestamps.nix` flip documented above).

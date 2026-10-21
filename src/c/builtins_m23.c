@@ -136,7 +136,7 @@ static Value prim_pathExists(const Value *args, int64_t argc) {
     (void)argc;
     Value v = asnix_force_for_print(args[0]);
     int must_be_dir = 0;
-    if (asnix_tag_of(v) == ASNIX_TAG_PTR && !asnix_value_is_path(v)) {
+    if (asnix_tag_of(v) == ASNIX_TAG_PTR && !asnix_value_is_path(v) && !asnix_value_is_float(v)) {
         int64_t slen;
         const char *s = asnix_ptr_bytes(v, &slen);
         if (slen >= 1 && s[slen - 1] == '/') must_be_dir = 1;
@@ -394,7 +394,7 @@ static Value groupBy2_impl(const Value *args, int64_t argc) {
     for (int64_t i = 0; i < n; i++) {
         Value key = asnix_apply(f, &elems[i], 1);
         key = asnix_force_for_print(key);
-        if (asnix_tag_of(key) != ASNIX_TAG_PTR || asnix_value_is_path(key)) {
+        if (asnix_tag_of(key) != ASNIX_TAG_PTR || asnix_value_is_path(key) || asnix_value_is_float(key)) {
             fprintf(stderr, "asnix: groupBy: key function must return a string\n");
             exit(1);
         }
@@ -477,41 +477,49 @@ static Value prim_parseDrvName(const Value *args, int64_t argc) {
     return asnix_bshared_make_attrs(syms, vals, 2);
 }
 
-/* `builtins.add`/`sub`/`mul`/`div` -- plain two-int-argument arithmetic,
+/* `builtins.add`/`sub`/`mul`/`div` -- plain two-argument arithmetic,
  * exposed as builtins (distinct from the `+`/`-`/`*`/`/` *operators*,
- * which compile to IR ops directly -- see compiler.c/op_arith.S). Scope
- * cut matching every other arithmetic entry point in this project: INT
- * operands only, fatal on a float (asnix has no float type at all yet)
- * or any other type -- verified `builtins.add 2 3` => 5,
- * `builtins.sub 0 1` => -1 against nix-instantiate. */
+ * which compile to IR ops directly -- see compiler.c/op_arith.S). M51:
+ * now shares the exact same int/float promotion rule the operators use
+ * (asnix_add_values/asnix_sub_values/asnix_mul_values/asnix_div_values,
+ * value_util.c) rather than being INT-only -- verified against
+ * `nix-instantiate --eval`: `builtins.add 2.0 2` => 4 (and
+ * `builtins.typeOf (builtins.add 2.0 2)` => "float"), matching real
+ * Nix's own `prim_add`/`prim_sub`/`prim_mul`/`prim_div`
+ * (~/nix/src/libexpr/primops.cc), which promote exactly the same way
+ * `+`/`-`/`*`/`/` do -- these are not two independently-scoped features.
+ * The all-int fast path asnix_add_values/etc. themselves keep (checked
+ * first, before ever considering float) means `builtins.add 2 3` still
+ * costs nothing extra over before this milestone. */
 static Value add2_impl(const Value *args, int64_t argc) {
     (void)argc;
-    ASNIX_REQUIRE_INT(args[0], "add");
-    ASNIX_REQUIRE_INT(args[1], "add");
-    return asnix_make_int(asnix_int_value(args[0]) + asnix_int_value(args[1]));
+    return asnix_add_values(args[0], args[1]);
 }
 static Value sub2_impl(const Value *args, int64_t argc) {
     (void)argc;
-    ASNIX_REQUIRE_INT(args[0], "sub");
-    ASNIX_REQUIRE_INT(args[1], "sub");
-    return asnix_make_int(asnix_int_value(args[0]) - asnix_int_value(args[1]));
+    if (asnix_tag_of(args[0]) == ASNIX_TAG_INT && asnix_tag_of(args[1]) == ASNIX_TAG_INT) {
+        return asnix_make_int(asnix_int_value(args[0]) - asnix_int_value(args[1]));
+    }
+    return asnix_sub_values(args[0], args[1]);
 }
 static Value mul2_impl(const Value *args, int64_t argc) {
     (void)argc;
-    ASNIX_REQUIRE_INT(args[0], "mul");
-    ASNIX_REQUIRE_INT(args[1], "mul");
-    return asnix_make_int(asnix_int_value(args[0]) * asnix_int_value(args[1]));
+    if (asnix_tag_of(args[0]) == ASNIX_TAG_INT && asnix_tag_of(args[1]) == ASNIX_TAG_INT) {
+        return asnix_make_int(asnix_int_value(args[0]) * asnix_int_value(args[1]));
+    }
+    return asnix_mul_values(args[0], args[1]);
 }
 static Value div2_impl(const Value *args, int64_t argc) {
     (void)argc;
-    ASNIX_REQUIRE_INT(args[0], "div");
-    ASNIX_REQUIRE_INT(args[1], "div");
-    int64_t rhs = asnix_int_value(args[1]);
-    if (rhs == 0) {
-        fprintf(stderr, "asnix: division by zero, aborting\n");
-        exit(1);
+    if (asnix_tag_of(args[0]) == ASNIX_TAG_INT && asnix_tag_of(args[1]) == ASNIX_TAG_INT) {
+        int64_t rhs = asnix_int_value(args[1]);
+        if (rhs == 0) {
+            fprintf(stderr, "asnix: division by zero, aborting\n");
+            exit(1);
+        }
+        return asnix_make_int(asnix_int_value(args[0]) / rhs);
     }
-    return asnix_make_int(asnix_int_value(args[0]) / rhs);
+    return asnix_div_values(args[0], args[1]);
 }
 static Value build_add(void) { return asnix_bshared_make_curried_native((void *)add2_impl, 2); }
 static Value build_sub(void) { return asnix_bshared_make_curried_native((void *)sub2_impl, 2); }

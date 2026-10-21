@@ -47,6 +47,11 @@ static void check_int(Value v, int64_t want, const char *msg) {
     CHECK(ok, msg);
 }
 
+static void check_float(Value v, double want, const char *msg) {
+    int ok = asnix_value_is_float(v) && asnix_float_value(v) == want;
+    CHECK(ok, msg);
+}
+
 static void check_string(Value v, const char *want, const char *msg) {
     int ok = asnix_tag_of(v) == ASNIX_TAG_PTR;
     if (ok) {
@@ -200,33 +205,25 @@ static void test_comments_and_crlf(void) {
     check_int(get(v, "c"), 3, "plain LF after CRLF line");
 }
 
-/* asnix has no float/double Value representation at all (see
- * include/asnix/value.h) -- a TOML float must fail loudly, not silently
- * truncate to an int or fake a string, so this follows the same
- * fork()+exit-code pattern test_abort.c established for other
- * unconditionally-fatal paths. Ground truth for *why* this is a scope
- * cut, not an oversight: lang/eval-okay-fromTOML-006/-007/-008/-060.exp
- * all require a genuine Nix float value (`1.5`, `inf`, `nan`, `3.0`). */
-static void test_float_is_fatal(void) {
-    int pipefd[2];
-    if (pipe(pipefd) != 0) { CHECK(0, "pipe() failed"); return; }
-    pid_t pid = fork();
-    if (pid == 0) {
-        close(pipefd[0]);
-        dup2(pipefd[1], 2);
-        close(pipefd[1]);
-        asnix_arena_init(0);
-        toml("a = 1.5");
-        _exit(42); /* reaching here means the float wasn't rejected */
-    }
-    close(pipefd[1]);
-    char buf[256] = { 0 };
-    ssize_t n = read(pipefd[0], buf, sizeof(buf) - 1);
-    close(pipefd[0]);
-    int status = 0;
-    waitpid(pid, &status, 0);
-    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 1, "a TOML float exits with code 1, not a crash or a silent int");
-    CHECK(n > 0 && strstr(buf, "not supported") != NULL, "the error names the unsupported-float reason");
+/* M51: asnix now has a real Float Value kind (include/asnix/value.h's
+ * ASNIX_TAG_PTR + heap.h's ASNIX_FLOAT_MARKER), so a TOML float/inf/nan
+ * parses to a genuine Nix float value instead of fatally rejecting --
+ * see toml.c's parse_float_token. Ground truth: lang/eval-okay-fromTOML-
+ * 006/-007/-008/-060.exp all require exactly this (a genuine Nix float
+ * value for `1.5`, `inf`, `nan`, `3.0`). NaN can't be compared with `==`
+ * (always false, by IEEE-754 definition, even against itself) -- checked
+ * via self-inequality instead, the standard NaN test. */
+static void test_float(void) {
+    Value v = toml("a = 1.5\nb = 3.0\nc = inf\nd = -inf\ne = nan\nf = -nan");
+    check_float(get(v, "a"), 1.5, "basic TOML float");
+    check_float(get(v, "b"), 3.0, "whole-number TOML float stays a Float, not an Int");
+    check_float(get(v, "c"), 1.0 / 0.0, "TOML inf");
+    check_float(get(v, "d"), -1.0 / 0.0, "TOML -inf");
+    Value nan_v = get(v, "e");
+    CHECK(asnix_value_is_float(nan_v) && asnix_float_value(nan_v) != asnix_float_value(nan_v), "TOML nan");
+    Value neg_nan_v = get(v, "f");
+    CHECK(asnix_value_is_float(neg_nan_v) && asnix_float_value(neg_nan_v) != asnix_float_value(neg_nan_v),
+          "TOML -nan");
 }
 
 int main(void) {
@@ -240,7 +237,7 @@ int main(void) {
     test_quoted_and_unusual_keys();
     test_timestamps();
     test_comments_and_crlf();
-    test_float_is_fatal();
+    test_float();
     if (failures) {
         fprintf(stderr, "%d failure(s)\n", failures);
         return 1;

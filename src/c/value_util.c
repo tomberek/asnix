@@ -32,6 +32,46 @@ int asnix_value_is_path(Value v) {
     return *(const int64_t *)(base + ASNIX_PATH_OFF_MARKER) == ASNIX_PATH_MARKER;
 }
 
+Value asnix_make_float_value(double d) {
+    void *mem = asnix_arena_alloc(16);
+    *(int64_t *)((char *)mem + ASNIX_FLOAT_OFF_MARKER) = ASNIX_FLOAT_MARKER;
+    *(double *)((char *)mem + ASNIX_FLOAT_OFF_VALUE) = d;
+    return (Value){ .raw = (uint64_t)(uintptr_t)mem | ASNIX_TAG_PTR };
+}
+
+int asnix_value_is_float(Value v) {
+    if (asnix_tag_of(v) != ASNIX_TAG_PTR) return 0;
+    const char *base = (const char *)(v.raw & ~0x7ULL);
+    return *(const int64_t *)(base + ASNIX_FLOAT_OFF_MARKER) == ASNIX_FLOAT_MARKER;
+}
+
+double asnix_float_value(Value v) {
+    const char *base = (const char *)(v.raw & ~0x7ULL);
+    return *(const double *)(base + ASNIX_FLOAT_OFF_VALUE);
+}
+
+/* Shared by asnix_add_values/asnix_sub_values/asnix_mul_values/
+ * asnix_div_values/the four asnix_cmp_*_values functions below: real
+ * Nix promotes an int operand to float whenever the OTHER operand is
+ * already a float (verified against `nix-instantiate --eval` for every
+ * one of the four arithmetic operators, and for the four ordering
+ * comparisons' CompareValues -- see
+ * value_util.h's comments on each). Returns 1 and writes `*out` if `v`
+ * is numeric (int or float), 0 (leaving `*out` untouched) otherwise --
+ * callers combine this with their own fatal message, since each call
+ * site's wording differs slightly (matching existing convention). */
+static int as_double(Value v, double *out) {
+    if (asnix_value_is_float(v)) {
+        *out = asnix_float_value(v);
+        return 1;
+    }
+    if (asnix_tag_of(v) == ASNIX_TAG_INT) {
+        *out = (double)asnix_int_value(v);
+        return 1;
+    }
+    return 0;
+}
+
 const char *asnix_ptr_bytes(Value v, int64_t *out_len) {
     const char *base = (const char *)(v.raw & ~0x7ULL);
     if (asnix_value_is_path(v)) {
@@ -64,6 +104,26 @@ Value asnix_coerce_to_string(Value v) {
             }
             break;
         case ASNIX_TAG_PTR: {
+            /* M51: a Float formats via the SAME rule real Nix's own
+             * `coerceToString` uses for `toString`/coerceMore (verified
+             * against `nix-instantiate --eval`: `toString 1.5` ==
+             * "1.500000", `toString (0.0 - 1.0/0.0 ... )`-style nan/inf
+             * cases print "nan"/"-nan"/"inf"/"-inf") -- `std::to_string`
+             * on a double is glibc's `%f`: always 6 digits after the
+             * decimal point for a finite value, and for non-finite
+             * values `%f`'s nan/inf spelling (with sign) falls out for
+             * free, no special-casing needed. NOT the same formatting
+             * the top-level value printer uses (main.c's
+             * print_value_inner, "%.6g"-style) -- two genuinely
+             * different real-Nix formatting rules for two different call
+             * sites, confirmed by directly comparing `nix-instantiate
+             * --eval '1.5'` ("1.5") against `nix-instantiate --eval
+             * 'toString 1.5'` ("1.500000"). */
+            if (asnix_value_is_float(v)) {
+                char buf[512]; /* worst case: %f of the largest finite double is ~317 bytes */
+                int n = snprintf(buf, sizeof(buf), "%f", asnix_float_value(v));
+                return asnix_make_string_value(buf, (size_t)n);
+            }
             if (!asnix_value_is_path(v)) return v; /* already a string */
             int64_t len;
             const char *bytes = asnix_ptr_bytes(v, &len);
@@ -140,6 +200,26 @@ static Value coerce_to_string_for_interp(Value v) {
          * scope notes) -- so this produces the plain path text instead,
          * a known, documented behavioral gap, not a crash. */
         if (asnix_value_is_path(v)) return asnix_coerce_to_string(v);
+        /* M51: a bare Float is a THIRD such kind -- same memory-corruption
+         * risk as Path if returned unchanged (its marker+double bytes
+         * would be misread as a string length+content). Unlike Path, a
+         * Float is REJECTED here, same as an int (verified against
+         * `nix-instantiate --eval`: `"${1.5}"` fails "cannot coerce a
+         * float to a string", while `"${toString 1.5}"` succeeds --
+         * `coerceToString`'s `coerceMore` branch, which handles nFloat,
+         * is exactly the branch `toString` takes and bare interpolation
+         * does not, same split this function's own header comment
+         * already describes for int/bool/null). Falls through to the
+         * generic rejection below, which already knows how to name a
+         * Float via asnix_tag_of(v)==ASNIX_TAG_PTR's... no -- that
+         * switch is INT-only for "an integer"; handled explicitly right
+         * here instead since the switch below has no float case of its
+         * own. */
+        if (asnix_value_is_float(v)) {
+            fprintf(stderr, "asnix: cannot coerce a float to a string in a string interpolation "
+                             "(use builtins.toString explicitly)\n");
+            exit(1);
+        }
         return v;
     }
     if (asnix_tag_of(v) == ASNIX_TAG_ATTRS) {
@@ -212,6 +292,24 @@ Value asnix_add_values(Value lhs, Value rhs) {
     if (lt == ASNIX_TAG_INT && rt == ASNIX_TAG_INT) {
         return asnix_make_int(asnix_int_value(lhs) + asnix_int_value(rhs));
     }
+    /* M51: int/float or float/float -- promote and add as doubles, same
+     * rule as real Nix's `+` (ExprConcatStrings::eval, ~/nix's eval.cc:
+     * "Upgrade the type from int to float" once either operand is a
+     * float). Checked BEFORE the plain-int-vs-non-int fatal below and
+     * the string/path concat fallback after it, since a float is
+     * neither. */
+    if (asnix_value_is_float(lhs) || asnix_value_is_float(rhs)) {
+        double a, b;
+        if (!as_double(lhs, &a)) {
+            fprintf(stderr, "asnix: '+': cannot add a non-numeric value to a float\n");
+            exit(1);
+        }
+        if (!as_double(rhs, &b)) {
+            fprintf(stderr, "asnix: '+': cannot add a non-numeric value to a float\n");
+            exit(1);
+        }
+        return asnix_make_float_value(a + b);
+    }
     if (lt == ASNIX_TAG_INT || rt == ASNIX_TAG_INT) {
         fprintf(stderr, "asnix: '+': cannot add an integer and a non-integer\n");
         exit(1);
@@ -224,6 +322,106 @@ Value asnix_add_values(Value lhs, Value rhs) {
         return asnix_make_path_value(bytes, (size_t)len);
     }
     return result;
+}
+
+/* M51: `-`/`*`'s slow-path fallback -- see value_util.h's comment. Only
+ * ever called when at least one operand isn't a plain int (the all-int
+ * case is already handled by op_arith.S's own fast path before this is
+ * reached), so getting here with two non-floats is already a type
+ * error. */
+Value asnix_sub_values(Value lhs, Value rhs) {
+    double a, b;
+    if (as_double(lhs, &a) && as_double(rhs, &b)) return asnix_make_float_value(a - b);
+    fprintf(stderr, "asnix: '-': operands must both be numbers (int or float), aborting\n");
+    exit(1);
+}
+
+Value asnix_mul_values(Value lhs, Value rhs) {
+    double a, b;
+    if (as_double(lhs, &a) && as_double(rhs, &b)) return asnix_make_float_value(a * b);
+    fprintf(stderr, "asnix: '*': operands must both be numbers (int or float), aborting\n");
+    exit(1);
+}
+
+Value asnix_div_values(Value lhs, Value rhs) {
+    double a, b;
+    if (!as_double(lhs, &a) || !as_double(rhs, &b)) {
+        fprintf(stderr, "asnix: '/': operands must both be numbers (int or float), aborting\n");
+        exit(1);
+    }
+    /* Matches real Nix exactly: the float-coerced divisor is checked
+     * against zero unconditionally, even when both operands started out
+     * as ints and would otherwise divide evenly as floats (e.g. there is
+     * no IEEE-754 "divide by zero gives infinity" case here at all --
+     * see value_util.h's comment). The pure-int/int zero check already
+     * lives in op_arith.S's own fast path; this is the one case that
+     * reaches here with a zero divisor: an int/float or float/float pair. */
+    if (b == 0.0) {
+        fprintf(stderr, "asnix: division by zero, aborting\n");
+        exit(1);
+    }
+    return asnix_make_float_value(a / b);
+}
+
+/* True iff `v` is a genuine String -- ASNIX_TAG_PTR but neither a Path
+ * nor a Float, the two other kinds that share the tag (see heap.h).
+ * Shared by the four ordering fallbacks below for their string<string
+ * case (same scope real Nix's `<`/`>`/`<=`/`>=` support beyond numbers:
+ * `~/nix/src/libexpr/primops.cc`'s `CompareValues` also orders paths and
+ * lists, but this project's existing `asnix_bshared_value_lt` -- used by
+ * `sort`/`lessThan` -- already deliberately narrows that to "INT<INT or
+ * string<string only", and this mirrors that same already-accepted
+ * scope cut for the operators rather than inventing a wider one). */
+static int is_plain_string(Value v) {
+    return asnix_tag_of(v) == ASNIX_TAG_PTR && !asnix_value_is_path(v) && !asnix_value_is_float(v);
+}
+
+/* Lexicographic byte comparison, shorter-is-less on a shared prefix --
+ * same rule as asnix_bshared_value_lt's existing string<string case
+ * (builtins_shared.c), reimplemented here rather than shared across the
+ * two files for the same reason value_util.c and builtins_shared.c
+ * already don't share this kind of tiny helper elsewhere (no import
+ * cycle: builtins_shared.c depends on value_util.h, not the reverse). */
+static int str_lt(Value a, Value b) {
+    int64_t la, lb;
+    const char *ba = asnix_ptr_bytes(a, &la);
+    const char *bb = asnix_ptr_bytes(b, &lb);
+    int64_t n = la < lb ? la : lb;
+    int c = n > 0 ? memcmp(ba, bb, (size_t)n) : 0;
+    if (c != 0) return c < 0;
+    return la < lb;
+}
+
+Value asnix_cmp_lt_values(Value lhs, Value rhs) {
+    double a, b;
+    if (as_double(lhs, &a) && as_double(rhs, &b)) return a < b ? ASNIX_TRUE : ASNIX_FALSE;
+    if (is_plain_string(lhs) && is_plain_string(rhs)) return str_lt(lhs, rhs) ? ASNIX_TRUE : ASNIX_FALSE;
+    fprintf(stderr, "asnix: comparison (< > <= >=) operands must both be numbers or both be strings, aborting\n");
+    exit(1);
+}
+
+Value asnix_cmp_gt_values(Value lhs, Value rhs) {
+    double a, b;
+    if (as_double(lhs, &a) && as_double(rhs, &b)) return a > b ? ASNIX_TRUE : ASNIX_FALSE;
+    if (is_plain_string(lhs) && is_plain_string(rhs)) return str_lt(rhs, lhs) ? ASNIX_TRUE : ASNIX_FALSE;
+    fprintf(stderr, "asnix: comparison (< > <= >=) operands must both be numbers or both be strings, aborting\n");
+    exit(1);
+}
+
+Value asnix_cmp_le_values(Value lhs, Value rhs) {
+    double a, b;
+    if (as_double(lhs, &a) && as_double(rhs, &b)) return a <= b ? ASNIX_TRUE : ASNIX_FALSE;
+    if (is_plain_string(lhs) && is_plain_string(rhs)) return !str_lt(rhs, lhs) ? ASNIX_TRUE : ASNIX_FALSE;
+    fprintf(stderr, "asnix: comparison (< > <= >=) operands must both be numbers or both be strings, aborting\n");
+    exit(1);
+}
+
+Value asnix_cmp_ge_values(Value lhs, Value rhs) {
+    double a, b;
+    if (as_double(lhs, &a) && as_double(rhs, &b)) return a >= b ? ASNIX_TRUE : ASNIX_FALSE;
+    if (is_plain_string(lhs) && is_plain_string(rhs)) return !str_lt(lhs, rhs) ? ASNIX_TRUE : ASNIX_FALSE;
+    fprintf(stderr, "asnix: comparison (< > <= >=) operands must both be numbers or both be strings, aborting\n");
+    exit(1);
 }
 
 Value asnix_concat_lists(Value lhs, Value rhs) {

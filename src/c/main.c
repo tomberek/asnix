@@ -127,6 +127,27 @@ static void print_value_inner(Value v) {
                 default: printf("<imm %d>", asnix_imm_subtag(v)); return;
             }
         case ASNIX_TAG_PTR: {
+            /* M51: a Float prints via the SAME "general"/"%.6g"-shaped
+             * rule real Nix's own top-level value printer uses (verified
+             * directly against `nix-instantiate --eval`: `1.5` -> "1.5",
+             * `2.2250738585072014e-308` -> "2.22507e-308" (6 significant
+             * digits), `0.0` -> "0", `builtins.add 2.0 2` -> "4" (no
+             * forced ".0" on an integral float) -- real Nix's printer
+             * (print.cc's printFloat) just does `ostream << double`,
+             * i.e. plain C++ default float formatting, which is
+             * bit-for-bit glibc's `%.6g`, including nan/inf spelling for
+             * non-finite values ("nan"/"-nan"/"inf"/"-inf", checked
+             * directly against glibc's printf -- no special-casing
+             * needed). NOT the same formatting `toString`/coerceToString
+             * uses (value_util.c's asnix_coerce_to_string, "%f"-style) --
+             * two genuinely different real-Nix formatting rules for two
+             * different call sites, confirmed by directly comparing
+             * `nix-instantiate --eval '1.5'` ("1.5") against
+             * `nix-instantiate --eval 'toString 1.5'` ("1.500000"). */
+            if (asnix_value_is_float(v)) {
+                printf("%.6g", asnix_float_value(v));
+                return;
+            }
             int64_t len;
             const char *bytes = asnix_ptr_bytes(v, &len);
             /* Paths print bare/unquoted (an absolute filesystem path, not

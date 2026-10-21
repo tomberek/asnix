@@ -254,6 +254,23 @@ static void compile_expr(IrBuilder *b, Ast *node, ScopeFrame *scope) {
         case AST_INT:
             ib_push_int(b, node->as.int_val);
             return;
+        case AST_FLOAT: {
+            /* M51: heap-allocated once, here, at compile time -- same
+             * "resolve once, not per-eval" precedent AST_PATH's literal
+             * resolution already established (compiler.c's AST_PATH
+             * case): a Float is a genuine 2-word heap box (see heap.h),
+             * not an immediate, so there's no cheaper way to materialize
+             * one than allocating it, and a literal's value never
+             * changes between evaluations of the same compiled program,
+             * so allocating it fresh on every OP_PUSH_CONST hit (if this
+             * were instead done at eval time) would be pure waste. Same
+             * mechanism AST_PATH/AST_STRING already use for a heap-value
+             * compile-time constant: ib_push_const stashes the raw
+             * tagged word in the constant pool. */
+            Value fv = asnix_make_float_value(node->as.float_val);
+            ib_push_const(b, (int64_t)fv.raw);
+            return;
+        }
         case AST_BOOL:
             if (node->as.bool_val)
                 ib_push_true(b);
@@ -588,6 +605,48 @@ static void compile_expr(IrBuilder *b, Ast *node, ScopeFrame *scope) {
             return;
         }
         case AST_BINOP:
+            /* M51: `>` and `<=` evaluate their RIGHT operand first, not
+             * left -- found while chasing numtide/nix-conformance's
+             * eval-okay-compare-operand-order.nix (blocked until this
+             * milestone by the same float-literal parse failure as
+             * every other file in this pass, but the bug it actually
+             * exercises is this evaluation-order rule, unrelated to
+             * floats per se). Real Nix's own grammar explains why
+             * (`~/nix/src/libexpr/parser.y`): `a > b` desugars to
+             * `__lessThan b a` and `a <= b` to `!(__lessThan b a)` --
+             * i.e. the operands are swapped at the AST level before
+             * `lessThan`'s own (curried, forces-its-first-applied-arg-
+             * first) application forces them, so `b` (the ORIGINAL
+             * right operand) is always forced before `a`. `<` and `>=`
+             * need no such swap: they desugar to `__lessThan a b` /
+             * `!(__lessThan a b)`, i.e. already plain left-to-right.
+             * Verified directly against `nix-instantiate --eval` with
+             * abort/throw canaries on both sides of both `>` and `<=`
+             * (see this milestone's session transcript). Implemented by
+             * compiling the operands in SWAPPED order and reusing the
+             * existing `<` IR op (ib_lt) with its own operands therefore
+             * *also* swapped relative to the source -- `a > b` becomes
+             * "push b, push a, lt" (computing "b < a", i.e. exactly "a >
+             * b"); `a <= b` becomes "push b, push a, lt, not" (computing
+             * "!(b < a)", i.e. exactly "a <= b") -- rather than adding a
+             * new IR op: OP_GT/OP_LE (ib_gt/ib_le, op_cmp.S's
+             * asnix_op_gt/asnix_op_le) are left completely unused by the
+             * compiler after this change (not deleted -- harmless dead
+             * code, same convention as any other op this project has
+             * ever superseded without ripping out). */
+            if (node->as.binop.op == 'g') {
+                compile_expr(b, node->as.binop.rhs, scope);
+                compile_expr(b, node->as.binop.lhs, scope);
+                ib_lt(b);
+                return;
+            }
+            if (node->as.binop.op == 'L') {
+                compile_expr(b, node->as.binop.rhs, scope);
+                compile_expr(b, node->as.binop.lhs, scope);
+                ib_lt(b);
+                ib_not(b);
+                return;
+            }
             compile_expr(b, node->as.binop.lhs, scope);
             compile_expr(b, node->as.binop.rhs, scope);
             switch (node->as.binop.op) {
@@ -597,8 +656,6 @@ static void compile_expr(IrBuilder *b, Ast *node, ScopeFrame *scope) {
                 case 'e': ib_eq(b); return;
                 case 'n': ib_neq(b); return;
                 case 'l': ib_lt(b); return;
-                case 'g': ib_gt(b); return;
-                case 'L': ib_le(b); return;
                 case 'G': ib_ge(b); return;
                 case 'u': ib_update(b); return;
                 case 'c': ib_concat(b); return;

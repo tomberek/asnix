@@ -121,7 +121,8 @@ const char *asnix_bshared_type_name(Value v) {
                 case ASNIX_IMM_NULL: return "null";
                 default: return "an immediate value";
             }
-        case ASNIX_TAG_PTR: return asnix_value_is_path(v) ? "a path" : "a string";
+        case ASNIX_TAG_PTR:
+            return asnix_value_is_path(v) ? "a path" : asnix_value_is_float(v) ? "a float" : "a string";
         case ASNIX_TAG_LIST: return "a list";
         case ASNIX_TAG_ATTRS: return "an attrset";
         case ASNIX_TAG_CLOSURE:
@@ -260,6 +261,25 @@ int asnix_bshared_value_eq(Value a, Value b) {
     a = asnix_force_for_print(a);
     b = asnix_force_for_print(b);
     int ta = asnix_tag_of(a), tb = asnix_tag_of(b);
+    /* M51: a Float on either side -- checked FIRST, before the generic
+     * PTR-vs-PTR string/path byte-compare below (a Float's bytes are a
+     * marker+double, not length-prefixed text, so that branch would
+     * misread them) and before the plain `ta != tb` type-mismatch
+     * rejection (int-vs-float must still compare equal when numerically
+     * equal, matching real Nix's own `==`/eqValues -- confirmed against
+     * `nix-instantiate --eval`: `1 == 1.0` is `true`). Not numeric on
+     * one side and not float-tagged on the other (e.g. a Float vs a
+     * string) simply isn't equal, same as any other cross-type `==`. */
+    if (asnix_value_is_float(a) || asnix_value_is_float(b)) {
+        double da, db;
+        if (asnix_value_is_float(a)) da = asnix_float_value(a);
+        else if (ta == ASNIX_TAG_INT) da = (double)asnix_int_value(a);
+        else return 0;
+        if (asnix_value_is_float(b)) db = asnix_float_value(b);
+        else if (tb == ASNIX_TAG_INT) db = (double)asnix_int_value(b);
+        else return 0;
+        return da == db;
+    }
     if (ta == ASNIX_TAG_PTR && tb == ASNIX_TAG_PTR) {
         int64_t la, lb;
         const char *ba = asnix_ptr_bytes(a, &la);
@@ -301,7 +321,7 @@ Value asnix_bshared_select_dynamic(Value target, Value name_val) {
                 asnix_bshared_type_name(target));
         exit(1);
     }
-    if (asnix_tag_of(name_val) != ASNIX_TAG_PTR || asnix_value_is_path(name_val)) {
+    if (asnix_tag_of(name_val) != ASNIX_TAG_PTR || asnix_value_is_path(name_val) || asnix_value_is_float(name_val)) {
         fprintf(stderr, "asnix: a dynamic '.${...}' attribute name must be a string (got %s)\n",
                 asnix_bshared_type_name(name_val));
         exit(1);
@@ -330,7 +350,7 @@ Value asnix_bshared_select_dynamic(Value target, Value name_val) {
  * inline asm makes for the static case. */
 int asnix_bshared_select_dynamic_or(Value target, Value name_val, Value *out) {
     if (asnix_tag_of(target) != ASNIX_TAG_ATTRS) return 0;
-    if (asnix_tag_of(name_val) != ASNIX_TAG_PTR || asnix_value_is_path(name_val)) {
+    if (asnix_tag_of(name_val) != ASNIX_TAG_PTR || asnix_value_is_path(name_val) || asnix_value_is_float(name_val)) {
         fprintf(stderr, "asnix: a dynamic '.${...}' attribute name must be a string (got %s)\n",
                 asnix_bshared_type_name(name_val));
         exit(1);
@@ -346,7 +366,7 @@ int asnix_bshared_select_dynamic_or(Value target, Value name_val, Value *out) {
 
 int asnix_bshared_has_attr_dynamic(Value target, Value name_val) {
     if (asnix_tag_of(target) != ASNIX_TAG_ATTRS) return 0;
-    if (asnix_tag_of(name_val) != ASNIX_TAG_PTR || asnix_value_is_path(name_val)) {
+    if (asnix_tag_of(name_val) != ASNIX_TAG_PTR || asnix_value_is_path(name_val) || asnix_value_is_float(name_val)) {
         fprintf(stderr, "asnix: a dynamic '${...}' attribute name must be a string (got %s)\n",
                 asnix_bshared_type_name(name_val));
         exit(1);
@@ -362,7 +382,8 @@ int asnix_bshared_value_lt(Value a, Value b, const char *who) {
     if (ta == ASNIX_TAG_INT && tb == ASNIX_TAG_INT) {
         return asnix_int_value(a) < asnix_int_value(b);
     }
-    if (ta == ASNIX_TAG_PTR && tb == ASNIX_TAG_PTR && !asnix_value_is_path(a) && !asnix_value_is_path(b)) {
+    if (ta == ASNIX_TAG_PTR && tb == ASNIX_TAG_PTR && !asnix_value_is_path(a) && !asnix_value_is_path(b) &&
+        !asnix_value_is_float(a) && !asnix_value_is_float(b)) {
         int64_t la, lb;
         const char *ba = asnix_ptr_bytes(a, &la);
         const char *bb = asnix_ptr_bytes(b, &lb);

@@ -11,6 +11,7 @@
 #include "builtins_attrs2.h"
 #include "builtins_closure.h"
 #include "builtins_compare.h"
+#include "builtins_json.h"
 #include "builtins_list.h"
 #include "builtins_list2.h"
 #include "builtins_m23.h"
@@ -89,7 +90,10 @@ static Value prim_typeOf(const Value *args, int64_t argc) {
                 case ASNIX_IMM_NULL: return make_string("null", 4);
                 default: return make_string("imm", 3);
             }
-        case ASNIX_TAG_PTR: return asnix_value_is_path(args[0]) ? make_string("path", 4) : make_string("string", 6);
+        case ASNIX_TAG_PTR:
+            return asnix_value_is_path(args[0]) ? make_string("path", 4)
+                 : asnix_value_is_float(args[0]) ? make_string("float", 5)
+                                                  : make_string("string", 6);
         case ASNIX_TAG_LIST: return make_string("list", 4);
         case ASNIX_TAG_ATTRS: return make_string("set", 3);
         case ASNIX_TAG_CLOSURE:
@@ -145,7 +149,7 @@ static Value make_primop_value(void *fn, int64_t arity) {
  */
 static Value hash_apply(const Value *args, int64_t (*hash_fn)(const void *, size_t, unsigned char *), size_t raw_len) {
     Value in = args[0];
-    if (asnix_tag_of(in) != ASNIX_TAG_PTR || asnix_value_is_path(in)) {
+    if (asnix_tag_of(in) != ASNIX_TAG_PTR || asnix_value_is_path(in) || asnix_value_is_float(in)) {
         /* Real Nix is strict here too: `hashString "sha256" ./foo.nix`
          * fails with "expected a string but found a path" (checked
          * against nix-instantiate) -- a path isn't auto-coerced. */
@@ -189,7 +193,7 @@ static Value prim_hashString_apply_sha512(const Value *args, int64_t argc) {
 static Value prim_hashString(const Value *args, int64_t argc) {
     (void)argc;
     Value algo = args[0];
-    if (asnix_tag_of(algo) != ASNIX_TAG_PTR || asnix_value_is_path(algo)) {
+    if (asnix_tag_of(algo) != ASNIX_TAG_PTR || asnix_value_is_path(algo) || asnix_value_is_float(algo)) {
         fprintf(stderr, "asnix: hashString: first argument (algorithm name) must be a string\n");
         exit(1);
     }
@@ -316,12 +320,12 @@ Value asnix_make_builtins_attrs(void) {
     const size_t list_shaped_counts[] = { asnix_builtins_list_count, ASNIX_ATTRS_BUILTINS_COUNT };
     const AsnixBuiltinMiscDef *const build_tables[] = {
         ASNIX_BUILTINS_MISC, ASNIX_CLOSURE_BUILTINS, ASNIX_LIST2_BUILTINS, ASNIX_ATTRS2_BUILTINS, ASNIX_COMPARE_BUILTINS,
-        ASNIX_M23_BUILTINS, ASNIX_REGEX_BUILTINS, ASNIX_TOML_BUILTINS, ASNIX_TRYEVAL_BUILTINS,
+        ASNIX_M23_BUILTINS, ASNIX_REGEX_BUILTINS, ASNIX_TOML_BUILTINS, ASNIX_TRYEVAL_BUILTINS, ASNIX_JSON_BUILTINS,
     };
     const size_t build_counts[] = {
         ASNIX_BUILTINS_MISC_COUNT, ASNIX_CLOSURE_BUILTINS_COUNT, ASNIX_LIST2_BUILTINS_COUNT,
         ASNIX_ATTRS2_BUILTINS_COUNT, ASNIX_COMPARE_BUILTINS_COUNT, ASNIX_M23_BUILTINS_COUNT, ASNIX_REGEX_BUILTINS_COUNT,
-        ASNIX_TOML_BUILTINS_COUNT, ASNIX_TRYEVAL_BUILTINS_COUNT,
+        ASNIX_TOML_BUILTINS_COUNT, ASNIX_TRYEVAL_BUILTINS_COUNT, ASNIX_JSON_BUILTINS_COUNT,
     };
 
     size_t n = 0;
