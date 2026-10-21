@@ -207,7 +207,25 @@ static const char ASNIX_FETCHURL_NIX_SOURCE[] =
 
 #define ASNIX_FETCHURL_TEMP_PATH "/tmp/.asnix-corepkgs-fetchurl.nix"
 
+/* Unlike derivation.c's write_derivation_nix (called at most once per
+ * process, from asnix_make_derivation_wrapper_value's own have_cached
+ * guard), this one is reached straight from OP_RESOLVE_SEARCH_PATH --
+ * once per `<nix/fetchurl.nix>` AST node *evaluation*, not once per
+ * process. Real nixpkgs' pkgs/build-support/fetchurl/boot.nix makes
+ * `import <nix/fetchurl.nix> {...}` the BODY of a function
+ * (`fetchurlBoot`), called fresh for every package's `src = fetchurl
+ * {...}` -- hundreds of times evaluating d.nix. Real Nix's own
+ * corepkgsFS (see the big comment below) is an in-memory virtual FS, so
+ * re-resolving it there costs nothing; porting it as a real on-disk
+ * temp file means every one of those hundreds of calls was paying a
+ * real fopen+fwrite+fclose (confirmed via strace: 280 rewrites of the
+ * same never-changing 1350 bytes evaluating d.nix). The file's content
+ * is static for the whole process, so write it once and reuse the
+ * path after that -- same have_cached shape as
+ * asnix_make_derivation_wrapper_value. */
 static const char *write_fetchurl_nix(void) {
+    static int written = 0;
+    if (written) return ASNIX_FETCHURL_TEMP_PATH;
     FILE *f = fopen(ASNIX_FETCHURL_TEMP_PATH, "w");
     if (!f) {
         fprintf(stderr, "asnix: could not write '%s' for <nix/fetchurl.nix>\n", ASNIX_FETCHURL_TEMP_PATH);
@@ -215,6 +233,7 @@ static const char *write_fetchurl_nix(void) {
     }
     fwrite(ASNIX_FETCHURL_NIX_SOURCE, 1, sizeof(ASNIX_FETCHURL_NIX_SOURCE) - 1, f);
     fclose(f);
+    written = 1;
     return ASNIX_FETCHURL_TEMP_PATH;
 }
 

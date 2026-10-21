@@ -7,6 +7,7 @@
 // (that's M7+, once real builtins exist and need it); it just sets up its
 // own self-contained mini dispatch context (mirroring asnix_eval's own
 // prologue) to run one thunk's body to completion and return the result.
+#include "asnix/force_scratch.h" // ASNIX_FORCE_{VALSTACK,RETSTACK}_BYTES, per-depth cache (perf)
 #include "asnix/ir.h"
 #include "asnix/stackcheck.h"
 #include "asnix/value.h"
@@ -22,8 +23,20 @@
     // %r12/%r14 themselves, since this routine can run nested inside an
     // active asnix_eval (a builtin forcing a value, e.g. derivation.c) or
     // even inside another asnix_force_for_print call.
-    .equ ASNIX_FORCE_VALSTACK_BYTES, 262144 // 32,768 Values, 256 KiB
-    .equ ASNIX_FORCE_RETSTACK_BYTES, 65536  // 2,048 call frames, 64 KiB
+    //
+    // asnix_force_depth: how many asnix_force_for_print frames
+    // (including this one, once past the increment below) are currently
+    // live, nested inside each other -- doubles as the index into
+    // force_scratch.c's per-depth buffer cache (see
+    // include/asnix/force_scratch.h's header comment for why indexing by
+    // depth, not a single cached slot, turned out to be necessary: `perf
+    // record -e page-faults -g` on d.nix showed most real calls here ARE
+    // nested a few levels deep via derivation.c, not top-level/flat).
+    .bss
+    .align 8
+    .globl asnix_force_depth
+asnix_force_depth:
+    .quad 0
 
     .section .rodata
 .Lmsg_blackhole:
@@ -93,18 +106,25 @@ asnix_force_for_print:                  // Value asnix_force_for_print(Value v)
     movq asnix_retsp_limit(%rip), %rdx
     pushq %rdx
 
-    movq $ASNIX_FORCE_VALSTACK_BYTES, %rdi
-    call asnix_arena_alloc
+    // perf: asnix_force_scratch_{valstack,retstack} (force_scratch.c)
+    // cache one buffer pair PER DEPTH instead of this routine minting a
+    // brand-new pair from the never-free bump arena on every single
+    // call -- see force_scratch.h's header comment. %rbx (the live
+    // Thunk*) survives both calls: ordinary SysV calls, and %rbx is
+    // callee-saved.
+    movq asnix_force_depth(%rip), %rdi
+    call asnix_force_scratch_valstack
     movq %rax, %r12
     leaq ASNIX_FORCE_VALSTACK_BYTES(%r12), %rdx
     movq %rdx, asnix_valstack_limit(%rip)
 
-    movq $ASNIX_FORCE_RETSTACK_BYTES, %rdi
-    call asnix_arena_alloc
+    movq asnix_force_depth(%rip), %rdi
+    call asnix_force_scratch_retstack
     movq %rax, %r14
     leaq ASNIX_FORCE_RETSTACK_BYTES(%r14), %rdx
     movq %rdx, asnix_retsp_limit(%rip)
 
+    incq asnix_force_depth(%rip)
     movq $ASNIX_THUNK_STATE_IN_PROGRESS, ASNIX_THUNK_OFF_STATE(%rbx)
 
     // Sentinel retframe: when the thunk's OP_RET fires, it memoizes into
@@ -125,6 +145,10 @@ asnix_force_for_print:                  // Value asnix_force_for_print(Value v)
 
 asnix_force_epilogue:
     movq -8(%r12), %rax                 // result, left on VALSTACK by the thunk body's own OP_RET
+    decq asnix_force_depth(%rip)        // pop -- frees this depth's slot in force_scratch.c's
+                                         // per-depth cache for reuse by the NEXT call that
+                                         // reaches this same depth (the buffers themselves are
+                                         // never freed, only their "currently in use" status)
     popq %rdx                           // restore the enclosing context's RETSP limit (pushed
     movq %rdx, asnix_retsp_limit(%rip)  // last above, so popped first)
     popq %rdx                           // ditto for the VALSTACK limit
