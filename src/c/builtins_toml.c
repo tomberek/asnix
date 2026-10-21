@@ -38,8 +38,13 @@ static Value build_fromTOML(void) { return asnix_bshared_make_primop((void *)pri
  * builtins.h's `asnix_make_import_primop` comment for the full list as
  * currently understood; `fetchTarball`/`fetchGit`/`fetchMercurial`/
  * `fetchTree`/`scopedImport`/`placeholder`/`derivationStrict`/`break`
- * are also real (per the same source), not yet implemented at all, and
- * not pursued speculatively here -- only `fromTOML` was actually hit. */
+ * are also real (per the same source) -- at the time this comment was
+ * written, none were implemented yet, and none were pursued
+ * speculatively here (only `fromTOML` was actually hit); `scopedImport`/
+ * `placeholder`/`derivationStrict` were added by M54/M58, and `fetchGit`
+ * by M82 (builtins_fetchgit.c) once nixpkgs's own rust-toolchain
+ * dependency chain actually referenced it -- `fetchTarball`/
+ * `fetchMercurial`/`fetchTree`/`break` remain real gaps. */
 Value asnix_make_fromTOML_primop(void) { return asnix_bshared_make_primop((void *)prim_fromTOML, 1); }
 
 const AsnixBuiltinMiscDef ASNIX_TOML_BUILTINS[] = {

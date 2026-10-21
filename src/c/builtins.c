@@ -11,6 +11,7 @@
 #include "builtins_attrs2.h"
 #include "builtins_closure.h"
 #include "builtins_compare.h"
+#include "builtins_fetchgit.h"
 #include "builtins_flakeref.h"
 #include "builtins_json.h"
 #include "builtins_list.h"
@@ -287,6 +288,7 @@ static const BuiltinDef BUILTINS[] = {
     { "toPath", asnix_prim_toPath, 1 },
     { "getEnv", asnix_prim_getEnv, 1 },
     { "parseDrvName", asnix_prim_parseDrvName, 1 },
+    { "fetchGit", asnix_prim_fetchGit, 1 }, /* M82: see builtins_fetchgit.c */
 };
 
 Value asnix_make_import_primop(void) {

@@ -8651,3 +8651,154 @@ quirk, not a language fact -- "fixing" it would regress asnix's own
 already-correct TOML date support), and `(a){24998}`-shaped regex
 inputs real Nix rejects via libstdc++'s internal NFA-state-count limit
 with no equivalent signal in glibc's `regcomp` to repurpose.
+
+## M82: real `builtins.fetchGit` -- `./asnix d.nix` now runs to completion
+
+Picking back up `d.nix` (`let a = /home/tbereknyei/nixpkgs/default.nix; in
+(import a {}).ffmpeg.outPath`) after M81: it had progressed from
+crashing immediately all the way to `asnix: undefined variable
+'fetchGit'`, reached transitively through ffmpeg's rust-toolchain
+dependency chain (`sphinx`/`requests`/`charset-normalizer`/
+`ast-serialize`/`cargo`/`rustc`/`llvmPackages`) into
+`pkgs/build-support/rust/import-cargo-lock.nix`, which references the
+bare top-level `fetchGit` builtin -- real Nix provides it, asnix didn't
+implement it at all (`fetchTarball`/`fetchGit`/`fetchMercurial`/
+`fetchTree`/`fetchFinalTree` were all still-documented gaps as of
+builtins.h's own "not yet implemented at all" list).
+
+**The actual root cause was narrower than it looked.** Reading
+`import-cargo-lock.nix` line-by-line: the only `fetchGit` call site is
+
+```nix
+else if allowBuiltinFetchGit then
+  fetchGit { inherit (gitParts) url; rev = gitParts.sha; allRefs = true; submodules = true; }
+else
+  missingHash;
+```
+
+with `allowBuiltinFetchGit ? false` -- and grepping all of
+`/home/tbereknyei/nixpkgs` for `allowBuiltinFetchGit` turns up no call
+site anywhere that ever sets it `true`. So this branch's `fetchGit`
+*call* is never actually reached at runtime evaluating
+`ffmpeg.outPath` -- the crash was a pure **static name-resolution**
+problem: this codebase compiles an entire imported file's whole AST up
+front (`compiler.c`'s `compile_expr`, invoked once per file from
+`asnix_eval_file`), including BOTH arms of every `if`, and
+`compile_expr`'s `AST_VAR` case resolves every free variable against
+the static scope chain *at compile time* -- a direct, deliberate port
+of real Nix's own `bindVars`, which is equally whole-file/static there.
+Real Nix's `bindVars` succeeds on this file because `fetchGit` is one
+of its registered bare-global primop names (every `addPrimOp` entry
+without a `__` prefix, per the existing M18/M27 "bare globals" rule
+documented on `builtins.h`/`compiler.c`); asnix's static scope chain
+simply didn't know the name at all, so merely *importing* this file --
+which happens for every nixpkgs package that transitively pulls in
+Rust's `buildRustPackage` -- failed before any of `allowBuiltinFetchGit`
+was ever consulted.
+
+**Fix, in proportion to what's actually needed:** `fetchGit` is now a
+real, working builtin (not a stub) -- `src/c/builtins_fetchgit.c`/`.h`
+(new), wired into `builtins.c`'s plain `BUILTINS[]` table
+(`builtins.fetchGit`) and into `compiler.c`'s `init_builtins_frame`/
+`eval_file.c`'s `make_root_env_ex` (bare global `fetchGit`, slot 15 of
+what's now a 16-slot root env -- the single source-of-truth site each
+already documents for exactly this kind of addition). One small,
+purely additive export was needed from `nar.c`/`nar.h`:
+`asnix_hash_path_nar_sha256` (NAR-hash a path without also computing
+its store path) -- `fetchGit`'s result attrset needs `narHash` AND
+`outPath` side by side, and the existing `asnix_copy_path_to_store_ext`
+only ever returned the latter; this reuses the exact same file-local
+`nar_dump`/hashing machinery rather than threading a new out-parameter
+through an already-verified M73/M80 formula. No other change to
+`derivation.c`/`value_util.c`/`string_context.c`/the rest of `nar.c`.
+
+Implementation: shells out to a real `git` binary (`popen`/`pclose`,
+same "plain external process" category docs/abi.md already describes
+for primop calls in general -- there is no git-object-store
+implementation in this codebase, and building one would be wildly
+disproportionate here) to do a real bare clone of the given
+URL/path, resolve `ref`/`rev`/bare-HEAD to a concrete commit (with a
+best-effort `git fetch origin <rev>` retry if that rev isn't reachable
+from the default clone's fetched branches/tags -- a practical stand-in
+for real Nix's `allRefs`-driven "fetch everything", without needing to
+replicate libfetchers' exact refspec/cache logic), `git archive`s that
+rev (which, as a side effect, gets real Nix's default `exportIgnore`
+behavior for free -- `git archive` already honors `export-ignore`
+`.gitattributes` entries on its own), then runs the extracted tree
+through M75/M80's existing NAR-hash store-copy machinery -- the exact
+same formula a fixed-output derivation or `builtins.path` already
+uses, so `outPath`/`narHash` are genuinely real, not placeholders.
+
+**Verified directly against `nix-instantiate --eval --strict`**
+(network access turned out to work fine in this environment, so this
+wasn't a "scope it out, no network" situation) across four cases, all
+byte-for-byte identical output including `outPath`/`narHash`:
+a local repo with `{ url; ref; }`, the bare-string shorthand
+(`fetchGit "/path/to/repo"`), the EXACT shape
+`import-cargo-lock.nix`'s own unreachable branch uses (`{ url; rev;
+allRefs = true; submodules = true; }`), and a real remote HTTPS GitHub
+clone pinned to a specific `rev`. Also checked the original crash
+repro directly: `builtins.typeOf (import
+.../import-cargo-lock.nix)` now returns `"lambda"` instead of dying
+with "undefined variable 'fetchGit'".
+
+**Deliberate, documented scope cuts** (none exercised by anything this
+project has actually needed to evaluate -- confirmed by the
+"nothing sets `allowBuiltinFetchGit=true`" grep above, so these are
+real, narrow gaps, not guesses): `submodules = true` doesn't actually
+recurse into/fetch submodule content (the field is echoed back
+correctly, matching real Nix's attrset shape, but the hashed tree
+itself won't contain real submodule content); local *dirty* working
+trees (uncommitted changes, real Nix's empty-sha1 `rev`/`dirtyRev`
+fallback) aren't modeled -- every target is treated as a plain clone
+and always resolves to a real committed rev; `verifyCommit`/
+`publicKeys` signed-commit verification, an explicit `exportIgnore =
+false` override, `lfs` smudging, a pinned `narHash`/`lastModified`
+argument to skip re-fetching, and flake-ref-shorthand strings
+(`"github:..."`) are accepted-and-ignored or simply not special-cased;
+unknown attrset keys beyond the handled set are silently accepted
+rather than validated against real Nix's fetcher-specific
+`allowedAttrs` schema; fetch failures are a plain fatal error, not a
+catchable `EvalError`. See `builtins_fetchgit.c`'s own header comment
+for the full list.
+
+`make test`/`make test-e2e`: unchanged, all green.
+`make test-nix-conformance`: `pass=646 fail=12 skip=148` both before
+and after this change (confirmed via a full stash/rebuild/retest
+cycle) -- zero regressions, and, as expected, zero fixes either (no
+numtide/nix-conformance fixture exercises `fetchGit`).
+`make test-nixpkgs-hash`: `pass=8 fail=0`, unchanged.
+
+**`./asnix d.nix` now runs to completion** -- no crash, no hang:
+
+```
+"/nix/store/f372whziay4smpsdkvvldaxaf7wj6qlc-ffmpeg-9.0.1-bin"
+```
+
+**A new gap surfaced immediately after, as expected going in:** real
+`nix-instantiate --eval --strict -E '(import
+/home/tbereknyei/nixpkgs/default.nix {}).ffmpeg.outPath'` returns a
+*different* store path:
+
+```
+"/nix/store/29iacg6h530yx7rxz4k1fhvi0kxxhsam-ffmpeg-9.0.1-bin"
+```
+
+Same derivation name/version (`ffmpeg-9.0.1-bin`), different hash --
+meaning asnix now evaluates the entire dependency graph far enough to
+construct a plausible `ffmpeg` derivation (attribute names, builder
+wiring, output naming all shaped correctly), but SOME ancestor
+derivation feeding into its `drvPath`/`outPath` hash chain diverges
+from real Nix's own computed hash somewhere upstream. This is
+confirmed NOT caused by this milestone's own `fetchGit` work --
+`fetchGit`'s actual call site is never reached at runtime for this
+specific evaluation (see above) -- so the divergence was already
+latent, just unreachable before this fix let evaluation run past the
+M81 crash point. Not chased down this session: ffmpeg's dependency
+closure is large (the rust-toolchain chain alone is five-plus packages
+deep), and isolating which single ancestor's hash first diverges needs
+a binary-search-style comparison (e.g. walking `drvPath`s of
+intermediate derivations in both asnix and real
+`nix-instantiate --eval --strict --json` for the same attribute paths)
+that's its own multi-step investigation, not a quick follow-up. This
+is the next thread to pull on `d.nix`.

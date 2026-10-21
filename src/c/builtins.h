@@ -32,11 +32,12 @@ Value asnix_make_builtins_attrs_for_derivation_bootstrap(void);
  * `builtins`/`true`/`false`/`null`/`__curPos`, which aren't ordinary
  * `addPrimOp`-registered primops and are handled separately. asnix
  * currently exposes `import`/`map`/`abort`/`throw`/`removeAttrs`/
- * `isNull`/`toString`/`derivation`/`baseNameOf`/`dirOf`/`fromTOML` bare
- * (see eval_file.c's root Env); the fetch-family (needs real network
- * I/O), `scopedImport`/`derivationStrict` (moderate undertakings), and
- * `break`/`placeholder` (not yet hit by anything evaluated) remain
- * documented, deliberate follow-ups, not attempted speculatively.
+ * `isNull`/`toString`/`derivation`/`baseNameOf`/`dirOf`/`fromTOML`/
+ * `placeholder`/`scopedImport`/`derivationStrict`/`fetchGit` (M82, see
+ * builtins_fetchgit.c) bare (see eval_file.c's root Env); the rest of
+ * the fetch family (`fetchTarball`/`fetchMercurial`/`fetchTree`/
+ * `fetchFinalTree`) and `break` (not yet hit by anything evaluated)
+ * remain documented, deliberate follow-ups, not attempted speculatively.
  * Returns a fresh PrimOp Value wrapping the exact same native function
  * `builtins.import` uses -- same behavior, just reachable two ways. */
 Value asnix_make_import_primop(void);

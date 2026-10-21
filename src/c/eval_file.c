@@ -14,6 +14,7 @@
 #include "asnix/ir.h"
 #include "builtins.h"
 #include "builtins_attrs.h"
+#include "builtins_fetchgit.h"
 #include "builtins_list.h"
 #include "builtins_m54.h"
 #include "builtins_misc.h"
@@ -224,17 +225,18 @@ static void import_cache_insert(const char *resolved, Value v) {
 }
 
 /* Fresh root env/builtins every call -- an imported file does not inherit
- * the importing file's local scope (see eval_file.h). Slots 1-13
+ * the importing file's local scope (see eval_file.h). Slots 1-15
  * (`import`, `map`, `abort`, `toString`, `removeAttrs`, `isNull`, `throw`,
  * `derivation`, `baseNameOf`, `dirOf`, `fromTOML`, `placeholder`,
- * `scopedImport`) are the names real Nix exposes as bare globals in
- * addition to `builtins.X` -- every primop cppnix registers WITHOUT a
- * `__` prefix gets this treatment automatically (`EvalState::addPrimOp`,
- * `eval.cc`); see builtins.h's asnix_make_import_primop comment and
- * builtins_toml.c's asnix_make_fromTOML_primop comment for the fuller
- * picture (including real ones not yet implemented at all:
- * `fetchTarball`/`fetchGit`/`fetchMercurial`/`fetchTree`/
- * `derivationStrict`/`break`). compiler.c's root ScopeFrame
+ * `scopedImport`, `derivationStrict`, `fetchGit`) are the names real Nix
+ * exposes as bare globals in addition to `builtins.X` -- every primop
+ * cppnix registers WITHOUT a `__` prefix gets this treatment
+ * automatically (`EvalState::addPrimOp`, `eval.cc`); see builtins.h's
+ * asnix_make_import_primop comment, builtins_toml.c's
+ * asnix_make_fromTOML_primop comment, and builtins_fetchgit.c's own
+ * header comment (M82) for the fuller picture (including real ones
+ * still not implemented at all: `fetchTarball`/`fetchMercurial`/
+ * `fetchTree`/`break`). compiler.c's root ScopeFrame
  * (init_builtins_frame) must list the same names in the same order. `up`
  * is the caller's choice (NULL for the ordinary case, or scopedImport's
  * own extra scope-attrs frame). */
@@ -249,7 +251,7 @@ static void import_cache_insert(const char *resolved, Value v) {
  * `derivationStrict` (slot 14). The ordinary path (every other caller)
  * passes 0 and gets the real wrapper, same as before this existed. */
 static Env *make_root_env_ex(Env *up, int skip_derivation_wrapper) {
-    Env *root_env = asnix_env_alloc(up, 15);
+    Env *root_env = asnix_env_alloc(up, 16);
     root_env->values[0] = skip_derivation_wrapper ? asnix_make_builtins_attrs_for_derivation_bootstrap()
                                                    : asnix_make_builtins_attrs();
     root_env->values[1] = asnix_make_import_primop();
@@ -267,6 +269,7 @@ static Env *make_root_env_ex(Env *up, int skip_derivation_wrapper) {
     root_env->values[12] = asnix_make_placeholder_primop();
     root_env->values[13] = asnix_make_scopedImport_primop();
     root_env->values[14] = asnix_make_derivation_strict_primop(); /* M58: derivationStrict, newly bare-global */
+    root_env->values[15] = asnix_make_fetchGit_primop(); /* M82: fetchGit, newly bare-global */
     return root_env;
 }
 

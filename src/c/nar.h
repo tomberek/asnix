@@ -82,4 +82,18 @@ typedef int (*AsnixNarFilter)(void *ctx, const char *path, const char *type);
 void asnix_copy_path_to_store_ext(const char *path, const char *name, int recursive, AsnixNarFilter filter,
                                    void *filter_ctx, const uint8_t expected_sha256[32], char *out, size_t out_cap);
 
+/* M82: `builtins.fetchGit` (builtins_fetchgit.c) needs the raw NAR sha256
+ * digest itself, not just the final store path `asnix_copy_path_to_store*`
+ * compute from it -- real Nix's returned attrset carries both `outPath`
+ * AND `narHash` (SRI form) side by side. Pure addition alongside the two
+ * functions above (reuses the same file-local `nar_dump`/hashing
+ * machinery, doesn't change either of their existing bodies/signatures)
+ * rather than threading a new out-parameter through
+ * `asnix_copy_path_to_store_ext` itself, which would mean touching an
+ * already-verified M73/M80 formula for a single new, unrelated caller.
+ * Returns whatever `asnix_hash_sha256` returns (0 on success, nonzero if
+ * libcrypto couldn't be loaded) -- same convention as every other hashing
+ * entry point in this codebase. */
+int asnix_hash_path_nar_sha256(const char *path, AsnixNarFilter filter, void *filter_ctx, uint8_t out[32]);
+
 #endif /* ASNIX_NAR_H */

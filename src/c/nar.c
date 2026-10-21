@@ -326,3 +326,13 @@ void asnix_copy_path_to_store_ext(const char *path, const char *name, int recurs
     asnix_compute_fixed_output_path(recursive ? "recursive" : "flat", content_digest, 32, "sha256", 6,
                                      effective_name, out, out_cap);
 }
+
+/* M82: see nar.h's own comment. */
+int asnix_hash_path_nar_sha256(const char *path, AsnixNarFilter filter, void *filter_ctx, uint8_t out[32]) {
+    NarBuf b = { 0 };
+    nb_cstr(&b, "nix-archive-1");
+    nar_dump(&b, path, 0, filter, filter_ctx);
+    int rc = asnix_hash_sha256(b.buf, b.len, out);
+    free(b.buf);
+    return rc;
+}
