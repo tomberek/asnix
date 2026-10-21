@@ -73,7 +73,8 @@ what's actually implemented and the scope decisions made along the way.
 | M58 — `derivation` is a real Nix-level wrapper around `derivationStrict`, giving self-referential multi-output objects (`drv.out.outPath`, etc.) | done (see below) |
 | M59 — `builtins.unsafeGetAttrPos`: a deliberately narrow, approximate implementation (no Attr-record growth, no lexer changes) | done, **scoped** (see below) |
 | M60 — `builtins.unsafeDiscardStringContext` (no-op, matching M54's getContext/appendContext scope cut) | done (see below) |
-| M61+ | not started |
+| M61 — `builtins.parseFlakeRef`/`builtins.flakeRefToString`: flake-ref URL-like syntax (github/gitlab/indirect/path/git+/tarball+/file+) | done, **scoped** (see below) |
+| M62+ | not started |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
 
@@ -6038,3 +6039,132 @@ Verified against real Nix: `builtins.unsafeDiscardStringContext "foo"
 `make test`/`test-e2e` green (one new `m60_*` fixture), `test-conformance`
 (mined subset) unchanged. `d.nix` progresses past this exact blocker to
 the next one.
+
+## M61 scope notes: `builtins.parseFlakeRef`/`builtins.flakeRefToString`
+
+**Root cause.** `make test-nix-conformance` had 10 failures named after
+flake refs (`eval-okay-parse-flake-ref*.nix`,
+`eval-okay-flake-ref-to-string*.nix`,
+`eval-okay-flake-ref-round-trip.nix`) because `builtins.parseFlakeRef`/
+`builtins.flakeRefToString` didn't exist at all. Confirmed by reading
+every one of those `.nix`/`.exp` pairs first (plus their
+`eval-fail-parse-flake-ref-*`/`eval-fail-flake-ref-to-string-*`
+siblings, for validation-rule hints even though they aren't in the
+required set) that this is pure string<->attrset syntax -- no flake
+resolution, no registry lookup, no filesystem/network access anywhere
+in any of them, confirmed directly: `cat eval-okay-parse-flake-ref.nix`
+is literally `builtins.parseFlakeRef "github:NixOS/nixpkgs/23.05?dir=lib"`.
+
+**Minimal verified repro.** `nix-instantiate --eval --strict -E
+'builtins.parseFlakeRef "github:NixOS/nixpkgs/23.05?dir=lib"'` (real
+Nix, Determinate Nix 3.22.5/2.35.2, same reference version this repo's
+other scope notes already use) returns `{ dir = "lib"; owner =
+"NixOS"; ref = "23.05"; repo = "nixpkgs"; type = "github"; }` -- asnix
+previously aborted with "attribute 'parseFlakeRef' missing".
+
+**The spec, reverse-engineered.** The flake-ref grammar is NOT
+documented anywhere nix-conformance ships; it was derived field-by-
+field from the 10 required `.nix`/`.exp` pairs (every scheme: bare
+`nixpkgs`-style indirect ids, `github:`/`gitlab:`, `flake:`, bare `/...`
+absolute paths and explicit `path:`, `git+https`/`git+ssh`/`git+file`/
+bare `git://`, `tarball+`/`file+`/bare `http(s)://`/bare `file:`), then
+cross-checked directly against real `nix-instantiate --eval` for every
+case that was genuinely ambiguous from the fixtures alone -- in
+particular: the exact percent-encoding "safe" charset (three distinct
+ones, found by sweeping every printable ASCII byte through a round-trip
+and comparing which survive bare vs. get escaped: a path *segment*
+escapes `/` and `%` and most sub-delims, a generic URL *path* additionally
+keeps `/` bare, a *query value* additionally keeps `?` bare too); that a
+raw, unescaped space in a query silently drops that one key/value pair
+("dubious URI query ... missing equal sign, ignoring" on stderr, not an
+error); that duplicate query keys use first-occurrence-wins
+(`std::map::emplace` semantics); that `github`/`gitlab`/`path` have a
+*strict* unknown-query-key error while `git`/`tarball`/`file` are
+*permissive* (unknown keys just ride along in the leftover `url`
+query) and `indirect` silently *drops* unknown keys; that a literal
+`url` query key is always dropped outright for git/tarball/file
+(`parseFlakeRef "https://x.org/a.tar.gz?dir=d&url=u"` keeps `dir` but
+drops `url=u` entirely); that `indirect` lowercases a hex-shaped `rev`
+at *parse* time but `github`/`git` only normalize (lowercase, or decode
+a `sha1-<base64>` SRI string to hex) at `flakeRefToString` time -- this
+asymmetry is real, confirmed by `eval-okay-flake-ref-round-trip.nix`'s
+own `"github:a/b/ABCDEF0123...` entry being `same = false`; and that an
+empty `narHash` string is substituted with the fixed all-zero sha256
+SRI dummy value (`sha256-AAAA...=`) for every type that keeps `narHash`
+except `path` (confirmed: `flakeRefToString { type="path"; path="/a";
+narHash=""; }` keeps `narHash=` literally empty, while every other type
+substitutes the dummy).
+
+**The fix.** New, self-contained module `src/c/builtins_flakeref.c`/`.h`,
+following the established `{name,build()}`-table-plus-integration-step
+pattern (`ASNIX_FLAKEREF_BUILTINS`, wired into `builtins.c`'s
+`asnix_make_builtins_attrs_ex`'s `build_tables`-adjacent list the same
+way M54's own table is, right after it -- a tiny, additive diff there).
+Both builtins are single-argument native primops
+(`asnix_bshared_make_primop`). Internals: a shared percent-decoder, the
+three-charset percent-encoder described above, a generic
+"`scheme://[authority]path[?query]`" URL parser/rebuilder (used by
+git/tarball/file, including port normalization -- `:080` -> `:80`,
+empty port dropped) and six scheme-specific
+parse/toString function pairs (forge-style `owner/repo/[ref|rev]`,
+`indirect`, `path`, `git`, `tarball`, `file`). All intermediate scratch
+buffers are plain `malloc`/`free` (freed before returning), the same
+pattern `builtins_m54.c`'s `toXML` already uses for its
+`open_memstream` buffer -- final results are always copied into a
+fresh arena-backed `Value` via `asnix_make_string_value`/
+`asnix_bshared_make_attrs` before returning.
+
+**Scope cuts, documented rather than silently approximated:**
+- No actual flake resolution/fetching/registry lookup for bare
+  `indirect` refs (`nixpkgs` alone never becomes a real nixpkgs
+  checkout) -- confirmed unnecessary by reading
+  `eval-okay-parse-flake-ref-indirect.nix` itself: it only ever calls
+  `parseFlakeRef`, never anything that would need the fetch to
+  actually happen.
+- `narHash` is NOT validated as a real SRI hash (real Nix errors "hash
+  'x' is not SRI" for a malformed one) -- every fixture this module
+  must match only ever gives `narHash` as `""` or an already-correct
+  SRI string, so it's treated as an opaque string (plus the one
+  confirmed `""` -> dummy substitution) rather than porting
+  `Hash::parseAny`'s full validation.
+- `sourcehut:` is accepted at the dispatch level (free to add, shares
+  the forge-style code path) but not independently verified against
+  real Nix -- no fixture exercises it.
+- The `eval-fail-parse-flake-ref-*`/`eval-fail-flake-ref-to-string-*`
+  siblings (ref-and-rev conflicts, a relative-path reference, a
+  negative int in a flakeRefToString attr) are not in the required set
+  and aren't graded on exact error text (`test-nix-conformance` only
+  checks `eval-fail-*` for a nonzero exit) -- several of the easy ones
+  (both-ref-and-rev, negative-int, "./foo" not being a valid absolute
+  path) are implemented anyway (cheap, and one -- the path-ref-and-rev
+  variant -- was caught as an actual regression during this pass, see
+  below), but this wasn't pursued exhaustively.
+- `builtins.getFlake` (actual fetching) is untouched -- out of scope by
+  design, not attempted.
+
+**A regression caught before committing.** The first working version
+only checked `ref`-in-path-vs-`ref`-in-query and `rev`-in-path-vs-`rev`-
+in-query conflicts separately, missing the cross case (`ref` from the
+path position, `rev` from the query, or vice versa) --
+`eval-fail-parse-flake-ref-github-path-ref-and-rev.nix`
+(`github:a/b/c?rev=aaaa...`, ref `c` from the path, `rev` from the
+query) went from "fails because `parseFlakeRef` doesn't exist" (an
+accidental pass) to "fails because it genuinely IS ambiguous" needing a
+real check -- caught by diffing the full conformance failure list
+before/after rather than trusting the net pass count alone. Fixed by
+checking `(has_ref) && (has_rev) && !(both came from the same
+multi-segment path position)` as one combined rule.
+
+**Final numbers.** All 10 target files now pass byte-for-byte against
+their `.exp` sidecars. `make test-nix-conformance`: pass=557/fail=101
+-> pass=567/fail=91 (skip=148 unchanged) -- a clean +10/-10, nothing
+else regressed (verified by diffing the full failed-file list
+before/after, not just the aggregate counts; one apparent extra
+regression, `eval-okay-toxml.nix`, turned out to be a one-off flake --
+it passes standalone and on a repeat full sweep). `make test`/`make
+test-e2e` stay green, plus 6 new fixtures under `tests/e2e/`
+(`flakeref_parse_github`/`_indirect`/`_path`/`_git`,
+`flakeref_to_string`, `flakeref_round_trip` -- the last one exercises
+`flakeRefToString (parseFlakeRef s) == s` across all five scheme
+families on inputs already in canonical form), each verified against
+real `nix-instantiate --eval --strict` before being trusted.
