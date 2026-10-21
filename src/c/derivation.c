@@ -12,6 +12,7 @@
 #include "base32.h"
 #include "base64.h"
 #include "builtins_compare.h" /* asnix_toJSON_cstr -- M69's __structuredAttrs support */
+#include "builtins_json.h" /* asnix_json_parse_structured_attrs -- M80's literal `__json` normalization */
 #include "builtins_shared.h" /* asnix_bshared_make_primop, asnix_bshared_make_attrs */
 #include "eval_file.h"       /* asnix_eval_file -- M58's derivation.nix wrapper */
 #include "hash_shim.h"
@@ -548,6 +549,39 @@ static void asnix_collect_input_refs(Value v, InputRefSet *out) {
     }
 }
 
+/* M80: a literal `__json = "...";` attribute -- real Nix's deprecated-
+ * but-still-supported alternative to `__structuredAttrs = true;` for
+ * setting structured attributes (confirmed directly: `nix-instantiate`
+ * warns "setting structured attributes via '__json' is deprecated... Set
+ * '__structuredAttrs = true' instead" but still accepts it) -- is NOT
+ * stored verbatim in the resulting `.drv`: real Nix's own
+ * `StructuredAttrs::parse(s)` (~/nix/src/libstore/parsed-derivations.cc)
+ * parses it with `nlohmann::json::parse` and keeps the ORIGINAL text as
+ * `verbatim`, but `derivationStrict`'s caller throws that `verbatim` away
+ * before this derivation is ever serialized (confirmed empirically, not
+ * just by reading `unparse()`'s verbatim-preserving fast path in
+ * isolation): two JSON texts that only differ in key order / number
+ * spelling / duplicate-key repetition (`{"b":1,"a":[1,2.5,null]}` vs
+ * `{"a":[1,2.5,null],"b":1}`, or `{"a":1,"a":2}` vs `{"a":2}`) produce
+ * BYTE-IDENTICAL `.drv` files against real `nix-instantiate`, which is
+ * only possible if the stored `__json` env value is the RE-DUMPED
+ * (sorted keys, shortest-round-trip numbers, last-wins duplicates) form,
+ * not the original bytes. Reusing `asnix_json_parse_structured_attrs`
+ * (parse) + `asnix_toJSON_cstr` (re-dump, same encoder `__structuredAttrs
+ * = true;` mode already uses below) gets exactly that for free. Also
+ * doubles as this attribute's OWN validation: a non-JSON `__json` value
+ * must fail the whole evaluation (eval-fail-json-attr-not-json.nix),
+ * which falls out of `asnix_json_parse_structured_attrs`'s ordinary
+ * fatal-on-malformed-input behavior with no extra code here. */
+static char *normalize_json_attr(const char *raw_json) {
+    Value parsed = asnix_json_parse_structured_attrs(raw_json, (int64_t)strlen(raw_json));
+    char *normalized_tmp = asnix_toJSON_cstr(parsed);
+    char *normalized = asnix_arena_alloc(strlen(normalized_tmp) + 1);
+    memcpy(normalized, normalized_tmp, strlen(normalized_tmp) + 1);
+    free(normalized_tmp);
+    return normalized;
+}
+
 Value asnix_prim_derivation(const Value *args, int64_t argc) {
     (void)argc;
     Value attrs_val = args[0];
@@ -814,6 +848,16 @@ Value asnix_prim_derivation(const Value *args, int64_t argc) {
                 char *keycstr = asnix_arena_alloc(keylen + 1);
                 memcpy(keycstr, key, keylen);
                 keycstr[keylen] = '\0';
+
+                /* M80: see normalize_json_attr's own comment -- only
+                 * reachable here (not in `__structuredAttrs = true;`
+                 * mode, where a literal `__json` key -- an unusual
+                 * combination real Nix doesn't special-case either --
+                 * would already have been folded into the `json_vals`
+                 * blob above like any other ordinary key instead). */
+                if (keylen == 6 && memcmp(key, "__json", 6) == 0) {
+                    valcstr = normalize_json_attr(valcstr);
+                }
 
                 if (nenv >= ASNIX_DRV_MAX_ENV) {
                     fprintf(stderr, "asnix: derivation: too many attributes (max %d)\n", ASNIX_DRV_MAX_ENV);

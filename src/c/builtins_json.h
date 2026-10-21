@@ -2,6 +2,7 @@
 #define ASNIX_BUILTINS_JSON_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 #include "builtins_misc.h" /* shared AsnixBuiltinMiscDef {name, build()} shape */
 
@@ -19,5 +20,17 @@
 
 extern const AsnixBuiltinMiscDef ASNIX_JSON_BUILTINS[];
 extern const size_t ASNIX_JSON_BUILTINS_COUNT;
+
+/* M80: for derivation.c's own `__json` attribute -- a raw JSON string
+ * handed to `derivation {...}` directly, which real Nix re-validates and
+ * NORMALIZES (parse, then re-dump) via `StructuredAttrs::parse`/
+ * `unparse()` rather than storing verbatim. Reuses this file's own
+ * recursive-descent parser but with a permissive integer-overflow policy
+ * (see builtins_json.c's own `permissive_overflow` comment) matching
+ * that function's plain-`nlohmann::json::parse` DOM semantics, which
+ * differ from `builtins.fromJSON`'s stricter SAX-visitor-based one.
+ * Fatal (exit 1, asnix's usual error convention) on malformed JSON --
+ * the caller doesn't need to catch anything. */
+Value asnix_json_parse_structured_attrs(const char *bytes, int64_t len);
 
 #endif /* ASNIX_BUILTINS_JSON_H */

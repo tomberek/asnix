@@ -55,6 +55,28 @@ typedef struct {
     const char *src;
     size_t len;
     size_t i;
+    /* M80: derivation.c's own `__json` attribute (a raw JSON string the
+     * user hands `derivation {...}` directly -- re-validated/normalized
+     * rather than built from an attrset, see that call site's own
+     * comment) needs a DIFFERENT integer-overflow policy than
+     * `builtins.fromJSON` below: real Nix's `StructuredAttrs::parse`
+     * goes through plain `nlohmann::json::parse` (a DOM parse, no extra
+     * validation layered on top), which silently demotes ANY integer
+     * literal too big to fit into a float rather than erroring --
+     * confirmed directly: `derivation { ... __json =
+     * "{\"d\":100000000000000000000}"; }`'s own `.drv` ends up with
+     * `"d":1e+20`, not an error, via real `nix-instantiate`.
+     * `builtins.fromJSON` goes through a SEPARATE hand-rolled SAX
+     * visitor (real Nix's `json-to-value.cc`) that adds its own
+     * explicit `number_unsigned` overflow check specifically to keep
+     * oversized integers out of the Nix language's own Int type
+     * (eval-fail-fromJSON-overflowing.nix depends on that **erroring**,
+     * not silently becoming a float) -- so the two entry points
+     * genuinely disagree on this, and `permissive_overflow` is this
+     * parser's single switch between them, set per entry point below
+     * rather than threading an extra argument through every mutually
+     * recursive parse_json_* function. */
+    int permissive_overflow;
 } JsonParser;
 
 static void json_fatal(const char *msg) {
@@ -272,6 +294,16 @@ static Value parse_json_number(JsonParser *p) {
         errno = 0;
         long long val = strtoll(buf, NULL, 10);
         if (errno == ERANGE || val < ASNIX_INT_MIN || val > ASNIX_INT_MAX) {
+            /* M80: `__json`'s own parser (see `permissive_overflow`'s
+             * header comment above) demotes to a float here instead of
+             * erroring -- matching real Nix's plain `nlohmann::json::
+             * parse` DOM path used by `StructuredAttrs::parse`, as
+             * opposed to `builtins.fromJSON`'s stricter SAX visitor. */
+            if (p->permissive_overflow) {
+                out = asnix_make_float_value(strtod(buf, NULL));
+                free(buf);
+                return out;
+            }
             json_fatal("number outside of Nix integer range");
         }
         out = asnix_make_int((int64_t)val);
@@ -342,14 +374,37 @@ static Value parse_json_object(JsonParser *p) {
         jp_expect(p, ':');
         jp_skip_ws(p);
         Value val = parse_json_value(p);
-        if (n == cap) {
-            cap *= 2;
-            syms = realloc(syms, cap * sizeof(uint32_t));
-            vals = realloc(vals, cap * sizeof(Value));
+        /* M80: a repeated key overwrites the EARLIER slot's value in
+         * place -- found chasing eval-okay-json-attr-normalised.nix's
+         * `{"a":1,"a":2}` case through to its `.drv` (whose `__json` env
+         * entry must come out byte-identical to `{"a":2}`'s own, per
+         * real `nix-instantiate`), which this parser's own header
+         * comment already claims ("last-wins via plain attrset-
+         * overwrite semantics") but the code actually below it didn't
+         * implement -- every prior key, even a repeated one, was being
+         * unconditionally appended as its own separate slot, violating
+         * the invariant every other `ASNIX_TAG_ATTRS` producer in this
+         * codebase relies on (no duplicate syms in one attrset) once
+         * this array reached `asnix_bshared_make_attrs` below. Matches
+         * real Nix's own `ValueMap::insert_or_assign` in its SAX
+         * visitor's `JSONObjectState::key()` (json-to-value.cc) --
+         * last-wins, one slot per unique key. */
+        int64_t existing = -1;
+        for (int64_t j = 0; j < (int64_t)n; j++) {
+            if (syms[j] == sym) { existing = j; break; }
         }
-        syms[n] = sym;
-        vals[n] = val;
-        n++;
+        if (existing >= 0) {
+            vals[existing] = val;
+        } else {
+            if (n == cap) {
+                cap *= 2;
+                syms = realloc(syms, cap * sizeof(uint32_t));
+                vals = realloc(vals, cap * sizeof(Value));
+            }
+            syms[n] = sym;
+            vals[n] = val;
+            n++;
+        }
         jp_skip_ws(p);
         char c = jp_cur(p);
         if (c == ',') {
@@ -397,8 +452,8 @@ static Value parse_json_value(JsonParser *p) {
     return asnix_make_imm(ASNIX_IMM_NULL); /* unreachable -- json_fatal exits */
 }
 
-static Value asnix_json_parse(const char *src, size_t len) {
-    JsonParser p = { src, len, 0 };
+static Value asnix_json_parse(const char *src, size_t len, int permissive_overflow) {
+    JsonParser p = { src, len, 0, permissive_overflow };
     Value out = parse_json_value(&p);
     jp_skip_ws(&p);
     if (p.i != p.len) json_fatal("trailing data after JSON value");
@@ -437,6 +492,7 @@ static Value asnix_json_parse(const char *src, size_t len) {
 typedef struct {
     const char *src;
     size_t len;
+    int permissive_overflow;
     Value result;
 } JsonParseCtx;
 
@@ -449,11 +505,12 @@ typedef struct {
 static JsonParseCtx *g_json_parse_ctx;
 
 static void json_parse_trampoline(void) {
-    g_json_parse_ctx->result = asnix_json_parse(g_json_parse_ctx->src, g_json_parse_ctx->len);
+    g_json_parse_ctx->result =
+        asnix_json_parse(g_json_parse_ctx->src, g_json_parse_ctx->len, g_json_parse_ctx->permissive_overflow);
 }
 
-static Value run_json_parse_on_big_stack(const char *src, size_t len) {
-    JsonParseCtx ctx = { src, len, asnix_make_imm(ASNIX_IMM_NULL) };
+static Value run_json_parse_on_big_stack(const char *src, size_t len, int permissive_overflow) {
+    JsonParseCtx ctx = { src, len, permissive_overflow, asnix_make_imm(ASNIX_IMM_NULL) };
     JsonParseCtx *saved_ctx = g_json_parse_ctx; /* restore on return, supporting nested fromJSON calls */
     g_json_parse_ctx = &ctx;
 
@@ -476,7 +533,7 @@ static Value prim_fromJSON(const Value *args, int64_t argc) {
     const char *bytes;
     int64_t len;
     asnix_bshared_string_bytes(args[0], &bytes, &len, "fromJSON");
-    return run_json_parse_on_big_stack(bytes, (size_t)len);
+    return run_json_parse_on_big_stack(bytes, (size_t)len, /* permissive_overflow */ 0);
 }
 
 static Value build_fromJSON(void) { return asnix_bshared_make_primop((void *)prim_fromJSON, 1); }
@@ -484,5 +541,16 @@ static Value build_fromJSON(void) { return asnix_bshared_make_primop((void *)pri
 const AsnixBuiltinMiscDef ASNIX_JSON_BUILTINS[] = {
     { "fromJSON", build_fromJSON },
 };
+
+/* M80: entry point for derivation.c's own `__json` attribute handling --
+ * see `permissive_overflow`'s header comment (this same file, top of
+ * `JsonParser`) for why this needs the big-stack machinery AND a parse
+ * policy distinct from `builtins.fromJSON`'s `prim_fromJSON` above,
+ * rather than being able to just call that primop's own Value-wrapping
+ * entry point. Fatal (exit 1) on any malformed JSON, same as fromJSON --
+ * exactly what eval-fail-json-attr-not-json.nix needs. */
+Value asnix_json_parse_structured_attrs(const char *bytes, int64_t len) {
+    return run_json_parse_on_big_stack(bytes, (size_t)len, /* permissive_overflow */ 1);
+}
 
 const size_t ASNIX_JSON_BUILTINS_COUNT = sizeof(ASNIX_JSON_BUILTINS) / sizeof(ASNIX_JSON_BUILTINS[0]);
