@@ -54,6 +54,13 @@ static int atermoutput_cmp(const void *a, const void *b) {
     return strcmp(((const AtermOutput *)a)->name, ((const AtermOutput *)b)->name);
 }
 
+/* M74: sorts a plain `char *[]` (e.g. InputRefSet's `srcs`) ascending --
+ * `qsort`'s comparator receives pointers to the array ELEMENTS, so for
+ * an array of `char *` that's a `char **`. */
+static int strptr_cmp(const void *a, const void *b) {
+    return strcmp(*(const char *const *)a, *(const char *const *)b);
+}
+
 /* Ported from ~/nix/src/libstore/derivations.cc's `outputPathName`: the
  * `name` component of an output's own store path is the derivation's
  * `name` attribute verbatim for the "out" output, and `name + "-" +
@@ -220,8 +227,17 @@ static void compute_store_path(const char *type, const uint8_t inner_digest[32],
     }
     hashstr[7 + 64] = '\0';
 
-    char preimage[512];
-    size_t n = asnix_store_path_preimage(type, hashstr, name, preimage, sizeof(preimage));
+    /* `type` is "text:" plus one ":"-joined store path per referenced
+     * input derivation/source (M74) -- unbounded by any fixed limit
+     * this project enforces elsewhere, unlike `name` (capped at 211
+     * bytes, asnix_check_store_path_name) or the hash (always exactly
+     * 71 bytes). A 512-byte fixed buffer overflowed for real stdenv
+     * derivations with many direct inputs (found chasing d.nix past
+     * M74's own small verification cases) -- size dynamically instead
+     * of guessing a bigger constant. */
+    size_t preimage_cap = strlen(type) + strlen(hashstr) + strlen(ASNIX_STORE_DIR) + strlen(name) + 8;
+    char *preimage = malloc(preimage_cap);
+    size_t n = asnix_store_path_preimage(type, hashstr, name, preimage, preimage_cap);
     if (n == 0) {
         fprintf(stderr, "asnix: derivation: preimage too long\n");
         exit(1);
@@ -229,6 +245,7 @@ static void compute_store_path(const char *type, const uint8_t inner_digest[32],
 
     uint8_t outer_digest[32];
     sha256_or_die(preimage, n, outer_digest);
+    free(preimage);
 
     if (asnix_make_store_path_from_digest(outer_digest, name, out, out_cap) == 0) {
         fprintf(stderr, "asnix: derivation: computed store path too long\n");
@@ -286,6 +303,207 @@ static void compute_fixed_output_path(const char *output_hash_mode, const uint8_
     uint8_t digest[32];
     sha256_or_die(payload, (size_t)n, digest);
     compute_store_path("output:out", digest, name, out, out_cap);
+}
+
+/* M74: a process-global, in-memory cache of every derivation's own
+ * "masked hash" (real Nix's `hashDerivationModulo`, see the long
+ * comment below), keyed by that derivation's `drvPath`. This is how a
+ * LATER `derivation {...}` call that references an EARLIER one (as
+ * `src`, `buildInputs`, etc.) resolves that earlier derivation's hash
+ * -- without ever touching a real `/nix/store` (this project has none,
+ * see docs/architecture.md's M45/M46 notes). Verified this is exactly
+ * what real Nix itself does in `--read-only-mode` (confirmed by
+ * reading `~/nix/src/libexpr/primops.cc` directly): plain evaluation
+ * normally ALSO writes real `.drv` files to disk as a side effect, and
+ * a later derivation's hash computation can fall back to reading one
+ * of those files back if its own in-process cache
+ * (`derivation::masked::hashes`) doesn't have it cached already -- but
+ * the cache is populated eagerly, immediately after every derivation's
+ * own hash is computed, specifically so the common case (an input
+ * derivation was evaluated earlier in the SAME process, which Nix's
+ * call-by-need evaluation guarantees for anything actually referenced)
+ * never needs the disk fallback at all. This project only implements
+ * the cache half -- correct for exactly that common, guaranteed-by-
+ * laziness case, which is the only one `asnix_collect_input_refs`
+ * below can ever actually produce a reference for in the first place
+ * (it can only find a reference to a derivation Value that was already
+ * forced, which only happens after that derivation was already
+ * evaluated). A linear-scan array, same "simple, small N" judgment as
+ * M65's import-value cache (`eval_file.c`'s `g_import_cache`) -- the
+ * number of distinct derivations one process constructs is nowhere
+ * near large enough for this to matter. */
+typedef struct {
+    char *drv_path;
+    int is_fixed_output;
+    uint8_t hash[32];
+} MaskedHashCacheEntry;
+static MaskedHashCacheEntry *g_masked_hash_cache = NULL;
+static size_t g_masked_hash_cache_count = 0, g_masked_hash_cache_cap = 0;
+
+static int masked_hash_cache_find(const char *drv_path, MaskedHashCacheEntry *out) {
+    for (size_t i = 0; i < g_masked_hash_cache_count; i++) {
+        if (strcmp(g_masked_hash_cache[i].drv_path, drv_path) == 0) {
+            *out = g_masked_hash_cache[i];
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void masked_hash_cache_insert(const char *drv_path, int is_fixed_output, const uint8_t hash[32]) {
+    if (g_masked_hash_cache_count == g_masked_hash_cache_cap) {
+        g_masked_hash_cache_cap = g_masked_hash_cache_cap ? g_masked_hash_cache_cap * 2 : 64;
+        g_masked_hash_cache = realloc(g_masked_hash_cache, g_masked_hash_cache_cap * sizeof(*g_masked_hash_cache));
+    }
+    size_t len = strlen(drv_path);
+    char *copy = malloc(len + 1);
+    memcpy(copy, drv_path, len + 1);
+    g_masked_hash_cache[g_masked_hash_cache_count].drv_path = copy;
+    g_masked_hash_cache[g_masked_hash_cache_count].is_fixed_output = is_fixed_output;
+    memcpy(g_masked_hash_cache[g_masked_hash_cache_count].hash, hash, 32);
+    g_masked_hash_cache_count++;
+}
+
+/* M74: a narrow, CALL-SCOPED collector of "which attribute values of
+ * THIS ONE `derivation {...}` call reference another derivation's
+ * output (or a plain already-in-the-store path)" -- NOT a general,
+ * persistent string-context feature (that was investigated and
+ * explicitly declined as disproportionate, see docs/architecture.md's
+ * M61 scope notes: a new Value-level heap kind propagated correctly
+ * through the ~101 call sites of every string-producing builtin). This
+ * only needs to answer one question, once, right here: real Nix's
+ * `derivationStrict` builds its `inputDrvs`/`inputSrcs` from the UNION
+ * of context collected while coercing every attribute to a string --
+ * this reconstructs just enough of that one specific union, by walking
+ * each attribute's ALREADY-FORCED value looking only for the shapes
+ * that can carry a reference in the first place, rather than adding a
+ * new tagged Value kind every OTHER builtin would also have to reason
+ * about. Scope cuts (matching M61's own precedent of naming what's
+ * deferred, not silently skipping it):
+ *  - `DrvDeep` context (referencing a derivation's `.drvPath` itself,
+ *    which in real Nix pulls in that derivation's ENTIRE transitive
+ *    closure) is not handled -- not hit by any attribute shape found
+ *    chasing `d.nix` so far (an attribute referencing `.drvPath`
+ *    directly, rather than an output, is rare).
+ *  - A plain (non-store, e.g. a local project file) Path attribute
+ *    value is not copied into a content-addressed store and tracked
+ *    as an `inputSrcs` entry -- this project has no such
+ *    infrastructure at all (M45's `toFile` explicitly declined the
+ *    equivalent: it computes what path content WOULD get, never
+ *    writes it). Only a Path value that's ALREADY a `/nix/store/...`
+ *    path (typically itself a previously-computed derivation output or
+ *    `toFile`/`<nix/fetchurl.nix>` path, reached as a bare Path rather
+ *    than through a derivation attrset) is tracked, verbatim, as an
+ *    `inputSrcs` entry. */
+typedef struct {
+    char *drv_path;
+    char *output_name;
+} BuiltRef;
+
+typedef struct {
+    BuiltRef *drvs;
+    size_t ndrvs, drvs_cap;
+    char **srcs;
+    size_t nsrcs, srcs_cap;
+} InputRefSet;
+
+static void input_ref_set_init(InputRefSet *s) {
+    memset(s, 0, sizeof(*s));
+}
+
+static char *dup_cstr(const char *s, size_t len) {
+    char *out = malloc(len + 1);
+    memcpy(out, s, len);
+    out[len] = '\0';
+    return out;
+}
+
+static void input_ref_add_built(InputRefSet *s, const char *drv_path, const char *output_name) {
+    for (size_t i = 0; i < s->ndrvs; i++) {
+        if (strcmp(s->drvs[i].drv_path, drv_path) == 0 && strcmp(s->drvs[i].output_name, output_name) == 0) return;
+    }
+    if (s->ndrvs == s->drvs_cap) {
+        s->drvs_cap = s->drvs_cap ? s->drvs_cap * 2 : 8;
+        s->drvs = realloc(s->drvs, s->drvs_cap * sizeof(*s->drvs));
+    }
+    s->drvs[s->ndrvs].drv_path = dup_cstr(drv_path, strlen(drv_path));
+    s->drvs[s->ndrvs].output_name = dup_cstr(output_name, strlen(output_name));
+    s->ndrvs++;
+}
+
+static void input_ref_add_src(InputRefSet *s, const char *path) {
+    for (size_t i = 0; i < s->nsrcs; i++) {
+        if (strcmp(s->srcs[i], path) == 0) return;
+    }
+    if (s->nsrcs == s->srcs_cap) {
+        s->srcs_cap = s->srcs_cap ? s->srcs_cap * 2 : 8;
+        s->srcs = realloc(s->srcs, s->srcs_cap * sizeof(*s->srcs));
+    }
+    s->srcs[s->nsrcs++] = dup_cstr(path, strlen(path));
+}
+
+static void asnix_collect_input_refs(Value v, InputRefSet *out) {
+    v = asnix_force_for_print(v);
+    int tag = asnix_tag_of(v);
+    if (tag == ASNIX_TAG_ATTRS) {
+        const char *base = (const char *)(v.raw & ~0x7ULL);
+        int64_t count = *(const int64_t *)(base + ASNIX_ATTRS_OFF_COUNT);
+        uint32_t sym_type = asnix_intern("type", 4);
+        uint32_t sym_drvpath = asnix_intern("drvPath", 7);
+        uint32_t sym_outname = asnix_intern("outputName", 10);
+        int64_t idx_type = -1, idx_drvpath = -1, idx_outname = -1;
+        for (int64_t i = 0; i < count; i++) {
+            const char *entry = base + ASNIX_ATTRS_OFF_ENTRIES + i * ASNIX_ATTR_SIZE;
+            uint32_t sym = *(const uint32_t *)(entry + ASNIX_ATTR_OFF_SYM);
+            if (sym == sym_type) idx_type = i;
+            else if (sym == sym_drvpath) idx_drvpath = i;
+            else if (sym == sym_outname) idx_outname = i;
+        }
+        /* Every derivation Value reachable from user code has these
+         * three fields (M58's wrapper, ASNIX_DERIVATION_NIX_SOURCE) --
+         * an attrset without all three just isn't a derivation output,
+         * and is a no-op here (not recursed into further: real Nix's
+         * own context mechanism attaches to the STRING a coercion
+         * produces, not to arbitrary nested structure, so there's
+         * nothing else in a non-derivation attrset that could carry a
+         * reference this scope cares about). */
+        if (idx_type < 0 || idx_drvpath < 0 || idx_outname < 0) return;
+        Value type_val = asnix_force_for_print(
+            *(const Value *)(base + ASNIX_ATTRS_OFF_ENTRIES + idx_type * ASNIX_ATTR_SIZE + ASNIX_ATTR_OFF_VALUE));
+        if (asnix_tag_of(type_val) != ASNIX_TAG_PTR) return;
+        int64_t tlen;
+        const char *tbytes = asnix_ptr_bytes(type_val, &tlen);
+        if (tlen != 10 || memcmp(tbytes, "derivation", 10) != 0) return;
+        Value drvpath_val = asnix_force_for_print(
+            *(const Value *)(base + ASNIX_ATTRS_OFF_ENTRIES + idx_drvpath * ASNIX_ATTR_SIZE + ASNIX_ATTR_OFF_VALUE));
+        Value outname_val = asnix_force_for_print(
+            *(const Value *)(base + ASNIX_ATTRS_OFF_ENTRIES + idx_outname * ASNIX_ATTR_SIZE + ASNIX_ATTR_OFF_VALUE));
+        int64_t dlen, olen;
+        const char *dbytes = asnix_ptr_bytes(drvpath_val, &dlen);
+        const char *obytes = asnix_ptr_bytes(outname_val, &olen);
+        char *dpath = dup_cstr(dbytes, (size_t)dlen);
+        char *oname = dup_cstr(obytes, (size_t)olen);
+        input_ref_add_built(out, dpath, oname);
+        free(dpath);
+        free(oname);
+        return;
+    }
+    if (tag == ASNIX_TAG_LIST) {
+        const char *base = (const char *)(v.raw & ~0x7ULL);
+        int64_t count = *(const int64_t *)(base + ASNIX_LIST_OFF_COUNT);
+        const Value *elems = (const Value *)(base + ASNIX_LIST_OFF_ELEMS);
+        for (int64_t i = 0; i < count; i++) asnix_collect_input_refs(elems[i], out);
+        return;
+    }
+    if (tag == ASNIX_TAG_PTR && asnix_value_is_path(v)) {
+        int64_t len;
+        const char *bytes = asnix_ptr_bytes(v, &len);
+        if (len > 11 && memcmp(bytes, "/nix/store/", 11) == 0) {
+            char *path = dup_cstr(bytes, (size_t)len);
+            input_ref_add_src(out, path);
+            free(path);
+        }
+    }
 }
 
 Value asnix_prim_derivation(const Value *args, int64_t argc) {
@@ -354,6 +572,14 @@ Value asnix_prim_derivation(const Value *args, int64_t argc) {
     Value json_vals[ASNIX_DRV_MAX_ENV];
     size_t njson = 0;
 
+    /* M74: collected from EVERY attribute's value below, unconditionally
+     * -- including `args`/`outputs`, matching real Nix's own
+     * context-collecting `coerceToString` calls for those two
+     * attributes specifically (confirmed in `~/nix/src/libexpr/
+     * primops.cc`), not just the generic per-attribute path. */
+    InputRefSet refs;
+    input_ref_set_init(&refs);
+
     for (int64_t i = 0; i < count; i++) {
         const char *entry = base + ASNIX_ATTRS_OFF_ENTRIES + i * ASNIX_ATTR_SIZE;
         uint32_t sym = *(const uint32_t *)(entry + ASNIX_ATTR_OFF_SYM);
@@ -364,6 +590,7 @@ Value asnix_prim_derivation(const Value *args, int64_t argc) {
          * context and properly saves/restores every register it touches
          * (see src/asm/force.S), so it nests like any well-behaved call. */
         Value val = asnix_force_for_print(raw_val);
+        asnix_collect_input_refs(val, &refs);
 
         size_t keylen;
         const char *key = asnix_sym_name(sym, &keylen);
@@ -600,6 +827,154 @@ Value asnix_prim_derivation(const Value *args, int64_t argc) {
 
     qsort(env, nenv, sizeof(env[0]), envvar_cmp);
 
+    /* M74: group the collected `Built` refs by `drv_path` into
+     * `(drv_path, [output_names...])` entries -- real Nix's own
+     * `DerivedPathMap<StringSet>` does the same grouping (one entry
+     * per distinct input derivation, with the union of every output
+     * name actually referenced anywhere in this derivation's
+     * attributes). `output_names` for a group is the exact list that
+     * ends up in BOTH the masked and real passes' `inputDrvs` section
+     * (`asnix_build_derivation_aterm`'s own convention, see aterm.h) --
+     * only the group's `drv_path` STRING differs between the two
+     * passes (literal for "real", the referenced derivation's own
+     * cached masked hash -- hex, no algorithm prefix, exactly real
+     * Nix's `drvHash.to_string(Base16, false)` -- for "masked", the
+     * actual `hashDerivationModulo` substitution). A small, bounded,
+     * linear-scan grouping, same convention as every other small array
+     * in this function (`ASNIX_DRV_MAX_ARGS`/`ENV`/`OUTPUTS` above). 64
+     * was too small for real nixpkgs: `stdenv-linux` alone has well
+     * over 64 direct input derivations once every setup-hook/wrapper
+     * dependency is counted (found chasing d.nix past M74's own small
+     * verification cases) -- 1024 accommodates that, but unlike every
+     * OTHER fixed-size array in this function, this one is heap- not
+     * stack-allocated: resolving one derivation's input refs can
+     * recursively force (hence recursively call this very function
+     * for) a dependency several levels deep in nixpkgs's own
+     * derivation graph, and 1024 entries' worth of these arrays on the
+     * stack per nested call overflowed the real stack chasing d.nix
+     * past this exact point. */
+#define ASNIX_DRV_MAX_INPUT_DRVS 1024
+    const char **group_paths = malloc(ASNIX_DRV_MAX_INPUT_DRVS * sizeof(const char *));
+    const char *(*group_outs)[ASNIX_DRV_MAX_OUTPUTS] = malloc(ASNIX_DRV_MAX_INPUT_DRVS * sizeof(*group_outs));
+    size_t *group_nouts = malloc(ASNIX_DRV_MAX_INPUT_DRVS * sizeof(size_t));
+    size_t ngroups = 0;
+    for (size_t i = 0; i < refs.ndrvs; i++) {
+        const char *dp = refs.drvs[i].drv_path;
+        size_t g = ngroups;
+        for (size_t k = 0; k < ngroups; k++) {
+            if (strcmp(group_paths[k], dp) == 0) {
+                g = k;
+                break;
+            }
+        }
+        if (g == ngroups) {
+            if (ngroups >= ASNIX_DRV_MAX_INPUT_DRVS) {
+                fprintf(stderr, "asnix: derivation: too many distinct input derivations (max %d)\n",
+                        ASNIX_DRV_MAX_INPUT_DRVS);
+                exit(1);
+            }
+            group_paths[ngroups] = dp;
+            group_nouts[ngroups] = 0;
+            ngroups++;
+        }
+        if (group_nouts[g] >= ASNIX_DRV_MAX_OUTPUTS) {
+            fprintf(stderr, "asnix: derivation: too many referenced outputs of one input derivation (max %d)\n",
+                    ASNIX_DRV_MAX_OUTPUTS);
+            exit(1);
+        }
+        group_outs[g][group_nouts[g]++] = refs.drvs[i].output_name;
+    }
+    /* Groups sorted by `drv_path` (an index array, since `group_paths`/
+     * `group_outs`/`group_nouts` are three separate parallel arrays);
+     * each group's own output-name list sorted too -- both required by
+     * `asnix_build_derivation_aterm`'s own sorting contract. */
+    size_t *group_order = malloc(ASNIX_DRV_MAX_INPUT_DRVS * sizeof(size_t));
+    for (size_t g = 0; g < ngroups; g++) group_order[g] = g;
+    for (size_t i = 1; i < ngroups; i++) {
+        size_t j = i;
+        while (j > 0 && strcmp(group_paths[group_order[j - 1]], group_paths[group_order[j]]) > 0) {
+            size_t t = group_order[j - 1];
+            group_order[j - 1] = group_order[j];
+            group_order[j] = t;
+            j--;
+        }
+    }
+    for (size_t g = 0; g < ngroups; g++) {
+        for (size_t i = 1; i < group_nouts[g]; i++) {
+            size_t j = i;
+            while (j > 0 && strcmp(group_outs[g][j - 1], group_outs[g][j]) > 0) {
+                const char *t = group_outs[g][j - 1];
+                group_outs[g][j - 1] = group_outs[g][j];
+                group_outs[g][j] = t;
+                j--;
+            }
+        }
+    }
+
+    AtermInputDrv *masked_input_drvs = malloc(ASNIX_DRV_MAX_INPUT_DRVS * sizeof(AtermInputDrv));
+    AtermInputDrv *real_input_drvs = malloc(ASNIX_DRV_MAX_INPUT_DRVS * sizeof(AtermInputDrv));
+    char (*masked_hash_hex)[65] = malloc(ASNIX_DRV_MAX_INPUT_DRVS * sizeof(*masked_hash_hex));
+    for (size_t gi = 0; gi < ngroups; gi++) {
+        size_t g = group_order[gi];
+        MaskedHashCacheEntry entry;
+        /* In a correctly-evaluated program this is always a hit: Nix's
+         * call-by-need evaluation always forces (hence already fully
+         * evaluated and cached, see masked_hash_cache_insert below) a
+         * derivation before any attribute referencing it can be read
+         * here. A miss means a real invariant was violated -- fatal,
+         * matching this project's standing convention, not a silent
+         * fallback. */
+        if (!masked_hash_cache_find(group_paths[g], &entry)) {
+            fprintf(stderr,
+                    "asnix: derivation: internal error: no cached hash for input derivation '%s' "
+                    "(referenced before it was ever evaluated?)\n",
+                    group_paths[g]);
+            exit(1);
+        }
+        static const char hexdigits[] = "0123456789abcdef";
+        for (int b = 0; b < 32; b++) {
+            masked_hash_hex[gi][2 * b] = hexdigits[entry.hash[b] >> 4];
+            masked_hash_hex[gi][2 * b + 1] = hexdigits[entry.hash[b] & 0xf];
+        }
+        masked_hash_hex[gi][64] = '\0';
+
+        masked_input_drvs[gi].drv_path = masked_hash_hex[gi];
+        masked_input_drvs[gi].output_names = group_outs[g];
+        masked_input_drvs[gi].noutput_names = group_nouts[g];
+
+        real_input_drvs[gi].drv_path = group_paths[g];
+        real_input_drvs[gi].output_names = group_outs[g];
+        real_input_drvs[gi].noutput_names = group_nouts[g];
+    }
+
+    /* Real Nix's `hashDerivationModulo` substitution doesn't just swap
+     * each `inputDrvs` entry's path for its resolved hash in place -- it
+     * rebuilds `inputDrvs` as a NEW `std::map<string, StringSet>` keyed
+     * by that hash string (`~/nix/src/libstore/derivations.cc`), and a
+     * `std::map`'s iteration (which `unparse` walks) is sorted by ITS
+     * OWN key. So the masked pass's `InputDrvs` section must be sorted
+     * by the substituted hash hex string, NOT by the literal drv_path
+     * order `group_order` already gives `real_input_drvs` -- a
+     * same-input-set derivation can have its two input drvs' hashes
+     * sort in the opposite order from their literal paths (confirmed:
+     * this milestone's own list-of-two-inputs verification case hits
+     * exactly this, `b2`'s hash sorts before `a`'s despite `a.drv`
+     * sorting before `b2.drv`). */
+    for (size_t i = 1; i < ngroups; i++) {
+        size_t j = i;
+        while (j > 0 && strcmp(masked_input_drvs[j - 1].drv_path, masked_input_drvs[j].drv_path) > 0) {
+            AtermInputDrv t = masked_input_drvs[j - 1];
+            masked_input_drvs[j - 1] = masked_input_drvs[j];
+            masked_input_drvs[j] = t;
+            j--;
+        }
+    }
+
+    /* `inputSrcs`: just the collected, deduped, already-in-the-store
+     * paths, sorted -- no substitution needed for either pass (unlike
+     * `inputDrvs`, a plain store path has no further hash to resolve). */
+    qsort(refs.srcs, refs.nsrcs, sizeof(char *), strptr_cmp);
+
     /* Masked pass: ONE hash covers every declared output at once (all
      * blanked to "" in both the Outputs section and their env vars) --
      * ported from real Nix's `processDerivationOutputPaths`
@@ -619,7 +994,8 @@ Value asnix_prim_derivation(const Value *args, int64_t argc) {
     }
     qsort(masked_outs, noutputs, sizeof(masked_outs[0]), atermoutput_cmp);
 
-    char *masked_aterm = asnix_build_derivation_aterm(masked_outs, noutputs, NULL, 0, NULL, 0, system, builder,
+    char *masked_aterm = asnix_build_derivation_aterm(masked_outs, noutputs, masked_input_drvs, ngroups,
+                                                       (const char **)refs.srcs, refs.nsrcs, system, builder,
                                                        arg_strs, nargs, env, nenv);
     uint8_t masked_digest[32];
     sha256_or_die(masked_aterm, strlen(masked_aterm), masked_digest);
@@ -712,16 +1088,116 @@ Value asnix_prim_derivation(const Value *args, int64_t argc) {
     }
     qsort(real_outs, noutputs, sizeof(real_outs[0]), atermoutput_cmp);
 
-    char *real_aterm = asnix_build_derivation_aterm(real_outs, noutputs, NULL, 0, NULL, 0, system, builder, arg_strs,
+    char *real_aterm = asnix_build_derivation_aterm(real_outs, noutputs, real_input_drvs, ngroups,
+                                                     (const char **)refs.srcs, refs.nsrcs, system, builder, arg_strs,
                                                      nargs, env, nenv);
     uint8_t real_digest[32];
     sha256_or_die(real_aterm, strlen(real_aterm), real_digest);
     free(real_aterm);
 
+    /* M74: `drvPath` itself is a content-addressed "text" path whose
+     * TYPE string is NOT the bare `"text"` this project previously
+     * (incorrectly, but unnoticed until this milestone's own 2-level
+     * verification case, which has an actual reference to catch it --
+     * every PRIOR fixture had zero references) used -- real Nix's
+     * `infoForDerivation` (~/nix/src/libstore/derivations.cc) builds
+     * `references = drv.inputSrcs ∪ {every drv.inputDrvs path}` and
+     * feeds `TextInfo{hash; references}` through
+     * `makeFixedOutputPathFromCA`, whose "text" branch is exactly
+     * `makeType(store, "text", references)` -- `"text"`, then `":" +
+     * path` for each reference IN SORTED ORDER (confirmed: a `.drv`
+     * genuinely "contains" the store paths of everything it refers to,
+     * by definition of what a derivation's `inputSrcs`/`inputDrvs`
+     * are, so this is a real reference-tracking requirement, not an
+     * arbitrary detail). `group_paths[]` (already sorted via
+     * `group_order`, the literal -- not hash-substituted -- input
+     * derivation paths) and `refs.srcs[]` (already sorted) are
+     * disjoint by construction (a path is either a derivation or a
+     * plain source, never both), so concatenating then re-sorting the
+     * union is simplest. */
+    const char **drv_refs = malloc((ngroups + refs.nsrcs) * sizeof(const char *));
+    size_t ndrv_refs = 0;
+    for (size_t gi = 0; gi < ngroups; gi++) drv_refs[ndrv_refs++] = group_paths[group_order[gi]];
+    for (size_t i = 0; i < refs.nsrcs; i++) drv_refs[ndrv_refs++] = refs.srcs[i];
+    qsort(drv_refs, ndrv_refs, sizeof(const char *), strptr_cmp);
+    free(group_paths);
+    free(group_order);
+    free(group_nouts);
+
+    /* A fixed-size buffer here overflowed for real stdenv derivations
+     * with many direct inputs (found chasing d.nix past M74's own small
+     * verification cases, same class of bug as compute_store_path's
+     * preimage buffer above) -- size exactly, from the known reference
+     * strings, instead of guessing a constant. */
+    size_t drv_type_cap = 5; /* "text" + NUL */
+    for (size_t i = 0; i < ndrv_refs; i++) drv_type_cap += strlen(drv_refs[i]) + 1; /* ":" + path */
+    char *drv_type = malloc(drv_type_cap);
+    size_t drv_type_len = (size_t)snprintf(drv_type, drv_type_cap, "text");
+    for (size_t i = 0; i < ndrv_refs; i++) {
+        drv_type_len += (size_t)snprintf(drv_type + drv_type_len, drv_type_cap - drv_type_len, ":%s", drv_refs[i]);
+    }
+    free(drv_refs);
+
     char drv_name[256];
     snprintf(drv_name, sizeof(drv_name), "%s.drv", name);
     char drv_path[300];
-    compute_store_path("text", real_digest, drv_name, drv_path, sizeof(drv_path));
+    compute_store_path(drv_type, real_digest, drv_name, drv_path, sizeof(drv_path));
+    free(drv_type);
+
+    /* M74: cache THIS derivation's own `hashDerivationModulo`-equivalent
+     * now, eagerly, right after computing it -- so a LATER derivation
+     * that references this one (via `drv_path`) can resolve it purely
+     * in-memory (see masked_hash_cache_find's own caller above). Two
+     * cases, matching real Nix's `DrvHashModulo` variant exactly:
+     *  - fixed-output: real Nix's own formula is `sha256("fixed:out:"
+     *    + <algo, "r:"-prefixed if recursive> + ":" + <bare hex, no
+     *    prefix> + ":" + <this output's own already-computed store
+     *    path>)`, verified directly against
+     *    `~/nix/src/libstore/derivations.cc`'s `hashDerivationModulo`
+     *    (the SAME real-Nix function this whole milestone ports, read
+     *    in full before writing this). Reuses `fixed_hash_algo_cstr`/
+     *    `fixed_hash_algo_hex` (already built above for the ATerm's
+     *    Outputs-section fields, M73) and `out_paths[0]` (this
+     *    derivation's own "out" path).
+     *  - every other (regular) derivation: `hashDerivationModulo(drv,
+     *    maskOutputs=false)` -- NOT `masked_digest` (that's
+     *    `maskOutputs=TRUE`, used only for THIS derivation's OWN
+     *    output-path computation above, M8/M62) and NOT `real_digest`
+     *    either (that hashes the LITERAL, as-written-to-disk ATerm --
+     *    literal `inputDrvs` paths, used only for this derivation's
+     *    OWN `drvPath` just above) -- a THIRD variant: this
+     *    derivation's REAL (filled-in, unmasked) outputs, same as
+     *    `real_outs`, combined with the SAME hash-SUBSTITUTED
+     *    `inputDrvs` the masked pass already uses (`masked_input_drvs`)
+     *    -- `hashDerivationModulo`'s own source confirms `maskOutputs`
+     *    only ever controls whether OUTPUT paths are blanked, NOT
+     *    whether `inputDrvs` get hash-substituted (that substitution
+     *    always happens, independent of `maskOutputs`). Found via this
+     *    milestone's own 2-level verification case: caching
+     *    `masked_digest` instead gave a plausible-looking but WRONG
+     *    substituted hash for a depending derivation, confirmed by
+     *    computing both candidate hashes by hand and checking which
+     *    one reproduces real Nix's actual output path. */
+    if (has_fixed_hash) {
+        char fixed_hash_payload[512];
+        int pn = snprintf(fixed_hash_payload, sizeof(fixed_hash_payload), "fixed:out:%s:%s:%s",
+                           fixed_hash_algo_cstr, fixed_hash_algo_hex, out_paths[0]);
+        uint8_t fixed_cache_hash[32];
+        sha256_or_die(fixed_hash_payload, (size_t)pn, fixed_cache_hash);
+        masked_hash_cache_insert(drv_path, 1, fixed_cache_hash);
+    } else {
+        char *cache_aterm = asnix_build_derivation_aterm(real_outs, noutputs, masked_input_drvs, ngroups,
+                                                           (const char **)refs.srcs, refs.nsrcs, system, builder,
+                                                           arg_strs, nargs, env, nenv);
+        uint8_t cache_digest[32];
+        sha256_or_die(cache_aterm, strlen(cache_aterm), cache_digest);
+        free(cache_aterm);
+        masked_hash_cache_insert(drv_path, 0, cache_digest);
+    }
+    free(group_outs);
+    free(masked_input_drvs);
+    free(real_input_drvs);
+    free(masked_hash_hex);
 
     /* `strict`'s own shape, matching real Nix's derivationStrict exactly
      * (~/nix/src/libexpr/primops.cc's `mkOutputString`): `drvPath` plus

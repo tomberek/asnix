@@ -86,7 +86,8 @@ what's actually implemented and the scope decisions made along the way.
 | M71 — `builtins.storeDir` (plain constant, `"/nix/store"`) | done (see below) |
 | M72 — bumped `derivation`'s fixed attribute-count cap from 64 to 256; **`./asnix d.nix` now evaluates to completion with no crash** (the standing bug-chase's own goal) | done (see below) |
 | M73 — fixed-output derivations now compute their real output/`.drv` paths via real Nix's actual `makeFixedOutputPath` formula (prerequisite for M74's `hashDerivationModulo` work) | done (see below) |
-| M74+ | not started |
+| M74 — real `hashDerivationModulo`: input derivations' own hashes are now substituted into a dependent derivation's `InputDrvs` before hashing, instead of every output/drvPath being computed from each derivation's own attributes in isolation | done, **scoped** (see below; `./asnix d.nix`'s `hello.outPath` still doesn't match real Nix bit-for-bit — a separately tracked, still-open gap, see below) |
+| M75+ | not started |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
 
@@ -7709,3 +7710,155 @@ as empty for now; `test_multi_output`'s unaffected by the new
 members). `make test-conformance` (mined subset) unchanged.
 `make test-nix-conformance`: `pass=624 fail=34 skip=148` before this
 fix, `pass=626 fail=32 skip=148` after -- +2 net, zero regressions.
+
+## M74 scope notes: real `hashDerivationModulo` (input-derivation hashing)
+
+The user explicitly rejected "`d.nix` evaluates without crashing" as
+good enough (M72's own stated goal) once it was pointed out that the
+computed `hello.outPath` hash didn't actually match real Nix's. Root
+cause: `hello`'s derivation depends on several other derivations
+(`bash`, `stdenv-linux`, a `fetchurl`-fixed-output source, etc.), and
+real Nix's `hashDerivationModulo` requires substituting each input
+derivation's *own* hash in place of its literal `.drv` path before
+hashing the dependent derivation -- `derivation.c` had no concept of
+"this attribute value references another derivation" at all, so it
+always string-coerced every attribute and lost that information
+entirely, making this substitution impossible.
+
+Two pieces, neither needing real store/file I/O:
+
+- **A narrow, call-scoped input-reference collector**
+  (`asnix_collect_input_refs`), *not* a persistent Value-level string-
+  context feature (that broader feature -- a 4th tagged Value kind
+  touching ~101 call sites -- was declined twice already, M61 and
+  implicitly M45/M54/M60, as disproportionate to its own user-facing
+  payoff). This one only needs to know, for the duration of one
+  `derivation {...}` call, which attribute values are (or contain) a
+  derivation-output reference. Walks each already-forced attribute
+  value: an attrset with `type`/`drvPath`/`outputName` (every
+  derivation Value has these, M58's wrapper) records a `Built` ref;
+  a list recurses into every element; a bare Path already under
+  `/nix/store/` records an `Opaque` `inputSrcs` ref. Nothing else is
+  tracked (scope cut, matching M61's own precedent of naming what's
+  deferred): no `DrvDeep` context, no copying arbitrary local files
+  into a content-addressed store (no precedent for that anywhere in
+  this project; M45's `toFile` explicitly declined the equivalent).
+- **A process-global, in-memory masked-hash cache**
+  (`g_masked_hash_cache`, modeled directly on M65's `g_import_cache`
+  precedent and real Nix's own `derivation::masked::hashes`). Real
+  Nix's `nix-instantiate --eval` normally writes real `.drv` files to
+  `/nix/store` as a side effect and could read them back, but its
+  OWN `--read-only-mode` falls back to exactly this kind of pure
+  in-process memoization instead -- since Nix's call-by-need
+  evaluation guarantees a referenced derivation was already forced
+  (hence already cached) before anything can reference it, asnix can
+  replicate read-only-mode's behavior with no real store at all. A
+  cache miss is fatal (a real invariant violated), not a silent
+  fallback, matching this project's standing convention.
+
+`aterm.c`/`aterm.h` generalized to accept real `InputDrvs`/`InputSrcs`
+sections (previously hardcoded to `"],[],[],"`) -- `AtermInputDrv`
+is `(drv_path, [output_names...])`, matching real Nix's own ATerm
+shape exactly. `derivation.c` groups the collected `Built` refs by
+`drv_path` (a small, bounded, linear-scan grouping, same convention as
+every other small array in this file), builds TWO parallel
+`AtermInputDrv` lists -- `real_input_drvs` (literal `.drv` paths, for
+this derivation's own on-disk `.drv` content/`drvPath` hash) and
+`masked_input_drvs` (each group's `drv_path` replaced by its cached
+masked hash, hex, no algorithm prefix -- the actual substitution) --
+and passes each into its own `asnix_build_derivation_aterm` call.
+
+Three distinct, non-obvious bugs found and fixed chasing this through
+increasingly complex verification cases (each isolated by comparing
+asnix's own ATerm text, via gdb, against a real `.drv` dump, and
+cross-checking suspect hash computations by hand in Python):
+
+1. **Wrong cache value for regular (non-fixed-output) derivations.**
+   Initially cached `masked_digest` (the `maskOutputs=TRUE` variant,
+   with THIS derivation's own outputs blanked) as the value a later
+   derivation substitutes in for this one. Wrong: real Nix's
+   `hashDerivationModulo`'s `maskOutputs` parameter only ever controls
+   whether OUTPUT paths are blanked -- it does NOT affect whether
+   `inputDrvs` get hash-substituted (that substitution always
+   happens). The correct cached value is a THIRD ATerm variant never
+   otherwise built: this derivation's REAL (filled-in) outputs
+   combined with the SAME hash-substituted `inputDrvs` the masked pass
+   already uses. Fixed by building `cache_aterm` from `real_outs` +
+   `masked_input_drvs` specifically for the cache-insert step.
+2. **Wrong `type` string for a derivation's own `drvPath`.** Even
+   after fix 1, a 2-level chain's dependent derivation's `outPath`
+   matched but its `drvPath` didn't, despite the real ATerm text being
+   byte-identical (confirmed via `diff`) to real Nix's actual `.drv`
+   file. Root cause: a `.drv`'s own store path is a content-addressed
+   "text" path whose TYPE string is NOT the bare `"text"` this project
+   previously used -- it's `"text:" + every inputSrcs/inputDrvs path,
+   sorted` (`infoForDerivation`, `~/nix/src/libstore/derivations.cc`):
+   a `.drv` genuinely "references" everything it mentions. Every PRIOR
+   fixture had zero references, so this was unnoticed until M74's own
+   2-level verification case gave it something to catch. Fixed by
+   building `drv_type` from the sorted union of `group_paths`/
+   `refs.srcs` before the final `compute_store_path` call.
+3. **Wrong `InputDrvs` ordering for the masked pass specifically.**
+   The `nativeBuildInputs = [ a b2 ]` (two distinct input derivations)
+   verification case still mismatched after fixes 1/2, even though the
+   REAL pass's `InputDrvs` section (sorted by literal `.drv` path) was
+   byte-identical to real Nix's actual `.drv`. Root cause: real Nix's
+   substitution doesn't just swap each `inputDrvs` entry's path for
+   its resolved hash in place -- it rebuilds `inputDrvs` as a NEW
+   `std::map<string, StringSet>` keyed by the hash STRING itself
+   (`~/nix/src/libstore/derivations.cc`), and a `std::map`'s iteration
+   (which `unparse` walks) is sorted by ITS OWN key -- so the MASKED
+   pass's `InputDrvs` section must be sorted by the substituted hash
+   hex string, independently of whatever order the literal paths
+   sorted in. Confirmed: `b2`'s masked hash sorts before `a`'s despite
+   `a.drv` sorting before `b2.drv`. Fixed by re-sorting
+   `masked_input_drvs` by its own (already-substituted) `drv_path`
+   field, separately from `real_input_drvs`'s literal-path order.
+
+Two more bugs surfaced only once this was run against real nixpkgs
+(`d.nix`, not any of this milestone's own small verification cases --
+every prior fixture had too few references/inputs to hit either):
+`compute_store_path`'s `preimage` buffer was a fixed 512 bytes, too
+small once `type` itself became `"text:" + N references` for a
+derivation with many direct inputs/sources; and the companion
+`drv_type` accumulation buffer (`derivation.c`) was a fixed 4096
+bytes with no overflow check on its own `snprintf` return value (a
+silent-truncation risk, not just a size cap). Both are now sized
+dynamically (`malloc`, exact required length) instead of guessing a
+bigger constant. A third, related issue: `ASNIX_DRV_MAX_INPUT_DRVS`
+(the grouping arrays' bound) was 64, too small for `stdenv-linux`
+alone (well over 64 distinct direct input derivations in real
+nixpkgs) -- bumped to 1024, but moved from the stack to `malloc`,
+since resolving one derivation's input refs can recursively force
+(hence recursively call `asnix_prim_derivation` for) a dependency
+several levels deep in nixpkgs's own derivation graph, and 1024
+entries' worth of these arrays on the stack per nested call actually
+overflowed the real stack chasing `d.nix` to this point.
+
+Verified against real `nix-instantiate --eval --strict`, all 5 cases
+from this milestone's own plan: a plain 2-level chain, a 3-level
+chain, a fixed-output input, a multi-output input (referenced by name,
+`a.dev` not just `a.out`), and a list of two distinct inputs
+(`nativeBuildInputs = [ a b2 ]`, the case that caught bug 3 above) --
+every case's `outPath` AND `drvPath` match exactly
+(`tests/e2e/m74_input_*`).
+
+**Still open, deliberately out of this milestone's scope** (per the
+plan's own Phase 1/Phase 2 split): `./asnix d.nix` now runs to
+completion with the real substitution logic in place (no longer
+crashing on the input-derivation-count/stack-depth bugs above), but
+`hello.outPath` still doesn't bit-for-bit match real Nix's
+(`n0m8hzqnp3bj0if010gjial5402xvgym...` vs real's
+`wpr3vw194dl8g7bj94d54rj76v3rp3c0...`). This milestone's own scope
+boundary explicitly anticipated this: there may be independent gaps
+elsewhere in the full nixpkgs/stdenv chain (real Nix's internal
+corepkgs builder/setup shell scripts, which this project doesn't
+embed, being the leading suspect) that this milestone's narrow,
+controlled verification cases can't surface. Chasing that down is a
+separately tracked follow-up, using the same gdb/direct-`.drv`-diff
+methodology this milestone itself used.
+
+`make test`/`test-e2e` green (5 new `m74_input_*` fixtures, each
+verified byte-for-byte against real `nix-instantiate --eval --strict`
+before being written). `make test-nix-conformance`:
+`pass=627 fail=31 skip=148` -- +1 net over M73, zero regressions.
