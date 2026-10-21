@@ -4046,6 +4046,36 @@ to `components_lt`'s numeric check as expected. One new e2e fixture
 green (207 e2e); `test-conformance` 644 passed (+1), 158 failed (-1),
 0 known, 62 skipped.
 
+### M57g: `path + string` canonicalizes `.`/`..` segments
+
+Path *literals* (`./a/../b`) were already lexically canonicalized at
+compile time by a `canon_path` helper local to compiler.c -- but a
+RUNTIME `path + string` concatenation (`asnix_add_values`, value_util.c)
+just concatenated the raw text and re-wrapped it as a Path verbatim, no
+canonicalization at all. Confirmed against real Nix this is wrong:
+`toString (/foo/bar + "/../xyzzy/./foo.txt")` == `/foo/xyzzy/foo.txt`,
+not the literal uncollapsed concatenation -- `eval-okay-string.nix`
+exercises exactly this (and, as a contrast case in the same fixture,
+confirms plain STRING + STRING concatenation involving `/../`-looking
+text is NOT canonicalized, since it's never a Path value to begin
+with: `"/../foo" + toString /x/y` stays literally `/../foo/x/y`).
+
+Fixed by promoting `canon_path` from a compiler.c-local `static` to a
+shared `asnix_canon_path` (value_util.c/.h) -- compiler.c keeps every
+one of its existing call sites working unchanged via a same-file
+`#define canon_path asnix_canon_path` alias, rather than touching each
+call site -- and having `asnix_add_values`'s Path-result branch run
+the concatenated text through it (NUL-terminating into a temp buffer
+first, since `asnix_canon_path` expects a C string but asnix strings
+aren't NUL-terminated) before building the final Path Value.
+
+Verified: `eval-okay-string.nix`'s full expected output now matches
+byte-for-byte, including the contrast case confirming plain strings
+are correctly left untouched. One new e2e fixture
+(`m57g_path_canon_concat.nix`). `make test`/`test-e2e` green (208
+e2e); `test-conformance` 645 passed (+1), 157 failed (-1), 0 known, 62
+skipped.
+
 ### M57: items investigated and explicitly skipped
 
 - **Function/derivation equality quirks** (item 3 in the original
@@ -4071,15 +4101,15 @@ green (207 e2e); `test-conformance` 644 passed (+1), 158 failed (-1),
   equality's `isDerivation`-style eager `type`-forcing during `==` was
   not investigated in depth given the above; left for a future pass.
 
-- **Path normalization for `path + string`** (item 6) and **symlink
-  resolution** (item 7) and **CLI flag plumbing** (item 8): not reached
-  in this pass -- time went to the higher-priority items above instead,
-  per the task's own suggested ordering (`compareVersions`'s
-  int-overflow-to-string quirk, item 3's other half, WAS reached --
-  see M57f above). None of these three were investigated beyond
-  reading the task description, so there's no
-  "turned out to be harder than expected" verdict for them; they're
-  simply undone, left for a follow-up M58+.
+- **Symlink resolution** (item 7) and **CLI flag plumbing** (item 8):
+  not reached in this pass -- time went to the higher-priority items
+  above instead, per the task's own suggested ordering
+  (`compareVersions`'s int-overflow-to-string quirk, item 3's other
+  half, and path normalization, item 6, WERE both reached -- see M57f/
+  M57g above). Neither of these two was investigated beyond reading
+  the task description, so there's no "turned out to be harder than
+  expected" verdict for them; they're simply undone, left for a
+  follow-up M58+.
 
 - **Context-attr-name throwing on a string-with-context dynamic
   attribute name** (item 5's third sub-item): confirmed string-context

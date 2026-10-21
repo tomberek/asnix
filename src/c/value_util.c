@@ -219,9 +219,23 @@ Value asnix_add_values(Value lhs, Value rhs) {
     Value parts[2] = { lhs, rhs };
     Value result = asnix_concat_strings(parts, 2);
     if (asnix_value_is_path(lhs)) {
+        /* M57g: canonicalize `.`/`..`/doubled-slash segments the result
+         * may now have (e.g. `/foo/bar + "/../xyzzy/./foo.txt"` ==
+         * `/foo/xyzzy/foo.txt`), same as a path *literal* already gets
+         * at compile time (compiler.c's AST_PATH case) -- a runtime
+         * `path + string` concatenation previously just kept the raw,
+         * uncollapsed text. `result`'s bytes always start with '/'
+         * here since `lhs` is already an absolute Path. */
         int64_t len;
         const char *bytes = asnix_ptr_bytes(result, &len);
-        return asnix_make_path_value(bytes, (size_t)len);
+        char *nul_terminated = malloc((size_t)len + 1);
+        memcpy(nul_terminated, bytes, (size_t)len);
+        nul_terminated[len] = '\0';
+        char *canon = asnix_canon_path(nul_terminated);
+        free(nul_terminated);
+        Value out = asnix_make_path_value(canon, strlen(canon));
+        free(canon);
+        return out;
     }
     return result;
 }
@@ -251,6 +265,48 @@ Value asnix_concat_lists(Value lhs, Value rhs) {
         memcpy(out + lcount, rbase + ASNIX_LIST_OFF_ELEMS, (size_t)rcount * sizeof(Value));
     }
     return (Value){ .raw = (uint64_t)(uintptr_t)mem | ASNIX_TAG_LIST };
+}
+
+/* Moved here from compiler.c (M57g) so asnix_add_values can reuse it for
+ * `path + string` concatenation -- see this function's own long comment
+ * in value_util.h for why, and compiler.c's AST_PATH case for the
+ * original, still-current, compile-time-literal use. */
+char *asnix_canon_path(const char *in) {
+    size_t len = strlen(in);
+    char *out = malloc(len + 2);
+    char **comps = malloc((len + 1) * sizeof(char *));
+    size_t ncomps = 0;
+
+    size_t i = 0;
+    while (i < len) {
+        while (i < len && in[i] == '/') i++;
+        size_t start = i;
+        while (i < len && in[i] != '/') i++;
+        size_t clen = i - start;
+        if (clen == 0) continue;
+        if (clen == 1 && in[start] == '.') continue; /* "." -- drop */
+        if (clen == 2 && in[start] == '.' && in[start + 1] == '.') {
+            if (ncomps > 0) ncomps--; /* ".." -- pop (no-op at root, like real Nix) */
+            continue;
+        }
+        char *c = malloc(clen + 1);
+        memcpy(c, in + start, clen);
+        c[clen] = '\0';
+        comps[ncomps++] = c;
+    }
+
+    size_t pos = 0;
+    for (size_t k = 0; k < ncomps; k++) {
+        out[pos++] = '/';
+        size_t clen = strlen(comps[k]);
+        memcpy(out + pos, comps[k], clen);
+        pos += clen;
+        free(comps[k]);
+    }
+    free(comps);
+    if (pos == 0) out[pos++] = '/';
+    out[pos] = '\0';
+    return out;
 }
 
 char *asnix_string_value_to_cstr(Value string_val) {

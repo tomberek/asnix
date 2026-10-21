@@ -29,49 +29,16 @@
  * returned) -- see src/c/eval_file.c. */
 static const char *g_compile_base_dir = NULL;
 
-/* Lexically canonicalizes an absolute path in place: collapses `.` and
- * `..` components and doubled slashes, same as real Nix's `canonPath`
+/* Lexically canonicalizes an absolute path: collapses `.` and `..`
+ * components and doubled slashes, same as real Nix's `canonPath`
  * (verified against `nix-instantiate --eval 'builtins.toString
  * ./sub/../foo.nix'`), but -- unlike `canonPath` -- never touches the
  * filesystem (no symlink resolution): cheap, and sufficient for every
- * case this project's fixtures exercise. `in` must start with '/'. */
-static char *canon_path(const char *in) {
-    size_t len = strlen(in);
-    char *out = malloc(len + 2);
-    char **comps = malloc((len + 1) * sizeof(char *));
-    size_t ncomps = 0;
-
-    size_t i = 0;
-    while (i < len) {
-        while (i < len && in[i] == '/') i++;
-        size_t start = i;
-        while (i < len && in[i] != '/') i++;
-        size_t clen = i - start;
-        if (clen == 0) continue;
-        if (clen == 1 && in[start] == '.') continue; /* "." -- drop */
-        if (clen == 2 && in[start] == '.' && in[start + 1] == '.') {
-            if (ncomps > 0) ncomps--; /* ".." -- pop (no-op at root, like real Nix) */
-            continue;
-        }
-        char *c = malloc(clen + 1);
-        memcpy(c, in + start, clen);
-        c[clen] = '\0';
-        comps[ncomps++] = c;
-    }
-
-    size_t pos = 0;
-    for (size_t k = 0; k < ncomps; k++) {
-        out[pos++] = '/';
-        size_t clen = strlen(comps[k]);
-        memcpy(out + pos, comps[k], clen);
-        pos += clen;
-        free(comps[k]);
-    }
-    free(comps);
-    if (pos == 0) out[pos++] = '/';
-    out[pos] = '\0';
-    return out;
-}
+ * case this project's fixtures exercise. `in` must start with '/'.
+ * M57g: moved to value_util.c as `asnix_canon_path` so `asnix_add_values`
+ * (`path + string` concatenation) can reuse it too -- see that
+ * function's own comment, value_util.h. */
+#define canon_path asnix_canon_path
 
 /* Resolves a NIX_PATH search-path entry name (the text inside `<...>`,
  * e.g. "nixpkgs" or "nixpkgs/lib") the same way real Nix's `findFile`
