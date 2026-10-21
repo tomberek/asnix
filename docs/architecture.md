@@ -70,7 +70,8 @@ what's actually implemented and the scope decisions made along the way.
 | M55 — regex engine gaps triage (`builtins.match`/`builtins.split`, 39 conformance failures) | investigated, **no fix** (see below) |
 | M56 — integer-overflow detection (`+`/`-`/`*`/`/`, `builtins.add/sub/mul/div`) + `fromTOML` validation gaps (bare/incomplete time literals, calendar-range checks, duplicate table headers, leading-zero/double-underscore integers, invalid bare tokens, embedded NUL bytes, integer-literal overflow) | done (see below) |
 | M57 — conformance grab-bag (9 sub-items a-i): `lessThan`/`sort` on lists, `genericClosure` key-comparability, `__overrides` propagation, `toJSON` UTF-8 validation, `import`'s `__toString` coercion, `compareVersions`' int-overflow quirk, path-concat canonicalization, import symlink resolution, CLI `--arg`/`--argstr`/`-A` | done, **scoped** (see below; function/derivation-equality, `-I`, and context-attr-name skipped) |
-| M58+ | not started |
+| M58 — `derivation` is a real Nix-level wrapper around `derivationStrict`, giving self-referential multi-output objects (`drv.out.outPath`, etc.) | done (see below) |
+| M59+ | not started |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
 
@@ -5732,3 +5733,118 @@ pass's `fromTOML`/`fromJSON` fixes also happened to unblock
 (`eval-okay-fromTOML-006/-007/-008/-060.nix`, the main
 `eval-okay-fromTOML.nix`, and `eval-okay-fromjson-escapes.nix`), minus
 the one `eval-fail-fromTOML-timestamps.nix` flip documented above).
+
+## M58 scope notes: `derivation` is a real Nix-level wrapper around `derivationStrict`
+
+Found continuing to chase `d.nix` right after M48: once nixpkgs' bootstrap
+chain got far enough to evaluate `pkgs/os-specific/linux/minimal-bootstrap/`
+(reached indirectly as a sibling dependency, not something `d.nix` asks
+for directly), it aborted with "'.' selection target is not an attrset
+(got a string), aborting". Root-caused with gdb (the by-now-standard
+technique: break on `asnix_bshared_select_type_fatal`, read `%rsi`'s
+IrOp operand for the symbol id *before* the jump that skips loading it,
+resolve via `asnix_sym_name`): the selection was `.outPath`, on a value
+whose string content was a derivation's own store path
+(`mescc-tools-extra-1.9.1`). Chasing further (another gdb session,
+this time printing the calling primop's own argument attrset) showed
+the attrset in question was `mescc-tools-extra/default.nix`-style
+`callPackage` auto-args, and the specific Nix-level culprit was
+nixpkgs' `lib.extendDerivation` (`lib/customisation.nix`, used by
+every `mkDerivation`-built package and by minimal-bootstrap's own
+`derivationWithMeta` helper), which does
+`inherit (drv.${outputName}) type outputName;` and
+`drv.${outputName}.outPath` -- both require `drv.out` (for the
+single-output case) to itself be attrset-shaped, so its OWN `.outPath`
+can be selected a second time.
+
+Confirmed directly against real Nix that this is exactly right:
+`builtins.typeOf (derivation {...}).out` is `"set"`, not `"string"`.
+asnix's `derivation.c` (`asnix_prim_derivation`) was setting
+`out = outPath` as a bare string -- simply wrong, inherited unchanged
+all the way from M8. The real reason: `derivation` is **not a primop**
+in real Nix at all -- it's a short Nix-level function
+(`~/nix/src/libexpr/primops/derivation.nix`, embedded into the `nix`
+binary, the same `#embed`-at-compile-time mechanism M46 already found
+for `<nix/fetchurl.nix>`) that calls the actual primop,
+`derivationStrict`, and then builds a self-referential "nice" object
+on top: for each output name (single `"out"` is all this project
+supports), `commonAttrs // { outPath; drvPath; type; outputName; }`,
+where `commonAttrs` already contains the original input attrs
+(`name`/`system`/`builder`/...), an `all` list, and `drvAttrs` --
+and, crucially, `commonAttrs` itself is built via
+`drvAttrs // (listToAttrs outputsList) // {...}`, so `commonAttrs.out`
+(and therefore `drv.out`) ends up pointing back at the very attrset
+being constructed. A `let`-bound mutual recursion between
+`commonAttrs` and `outputsList`, which asnix's `let` already supports
+correctly (confirmed directly:
+`let a = {x=1;} // b; b = {y = a.x + 1;}; in a.y` → `2` on both
+engines) -- the fix needed none of the "disproportionate" infra the
+M8-era design doc worried about.
+
+**Implementation**: ported `derivation.nix` verbatim (its leading doc
+comment dropped, no semantic effect) into a new
+`ASNIX_DERIVATION_NIX_SOURCE` string constant in `derivation.c`,
+written to a fixed temp path once per process and evaluated via
+`asnix_eval_file`, exactly mirroring M46's `<nix/fetchurl.nix>`
+pattern. The existing C primop (`asnix_prim_derivation`, unchanged)
+is now bound as `derivationStrict` (both the bare global and
+`builtins.derivationStrict` -- confirmed real Nix exposes it as a bare
+global too: `builtins.isFunction derivationStrict` is `true` there).
+`derivation` itself (both bare and `builtins.derivation`) is now
+`asnix_make_derivation_wrapper_value()`'s result: the wrapper source
+lexed/parsed/compiled/evaluated exactly once and cached as a process-
+wide static `Value`, since it's a pure function with no caller-specific
+state -- reusing one across every root Env's `derivation` binding is
+behaviorally identical to rebuilding it fresh per file-import (which
+every *other* root-env slot still does) without paying the parse/compile
+cost repeatedly.
+
+One real wrinkle: bootstrapping the wrapper creates a self-referential
+construction problem, not just a self-referential *value* -- building
+ANY root Env eagerly constructs all fifteen bare-global slots
+(including `derivation` itself) and the whole `builtins` attrset
+(including its own "derivation" entry), so evaluating the wrapper
+file's OWN root Env would try to build the wrapper again, forever.
+Fixed with a narrow, explicit escape hatch rather than making
+construction lazy everywhere: `eval_file.c`'s `make_root_env` became
+`make_root_env_ex(up, skip_derivation_wrapper)` and
+`builtins.c`'s `asnix_make_builtins_attrs` became
+`asnix_make_builtins_attrs_ex(skip_derivation_wrapper)`; passing 1
+substitutes the plain `derivationStrict` primop for slot 8 (and for
+`builtins.derivation`) in that one bootstrap evaluation only -- correct
+because the wrapper source never references bare `derivation`, only
+`derivationStrict`. `asnix_eval_file_for_derivation_bootstrap` is the
+dedicated entry point that passes 1; every other caller still goes
+through the ordinary `asnix_eval_file`/`make_root_env` (`skip=0`) path
+unchanged.
+
+Root env/builtins-name-list bookkeeping: the root `Env` grew from 14 to
+15 slots (`derivationStrict` is new, slot 14); `compiler.c`'s
+`init_builtins_frame` scope-name list grew to match.
+
+**Known, pre-existing limitation surfaced (not caused) by this fix**:
+asnix's printer has no cycle/sharing detection (real Nix prints
+`«repeated»` for a value it's already printed higher up the same
+structure, see `nix-instantiate --eval`'s own output on
+`(derivation {...}).all`). Since `derivation`'s result is now
+genuinely self-referential (`drv.out.out == drv.out`, matching real
+Nix exactly), printing the WHOLE structure (`d.all`, or bare `d`
+itself) recurses forever and segfaults on asnix, where real Nix
+produces a finite, `«repeated»`-marked printout. Not hit by `d.nix`
+(which only ever selects `.outPath`, a plain string leaf, never prints
+the whole derivation object) or by anything in `test-e2e`/
+`test-conformance`; a separately tracked gap (cycle-aware printing),
+out of scope for this fix.
+
+Verified directly against real Nix (`/tmp/m58_check.nix`-style
+fixture): `builtins.typeOf d.out == "set"`, `d.out.outPath == d.outPath`,
+`d.out.outputName == "out"`, all `true` on both engines. New
+`tests/e2e/m58_derivation_self_ref_out.nix` fixture added (`true`).
+`make test`/`test-e2e` both green, zero regressions. Before/after
+`git stash` comparison on a quick custom harness over
+`/tmp/nix-conformance/lang`'s `eval-okay-*.nix`/`eval-fail-*.nix` files
+(not the same methodology as this file's other `test-conformance`
+numbers above, which run this project's own small mined
+`tests/conformance/` subset -- noted here as a distinct, one-off check,
+not a new standing baseline): 553 passed/105 failed/148 skipped before
+this fix, 556/102/148 after -- +3 net, zero regressions.

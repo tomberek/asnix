@@ -46,4 +46,12 @@ Value asnix_eval_file_scoped(const char *path, Value scope);
  * value has no "containing file" of its own to resolve against). */
 Value asnix_eval_expr_source(const char *src);
 
+/* M58: same pipeline as asnix_eval_file, but for bootstrapping the
+ * `derivation` wrapper itself (derivation.c's
+ * asnix_make_derivation_wrapper_value) -- breaks the self-referential
+ * cycle that would otherwise result from building a root Env's own
+ * `derivation` slot, see eval_file.c's make_root_env_ex comment for the
+ * full rationale. Not useful for anything else. */
+Value asnix_eval_file_for_derivation_bootstrap(const char *path);
+
 #endif /* ASNIX_EVAL_FILE_H */

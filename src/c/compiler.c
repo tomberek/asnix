@@ -1138,28 +1138,30 @@ static void compile_expr(IrBuilder *b, Ast *node, ScopeFrame *scope) {
     }
 }
 
-/* The root env (constructed by eval_file.c) has thirteen slots: the
+/* The root env (constructed by eval_file.c) has fifteen slots: the
  * `builtins` attrset, plus `import`/`map`/`abort`/`toString`/
  * `removeAttrs`/`isNull`/`throw`/`derivation`/`baseNameOf`/`dirOf`/
- * `fromTOML`/`scopedImport` bare -- names real Nix exposes as bare globals
- * in addition to `builtins.X` (see builtins.h's asnix_make_import_primop
- * comment). This scope frame makes `builtins.toString 5` and bare
- * `import ./x`/`map f xs`/`abort "msg"`/`toString 5`/`removeAttrs set
- * ["a"]`/`isNull x`/`throw "msg"`/`derivation {...}`/`baseNameOf x`/
- * `dirOf x`/`fromTOML s`/`placeholder "out"`/`scopedImport scope path`
- * all resolve like any other variable reference. Shared by asnix_compile
- * and asnix_compile_scoped (M54) below -- both need exactly this same
- * outermost frame, just with a possible extra frame spliced in front of
- * it for the latter. */
+ * `fromTOML`/`placeholder`/`scopedImport`/`derivationStrict` bare -- names
+ * real Nix exposes as bare globals in addition to `builtins.X` (see
+ * builtins.h's asnix_make_import_primop comment). This scope frame makes
+ * `builtins.toString 5` and bare `import ./x`/`map f xs`/`abort "msg"`/
+ * `toString 5`/`removeAttrs set ["a"]`/`isNull x`/`throw "msg"`/
+ * `derivation {...}`/`baseNameOf x`/`dirOf x`/`fromTOML s`/
+ * `placeholder "out"`/`scopedImport scope path`/`derivationStrict {...}`
+ * (M58: `derivation` itself is now a Nix-level wrapper around this,
+ * see derivation.h) all resolve like any other variable reference.
+ * Shared by asnix_compile and asnix_compile_scoped (M54) below -- both
+ * need exactly this same outermost frame, just with a possible extra
+ * frame spliced in front of it for the latter. */
 static void init_builtins_frame(ScopeFrame *f) {
-    static const char *builtins_names[14] = {
+    static const char *builtins_names[15] = {
         "builtins", "import", "map", "abort", "toString", "removeAttrs", "isNull", "throw", "derivation",
-        "baseNameOf", "dirOf", "fromTOML", "placeholder", "scopedImport" };
-    static size_t builtins_name_lens[14] = { 8, 6, 3, 5, 8, 11, 6, 5, 10, 10, 5, 8, 11, 12 };
+        "baseNameOf", "dirOf", "fromTOML", "placeholder", "scopedImport", "derivationStrict" };
+    static size_t builtins_name_lens[15] = { 8, 6, 3, 5, 8, 11, 6, 5, 10, 10, 5, 8, 11, 12, 16 };
     f->up = NULL;
     f->names = builtins_names;
     f->name_lens = builtins_name_lens;
-    f->count = 14;
+    f->count = 15;
     f->is_with = 0;
 }
 

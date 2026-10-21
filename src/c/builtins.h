@@ -10,6 +10,13 @@
  * variable: `builtins.toString 5`. */
 Value asnix_make_builtins_attrs(void);
 
+/* M58: same as asnix_make_builtins_attrs, but substitutes the plain
+ * `derivationStrict` primop for the "derivation" entry too -- used only
+ * by eval_file.c's asnix_eval_file_for_derivation_bootstrap to break the
+ * self-referential cycle building the `derivation` wrapper's own
+ * `builtins` attrset would otherwise hit. See derivation.h. */
+Value asnix_make_builtins_attrs_for_derivation_bootstrap(void);
+
 /* `import` is one of real Nix's bare-global names, exposed in addition
  * to `builtins.import`. The actual rule (read directly from cppnix's
  * source, `EvalState::addPrimOp`, `~/nix/src/libexpr/eval.cc`, after
@@ -43,11 +50,9 @@ Value asnix_make_throw_primop(void);
 /* Same idea, for `toString` -- also one of real Nix's bare-global names. */
 Value asnix_make_toString_primop(void);
 
-/* Same idea, for `derivation` -- also one of real Nix's bare-global
- * names (M23: found needed by numtide/nix-conformance's
- * eval-okay-drv-fixed-output.nix/eval-okay-drv-structured-attrs.nix,
- * both of which call bare `derivation {...}`, not
- * `builtins.derivation {...}`). */
-Value asnix_make_derivation_primop(void);
+/* M58: `derivation`/`derivationStrict`'s bare-global constructors moved
+ * to derivation.h (asnix_make_derivation_wrapper_value /
+ * asnix_make_derivation_strict_primop) -- `derivation` is no longer a
+ * plain primop, see that header's comment. */
 
 #endif /* ASNIX_BUILTINS_H */

@@ -10,6 +10,8 @@
 #include "asnix/ir.h" /* asnix_force_for_print */
 #include "aterm.h"
 #include "base32.h"
+#include "builtins_shared.h" /* asnix_bshared_make_primop */
+#include "eval_file.h"       /* asnix_eval_file -- M58's derivation.nix wrapper */
 #include "hash_shim.h"
 #include "store_path.h"
 #include "symtab.h"
@@ -313,3 +315,79 @@ Value asnix_prim_derivation(const Value *args, int64_t argc) {
     }
     return (Value){ .raw = (uint64_t)(uintptr_t)mem | ASNIX_TAG_ATTRS };
 }
+
+Value asnix_make_derivation_strict_primop(void) {
+    return asnix_bshared_make_primop((void *)asnix_prim_derivation, 1);
+}
+
+/* M58: verbatim port of cppnix's `~/nix/src/libexpr/primops/
+ * derivation.nix` (its large leading doc comment, lines 1-28 there,
+ * dropped -- purely descriptive, no semantic effect), see derivation.h's
+ * header comment on asnix_make_derivation_wrapper_value for why this
+ * exists. References the bare global `derivationStrict` (not
+ * `builtins.derivationStrict`), matching the original exactly -- this
+ * resolves via the ordinary ASNIX_ROOT_BARE_GLOBALS machinery
+ * (compiler.c/eval_file.c), the same way `derivation` itself already
+ * was, not any special injected scope. */
+static const char ASNIX_DERIVATION_NIX_SOURCE[] =
+    "drvAttrs@{\n"
+    "  outputs ? [ \"out\" ],\n"
+    "  ...\n"
+    "}:\n"
+    "\n"
+    "let\n"
+    "\n"
+    "  strict = derivationStrict drvAttrs;\n"
+    "\n"
+    "  commonAttrs =\n"
+    "    drvAttrs\n"
+    "    // (builtins.listToAttrs outputsList)\n"
+    "    // {\n"
+    "      all = map (x: x.value) outputsList;\n"
+    "      inherit drvAttrs;\n"
+    "    };\n"
+    "\n"
+    "  outputToAttrListElement = outputName: {\n"
+    "    name = outputName;\n"
+    "    value = commonAttrs // {\n"
+    "      outPath = strict.${outputName};\n"
+    "      drvPath = strict.drvPath;\n"
+    "      type = \"derivation\";\n"
+    "      inherit outputName;\n"
+    "    };\n"
+    "  };\n"
+    "\n"
+    "  outputsList = map outputToAttrListElement outputs;\n"
+    "\n"
+    "in\n"
+    "(builtins.head outputsList).value\n";
+
+#define ASNIX_DERIVATION_TEMP_PATH "/tmp/.asnix-corepkgs-derivation.nix"
+
+static const char *write_derivation_nix(void) {
+    FILE *f = fopen(ASNIX_DERIVATION_TEMP_PATH, "w");
+    if (!f) {
+        fprintf(stderr, "asnix: could not write '%s' for the `derivation` wrapper\n", ASNIX_DERIVATION_TEMP_PATH);
+        exit(1);
+    }
+    fwrite(ASNIX_DERIVATION_NIX_SOURCE, 1, sizeof(ASNIX_DERIVATION_NIX_SOURCE) - 1, f);
+    fclose(f);
+    return ASNIX_DERIVATION_TEMP_PATH;
+}
+
+Value asnix_make_derivation_wrapper_value(void) {
+    static int have_cached = 0;
+    static Value cached;
+    if (!have_cached) {
+        cached = asnix_eval_file_for_derivation_bootstrap(write_derivation_nix());
+        have_cached = 1;
+    }
+    return cached;
+}
+
+const AsnixBuiltinMiscDef ASNIX_DERIVATION_BUILTINS[] = {
+    { "derivation", asnix_make_derivation_wrapper_value },
+    { "derivationStrict", asnix_make_derivation_strict_primop },
+};
+const size_t ASNIX_DERIVATION_BUILTINS_COUNT =
+    sizeof(ASNIX_DERIVATION_BUILTINS) / sizeof(ASNIX_DERIVATION_BUILTINS[0]);

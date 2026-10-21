@@ -20,6 +20,7 @@
 #include "builtins_shared.h"
 #include "builtins_toml.h"
 #include "compiler.h"
+#include "derivation.h"
 #include "lexer.h"
 #include "parser.h"
 #include "symtab.h"
@@ -166,9 +167,20 @@ static Ast *parse_file(const char *path, char **resolved_out, char **base_dir_ou
  * (init_builtins_frame) must list the same names in the same order. `up`
  * is the caller's choice (NULL for the ordinary case, or scopedImport's
  * own extra scope-attrs frame). */
-static Env *make_root_env(Env *up) {
-    Env *root_env = asnix_env_alloc(up, 14);
-    root_env->values[0] = asnix_make_builtins_attrs();
+/* `skip_derivation_wrapper`: slot 8 (`derivation`) is normally
+ * asnix_make_derivation_wrapper_value() (M58), which itself lexes,
+ * parses, and evaluates a small embedded .nix file -- and THAT
+ * evaluation calls back into this very function to build ITS OWN root
+ * env, which would try to construct slot 8 again, forever. Passing 1
+ * breaks that cycle by using the plain `derivationStrict` primop in
+ * slot 8 instead for that one bootstrap evaluation; harmless, since the
+ * wrapper source never references bare `derivation` itself, only
+ * `derivationStrict` (slot 14). The ordinary path (every other caller)
+ * passes 0 and gets the real wrapper, same as before this existed. */
+static Env *make_root_env_ex(Env *up, int skip_derivation_wrapper) {
+    Env *root_env = asnix_env_alloc(up, 15);
+    root_env->values[0] = skip_derivation_wrapper ? asnix_make_builtins_attrs_for_derivation_bootstrap()
+                                                   : asnix_make_builtins_attrs();
     root_env->values[1] = asnix_make_import_primop();
     root_env->values[2] = asnix_make_map_primop();
     root_env->values[3] = asnix_make_abort_primop();
@@ -176,20 +188,37 @@ static Env *make_root_env(Env *up) {
     root_env->values[5] = asnix_make_removeAttrs_primop();
     root_env->values[6] = asnix_make_isNull_primop();
     root_env->values[7] = asnix_make_throw_primop();
-    root_env->values[8] = asnix_make_derivation_primop();
+    root_env->values[8] = skip_derivation_wrapper ? asnix_make_derivation_strict_primop()
+                                                   : asnix_make_derivation_wrapper_value();
     root_env->values[9] = asnix_make_baseNameOf_primop();
     root_env->values[10] = asnix_make_dirOf_primop();
     root_env->values[11] = asnix_make_fromTOML_primop();
     root_env->values[12] = asnix_make_placeholder_primop();
     root_env->values[13] = asnix_make_scopedImport_primop();
+    root_env->values[14] = asnix_make_derivation_strict_primop(); /* M58: derivationStrict, newly bare-global */
     return root_env;
 }
+
+static Env *make_root_env(Env *up) { return make_root_env_ex(up, 0); }
 
 Value asnix_eval_file(const char *path) {
     char *resolved, *base_dir;
     Ast *ast = parse_file(path, &resolved, &base_dir);
     IrProgram *prog = asnix_compile(ast, base_dir);
     Env *root_env = make_root_env(NULL);
+    Value result = asnix_eval(prog, root_env);
+    free(resolved);
+    free(base_dir);
+    return result;
+}
+
+/* M58: the one caller that needs make_root_env_ex's cycle-breaking
+ * `skip_derivation_wrapper=1` path -- see that function's comment. */
+Value asnix_eval_file_for_derivation_bootstrap(const char *path) {
+    char *resolved, *base_dir;
+    Ast *ast = parse_file(path, &resolved, &base_dir);
+    IrProgram *prog = asnix_compile(ast, base_dir);
+    Env *root_env = make_root_env_ex(NULL, 1);
     Value result = asnix_eval(prog, root_env);
     free(resolved);
     free(base_dir);

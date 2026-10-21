@@ -274,7 +274,7 @@ static const BuiltinDef BUILTINS[] = {
     { "typeOf", prim_typeOf, 1 },
     { "length", prim_length, 1 },
     { "hashString", prim_hashString, 1 }, /* true arity 2, curried -- see hash_apply's comment above */
-    { "derivation", asnix_prim_derivation, 1 },
+    { "derivationStrict", asnix_prim_derivation, 1 }, /* M58: `derivation` itself is a wrapper, see below */
     { "import", prim_import, 1 },
     { "abort", prim_abort, 1 },
     { "throw", prim_throw, 1 },
@@ -303,9 +303,9 @@ Value asnix_make_toString_primop(void) {
     return make_primop_value((void *)prim_toString, 1);
 }
 
-Value asnix_make_derivation_primop(void) {
-    return make_primop_value((void *)asnix_prim_derivation, 1);
-}
+/* M58: `derivation` moved to derivation.c's asnix_make_derivation_wrapper_value
+ * (a Nix-level wrapper around this same primop, now bound as
+ * `derivationStrict` instead) -- see derivation.h's header comment. */
 
 /* Merges this file's own BUILTINS[] with the builtins-expansion modules
  * added across three passes (M17: list/attrs/misc; M19: closure/list2/
@@ -327,7 +327,15 @@ Value asnix_make_derivation_primop(void) {
  * Value, since several entries are curried Closure chains rather than a
  * single PrimOp, see builtins_shared.h's make_curried_native) is
  * registered by just calling build(). */
-Value asnix_make_builtins_attrs(void) {
+/* `skip_derivation_wrapper`: see eval_file.c's make_root_env_ex comment
+ * -- building the `derivation.nix` wrapper's OWN `builtins` attrset
+ * must not recurse into building the wrapper again via this same
+ * attrset's "derivation" entry. 1 substitutes the plain
+ * `derivationStrict` primop for "derivation" too in that one bootstrap
+ * case (harmless: the wrapper source only ever uses bare `derivationStrict`,
+ * never `builtins.derivation`). asnix_make_builtins_attrs (below) is the
+ * ordinary `skip_derivation_wrapper=0` case every other caller gets. */
+static Value asnix_make_builtins_attrs_ex(int skip_derivation_wrapper) {
     static const BuiltinDef *const plain_tables[] = { BUILTINS };
     static const size_t plain_counts[] = { sizeof(BUILTINS) / sizeof(BUILTINS[0]) };
     const AsnixBuiltinDef *const list_shaped_tables[] = { asnix_builtins_list, ASNIX_ATTRS_BUILTINS };
@@ -335,11 +343,13 @@ Value asnix_make_builtins_attrs(void) {
     const AsnixBuiltinMiscDef *const build_tables[] = {
         ASNIX_BUILTINS_MISC, ASNIX_CLOSURE_BUILTINS, ASNIX_LIST2_BUILTINS, ASNIX_ATTRS2_BUILTINS, ASNIX_COMPARE_BUILTINS,
         ASNIX_M23_BUILTINS, ASNIX_REGEX_BUILTINS, ASNIX_TOML_BUILTINS, ASNIX_TRYEVAL_BUILTINS, ASNIX_JSON_BUILTINS,
+        ASNIX_DERIVATION_BUILTINS,
     };
     const size_t build_counts[] = {
         ASNIX_BUILTINS_MISC_COUNT, ASNIX_CLOSURE_BUILTINS_COUNT, ASNIX_LIST2_BUILTINS_COUNT,
         ASNIX_ATTRS2_BUILTINS_COUNT, ASNIX_COMPARE_BUILTINS_COUNT, ASNIX_M23_BUILTINS_COUNT, ASNIX_REGEX_BUILTINS_COUNT,
         ASNIX_TOML_BUILTINS_COUNT, ASNIX_TRYEVAL_BUILTINS_COUNT, ASNIX_JSON_BUILTINS_COUNT,
+        ASNIX_DERIVATION_BUILTINS_COUNT,
     };
     /* M54: a further builtins-expansion pass (bitAnd/bitOr/bitXor/trace/
      * zipAttrsWith/toXML/convertHash/getContext/appendContext/
@@ -374,8 +384,12 @@ Value asnix_make_builtins_attrs(void) {
     }
     for (size_t t = 0; t < sizeof(build_counts) / sizeof(build_counts[0]); t++) {
         for (size_t i = 0; i < build_counts[t]; i++, k++) {
+            AsnixBuiltinMiscBuilder build = build_tables[t][i].build;
+            if (skip_derivation_wrapper && build == asnix_make_derivation_wrapper_value) {
+                build = asnix_make_derivation_strict_primop;
+            }
             syms[k] = asnix_intern(build_tables[t][i].name, strlen(build_tables[t][i].name));
-            vals[k] = build_tables[t][i].build();
+            vals[k] = build();
         }
     }
     for (size_t t = 0; t < sizeof(m54_counts) / sizeof(m54_counts[0]); t++) {
@@ -408,3 +422,10 @@ Value asnix_make_builtins_attrs(void) {
     free(order);
     return (Value){ .raw = (uint64_t)(uintptr_t)mem | ASNIX_TAG_ATTRS };
 }
+
+Value asnix_make_builtins_attrs(void) { return asnix_make_builtins_attrs_ex(0); }
+
+/* M58: the `builtins` attrset half of eval_file.c's
+ * asnix_eval_file_for_derivation_bootstrap cycle-break -- see
+ * asnix_make_builtins_attrs_ex's comment above. */
+Value asnix_make_builtins_attrs_for_derivation_bootstrap(void) { return asnix_make_builtins_attrs_ex(1); }
