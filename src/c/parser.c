@@ -135,6 +135,7 @@ struct BTNode {
     int is_leaf;
     Ast *leaf_value;   /* valid iff is_leaf */
     int is_inherit;    /* valid iff is_leaf */
+    int is_hidden;     /* valid iff is_leaf -- see AstBinding.is_hidden (ast.h) */
     int rec;           /* valid iff !is_leaf: whether the attrset this branch finalizes
                          * into should be `rec`. Always 0 for a branch created purely by
                          * attrpath-sugar descent (`a.b = 1;` makes an ordinary, non-rec
@@ -208,7 +209,7 @@ static void reopen_attrset_into(BTVec *dest, Ast *attrs) {
         AstBinding *b = &attrs->as.attrset.bindings[i];
         btvec_push(dest, (BTNode){
             .name = b->name, .name_len = b->name_len,
-            .is_leaf = 1, .leaf_value = b->value, .is_inherit = b->is_inherit });
+            .is_leaf = 1, .leaf_value = b->value, .is_inherit = b->is_inherit, .is_hidden = b->is_hidden });
     }
 }
 
@@ -278,7 +279,7 @@ static AstBinding finalize_bt_node(BTNode *node) {
     if (node->is_leaf) {
         return (AstBinding){
             .name = node->name, .name_len = node->name_len,
-            .value = node->leaf_value, .is_inherit = node->is_inherit };
+            .value = node->leaf_value, .is_inherit = node->is_inherit, .is_hidden = node->is_hidden };
     }
     BindingVec out = { 0 };
     for (size_t i = 0; i < node->children.len; i++) {
@@ -488,7 +489,28 @@ static AstStringPart *strip_indentation(RawIndVec *raw, size_t *out_count) {
 typedef struct {
     Token *toks;
     size_t pos;
+    const char *src; /* M80: the buffer every Token.pos/.start points into -- see
+                       * curpos_line_col below, parser.h's own asnix_parse comment. */
 } Parser;
+
+/* M80: 1-based line/column of `at` (a pointer into `src`, e.g. a
+ * `Token.pos`) -- counts newlines from the start of the buffer up to
+ * `at`, same convention real Nix's own `Pos` uses (confirmed against
+ * `nix-instantiate --eval`: the very first character of a file is line
+ * 1, column 1). Only ever called for the rare `__curPos` occurrence (not
+ * once per token), so an O(file size) scan here is a non-issue -- real
+ * Nix itself only computes a `Pos`'s line/column lazily, on demand, for
+ * exactly the same reason (`Pos::LazyLine`/`actualPos`, `~/nix/src/
+ * libutil/position.cc`). */
+static void curpos_line_col(const char *src, const char *at, int *out_line, int *out_col) {
+    int line = 1, col = 1;
+    for (const char *c = src; c < at; c++) {
+        if (*c == '\n') { line++; col = 1; }
+        else col++;
+    }
+    *out_line = line;
+    *out_col = col;
+}
 
 static Token *cur(Parser *p) {
     return &p->toks[p->pos];
@@ -693,6 +715,15 @@ static Ast *build_dynamic_chain_value(AttrSeg *segs, size_t start, size_t count,
  * attributes not allowed in let", matching real Nix's own explicit
  * rejection there); non-NULL (plain `{...}`/`rec {...}`) collects it
  * instead of fataling. See DynBindingVec's own comment above. */
+/* M80 (see docs/architecture.md): every synthetic hidden binding
+ * `inherit (expr) a b c;` generates (below) gets a name built from this
+ * counter, prefixed with a byte ('\x01') the lexer can never produce
+ * inside an identifier/string-attr token -- guarantees it can never
+ * collide with a real, source-written attribute name, so it's safe to
+ * `btvec_push` directly (bypassing insert_attrpath's dup-attr/merge
+ * checks entirely, which exist only for names a *user* could write). */
+static int g_inherit_hidden_counter = 0;
+
 static void parse_binding_stmt(Parser *p, BTVec *out, DynBindingVec *dyn_out) {
     if (cur(p)->kind == TOK_INHERIT) {
         advance(p);
@@ -702,6 +733,13 @@ static void parse_binding_stmt(Parser *p, BTVec *out, DynBindingVec *dyn_out) {
             src_expr = parse_expr(p);
             expect(p, TOK_RPAREN, "')'");
         }
+        /* Collect every inherited name first (real Nix's own grammar,
+         * `attrs: attrs attr | attrs string_attr`, already requires this
+         * -- one `inherit (expr) ...;` clause's names are all read before
+         * anything is done with them) so the `src_expr != NULL` case
+         * below can decide, from the final count, whether to share one
+         * evaluation of `expr` across every name. */
+        AttrSegVec names = { 0 };
         while (cur(p)->kind == TOK_IDENT || cur(p)->kind == TOK_STR_START || cur(p)->kind == TOK_DOLLAR_LBRACE) {
             AttrSeg name = parse_attr_segment(p, "an inherited name");
             /* real Nix's grammar lets a bare `${...}`/interpolated
@@ -716,10 +754,87 @@ static void parse_binding_stmt(Parser *p, BTVec *out, DynBindingVec *dyn_out) {
                 fprintf(stderr, "asnix: parse error: dynamic attributes not allowed in inherit\n");
                 exit(1);
             }
+            attrsegvec_push(&names, name);
+        }
+        /* M80: `inherit (expr) a b;` must evaluate `expr` exactly ONCE,
+         * shared by every inherited name -- found via numtide/nix-
+         * conformance's eval-okay-inherit-from.nix (`inherit (builtins.
+         * trace "used" {...}) a b;` printed "trace: used" twice, real
+         * Nix once; confirmed directly against real `nix-instantiate
+         * --eval`, and against real Nix's own parser.y/nixexpr.cc, which
+         * give every `inherit (expr) ...;` clause exactly one shared
+         * `inheritFromExprs` thunk). Previously each name's `AST_SELECT`
+         * re-embedded the SAME `src_expr` Ast* pointer directly as its
+         * own `target` -- harmless when `src_expr` is a bare variable
+         * (forcing an already-memoized Env slot twice is a no-op) but
+         * wrong whenever it's a genuine expression with its own side
+         * effect or allocation cost, since compiler.c gives every
+         * binding (including each of these selects) its own independent
+         * `OP_MK_THUNK`, so `target` was really being *recompiled and
+         * re-run* once per inherited name, not shared.
+         *
+         * Fixed by introducing one synthetic hidden binding (named via
+         * `g_inherit_hidden_counter` above, `is_hidden` so neither
+         * compiler.c's `AST_ATTRSET` case nor main.c's printer ever
+         * treats it as a real attribute) holding `src_expr` itself, and
+         * having every name's `AST_SELECT.target` be an `AST_VAR`
+         * referencing that ONE binding instead -- it then goes through
+         * the exact same frame/env-slot machinery (`OP_MK_THUNK` once,
+         * `OP_FRAME_GET`/`OP_VAR_REF` to re-read the already-forced
+         * result from then on) every ordinary shared `let`/`rec {}`
+         * binding already uses to memoize itself, with zero new runtime
+         * machinery needed. */
+        Ast *hidden_var = NULL;
+        if (src_expr && names.len > 1) {
+            /* M80: only bother introducing the hidden shared-source
+             * binding when there's more than one name to share it
+             * between -- a single-name `inherit (expr) x;` already
+             * evaluates `expr` exactly once either way (there's only
+             * ever the one `AST_SELECT` referencing it), so leaving it
+             * exactly as before for that case sidesteps a real
+             * complication: a `rec {}` combining `__overrides` with
+             * this hidden mechanism needs more care than this pass
+             * attempts (see compiler.c's AST_ATTRSET/overrides_slot
+             * comment) -- numtide/nix-conformance's own eval-okay-
+             * inherit-from.nix happens to combine exactly those two
+             * (`__overrides.y.d = [ ];` alongside `inherit (x) c;`/
+             * `inherit (y) d;`), but both of ITS inherit-from clauses
+             * are single-name, so this `> 1` guard keeps them on the
+             * untouched, already-correct path and avoids the conflict
+             * entirely rather than papering over it. */
+            char *hidden_name = malloc(32);
+            int hlen = snprintf(hidden_name, 32, "\x01inherit#%d", g_inherit_hidden_counter++);
+            BTNode hidden_node = {
+                .name = hidden_name, .name_len = (size_t)hlen,
+                .is_leaf = 1, .leaf_value = src_expr, .is_inherit = 0, .is_hidden = 1 };
+            btvec_push(out, hidden_node);
+            Ast *v = asnix_ast_new(AST_VAR);
+            v->as.var.name = hidden_name;
+            v->as.var.name_len = (size_t)hlen;
+            hidden_var = v;
+        }
+        for (size_t ni = 0; ni < names.len; ni++) {
+            AttrSeg name = names.items[ni];
             Ast *value;
             if (src_expr) {
+                /* Single-name `inherit (expr) x;` (no hidden binding was
+                 * created -- `names.len` wasn't `> 1`) still selects off
+                 * `src_expr` directly, exactly as before M80; a multi-name
+                 * clause selects off the shared `hidden_var` instead. Bug
+                 * fix (caught before landing, isolating this same change):
+                 * an earlier version of this checked `if (hidden_var)`
+                 * here instead of `if (src_expr)`, so a single-name
+                 * `inherit (x) c;` fell into the bare-`inherit` branch
+                 * below and compiled `c`'s value as a plain `AST_VAR("c")`
+                 * -- which, looked up against this same block's own
+                 * recursive frame (`is_inherit` was correctly 0, since
+                 * `src_expr != NULL`), resolved right back to itself:
+                 * `c`'s own thunk forcing `c`'s own thunk, a genuine
+                 * blackhole (confirmed via numtide/nix-conformance's own
+                 * eval-okay-inherit-from.nix, whose `rec {}` block has
+                 * exactly this shape). */
                 Ast *sel = asnix_ast_new(AST_SELECT);
-                sel->as.select.target = src_expr;
+                sel->as.select.target = hidden_var ? hidden_var : src_expr;
                 sel->as.select.attr = name.attr;
                 sel->as.select.attr_len = name.attr_len;
                 sel->as.select.attr_expr = NULL;
@@ -745,7 +860,10 @@ static void parse_binding_stmt(Parser *p, BTVec *out, DynBindingVec *dyn_out) {
              * own grammar (`attrs: attrs attr | ...`, never `attrpath`),
              * so it always goes through insert_attrpath as a length-1
              * path -- still subject to the same dup-attr/merge rules as
-             * an ordinary binding if it collides with one. */
+             * an ordinary binding if it collides with one. The
+             * *synthetic* hidden binding above bypasses insert_attrpath
+             * entirely instead (pushed straight to `out`) -- see its own
+             * comment on why that's safe. */
             insert_attrpath(out, &name, 1, 0, value, (src_expr == NULL));
         }
         expect(p, TOK_SEMI, "';'");
@@ -942,6 +1060,22 @@ static Ast *parse_atom(Parser *p) {
             return parse_indented_string(p);
         case TOK_IDENT:
         case TOK_OR: { /* M67: bare `or` as an ordinary (deprecated/"cursed") variable -- see starts_atom's comment */
+            /* M80: `__curPos` -- a genuine special FORM in real Nix's own
+             * grammar (`parser.y`'s `IND_STRING | ... | '__curPos'`
+             * production builds an `ExprPos` node directly, not an
+             * ordinary variable reference, confirmed: `nix-instantiate
+             * --eval -E 'let __curPos = 1; in __curPos'` still evaluates
+             * to the POSITION of that `__curPos` token, never binding to
+             * the shadowing `let`), so it's intercepted here, before
+             * ever becoming an ordinary AST_VAR, exactly like real Nix's
+             * own grammar treats it as a distinct token/production
+             * rather than a lexically-rebindable identifier. */
+            if (t->kind == TOK_IDENT && t->len == 8 && memcmp(t->start, "__curPos", 8) == 0) {
+                advance(p);
+                Ast *n = asnix_ast_new(AST_CURPOS);
+                curpos_line_col(p->src, t->pos, &n->as.curpos.line, &n->as.curpos.column);
+                return n;
+            }
             advance(p);
             Ast *n = asnix_ast_new(AST_VAR);
             n->as.var.name = t->start;
@@ -1645,9 +1779,9 @@ static Ast *parse_expr(Parser *p) {
     return parse_impl(p);
 }
 
-Ast *asnix_parse(Token *toks, size_t count) {
+Ast *asnix_parse(Token *toks, size_t count, const char *src) {
     (void)count;
-    Parser p = { .toks = toks, .pos = 0 };
+    Parser p = { .toks = toks, .pos = 0, .src = src };
     Ast *result = parse_expr(&p);
     expect(&p, TOK_EOF, "end of input");
     return result;

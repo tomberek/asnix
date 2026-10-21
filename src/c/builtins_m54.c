@@ -793,10 +793,17 @@ Value asnix_make_scopedImport_primop(void) { return build_scopedImport(); }
  * feature this project's docs have long flagged as a disproportionate,
  * cross-cutting change). What this function actually does:
  *
- *   - The null-vs-not-null distinction IS exact: returns real `ASNIX_NULL`
- *     if `name` isn't one of `attrset`'s attributes (asnix_bshared_
- *     attrs_find), a `{file;line;column;}` attrset otherwise -- same
- *     membership test `hasAttr`/`getAttr` already use.
+ *   - The null-vs-not-null distinction IS exact in two different ways,
+ *     now (M80, see docs/architecture.md): returns real `ASNIX_NULL` if
+ *     `name` isn't one of `attrset`'s attributes at all (asnix_bshared_
+ *     attrs_find, unchanged since M59) -- same membership test
+ *     `hasAttr`/`getAttr` already use -- AND ALSO if it is, but its
+ *     (forced) value is `ASNIX_TAG_PRIMOP`: a native builtin genuinely
+ *     has no source position in real Nix either (confirmed:
+ *     `unsafeGetAttrPos "abort" builtins` => `null`, even though
+ *     `abort` is unquestionably an attribute of `builtins`) -- found via
+ *     numtide/nix-conformance's eval-okay-getattrpos-undefined.nix.
+ *     `{file;line;column;}` otherwise.
  *   - `file` is APPROXIMATE: the resolved absolute path of the
  *     OUTERMOST file asnix was originally invoked on (asnix_eval_
  *     top_level_file, eval_file.c/.h), reported uniformly for every
@@ -821,7 +828,29 @@ static Value unsafeGetAttrPos2_impl(const Value *args, int64_t argc) {
     asnix_bshared_string_bytes(args[0], &name_bytes, &name_len, "unsafeGetAttrPos");
     uint32_t name_sym = asnix_intern(name_bytes, (size_t)name_len);
 
-    if (asnix_bshared_attrs_find(args[1], name_sym) < 0) return ASNIX_NULL;
+    int64_t idx = asnix_bshared_attrs_find(args[1], name_sym);
+    if (idx < 0) return ASNIX_NULL;
+
+    /* M80 (see docs/architecture.md): a NATIVE builtin has no source
+     * position at all in real Nix (confirmed directly against
+     * `nix-instantiate --eval`: `unsafeGetAttrPos "abort" builtins` is
+     * `null`, even though `abort` genuinely IS an attribute of
+     * `builtins` -- eval.cc's own `Value::determinePos` returns
+     * `noPos`/`std::nullopt` for a `tPrimOp`/`tPrimOpApp`, never a
+     * placeholder). `ASNIX_TAG_PRIMOP` is UNAMBIGUOUSLY a from-C native
+     * builtin with no Nix-source binding to point at -- unlike
+     * `ASNIX_TAG_CLOSURE` (main.c's printer has its own comment on why
+     * THAT tag can't be trusted the same way: a partially-applied
+     * multi-arg native builtin is indistinguishable, at this tag alone,
+     * from a genuine user lambda) -- so this check is exact for the
+     * `ASNIX_TAG_PRIMOP` case, not another approximation layered on top
+     * of the existing one: a curried-but-not-yet-fully-applied native
+     * (still `ASNIX_TAG_CLOSURE`) isn't caught here and keeps the
+     * pre-existing placeholder position, same documented gap as
+     * before. */
+    const char *entry = (const char *)(args[1].raw & ~0x7ULL) + ASNIX_ATTRS_OFF_ENTRIES + idx * ASNIX_ATTR_SIZE;
+    Value attr_val = asnix_force_for_print(*(const Value *)(entry + ASNIX_ATTR_OFF_VALUE));
+    if (asnix_tag_of(attr_val) == ASNIX_TAG_PRIMOP) return ASNIX_NULL;
 
     const char *file = asnix_eval_top_level_file();
     if (!file) file = "";

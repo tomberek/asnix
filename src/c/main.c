@@ -116,27 +116,42 @@ static void print_attr_name(const char *name, size_t len) {
 
 /* M58-adjacent (no new milestone number -- a same-day follow-up, see
  * docs/architecture.md's M58 scope notes): real Nix's printer tracks
- * which ATTRS/LIST heap objects are
- * currently *active* -- on the stack of values being printed right
- * now, i.e. an actual ancestor in the DFS -- and prints `«repeated»`
- * instead of recursing when a value already on that stack comes back
- * around (confirmed directly: `nix-instantiate --eval` on M58's new
- * self-referential `derivation` result prints `out = «repeated»;` for
- * the genuine `drv.out.out == drv.out` cycle, but still prints
- * `drvAttrs = {...}` in full even though the same attrset also
- * reachable elsewhere -- it's only a TRUE cycle (an ancestor, not
- * merely "seen before anywhere") that gets collapsed). Before this
- * fix, `print_value_inner` had no cycle guard at all: M58 made
- * `derivation`'s result genuinely self-referential (`drv.out` is now
- * the whole output object, not a bare string), so printing one all the
- * way (`d.all`, or bare `d`) recursed forever and segfaulted -- not
- * hit by anything in tests/e2e or tests/conformance (which only ever
- * print leaf fields like `.outPath`), but a real, now-reachable crash
- * for any future caller that *does* print a whole derivation. A fixed-
- * size stack of currently-active base pointers (ATTRS/LIST raw,
- * already untagged) is checked on entry to those two cases and
- * popped on exit -- same "small, bounded, defensive cap" convention
- * this file's attrset printer already uses for its 64-entry cap. */
+ * which LIST heap objects are currently *active* -- on the stack of
+ * values being printed right now, i.e. an actual ancestor in the DFS
+ * -- and prints `«repeated»` instead of recursing when a value already
+ * on that stack comes back around. Before this fix, `print_value_inner`
+ * had no cycle guard at all: M58 made `derivation`'s result genuinely
+ * self-referential (`drv.out` is now the whole output object, not a
+ * bare string), so printing one all the way (`d.all`, or bare `d`)
+ * recursed forever and segfaulted -- not hit by anything in tests/e2e
+ * or tests/conformance (which only ever print leaf fields like
+ * `.outPath`), but a real, now-reachable crash for any future caller
+ * that *does* print a whole derivation. A fixed-size stack of
+ * currently-active LIST base pointers (already untagged) is checked on
+ * entry and popped on exit -- same "small, bounded, defensive cap"
+ * convention this file's attrset printer already uses for its 64-entry
+ * cap.
+ *
+ * M80 (see docs/architecture.md): this ancestor-stack approach is
+ * *correct* for LIST (real Nix's own `printList`, print.cc, keys its
+ * `seen` set by `&v` -- the address of the Value slot itself, which can
+ * only ever recur via a genuine cycle, not merely by two different
+ * bindings sharing the same list payload) but was WRONG for ATTRS: real
+ * Nix's `printAttrs` keys its `seen` set by `v.attrs()` -- the shared
+ * `Bindings*` heap pointer -- and that set is never popped, persisting
+ * for the entire top-level print call, not just while an ancestor is
+ * active (confirmed directly against real Nix's print.cc source AND
+ * against `nix-instantiate --eval`: `let a = { x = 1; }; in { p = a; q
+ * = a; }` prints `{ p = { x = 1; }; q = «repeated»; }` even though `q`
+ * is a SIBLING of `p`, not a cyclic ancestor). asnix's old comment here
+ * claimed this was "confirmed directly" to NOT happen for ATTRS (citing
+ * M58's own derivation `drvAttrs` case) -- that claim stands for
+ * `drvAttrs` specifically only because real Nix's `derivation` builtin
+ * happens to construct a genuinely distinct `Bindings*` at each site
+ * (not because non-ancestor ATTRS sharing is never collapsed in
+ * general, which the `a`/`p`/`q` example above disproves). See
+ * `print_attrs_seen_mark` below for the ATTRS-specific whole-print-call
+ * tracking this split off into. */
 #define ASNIX_PRINT_MAX_DEPTH 4096
 static const void *g_print_active[ASNIX_PRINT_MAX_DEPTH];
 static int g_print_active_count = 0;
@@ -151,6 +166,26 @@ static int print_active_push(const void *base) {
 
 static void print_active_pop(void) {
     if (g_print_active_count > 0) g_print_active_count--;
+}
+
+/* M80: ATTRS dedup, scoped to the ENTIRE top-level print call (never
+ * popped -- reset once, in `print_value`, which main.c's `main` calls
+ * exactly once per process) -- see the comment above for why this must
+ * differ from LIST's ancestor-only stack. Same "small, bounded,
+ * defensive cap" convention as `g_print_active` above; a real Nix
+ * process printing a pathologically large number of distinct attrsets
+ * would use a real std::set with no such cap, but nothing in this
+ * project's fixtures/corpora comes remotely close to 4096 distinct
+ * ATTRS values in one print call. */
+static const void *g_attrs_seen[ASNIX_PRINT_MAX_DEPTH];
+static int g_attrs_seen_count = 0;
+
+static int print_attrs_seen_mark(const void *base) {
+    for (int i = 0; i < g_attrs_seen_count; i++) {
+        if (g_attrs_seen[i] == base) return 0; /* already printed earlier in this print call */
+    }
+    if (g_attrs_seen_count < ASNIX_PRINT_MAX_DEPTH) g_attrs_seen[g_attrs_seen_count++] = base;
+    return 1;
 }
 
 static void print_value_inner(Value v) {
@@ -220,7 +255,7 @@ static void print_value_inner(Value v) {
              * }`). Re-sort by name for display only; the stored order is
              * untouched. */
             const char *base = (const char *)(v.raw & ~0x7ULL);
-            if (!print_active_push(base)) { printf("«repeated»"); return; }
+            if (!print_attrs_seen_mark(base)) { printf("«repeated»"); return; }
             int64_t count = *(const int64_t *)(base + ASNIX_ATTRS_OFF_COUNT);
             const char *names[64];
             size_t name_lens[64];
@@ -259,7 +294,9 @@ static void print_value_inner(Value v) {
                 printf("; ");
             }
             printf("}");
-            print_active_pop();
+            /* no print_active_pop() here -- ATTRS dedup is whole-print-
+             * call scoped (print_attrs_seen_mark), never popped, see
+             * that function's own comment above. */
             return;
         }
         /* M67/M80: real Nix's printer (print.cc) shows `<PRIMOP>` for an
@@ -331,6 +368,7 @@ static void print_value_inner(Value v) {
 }
 
 static void print_value(Value v) {
+    g_attrs_seen_count = 0; /* fresh whole-print-call scope, see print_attrs_seen_mark */
     print_value_inner(v);
     printf("\n");
 }

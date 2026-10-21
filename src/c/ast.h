@@ -36,6 +36,9 @@ typedef enum {
     AST_WITH,
     AST_HAS_ATTR,
     AST_PATH,
+    AST_CURPOS, /* M80: `__curPos` -- see parser.c's special-case in its TOK_IDENT
+                 * handling and compiler.c's own case for how `line`/`column` (captured
+                 * here, at parse time) become a `{file;line;column;}` attrset. */
 } AstKind;
 
 typedef struct Ast Ast;
@@ -83,6 +86,20 @@ typedef struct {
     size_t name_len;
     Ast *value;
     int is_inherit;
+    /* M80 (see docs/architecture.md): set only on the synthetic hidden
+     * binding `inherit (expr) a b c;` (parser.c's parse_binding_stmt)
+     * generates to hold `expr` itself, shared by every one of that
+     * clause's `AST_SELECT`s instead of each re-embedding (and so
+     * re-evaluating, on every force) its own copy of `expr`. Gets a
+     * normal frame/env slot exactly like any other binding (so sibling
+     * selects can read it back), but is never a real attribute: both
+     * AST_ATTRSET compiler cases (compiler.c) and the pretty-printer
+     * must skip it. The synthetic name itself (a NUL byte prefix,
+     * parser.c) is already unreachable from source syntax, so the only
+     * reason this flag exists at all is to make the exclusion an O(1)
+     * check instead of a string-prefix comparison at every call site
+     * that needs it. */
+    int is_hidden;
 } AstBinding;
 
 /* One `${expr} = value;` entry in a plain `{...}`/`rec {...}` literal --
@@ -247,6 +264,10 @@ struct Ast {
                                            * directly rather than inventing a second one). */
             size_t interp_count;
         } path; /* AST_PATH */
+        struct {
+            int line;   /* 1-based, matching real Nix's own `__curPos`/`unsafeGetAttrPos` */
+            int column; /* 1-based, ditto */
+        } curpos; /* AST_CURPOS */
     } as;
 };
 

@@ -28,7 +28,7 @@ static double now_seconds(void) {
 static void bench_one(const char *label, const char *src, long iters) {
     size_t ntoks;
     Token *toks = asnix_lex(src, &ntoks);
-    Ast *ast = asnix_parse(toks, ntoks);
+    Ast *ast = asnix_parse(toks, ntoks, src);
 
     IrProgram *prog = asnix_compile(ast, "."); /* no path literals in these workloads; base_dir is unused */
     Env *root = asnix_arena_alloc(8);

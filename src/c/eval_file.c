@@ -149,7 +149,7 @@ static Ast *parse_resolved_file(const char *resolved, char **base_dir_out) {
     char *src = read_file(resolved);
     size_t ntoks;
     Token *toks = asnix_lex(src, &ntoks);
-    return asnix_parse(toks, ntoks);
+    return asnix_parse(toks, ntoks, src);
 }
 
 /* Shared by asnix_eval_file_scoped (M54) and the pre-M65 asnix_eval_file
@@ -373,7 +373,7 @@ Value asnix_eval_expr_source(const char *src) {
     }
     size_t ntoks;
     Token *toks = asnix_lex(src, &ntoks);
-    Ast *ast = asnix_parse(toks, ntoks);
+    Ast *ast = asnix_parse(toks, ntoks, src);
     IrProgram *prog = asnix_compile(ast, cwd);
     Env *root_env = make_root_env(NULL);
     return asnix_eval(prog, root_env);
