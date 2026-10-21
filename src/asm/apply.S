@@ -39,6 +39,22 @@
     .equ ASNIX_APPLY_VALSTACK_BYTES, 262144 // 32,768 Values, 256 KiB
     .equ ASNIX_APPLY_RETSTACK_BYTES, 65536  // 2,048 call frames, 64 KiB
 
+    // M38: scratch stack layout for asnix_apply's PrimOp branch's own
+    // argument-forcing loop (see that branch's comment for why it's
+    // needed) -- 8 Value slots is comfortably above every real primop
+    // arity in this codebase (max 3, e.g. replaceStrings/foldl/foldr),
+    // and the fatal fallback below handles anything larger cleanly
+    // rather than silently overflowing. Header (fn ptr/argc/original
+    // args ptr/loop index, 4 x 8 bytes) + 8 Value slots = 96, plus 8
+    // bytes of padding so the total is ≡ 8 (mod 16) -- required because
+    // %rsp is already 8 mod 16 at this function's own entry (the
+    // ordinary call-site convention: the return address consumes 8 of
+    // the 16), and subtracting an amount ≡ 8 (mod 16) is exactly what
+    // brings %rsp to 0 mod 16 for every `call` made while this scratch
+    // region is live.
+    .equ ASNIX_APPLY_MAX_PRIMOP_ARGC, 8
+    .equ ASNIX_APPLY_PRIMOP_SCRATCH_BYTES, 104
+
     .section .rodata
 .Lmsg_apply_type:
     .ascii "asnix: apply target is not a function, aborting\n"
@@ -46,6 +62,9 @@
 .Lmsg_apply_arity:
     .ascii "asnix: apply argument count does not match arity, aborting\n"
     .equ ASNIX_MSG_APPLY_ARITY_LEN, . - .Lmsg_apply_arity
+.Lmsg_apply_too_many:
+    .ascii "asnix: apply: too many arguments to a primop, aborting\n"
+    .equ ASNIX_MSG_APPLY_TOO_MANY_LEN, . - .Lmsg_apply_too_many
 
     .data
     .align 8
@@ -71,20 +90,82 @@ asnix_apply:                            // Value asnix_apply(Value fn, const Val
 
     // PrimOp: a plain C function, Value (*)(const Value *args, int64_t
     // argc) -- same convention op_call.S's primop path calls it with (see
-    // docs/abi.md's "Primop calls (M7)" section). No Env/VALSTACK/RETSP
-    // needed at all (a primop has no lexical body to run through the
-    // dispatch loop), so this is a plain tail call: shuffle our own
-    // (args, argc) into the native argument registers and jump straight
-    // into it, letting its own `ret` return directly to our caller.
+    // docs/abi.md's "Primop calls (M7)" section). No Env/RETSP needed
+    // (a primop has no lexical body to run through the dispatch loop),
+    // but unlike the original tail-jmp version of this branch, it now
+    // needs a real `call` + its own small epilogue:
+    //
+    // M38: force every argument before handing it to the native C
+    // function (mirrors op_call.S's own M25 force loop -- a primop reads
+    // args[i]'s raw tag directly and has no way to force a thunk
+    // itself), and force the return value before handing it back
+    // (mirrors op_call.S's M23 fix for lazy-passthrough primops like
+    // getAttr). asnix_apply is a *separate* call path from the normal
+    // dispatch loop's OP_CALL -- used directly from C by any/all/
+    // partition/concatMap/genericClosure's operator/sort's comparator/
+    // etc. to invoke a user- or builtin-supplied function on a
+    // possibly-still-lazy list element -- so it needs this exact same
+    // forcing discipline independently; OP_CALL's own force loop never
+    // runs for calls made this way. Found via d.nix: a `map`-produced
+    // list's elements, applied to `builtins.attrNames` through one of
+    // these call sites, crashed on an unforced Thunk that OP_CALL's own
+    // force loop would have caught had this gone through the ordinary
+    // dispatch path instead.
+    //
+    // Never mutates the caller's own `args` buffer (it may be read-only,
+    // or read again later by other code after this call returns) --
+    // builds a local forced copy on the stack instead. Every value in
+    // that copy is reloaded from memory around each `call` below rather
+    // than kept in a register, since asnix_force_for_print clobbers
+    // every caller-saved register; this is not a hot path (OP_CALL's own
+    // in-dispatch-loop forcing loop handles the common case), so the
+    // extra loads cost nothing that matters.
 .Lapply_is_primop:
     andq $-8, %rax                      // rax = real PrimOp*
     movq ASNIX_PRIMOP_OFF_ARITY(%rax), %rcx
     cmpq %rcx, %rdx
     jne .Lapply_arity_error
+    cmpq $ASNIX_APPLY_MAX_PRIMOP_ARGC, %rdx
+    ja .Lapply_too_many_args
+
     movq ASNIX_PRIMOP_OFF_FN(%rax), %rcx
-    movq %rsi, %rdi                      // arg1 = args ptr
-    movq %rdx, %rsi                      // arg2 = argc
-    jmp *%rcx
+    movq ASNIX_PRIMOP_OFF_NOFORCE(%rax), %r8
+
+    subq $ASNIX_APPLY_PRIMOP_SCRATCH_BYTES, %rsp
+    movq %rcx, 0(%rsp)                  // fn ptr
+    movq %rdx, 8(%rsp)                  // argc
+    movq %rsi, 16(%rsp)                 // original args ptr
+    movq $0, 24(%rsp)                   // loop index i
+
+    cmpq $0, %r8
+    jne .Lapply_primop_skip_force
+.Lapply_primop_force_loop:
+    movq 24(%rsp), %rcx                 // i
+    movq 8(%rsp), %rdx                  // argc
+    cmpq %rdx, %rcx
+    jge .Lapply_primop_force_done
+    movq 16(%rsp), %rsi                 // original args ptr
+    movq (%rsi, %rcx, 8), %rdi          // args[i]
+    call asnix_force_for_print
+    movq 24(%rsp), %rcx                 // reload i (clobbered by the call)
+    movq %rax, 32(%rsp, %rcx, 8)        // forced_args[i] = result
+    incq %rcx
+    movq %rcx, 24(%rsp)
+    jmp .Lapply_primop_force_loop
+.Lapply_primop_force_done:
+    leaq 32(%rsp), %rsi                 // args ptr = our forced local copy
+    jmp .Lapply_primop_call
+.Lapply_primop_skip_force:
+    movq 16(%rsp), %rsi                 // args ptr = original, unforced (e.g. tryEval via apply)
+.Lapply_primop_call:
+    movq %rsi, %rdi                     // arg1 = args ptr
+    movq 8(%rsp), %rsi                  // arg2 = argc
+    movq 0(%rsp), %rax                  // fn ptr
+    call *%rax
+    movq %rax, %rdi
+    call asnix_force_for_print          // force the result (M23 parity with op_call.S)
+    addq $ASNIX_APPLY_PRIMOP_SCRATCH_BYTES, %rsp
+    ret
 
     // Closure: needs a real frame and a real dispatch context to run its
     // IR body through, exactly like op_call.S's closure path, except
@@ -194,5 +275,9 @@ asnix_apply_epilogue:
 .Lapply_arity_error:
     leaq .Lmsg_apply_arity(%rip), %rdi
     movq $ASNIX_MSG_APPLY_ARITY_LEN, %rsi
+    jmp asnix_fatal
+.Lapply_too_many_args:
+    leaq .Lmsg_apply_too_many(%rip), %rdi
+    movq $ASNIX_MSG_APPLY_TOO_MANY_LEN, %rsi
     jmp asnix_fatal
     .size asnix_apply, . - asnix_apply

@@ -50,7 +50,8 @@ what's actually implemented and the scope decisions made along the way.
 | M35 — `builtins.currentSystem`, `builtins.isPath` + `isString` path bug | done (see below) |
 | M36 — name the attribute in `.` selection's "attribute missing" error | done (see below) |
 | M37 — `builtins.functionArgs` | done (see below) |
-| M38+ | not started |
+| M38 — `asnix_apply`'s PrimOp path never forced args/return (core evaluator fix) | done (see below) |
+| M39+ | not started |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
 
@@ -3516,3 +3517,55 @@ via the IrBuilder API in test scaffolding) to pass the new required
 `formals_raw` argument, `0` in every case since none of those tests
 exercise `functionArgs`; `test-conformance` still 632 passed, no
 regressions.
+
+## M38 scope notes: `asnix_apply`'s PrimOp path never forced args/return (core evaluator fix)
+
+Found continuing to chase `d.nix` right after M37: `builtins.attrNames`
+crashed with "argument is not an attrset" even though the real nixpkgs
+call passed a well-typed attrset list -- same symptom shape as M34's
+`replaceStrings` bug, root-caused the same way (gdb, read the failing
+`Value`'s raw tag at the fatal check: `6` = `ASNIX_TAG_THUNK`). But this
+time the unforced Thunk wasn't a raw list-element *read* (M34's class) --
+it was passed as a function-call *argument*, through `map builtins.
+attrNames (map f list)`: the outer `map`'s own C implementation
+(`prim_map_stage2`, builtins_list.c) calls `asnix_bshared_make_lazy_call1`
+per element, which *does* go through a real compiled IR snippet
+(`OP_VAR_REF`+`OP_CALL`) when forced later -- so that path was already
+correct. The actual gap was lower-level: `asnix_apply`
+(`src/asm/apply.S`), the generic "call this Value from C" entry point
+used by `any`/`all`/`partition`/`concatMap`/`genericClosure`'s operator/
+`sort`'s comparator/`filterAttrs`'s predicate/etc. to invoke a function
+value directly against a (possibly still-lazy) list element, had a
+PrimOp branch that was a bare tail-`jmp` straight into the native C
+function -- no argument forcing, and no forcing of the returned value
+either. `OP_CALL`'s own asm path has carried both of these (M25's
+argument-forcing loop, M23's return-value forcing for lazy-passthrough
+primops like `getAttr`) since those milestones, but `asnix_apply` is a
+genuinely separate call path that never picked up either fix -- it
+simply hadn't been exercised by a case where the applied function was
+itself a PrimOp receiving an unforced argument until this nixpkgs
+pattern (`map somePrimop (map f list)`) surfaced it.
+
+Fixed by converting the PrimOp branch from a tail-`jmp` into a real
+`call` + a small epilogue (needed either way, since forcing the return
+value requires getting control back): builds a local, forced copy of
+the arguments on the native stack (never mutates the caller's own
+`args` buffer, which may be read-only or re-read later), skipping the
+copy/force step when `ASNIX_PRIMOP_OFF_NOFORCE` is set (same `tryEval`
+exception `OP_CALL` already carves out), then calls the native
+function and forces its return value before handing it back -- the
+exact same two fixes `OP_CALL`'s primop path already has, just
+independently implemented since `asnix_apply` doesn't dispatch through
+that code. Bounded to 8 arguments (comfortably above every real primop
+arity in this codebase, max 3) with a clean fatal fallback rather than
+risking a silent stack-buffer overflow if ever exceeded. Every value is
+reloaded from a stack scratch slot around each `call` rather than kept
+in a register, since `asnix_force_for_print` clobbers every caller-
+saved register -- deliberately not hot-path-optimized, since `OP_CALL`'s
+own in-dispatch-loop loop already handles the common (direct Nix-level
+call) case; this path only runs for the comparatively rare "invoke a
+function value directly from C" call sites.
+
+`make test`/`test-e2e` green (191 e2e, two new `m38_*` fixtures, each a
+`map somePrimop (map (x: x) [...])`-shaped repro); `test-conformance`
+still 632 passed, no regressions.
