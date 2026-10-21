@@ -1,9 +1,15 @@
 // Comparison/boolean-NOT ops ("operators" milestone).
 //
-// == / != delegate to asnix_bshared_value_eq (src/c/builtins_shared.c) for
-// real structural equality -- ints/IMM-subtag/string-or-path-bytes compare
-// directly, lists/attrsets recurse elementwise (forcing lazy elements
-// along the way), closures/primops/thunks fall back to pointer identity.
+// == / != delegate to asnix_bshared_value_eq_op (src/c/builtins_shared.c)
+// for real structural equality -- ints/IMM-subtag/string-or-path-bytes
+// compare directly, lists/attrsets recurse elementwise (forcing lazy
+// elements along the way), closures/primops/thunks fall back to pointer
+// identity UNLESS both of == 's own two top-level operands are
+// function-typed (closure or primop), in which case the answer is always
+// "not equal" -- see builtins_shared.h's M80 comment on
+// asnix_bshared_value_eq_op for why that extra rule only applies at this
+// top level, not to the plain asnix_bshared_value_eq recursion used one
+// level down (list/attrset elements) or by builtins.elem/genericClosure.
 // A pure-asm raw `cmpq` on the two Value words (the original
 // implementation here) is only correct for INT/IMM and happens to be
 // right whenever the two pointers are literally identical, but is WRONG
@@ -45,7 +51,7 @@ asnix_op_eq:
     pushq %rdi                          // save ENV (2 pushes -- stays 16-byte aligned)
     movq %rax, %rdi                     // arg1 = lhs
     movq %rcx, %rsi                     // arg2 = rhs
-    call asnix_bshared_value_eq
+    call asnix_bshared_value_eq_op
     popq %rdi                           // ENV
     popq %rsi                           // IP
 
@@ -72,7 +78,7 @@ asnix_op_neq:
     pushq %rdi                          // save ENV
     movq %rax, %rdi                     // arg1 = lhs
     movq %rcx, %rsi                     // arg2 = rhs
-    call asnix_bshared_value_eq
+    call asnix_bshared_value_eq_op
     popq %rdi                           // ENV
     popq %rsi                           // IP
 

@@ -162,6 +162,37 @@ void asnix_bshared_string_bytes(Value v, const char **bytes_out, int64_t *len_ou
  * aggregates is pervasive in real nixpkgs code). */
 int asnix_bshared_value_eq(Value a, Value b);
 
+/* M80: the `==`/`!=` OPERATORS' OWN two direct operands need one more rule
+ * on top of asnix_bshared_value_eq above: real Nix's `ExprOpEq::eval`
+ * (eval.cc) always evaluates each of its two operands into a *fresh* local
+ * `Value` (plain `eval()`, never the `maybeThunk()` which elides a new
+ * allocation for a bare variable reference) before calling `eqValues`, so
+ * `eqValues`'s own "hack to support some old broken code that relies on
+ * pointer equality" (`if (&v1 == &v2) return true;`) can NEVER fire for
+ * `==`'s own two top-level operands, no matter what expression either side
+ * is -- confirmed against real Nix: `let f = x: x; in f == f` is `false`,
+ * even though both sides are literally the same binding (see
+ * tests/conformance or eval-okay-equal-function-direct-identical.nix in
+ * numtide/nix-conformance). That pointer-identity hack DOES still fire one
+ * level down inside a list/attrset (`[f] == [f]` is `true`: there, `==`'s
+ * own two operands are two distinct list values, but the lists' sole
+ * element came from the same variable slot, so *those* Values are
+ * pointer-identical) -- asnix has no separate "Value cell" indirection (a
+ * Value already IS its payload, see value.h) so it cannot replicate that
+ * nested case in general; asnix_bshared_value_eq's existing pointer-
+ * identity-on-payload default for closures/primops is kept as-is for every
+ * caller other than op_eq/op_neq themselves (recursive list/attrset
+ * elements, and builtins.elem/genericClosure which call
+ * asnix_bshared_value_eq directly) since narrowing it further there
+ * regresses other currently-passing cases (e.g. eval-okay-eq-slot-attrs)
+ * without actually making eval-okay-eq-slot-elem/-identity pass either --
+ * see docs/architecture.md's M80 notes for why those two stay out of scope.
+ * This wrapper only strengthens the TOP-level, direct-operand case: if both
+ * forced operands are the same function-ish tag (closure or primop), the
+ * answer is unconditionally "not equal", matching ExprOpEq::eval exactly;
+ * everything else defers entirely to asnix_bshared_value_eq. */
+int asnix_bshared_value_eq_op(Value a, Value b);
+
 /* Ordering used by lessThan/sort: INT<INT (numeric), string<string
  * (lexicographic byte compare, shorter-is-less on a shared prefix), and
  * (M57a) list<list (lexicographic element-by-element, recursing this same

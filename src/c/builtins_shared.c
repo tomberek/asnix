@@ -426,6 +426,15 @@ int asnix_bshared_value_eq(Value a, Value b) {
     }
 }
 
+/* See builtins_shared.h's long M80 comment. */
+int asnix_bshared_value_eq_op(Value a, Value b) {
+    Value fa = asnix_force_for_print(a);
+    Value fb = asnix_force_for_print(b);
+    int ta = asnix_tag_of(fa), tb = asnix_tag_of(fb);
+    if (ta == tb && (ta == ASNIX_TAG_CLOSURE || ta == ASNIX_TAG_PRIMOP)) return 0;
+    return asnix_bshared_value_eq(fa, fb);
+}
+
 Value asnix_bshared_select_dynamic(Value target, Value name_val) {
     if (asnix_tag_of(target) != ASNIX_TAG_ATTRS) {
         fprintf(stderr, "asnix: cannot select an attribute (dynamic) on a non-attrset value (got %s)\n",
