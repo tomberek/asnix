@@ -44,7 +44,8 @@ what's actually implemented and the scope decisions made along the way.
 | M29 — `rec {}` eagerly forced every field on construction (core evaluator fix) | done (see below) |
 | M30 — `builtins.tryEval` (catchable `throw`/failed `assert`) | done, **scoped** (see below) |
 | M31 — lazy `<name>` search-path resolution (catchable by `tryEval`) | done (see below) |
-| M32+ | not started |
+| M32 — dotted attrpath after `?` (`x ? a.b.c`) | done (see below) |
+| M33+ | not started |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
 
@@ -3204,3 +3205,38 @@ uncaught (no active `tryEval`) miss both still behave identically to
 before. `make test`/`test-e2e`/`test-conformance` all green (172 e2e, 19
 conformance, full unit suite). numtide/nix-conformance's `lang/`: 627 ->
 628 (small additional gain on top of M30's own +239, no regression).
+
+## M32 scope notes: dotted attrpath after `?` (`x ? a.b.c`)
+
+Found continuing to chase `d.nix`: `lib/systems/default.nix` has
+`platform ? gcc.arch -> ...`, a multi-segment dotted path on the
+right-hand side of `?`. asnix's `parse_has_attr` only ever parsed a
+single segment -- confirmed against cppnix's own grammar
+(`~/nix/src/libexpr/parser.y`: `expr_op '?' attrpath`, where `attrpath`
+is a full `.`-separated chain, not a lone `attr`) that this is a real,
+necessary feature, not an edge case to special-case around.
+
+Desugars directly to existing, already-correct machinery at parse
+time -- no new AST node or IR op needed: `x ? a.b.c` becomes `x ? a &&
+(x.a or {}) ? b && ((x.a or {}).b or {}) ? c`, chaining `AST_AND` over
+successive `AST_HAS_ATTR` checks, with each intermediate step's target
+built via `AST_SELECT`'s existing `or {}` fallback (`OP_SELECT_OR`) so a
+missing or non-attrset intermediate value gracefully short-circuits to
+`false` rather than erroring -- exactly matching `AST_HAS_ATTR`'s own
+established "not even an attrset simply means no" rule. Verified against
+real `nix-instantiate --eval` for the three cases that actually
+distinguish this from a naive implementation: a fully-present chain
+(`true`), an existing-but-wrong-type intermediate value (`false`, not a
+type error), and a missing intermediate attribute (`false`).
+
+The pre-existing outer `while (TOK_QUESTION)` loop (allowing `?` to
+apply repeatedly, e.g. the curious-but-real-Nix-tolerated `x ? a ? b`)
+was left untouched/preserved -- real Nix's own grammar declares `?` as
+`%nonassoc`, but empirically still accepts this when tested directly
+against `nix-instantiate`, so whatever this project's existing loop was
+doing already matched real Nix's actual behavior; this milestone only
+adds dotted-chain support *within* one `?` application, each still
+appended via that same outer loop as before.
+
+`make test`/`test-e2e`/`test-conformance` all green (173 e2e, 19
+conformance, full unit suite).

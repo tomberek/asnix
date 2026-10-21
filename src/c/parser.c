@@ -882,15 +882,57 @@ static Ast *parse_has_attr(Parser *p) {
     Ast *e = parse_negate(p);
     while (cur(p)->kind == TOK_QUESTION) {
         advance(p);
-        /* Plain identifier or a static quoted-string segment, same as
-         * parse_select -- verified against `nix-instantiate --eval`:
-         * `x ? "a b"` is valid real-Nix syntax. */
+        /* `expr ? attrpath`, real Nix's grammar for the right-hand side
+         * (`~/nix/src/libexpr/parser.y`: `expr_op '?' attrpath`) is a
+         * full DOTTED chain, not a single segment -- `x ? a.b.c` checks
+         * nested existence, confirmed against `nix-instantiate --eval`
+         * (found needed evaluating real nixpkgs: `lib/systems/
+         * default.nix` has `platform ? gcc.arch`). Each segment may be a
+         * plain identifier or a static quoted-string, same as
+         * parse_select (parse_attr_segment). Desugars directly to `x ? a
+         * && (x.a or {}) ? b && ((x.a or {}).b or {}) ? c ...` -- reusing
+         * the already-correct AST_HAS_ATTR/AST_SELECT-with-`or`/AST_AND
+         * nodes, no new AST node or IR op needed. Verified this
+         * desugaring matches real Nix exactly for the three cases that
+         * actually distinguish it from a naive "just select, no
+         * fallback" version: a missing intermediate attr, an
+         * intermediate value that exists but isn't an attrset, and a
+         * fully-present chain -- all graceful (`false`), none fatal. */
         Token *attr = parse_attr_segment(p, "an attribute name");
         Ast *n = asnix_ast_new(AST_HAS_ATTR);
         n->as.has_attr.target = e;
         n->as.has_attr.attr = attr->start;
         n->as.has_attr.attr_len = attr->len;
-        e = n;
+        Ast *result = n;
+        Ast *running_target = e;
+        while (cur(p)->kind == TOK_DOT) {
+            advance(p);
+            Ast *sel = asnix_ast_new(AST_SELECT);
+            sel->as.select.target = running_target;
+            sel->as.select.attr = attr->start;   /* the segment just checked above */
+            sel->as.select.attr_len = attr->len;
+            sel->as.select.attr_expr = NULL;
+            Ast *empty_attrs = asnix_ast_new(AST_ATTRSET);
+            empty_attrs->as.attrset.bindings = NULL;
+            empty_attrs->as.attrset.count = 0;
+            empty_attrs->as.attrset.is_rec = 0;
+            empty_attrs->as.attrset.dyn_bindings = NULL;
+            empty_attrs->as.attrset.dyn_count = 0;
+            sel->as.select.default_ = empty_attrs;
+            running_target = sel; /* == the previous target's `.attr or {}` */
+
+            attr = parse_attr_segment(p, "an attribute name");
+            Ast *next_check = asnix_ast_new(AST_HAS_ATTR);
+            next_check->as.has_attr.target = running_target;
+            next_check->as.has_attr.attr = attr->start;
+            next_check->as.has_attr.attr_len = attr->len;
+
+            Ast *and_node = asnix_ast_new(AST_AND);
+            and_node->as.logic.lhs = result;
+            and_node->as.logic.rhs = next_check;
+            result = and_node;
+        }
+        e = result;
     }
     return e;
 }
