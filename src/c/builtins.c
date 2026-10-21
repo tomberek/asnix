@@ -263,6 +263,10 @@ Value asnix_make_toString_primop(void) {
     return make_primop_value((void *)prim_toString, 1);
 }
 
+Value asnix_make_derivation_primop(void) {
+    return make_primop_value((void *)asnix_prim_derivation, 1);
+}
+
 /* Merges this file's own BUILTINS[] with the builtins-expansion modules
  * added across two passes (M17: list/attrs/misc; this pass: closure/
  * list2/attrs2/compare), each kept in its own translation unit so agents

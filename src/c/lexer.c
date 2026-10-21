@@ -58,10 +58,26 @@ static int ident_start(char c) {
     return isalpha((unsigned char)c) || c == '_';
 }
 static int ident_cont(char c) {
-    /* Deliberately excludes '-': real Nix allows hyphenated identifiers,
-     * but that collides with binary minus in this minimal lexer and isn't
-     * needed by the M4 subset -- see docs/architecture.md M4 scope notes. */
-    return isalnum((unsigned char)c) || c == '_' || c == '\'';
+    /* M23: now INCLUDES '-' -- real Nix's own identifier regex is
+     * `[a-zA-Z_][a-zA-Z0-9_'-]*`, i.e. a hyphen is an ordinary identifier
+     * character (not just special attrpath-binding syntax), verified
+     * directly against `nix-instantiate --eval`: `let flat-md5 = 1; in
+     * flat-md5` succeeds (one identifier), and critically `a-b` (NO
+     * surrounding whitespace) is itself one identifier/undefined-variable
+     * lookup, NOT `a - b` subtraction -- subtraction only "wins" when at
+     * least one side has separating whitespace (`a -b`, `a- b` is actually
+     * `a-` as a dangling identifier, `a - b`), by ordinary maximal-munch
+     * tokenization (same principle as C's `a+++b`). This was a deliberate
+     * M4-era scope cut (previously excluded exactly to dodge this
+     * ambiguity in the easy, unambiguous way) but real-world Nix source
+     * uses hyphenated attribute names constantly (`drv-fixed-output.nix`'s
+     * `flat-md5`, nixpkgs's own package/attribute names) -- found blocking
+     * numtide/nix-conformance's eval-okay-drv-fixed-output.nix. No existing
+     * asnix fixture relied on whitespace-free `a-b` meaning subtraction
+     * (checked: every existing `-` arithmetic use already has at least one
+     * space), so this is a pure feature add, not a documented-behavior
+     * change to anything previously exercised. */
+    return isalnum((unsigned char)c) || c == '_' || c == '\'' || c == '-';
 }
 
 typedef struct {
