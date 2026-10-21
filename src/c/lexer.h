@@ -92,6 +92,10 @@ typedef enum {
     TOK_PATH_END,    /* M64: closes an interpolated path literal -- a boundary marker only,
                       * no payload (mirrors TOK_STR_END). */
     TOK_SEARCH_PATH, /* <nixpkgs>-style NIX_PATH search-path literal */
+    TOK_URI, /* bare URL literal (deprecated-but-still-default-accepted real-Nix syntax,
+              * e.g. `http://example.com`) -- see lexer.c's try_scan_uri. Carries its
+              * full literal text in start/len, same as TOK_PATH/TOK_SEARCH_PATH; the
+              * parser turns it into a plain (non-interpolated) AST_STRING. */
     TOK_EOF,
 } TokKind;
 
@@ -100,8 +104,8 @@ typedef struct {
     int64_t int_val;    /* TOK_INT */
     double float_val;   /* TOK_FLOAT (M51) */
     const char *start;  /* TOK_IDENT / TOK_STR_PART / TOK_ISTR_PART / TOK_PATH / TOK_PATH_PART /
-                          * TOK_SEARCH_PATH: pointer into a buffer (TOK_IDENT/TOK_PATH/
-                          * TOK_PATH_PART/TOK_SEARCH_PATH point into the original source,
+                          * TOK_SEARCH_PATH / TOK_URI: pointer into a buffer (TOK_IDENT/TOK_PATH/
+                          * TOK_PATH_PART/TOK_SEARCH_PATH/TOK_URI point into the original source,
                           * TOK_SEARCH_PATH excluding the angle brackets; TOK_STR_PART/
                           * TOK_ISTR_PART point into a freshly malloc'd decoded buffer, since escape
                           * processing can shrink/change the bytes) */

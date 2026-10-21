@@ -18,6 +18,7 @@
 #include "builtins_m23.h"
 #include "builtins_m54.h"
 #include "builtins_misc.h"
+#include "builtins_path.h"
 #include "builtins_regex.h"
 #include "builtins_toml.h"
 #include "builtins_tryeval.h"
@@ -344,13 +345,13 @@ static Value asnix_make_builtins_attrs_ex(int skip_derivation_wrapper) {
     const AsnixBuiltinMiscDef *const build_tables[] = {
         ASNIX_BUILTINS_MISC, ASNIX_CLOSURE_BUILTINS, ASNIX_LIST2_BUILTINS, ASNIX_ATTRS2_BUILTINS, ASNIX_COMPARE_BUILTINS,
         ASNIX_M23_BUILTINS, ASNIX_REGEX_BUILTINS, ASNIX_TOML_BUILTINS, ASNIX_TRYEVAL_BUILTINS, ASNIX_JSON_BUILTINS,
-        ASNIX_DERIVATION_BUILTINS,
+        ASNIX_DERIVATION_BUILTINS, ASNIX_PATH_BUILTINS,
     };
     const size_t build_counts[] = {
         ASNIX_BUILTINS_MISC_COUNT, ASNIX_CLOSURE_BUILTINS_COUNT, ASNIX_LIST2_BUILTINS_COUNT,
         ASNIX_ATTRS2_BUILTINS_COUNT, ASNIX_COMPARE_BUILTINS_COUNT, ASNIX_M23_BUILTINS_COUNT, ASNIX_REGEX_BUILTINS_COUNT,
         ASNIX_TOML_BUILTINS_COUNT, ASNIX_TRYEVAL_BUILTINS_COUNT, ASNIX_JSON_BUILTINS_COUNT,
-        ASNIX_DERIVATION_BUILTINS_COUNT,
+        ASNIX_DERIVATION_BUILTINS_COUNT, ASNIX_PATH_BUILTINS_COUNT,
     };
     /* M54: a further builtins-expansion pass (bitAnd/bitOr/bitXor/trace/
      * zipAttrsWith/toXML/convertHash/getContext/appendContext/

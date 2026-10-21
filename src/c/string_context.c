@@ -40,14 +40,27 @@ void asnix_ctx_add_opaque(AsnixStringContext *ctx, const char *path) {
     ctx->srcs[ctx->nsrcs++] = dup_cstr(path);
 }
 
+/* M80: see string_context.h's own `deep` field comment. */
+void asnix_ctx_add_deep(AsnixStringContext *ctx, const char *drv_path) {
+    for (size_t i = 0; i < ctx->ndeep; i++) {
+        if (strcmp(ctx->deep[i], drv_path) == 0) return;
+    }
+    if (ctx->ndeep == ctx->deep_cap) {
+        ctx->deep_cap = ctx->deep_cap ? ctx->deep_cap * 2 : 8;
+        ctx->deep = realloc(ctx->deep, ctx->deep_cap * sizeof(*ctx->deep));
+    }
+    ctx->deep[ctx->ndeep++] = dup_cstr(drv_path);
+}
+
 int asnix_ctx_is_empty(const AsnixStringContext *ctx) {
-    return !ctx || (ctx->ndrvs == 0 && ctx->nsrcs == 0);
+    return !ctx || (ctx->ndrvs == 0 && ctx->nsrcs == 0 && ctx->ndeep == 0);
 }
 
 void asnix_ctx_union_into(AsnixStringContext *dst, const AsnixStringContext *src) {
     if (asnix_ctx_is_empty(src)) return;
     for (size_t i = 0; i < src->ndrvs; i++) asnix_ctx_add_built(dst, src->drvs[i].drv_path, src->drvs[i].output_name);
     for (size_t i = 0; i < src->nsrcs; i++) asnix_ctx_add_opaque(dst, src->srcs[i]);
+    for (size_t i = 0; i < src->ndeep; i++) asnix_ctx_add_deep(dst, src->deep[i]);
 }
 
 /* Perf note (post-M76 profiling pass): this table is NOT "small N" like

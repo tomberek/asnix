@@ -52,11 +52,37 @@ typedef struct {
     size_t ndrvs, drvs_cap;
     char **srcs;
     size_t nsrcs, srcs_cap;
+    /* M80: real Nix's third context-element kind, `NixStringContextElem::
+     * DrvDeep` -- "this string refers to the WHOLE closure of this
+     * derivation (all its outputs), not just one named output" -- the
+     * kind attached to a derivation's own `.drvPath` string (see
+     * derivation.c's asnix_prim_derivation) and produced by `builtins.
+     * addDrvOutputDependencies`. Exposed at the language level by
+     * `getContext` as `{ allOutputs = true; }` (builtins_m54.c) --
+     * distinct from `drvs` above (a specific NAMED output, `{ outputs =
+     * [...]; }`) and from `srcs` (a plain store-path reference with no
+     * derivation relationship at all, `{ path = true; }`). Deliberately
+     * a separate bare `char *` array, not a 3rd field on
+     * AsnixCtxBuiltRef, since a DrvDeep element has no output name at
+     * all (unlike Built) -- reusing that struct with a NULL/sentinel
+     * output_name would make every existing `ndrvs`-only reader
+     * (derivation.c's asnix_collect_input_refs) responsible for skipping
+     * it, which this keeps them oblivious to instead (that file is
+     * deliberately untouched by this milestone -- a DrvDeep-tagged
+     * string used directly as a derivation attribute's VALUE still
+     * collects zero input refs, exactly like before this milestone,
+     * when `.drvPath` carried no context at all; full "deep" closure
+     * dependency propagation is a separate, substantially larger
+     * feature -- see M80's own scope notes in docs/architecture.md). */
+    char **deep;
+    size_t ndeep, deep_cap;
 } AsnixStringContext;
 
 void asnix_ctx_init(AsnixStringContext *ctx);
 void asnix_ctx_add_built(AsnixStringContext *ctx, const char *drv_path, const char *output_name);
 void asnix_ctx_add_opaque(AsnixStringContext *ctx, const char *path);
+/* M80: see AsnixStringContext's own `deep` field comment just above. */
+void asnix_ctx_add_deep(AsnixStringContext *ctx, const char *drv_path);
 int asnix_ctx_is_empty(const AsnixStringContext *ctx);
 /* dst |= src (deduped) -- a no-op if src is NULL or empty. */
 void asnix_ctx_union_into(AsnixStringContext *dst, const AsnixStringContext *src);

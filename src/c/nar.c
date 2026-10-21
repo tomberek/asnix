@@ -10,6 +10,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "derivation.h" /* M80: asnix_compute_fixed_output_path, shared with builtins.path's formula */
 #include "hash_shim.h"
 #include "store_path.h"
 
@@ -62,7 +63,18 @@ static int name_cmp(const void *a, const void *b) {
     return strcmp(*(const char *const *)a, *(const char *const *)b);
 }
 
-static void nar_dump(NarBuf *b, const char *path, int depth) {
+/* M80: real Nix's `FileType` names (~/nix/src/libutil/file-system.hh's
+ * `InputAccessor::Type` -> `dumpPath`'s own filter calls), used both for
+ * `nar_dump`'s own filter calls below and matching exactly what a Nix-
+ * level `filter = path: type: ...` function receives. */
+static const char *nar_file_type_name(mode_t mode) {
+    if (S_ISREG(mode)) return "regular";
+    if (S_ISDIR(mode)) return "directory";
+    if (S_ISLNK(mode)) return "symlink";
+    return "unknown";
+}
+
+static void nar_dump(NarBuf *b, const char *path, int depth, AsnixNarFilter filter, void *filter_ctx) {
     if (depth >= ASNIX_NAR_MAX_DEPTH) {
         fprintf(stderr, "asnix: path '%s' exceeds maximum NAR directory depth of %d\n", path, ASNIX_NAR_MAX_DEPTH);
         exit(1);
@@ -130,14 +142,32 @@ static void nar_dump(NarBuf *b, const char *path, int depth) {
         qsort(names, nnames, sizeof(char *), name_cmp);
 
         for (size_t i = 0; i < nnames; i++) {
+            char child[4096];
+            snprintf(child, sizeof(child), "%s/%s", path, names[i]);
+            /* M80: `filter` (NULL from `asnix_copy_path_to_store`'s own
+             * call below -- behaviorally IDENTICAL to this function's
+             * pre-M80 self, every "entry"/"node" pair still emitted
+             * unconditionally) decides whether this child (and, if it's
+             * a directory, its ENTIRE subtree -- simply never recursed
+             * into, same as real Nix's own `PathFilter`) appears in the
+             * NAR at all. */
+            if (filter) {
+                struct stat cst;
+                if (lstat(child, &cst) != 0) {
+                    fprintf(stderr, "asnix: cannot stat '%s' while copying it to the store\n", child);
+                    exit(1);
+                }
+                if (!filter(filter_ctx, child, nar_file_type_name(cst.st_mode))) {
+                    free(names[i]);
+                    continue;
+                }
+            }
             nb_cstr(b, "entry");
             nb_cstr(b, "(");
             nb_cstr(b, "name");
             nb_cstr(b, names[i]);
             nb_cstr(b, "node");
-            char child[4096];
-            snprintf(child, sizeof(child), "%s/%s", path, names[i]);
-            nar_dump(b, child, depth + 1);
+            nar_dump(b, child, depth + 1, filter, filter_ctx);
             nb_cstr(b, ")");
             free(names[i]);
         }
@@ -194,7 +224,7 @@ void asnix_copy_path_to_store(const char *path, char *out, size_t out_cap) {
 
     NarBuf b = { 0 };
     nb_cstr(&b, "nix-archive-1");
-    nar_dump(&b, path, 0);
+    nar_dump(&b, path, 0, NULL, NULL);
 
     uint8_t nar_hash[32];
     if (asnix_hash_sha256(b.buf, b.len, nar_hash) != 0) {
@@ -241,4 +271,58 @@ void asnix_copy_path_to_store(const char *path, char *out, size_t out_cap) {
     }
 
     copy_cache_insert(path, out);
+}
+
+void asnix_copy_path_to_store_ext(const char *path, const char *name, int recursive, AsnixNarFilter filter,
+                                   void *filter_ctx, const uint8_t expected_sha256[32], char *out, size_t out_cap) {
+    const char *slash = strrchr(path, '/');
+    const char *effective_name = name ? name : (slash ? slash + 1 : path);
+
+    uint8_t content_digest[32];
+    if (recursive) {
+        NarBuf b = { 0 };
+        nb_cstr(&b, "nix-archive-1");
+        nar_dump(&b, path, 0, filter, filter_ctx);
+        if (asnix_hash_sha256(b.buf, b.len, content_digest) != 0) {
+            fprintf(stderr, "asnix: failed to load libcrypto -- enter the flake devShell\n");
+            exit(1);
+        }
+        free(b.buf);
+    } else {
+        /* Flat method -- real Nix requires `path` be a regular file
+         * (`builtins.path { recursive = false; ... }` on a directory is
+         * a hard error there); no filter applies (there's nothing to
+         * recurse into). */
+        struct stat st;
+        if (lstat(path, &st) != 0) {
+            fprintf(stderr, "asnix: path '%s' does not exist\n", path);
+            exit(1);
+        }
+        if (!S_ISREG(st.st_mode)) {
+            fprintf(stderr, "asnix: path '%s' is not a regular file (required for a non-recursive hash)\n", path);
+            exit(1);
+        }
+        FILE *f = fopen(path, "rb");
+        if (!f) {
+            fprintf(stderr, "asnix: cannot open '%s'\n", path);
+            exit(1);
+        }
+        char *buf = malloc((size_t)st.st_size ? (size_t)st.st_size : 1);
+        size_t got = fread(buf, 1, (size_t)st.st_size, f);
+        fclose(f);
+        if (asnix_hash_sha256(buf, got, content_digest) != 0) {
+            fprintf(stderr, "asnix: failed to load libcrypto -- enter the flake devShell\n");
+            exit(1);
+        }
+        free(buf);
+    }
+
+    if (expected_sha256 && memcmp(expected_sha256, content_digest, 32) != 0) {
+        fprintf(stderr, "asnix: hash mismatch copying '%s' to the store (sha256 does not match the pinned value)\n",
+                path);
+        exit(1);
+    }
+
+    asnix_compute_fixed_output_path(recursive ? "recursive" : "flat", content_digest, 32, "sha256", 6,
+                                     effective_name, out, out_cap);
 }

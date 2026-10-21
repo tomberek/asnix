@@ -17,6 +17,7 @@
 #include "asnix/ir.h"
 #include "builtins_shared.h"
 #include "nar.h" /* asnix_copy_path_to_store -- see json_encode's Path case below */
+#include "string_context.h" /* M80: replaceStrings' context propagation */
 #include "symtab.h"
 #include "value_util.h"
 
@@ -246,6 +247,14 @@ static Value replaceStrings3_impl(const Value *args, int64_t argc) {
     const char *sbytes;
     asnix_bshared_string_bytes(s_v, &sbytes, &slen, "replaceStrings");
 
+    /* M80: real Nix's own `prim_replaceStrings` unions `s`'s context with
+     * the context of every DISTINCT `to[i]` actually spliced in at least
+     * once (never an index that's never matched) -- ported verbatim,
+     * see this function's own header comment's "replaceInto" case. */
+    AsnixStringContext ctx;
+    asnix_ctx_init(&ctx);
+    asnix_ctx_union_into(&ctx, asnix_string_context_of(s_v));
+
     size_t cap = (size_t)slen + 16, outlen = 0;
     char *out = malloc(cap);
     int64_t p = 0;
@@ -261,7 +270,9 @@ static Value replaceStrings3_impl(const Value *args, int64_t argc) {
         if (found >= 0) {
             const char *tb;
             int64_t tl;
-            asnix_bshared_string_bytes(asnix_force_for_print(to_elems[found]), &tb, &tl, "replaceStrings");
+            Value to_forced = asnix_force_for_print(to_elems[found]);
+            asnix_bshared_string_bytes(to_forced, &tb, &tl, "replaceStrings");
+            asnix_ctx_union_into(&ctx, asnix_string_context_of(to_forced));
             if (outlen + (size_t)tl + 1 > cap) {
                 cap = (outlen + (size_t)tl + 1) * 2;
                 out = realloc(out, cap);
@@ -283,6 +294,7 @@ static Value replaceStrings3_impl(const Value *args, int64_t argc) {
         }
     }
     Value result = asnix_make_string_value(out, outlen);
+    if (!asnix_ctx_is_empty(&ctx)) asnix_string_attach_context(result, &ctx);
     free(out);
     free(from_bytes);
     free(from_lens);
@@ -497,9 +509,10 @@ static int json_name_cmp(const char *an, size_t al, const char *bn, size_t bl) {
     return (al > bl) - (al < bl);
 }
 
-static void json_encode(Value v, JsonBuf *out);
+static void json_encode_ctx(Value v, JsonBuf *out, AsnixStringContext *ctx);
+static void json_encode(Value v, JsonBuf *out) { json_encode_ctx(v, out, NULL); }
 
-static void json_encode_attrs(Value v, JsonBuf *out) {
+static void json_encode_attrs_ctx(Value v, JsonBuf *out, AsnixStringContext *ctx) {
     int64_t n = asnix_bshared_attrs_count(v);
     int64_t *order = n > 0 ? malloc((size_t)n * sizeof(int64_t)) : NULL;
     for (int64_t i = 0; i < n; i++) order[i] = i;
@@ -523,13 +536,22 @@ static void json_encode_attrs(Value v, JsonBuf *out) {
         const char *name = asnix_sym_name(asnix_bshared_attrs_sym(v, order[i]), &len);
         jb_escape_string(out, name, (int64_t)len);
         jb_putc(out, ':');
-        json_encode(asnix_force_for_print(asnix_bshared_attrs_value(v, order[i])), out);
+        json_encode_ctx(asnix_force_for_print(asnix_bshared_attrs_value(v, order[i])), out, ctx);
     }
     jb_putc(out, '}');
     free(order);
 }
 
-static void json_encode(Value v, JsonBuf *out) {
+/* M80: `ctx` (NULL from every pre-existing call site, see this
+ * function's own forward-declared one-line wrapper just above) collects
+ * the union of every STRING leaf's own context encountered while
+ * walking `v` -- real Nix's own `printValueAsJSON` does the same
+ * (`~/nix/src/libexpr/value-to-json.cc` threads a `NixStringContext &
+ * context` output parameter through its whole recursion), needed so
+ * `builtins.toJSON { inherit s; }` (prim_toJSON below) can attach the
+ * combined context to its result string, matching real Nix's
+ * `getContext (toJSON {...})`. */
+static void json_encode_ctx(Value v, JsonBuf *out, AsnixStringContext *ctx) {
     v = asnix_force_for_print(v);
     switch (asnix_tag_of(v)) {
         case ASNIX_TAG_INT: {
@@ -577,6 +599,7 @@ static void json_encode(Value v, JsonBuf *out) {
             if (!utf8_is_valid(bytes, len)) {
                 asnix_bshared_fatal("toJSON", "string is not valid UTF-8");
             }
+            if (ctx) asnix_ctx_union_into(ctx, asnix_string_context_of(v));
             jb_escape_string(out, bytes, len);
             break;
         }
@@ -586,7 +609,7 @@ static void json_encode(Value v, JsonBuf *out) {
             jb_putc(out, '[');
             for (int64_t i = 0; i < n; i++) {
                 if (i > 0) jb_putc(out, ',');
-                json_encode(elems[i], out);
+                json_encode_ctx(elems[i], out, ctx);
             }
             jb_putc(out, ']');
             break;
@@ -606,9 +629,9 @@ static void json_encode(Value v, JsonBuf *out) {
             uint32_t sym_tostring = asnix_intern("__toString", 10);
             uint32_t sym_outpath = asnix_intern("outPath", 7);
             if (asnix_bshared_attrs_find(v, sym_tostring) >= 0 || asnix_bshared_attrs_find(v, sym_outpath) >= 0) {
-                json_encode(asnix_coerce_to_string(v), out);
+                json_encode_ctx(asnix_coerce_to_string(v), out, ctx);
             } else {
-                json_encode_attrs(v, out);
+                json_encode_attrs_ctx(v, out, ctx);
             }
             break;
         }
@@ -631,9 +654,22 @@ char *asnix_toJSON_cstr(Value v) {
 
 static Value prim_toJSON(const Value *args, int64_t argc) {
     (void)argc;
-    char *s = asnix_toJSON_cstr(args[0]);
-    Value result = asnix_make_string_value(s, strlen(s));
-    free(s);
+    JsonBuf jb;
+    jb_init(&jb);
+    AsnixStringContext ctx;
+    asnix_ctx_init(&ctx);
+    json_encode_ctx(args[0], &jb, &ctx);
+    jb_putc(&jb, '\0');
+    Value result = asnix_make_string_value(jb.buf, strlen(jb.buf));
+    /* M80: unlike the public `asnix_toJSON_cstr` entry point (used for
+     * `__json`-structured-attrs serialization, derivation.c -- that
+     * caller already collects context from the RAW attrset directly,
+     * `asnix_collect_input_refs`, independent of this JSON text), the
+     * user-facing `builtins.toJSON` primop attaches the union of every
+     * string leaf's own context to its result (see json_encode_ctx's
+     * own header comment). */
+    if (!asnix_ctx_is_empty(&ctx)) asnix_string_attach_context(result, &ctx);
+    free(jb.buf);
     return result;
 }
 static Value build_toJSON(void) { return asnix_bshared_make_primop((void *)prim_toJSON, 1); }

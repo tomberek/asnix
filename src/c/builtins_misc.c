@@ -161,7 +161,15 @@ static Value substring3_impl(const Value *args, int64_t argc) {
 
     int64_t start_n = start > slen ? slen : start;
     int64_t actual_len = len < 0 ? slen - start_n : (start_n + len > slen ? slen - start_n : len);
-    return asnix_make_string_value(bytes + start_n, (size_t)actual_len);
+    Value out = asnix_make_string_value(bytes + start_n, (size_t)actual_len);
+    /* M80: real Nix's own `prim_substring` copies the WHOLE original
+     * string's context onto the slice verbatim, regardless of which
+     * bytes the slice actually keeps (confirmed directly: `getContext
+     * (substring 0 0 "${d}")` is non-empty on real Nix, same as the
+     * full string's -- substring never trims context). */
+    const AsnixStringContext *ctx = asnix_string_context_of(str_v);
+    if (!asnix_ctx_is_empty(ctx)) asnix_string_attach_context(out, ctx);
+    return out;
 }
 
 static Value build_substring(void) {
@@ -460,7 +468,16 @@ static Value prim_baseNameOf(const Value *args, int64_t argc) {
                                                     * eval-okay-baseNameOf.nix. */
     int64_t start = len;
     while (start > 0 && bytes[start - 1] != '/') start--;
-    return asnix_make_string_value(bytes + start, (size_t)(len - start));
+    Value out = asnix_make_string_value(bytes + start, (size_t)(len - start));
+    /* M80: real Nix's own `prim_baseNameOf` copies `args[0]`'s context onto
+     * the result verbatim (`v.mkString(getName(str), context)`,
+     * ~/nix/src/libexpr/primops.cc) -- confirmed needed directly:
+     * `getContext (baseNameOf "${d}")` keeps `d`'s own context on real
+     * Nix. `asnix_string_context_of` on a Path is always NULL (Paths
+     * never get an entry), so this is a no-op for the Path-argument case. */
+    const AsnixStringContext *ctx = asnix_string_context_of(args[0]);
+    if (!asnix_ctx_is_empty(ctx)) asnix_string_attach_context(out, ctx);
+    return out;
 }
 
 static Value prim_dirOf(const Value *args, int64_t argc) {
@@ -483,10 +500,25 @@ static Value prim_dirOf(const Value *args, int64_t argc) {
     }
     int64_t pos = len;
     while (pos > 0 && bytes[pos - 1] != '/') pos--;
-    if (pos == 0) return asnix_make_string_value(".", 1);
+    /* M80: the String-argument branches, unlike the Path ones above,
+     * propagate `v`'s own context onto the result -- a Path value never
+     * carries string context at all in real Nix (context only applies
+     * to strings-with-context), so only this branch needs it. */
+    const AsnixStringContext *ctx = asnix_string_context_of(v);
+    if (pos == 0) {
+        Value out = asnix_make_string_value(".", 1);
+        if (!asnix_ctx_is_empty(ctx)) asnix_string_attach_context(out, ctx);
+        return out;
+    }
     pos--; /* back up onto the '/' itself */
-    if (pos == 0) return asnix_make_string_value("/", 1);
-    return asnix_make_string_value(bytes, (size_t)pos);
+    if (pos == 0) {
+        Value out = asnix_make_string_value("/", 1);
+        if (!asnix_ctx_is_empty(ctx)) asnix_string_attach_context(out, ctx);
+        return out;
+    }
+    Value out = asnix_make_string_value(bytes, (size_t)pos);
+    if (!asnix_ctx_is_empty(ctx)) asnix_string_attach_context(out, ctx);
+    return out;
 }
 
 static Value build_baseNameOf(void) { return make_primop_value((void *)prim_baseNameOf, 1); }
@@ -575,6 +607,50 @@ static Value prim_toFile(const Value *args, int64_t argc) {
     const char *contents_bytes;
     asnix_bshared_string_bytes(args[1], &contents_bytes, &contents_len, "toFile");
 
+    /* M80: `contents`' own context becomes this file's STORE REFERENCES
+     * -- ported from `~/nix/src/libexpr/primops.cc`'s `prim_toFile`:
+     * every Opaque context element is a reference (`refs.insert(p->
+     * path)`); any OTHER kind (Built/DrvDeep -- i.e. `contents`
+     * mentions a derivation, not just a plain path) is a hard error
+     * ("files created by builtins.toFile may not reference
+     * derivations"), confirmed directly against real `nix-instantiate
+     * --eval` (`eval-fail-drv-tofile-output-reference.nix`: `toFile "t"
+     * "${d}"` fails for exactly this reason -- a derivation OUTPUT
+     * reference, not a plain path). References (if any) get folded into
+     * the preimage's "type" field via real Nix's `makeType`
+     * (`~/nix/src/libstore/store-dir-config.cc`): `"text" + for each
+     * reference, SORTED ascending, ":" + path` -- changes the resulting
+     * store path's hash, confirmed needed directly:
+     * `eval-okay-drv-sources.nix`'s `refers = toFile "refers" "see
+     * ${text}";` must hash to the exact same path real Nix computes,
+     * which depends on `text`'s own store path being folded into this
+     * preimage, not just `contents`' raw bytes. */
+    const AsnixStringContext *contents_ctx = asnix_string_context_of(args[1]);
+    if (contents_ctx && (contents_ctx->ndrvs > 0 || contents_ctx->ndeep > 0)) {
+        fprintf(stderr,
+                "asnix: toFile: files created by builtins.toFile may not reference derivations, but '%s' does\n",
+                name);
+        exit(1);
+    }
+    size_t nrefs = contents_ctx ? contents_ctx->nsrcs : 0;
+    char **refs = NULL;
+    if (nrefs > 0) {
+        refs = malloc(nrefs * sizeof(char *));
+        memcpy(refs, contents_ctx->srcs, nrefs * sizeof(char *));
+        /* Ascending lexicographic sort -- see this function's own
+         * comment above (matches real Nix's `StorePathSet`, a
+         * `std::set<StorePath>` ordered by its own basename string). */
+        for (size_t i = 1; i < nrefs; i++) {
+            size_t j = i;
+            while (j > 0 && strcmp(refs[j - 1], refs[j]) > 0) {
+                char *tmp = refs[j - 1];
+                refs[j - 1] = refs[j];
+                refs[j] = tmp;
+                j--;
+            }
+        }
+    }
+
     uint8_t inner_digest[ASNIX_HASH_SHA256_LEN];
     int64_t rc = asnix_hash_sha256(contents_bytes, (size_t)contents_len, inner_digest);
     if (rc != 0) {
@@ -592,8 +668,21 @@ static Value prim_toFile(const Value *args, int64_t argc) {
     }
     hashstr[7 + 64] = '\0';
 
-    char preimage[512];
-    size_t n = asnix_store_path_preimage("text", hashstr, name, preimage, sizeof(preimage));
+    char *type_str = malloc(4 + nrefs * 300 + 1);
+    size_t type_len = 4;
+    memcpy(type_str, "text", 4);
+    for (size_t i = 0; i < nrefs; i++) {
+        type_str[type_len++] = ':';
+        size_t rl = strlen(refs[i]);
+        memcpy(type_str + type_len, refs[i], rl);
+        type_len += rl;
+    }
+    type_str[type_len] = '\0';
+
+    char preimage[4096];
+    size_t n = asnix_store_path_preimage(type_str, hashstr, name, preimage, sizeof(preimage));
+    free(type_str);
+    free(refs);
     if (n == 0) {
         fprintf(stderr, "asnix: toFile: preimage too long\n");
         exit(1);

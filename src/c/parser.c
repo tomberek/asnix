@@ -548,7 +548,8 @@ static Token *expect(Parser *p, TokKind kind, const char *what) {
 static int starts_atom(TokKind k) {
     return k == TOK_INT || k == TOK_FLOAT || k == TOK_IDENT || k == TOK_TRUE || k == TOK_FALSE || k == TOK_NULL ||
            k == TOK_LPAREN || k == TOK_STR_START || k == TOK_ISTR_START || k == TOK_LBRACKET ||
-           k == TOK_LBRACE || k == TOK_REC || k == TOK_PATH || k == TOK_SEARCH_PATH || k == TOK_OR;
+           k == TOK_LBRACE || k == TOK_REC || k == TOK_PATH || k == TOK_SEARCH_PATH || k == TOK_OR ||
+           k == TOK_URI;
 }
 
 static Ast *parse_expr(Parser *p);
@@ -1102,6 +1103,23 @@ static Ast *parse_atom(Parser *p) {
             n->as.path.is_home = t->is_home;
             n->as.path.interp_parts = NULL;
             n->as.path.interp_count = 0;
+            return n;
+        }
+        case TOK_URI: {
+            /* Bare URL literal -- lexes to a plain, non-interpolated
+             * string (real Nix: `ExprString` built straight from the
+             * literal's text, same AST shape a `"..."` with no `${`
+             * ever produces). See lexer.c's try_scan_uri for the
+             * grammar/precedence rationale. */
+            advance(p);
+            Ast *n = asnix_ast_new(AST_STRING);
+            AstStringPart *parts = malloc(sizeof(AstStringPart));
+            parts[0].is_expr = 0;
+            parts[0].text = t->start;
+            parts[0].text_len = t->len;
+            parts[0].expr = NULL;
+            n->as.string.parts = parts;
+            n->as.string.count = 1;
             return n;
         }
         case TOK_SEARCH_PATH: {

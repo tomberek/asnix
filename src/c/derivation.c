@@ -116,7 +116,7 @@ static size_t hash_algo_digest_bytes(const char *s, size_t len) {
 /* M73: on top of validate_output_hash_fields's existing well-formedness
  * checks (unchanged below), this ALSO decodes a valid `outputHash` into
  * raw digest bytes and reports the resolved algorithm -- needed by
- * compute_fixed_output_path (below) to actually implement real Nix's
+ * asnix_compute_fixed_output_path (below) to actually implement real Nix's
  * `makeFixedOutputPath` formula, which this project validated the
  * SHAPE of since M48 but never actually used for path computation
  * (confirmed via a direct `nix-instantiate` comparison: a fixed-output
@@ -282,8 +282,16 @@ static void compute_store_path(const char *type, const uint8_t inner_digest[32],
  *    mode, which is `<nix/fetchurl.nix>`'s own default, M46): hash a
  *    small "fixed:out:<modePrefix><algo>:<hex-hash>:" payload string
  *    with SHA-256, then feed THAT hash into
- *    `makeStorePath("output:out", ..., name)` the same way. */
-static void compute_fixed_output_path(const char *output_hash_mode, const uint8_t raw[64], size_t raw_len,
+ *    `makeStorePath("output:out", ..., name)` the same way.
+ *
+ * M80: made non-`static` (declared in derivation.h) -- `builtins.path`'s
+ * `recursive=false`/pinned-`sha256` modes (builtins_path.c) need this
+ * EXACT SAME formula (confirmed directly against real `nix-instantiate
+ * --eval`: a `recursive=false` `builtins.path` call's resulting store
+ * path matches a fixed-output derivation's own "flat" formula bit-for-
+ * bit), not a second, independently-written copy of it. Body
+ * unchanged. */
+void asnix_compute_fixed_output_path(const char *output_hash_mode, const uint8_t raw[64], size_t raw_len,
                                        const char *algo, size_t algo_len, const char *name, char *out,
                                        size_t out_cap) {
     int is_recursive = output_hash_mode && strcmp(output_hash_mode, "recursive") == 0;
@@ -1152,7 +1160,7 @@ Value asnix_prim_derivation(const Value *args, int64_t argc) {
 
     /* M73: a fixed-output derivation's "out" path is NOT derived from
      * `masked_digest` at all -- override it with the real formula
-     * (compute_fixed_output_path, above). Safe to index [0]/output_names[0]
+     * (asnix_compute_fixed_output_path, above). Safe to index [0]/output_names[0]
      * directly: `output_hash` (hence `has_fixed_hash`) is only ever
      * accepted together with exactly one output named "out" (the
      * `multiple outputs are not supported in fixed-output derivations`
@@ -1164,7 +1172,7 @@ Value asnix_prim_derivation(const Value *args, int64_t argc) {
     char fixed_hash_algo_cstr[16]; /* longest: "r:" + "sha256"/"sha512" + NUL */
     char fixed_hash_algo_hex[128 + 1];
     if (has_fixed_hash) {
-        compute_fixed_output_path(output_hash_mode, fixed_hash_raw, fixed_hash_raw_len, fixed_hash_algo,
+        asnix_compute_fixed_output_path(output_hash_mode, fixed_hash_raw, fixed_hash_raw_len, fixed_hash_algo,
                                    fixed_hash_algo_len, name, out_paths[0], sizeof(out_paths[0]));
         for (size_t i = 0; i < nenv; i++)
             if (strcmp(env[i].key, "out") == 0) env[i].value = out_paths[0];
@@ -1182,7 +1190,7 @@ Value asnix_prim_derivation(const Value *args, int64_t argc) {
          * `("out",path,"r:sha256",hash)`, not `("out",path,"sha256",
          * hash)`) -- `makeFileIngestionPrefix`'s own "r:"/""  split,
          * used here ONLY for this ATerm-serialization field, NOT for
-         * compute_fixed_output_path's path-computation formula above
+         * asnix_compute_fixed_output_path's path-computation formula above
          * (whose two branches already each handle this distinction
          * their own way: the recursive+sha256 branch bypasses the
          * "fixed:out:..." payload scheme entirely, every other
@@ -1352,6 +1360,27 @@ Value asnix_prim_derivation(const Value *args, int64_t argc) {
     Value vals[1 + ASNIX_DRV_MAX_OUTPUTS];
     syms[0] = asnix_intern("drvPath", 7);
     vals[0] = asnix_make_string_value(drv_path, strlen(drv_path));
+    /* M80: `vals[0]` (`drvPath` itself) gets real Nix's `DrvDeep` context
+     * element, self-referential (`DrvDeep{drvPath}` pointing at its OWN
+     * path) -- confirmed directly against `~/nix/src/libexpr/primops.cc`
+     * (`derivationStrict`'s `attrs.alloc(sDrvPath).mkString(drvPath,
+     * {NixStringContextElem::DrvDeep{drvPath}})`). This is PURELY
+     * introspection metadata (`getContext`/`addDrvOutputDependencies`/
+     * `unsafeDiscardOutputDependency`, builtins_m54.c) -- deliberately
+     * NOT read by `asnix_collect_input_refs` below (that function only
+     * ever consults `ctx->ndrvs`/`ctx->nsrcs`, both still zero here), so
+     * a `.drvPath` string used directly as a LATER derivation's
+     * attribute value still collects exactly zero input refs, same as
+     * before this milestone (when `drvPath` carried no context at all)
+     * -- zero risk to M74-M79's hash-parity work. Real Nix's OWN "deep"
+     * dependency propagation (walking the referenced drv's full
+     * transitive closure and adding every output of every derivation in
+     * it as an input) is a separate, substantially larger feature, not
+     * attempted here -- see M80's scope notes in docs/architecture.md. */
+    AsnixStringContext drv_ctx;
+    asnix_ctx_init(&drv_ctx);
+    asnix_ctx_add_deep(&drv_ctx, drv_path);
+    asnix_string_attach_context(vals[0], &drv_ctx);
     for (size_t o = 0; o < noutputs; o++) {
         syms[1 + o] = asnix_intern(output_names[o], strlen(output_names[o]));
         vals[1 + o] = asnix_make_string_value(out_paths[o], strlen(out_paths[o]));
@@ -1364,10 +1393,7 @@ Value asnix_prim_derivation(const Value *args, int64_t argc) {
          * (string interpolation, not just a bare attrset/Path) recover
          * this dependency -- see string_context.h's header comment for
          * why this matters (hello.drv's own `builder` attribute reaches
-         * `bash` only this way). `vals[0]` (`drvPath` itself) stays
-         * context-free -- that's real Nix's separate `DrvDeep` context
-         * (referencing the WHOLE closure), explicitly out of scope,
-         * same as M74's own structural collector never handled it. */
+         * `bash` only this way). */
         AsnixStringContext out_ctx;
         asnix_ctx_init(&out_ctx);
         asnix_ctx_add_built(&out_ctx, drv_path, output_names[o]);

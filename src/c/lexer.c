@@ -117,6 +117,45 @@ static size_t try_scan_home_path(const char *src, size_t i) {
     return j - i;
 }
 
+/* Bare URL literals (deprecated-but-default-accepted real-Nix syntax --
+ * `eval-okay-url-literal-default.nix`'s own comment: "By default (no
+ * flags), unquoted URL literals are accepted"). Ported directly from
+ * real Nix's own lexer.l `URI` regex:
+ *   [a-zA-Z][a-zA-Z0-9\+\-\.]*\:[a-zA-Z0-9\%\/\?\:\@\&\=\+\$\,\_\.\!\~\*\'\-]+
+ * Tried in the main loop BEFORE ordinary identifier/keyword scanning,
+ * same "longest match wins" precedence flex itself gives this rule over
+ * ID: e.g. `x:x+1` lexes as ONE URI token "x:x+1", not as a lambda
+ * `x: x+1` -- a well-known real-Nix footgun, verified directly against
+ * `nix-instantiate --eval` (`(x:x+1) 5` fails with "attempt to call
+ * something which is not a function but a string"). Checked the only
+ * two *.nix drivers this project's own derivation-hashing work depends
+ * on (d.nix/e.nix) for any whitespace-free `ident:ident` lambda that
+ * this might newly misparse -- none found. */
+static int uri_scheme_char(char c) {
+    return isalnum((unsigned char)c) || c == '+' || c == '-' || c == '.';
+}
+static int uri_tail_char(char c) {
+    switch (c) {
+        case '%': case '/': case '?': case ':': case '@': case '&': case '=':
+        case '+': case '$': case ',': case '_': case '.': case '!': case '~':
+        case '*': case '\'': case '-':
+            return 1;
+        default:
+            return isalnum((unsigned char)c);
+    }
+}
+static size_t try_scan_uri(const char *src, size_t i) {
+    if (!isalpha((unsigned char)src[i])) return 0;
+    size_t j = i + 1;
+    while (uri_scheme_char(src[j])) j++;
+    if (src[j] != ':') return 0;
+    size_t k = j + 1;
+    size_t tail_start = k;
+    while (uri_tail_char(src[k])) k++;
+    if (k == tail_start) return 0; /* need >=1 tail char after the ':' */
+    return k - i;
+}
+
 static int ident_start(char c) {
     return isalpha((unsigned char)c) || c == '_';
 }
@@ -571,6 +610,15 @@ Token *asnix_lex(const char *src, size_t *out_count) {
                     mode_push(&modes, MODE_NORMAL);
                     push_tok(&v, (Token){ .kind = TOK_DOLLAR_LBRACE });
                 }
+                continue;
+            }
+        }
+
+        if (isalpha((unsigned char)c)) {
+            size_t ulen = try_scan_uri(src, i);
+            if (ulen > 0) {
+                push_tok(&v, (Token){ .kind = TOK_URI, .start = src + i, .len = ulen, .pos = src + tok_start });
+                i += ulen;
                 continue;
             }
         }

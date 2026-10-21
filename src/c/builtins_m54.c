@@ -19,6 +19,7 @@
 #include "builtins_shared.h"
 #include "eval_file.h"
 #include "hash_shim.h"
+#include "string_context.h"
 #include "symtab.h"
 #include "value_util.h"
 
@@ -662,61 +663,343 @@ static Value prim_convertHash(const Value *args, int64_t argc) {
 static Value build_convertHash(void) { return asnix_bshared_make_primop((void *)prim_convertHash, 1); }
 
 /* ---------------------------------------------------------------------
- * getContext s / appendContext msg ctxAttrs (M54) -- `__getContext`/
- * `__appendContext` in real Nix (both builtins-only). asnix has NO
- * string-context tracking at all anywhere in this codebase (confirmed:
- * grepping every src/c/ C file for "context" turns up only unrelated hits --
- * error-context (`addErrorContext`, M39), parser context, register-
- * save context) -- derivation-output string context is a substantially
- * larger, separate feature (tracked elsewhere, not attempted here).
- * Scoped to exactly the one case that's realistically supportable
- * without it: a plain string/value with NO actual context attached.
- * Verified against real `nix-instantiate --eval`:
- *   getContext "plain"           == {}
- *   getContext ""                == {}
- *   appendContext "plain" {}     == "plain"   (same string, unaffected)
- * `appendContext`'s second argument is validated (must be an attrset --
- * real Nix also validates its exact {outputs=[...];}/{allOutputs=true;}/
- * {path=true;} per-key shape, not replicated here since nothing is ever
- * actually stored) but otherwise ignored: since nothing in this
- * evaluator ever tracks or consults context, returning `msg` completely
- * unchanged already reproduces every observable case above. The three
- * conformance tests that exercise these (eval-okay-context-builtins/
- * substring-context/context-inputs) each fundamentally depend on real
- * derivation-output context propagation through `${drv}`/`drv.outPath`/
- * `builtins.toFile`/etc, which this scope cut does not provide -- they
- * are expected to keep failing for that documented, pre-existing reason
- * (asnix's derivation support is itself a narrower M8 scope cut), not
- * because getContext/appendContext themselves are wrong. */
+ * getContext / hasContext / appendContext / unsafeDiscardOutputDependency /
+ * addDrvOutputDependencies (M54, real semantics added M80) --
+ * `__getContext`/`__hasContext`/`__appendContext`/
+ * `__unsafeDiscardOutputDependency`/`__addDrvOutputDependencies` in real
+ * Nix (all builtins-only, ~/nix/src/libexpr/primops/context.cc, read in
+ * full before writing this). M76 gave this codebase a REAL string-
+ * context side table (string_context.c/.h) for derivation-hashing
+ * purposes, but these five builtins -- the first thing to ever expose
+ * that mechanism at the Nix-language level -- were still the M54-era
+ * hardcoded no-ops described in this comment's prior revision (git
+ * history). Real Nix's context has exactly three element kinds (see
+ * string_context.h): Opaque (a plain store-path reference, `{path=
+ * true;}`), Built (a specific named output of a derivation, `{outputs=
+ * [...];}`), and DrvDeep (the WHOLE closure of a derivation, `{
+ * allOutputs=true;}` -- attached to a derivation's own `.drvPath`
+ * string, derivation.c's asnix_prim_derivation). */
 static Value prim_getContext(const Value *args, int64_t argc) {
     (void)argc;
     ASNIX_REQUIRE_STRING(args[0], "getContext");
-    return asnix_bshared_make_attrs(NULL, NULL, 0);
+    const AsnixStringContext *ctx = asnix_string_context_of(args[0]);
+    if (asnix_ctx_is_empty(ctx)) return asnix_bshared_make_attrs(NULL, NULL, 0);
+
+    /* One aggregated record per distinct drv_path, matching real Nix's
+     * own `std::map<StorePath, ContextInfo>` (context.cc's
+     * prim_getContext) -- a path may have `path`/`allOutputs` both set
+     * AND a non-empty `outputs` list all at once. Linear-scan
+     * find-or-create: this project's own context table is itself a
+     * linear/hash scan over similarly small per-string N (see
+     * string_context.c's own perf note), and a single string's context
+     * here is bounded by how many distinct derivations/paths it
+     * mentions -- not a hot path the way the side table's OWN lookup is. */
+    typedef struct {
+        const char *path;
+        int is_path;
+        int all_outputs;
+        const char **outputs;
+        size_t noutputs, outputs_cap;
+    } GetCtxEntry;
+    size_t cap = ctx->ndrvs + ctx->nsrcs + ctx->ndeep;
+    GetCtxEntry *entries = calloc(cap ? cap : 1, sizeof(GetCtxEntry));
+    size_t nentries = 0;
+#define GETCTX_FIND_OR_CREATE(pathArg)                                                                               \
+    ({                                                                                                               \
+        GetCtxEntry *found = NULL;                                                                                   \
+        for (size_t _i = 0; _i < nentries; _i++) {                                                                   \
+            if (strcmp(entries[_i].path, (pathArg)) == 0) {                                                         \
+                found = &entries[_i];                                                                                \
+                break;                                                                                               \
+            }                                                                                                        \
+        }                                                                                                            \
+        if (!found) {                                                                                                \
+            found = &entries[nentries++];                                                                           \
+            found->path = (pathArg);                                                                                 \
+        }                                                                                                            \
+        found;                                                                                                       \
+    })
+    for (size_t i = 0; i < ctx->ndrvs; i++) {
+        GetCtxEntry *e = GETCTX_FIND_OR_CREATE(ctx->drvs[i].drv_path);
+        if (e->noutputs == e->outputs_cap) {
+            e->outputs_cap = e->outputs_cap ? e->outputs_cap * 2 : 4;
+            e->outputs = realloc(e->outputs, e->outputs_cap * sizeof(*e->outputs));
+        }
+        e->outputs[e->noutputs++] = ctx->drvs[i].output_name;
+    }
+    for (size_t i = 0; i < ctx->nsrcs; i++) {
+        GetCtxEntry *e = GETCTX_FIND_OR_CREATE(ctx->srcs[i]);
+        e->is_path = 1;
+    }
+    for (size_t i = 0; i < ctx->ndeep; i++) {
+        GetCtxEntry *e = GETCTX_FIND_OR_CREATE(ctx->deep[i]);
+        e->all_outputs = 1;
+    }
+#undef GETCTX_FIND_OR_CREATE
+
+    uint32_t sym_path = asnix_intern("path", 4);
+    uint32_t sym_alloutputs = asnix_intern("allOutputs", 10);
+    uint32_t sym_outputs = asnix_intern("outputs", 7);
+    uint32_t *top_syms = malloc(nentries * sizeof(uint32_t));
+    Value *top_vals = malloc(nentries * sizeof(Value));
+    for (size_t i = 0; i < nentries; i++) {
+        GetCtxEntry *e = &entries[i];
+        uint32_t nsyms[3];
+        Value nvals[3];
+        size_t nk = 0;
+        if (e->is_path) {
+            nsyms[nk] = sym_path;
+            nvals[nk] = asnix_make_imm(ASNIX_IMM_TRUE);
+            nk++;
+        }
+        if (e->all_outputs) {
+            nsyms[nk] = sym_alloutputs;
+            nvals[nk] = asnix_make_imm(ASNIX_IMM_TRUE);
+            nk++;
+        }
+        if (e->noutputs > 0) {
+            /* M80: real Nix's context is a `std::set<NixStringContextElem>`
+             * ordered by variant-index-then-value (~/nix/src/libexpr/
+             * include/nix/expr/value/context.hh) -- for same-drvPath
+             * `Built` elements, that's alphabetical by OUTPUT NAME, not
+             * the order they were encountered scanning the string's own
+             * text (which is what `ctx->drvs`, a plain append-on-first-
+             * attach array, preserves instead). Confirmed needed
+             * directly: `eval-okay-context-introspection.nix`'s `combo-
+             * path` interpolates `drv.outPath` (output "out") BEFORE
+             * `drv.foo.outPath` (output "foo"), yet real Nix's own
+             * `getContext` reports `outputs = [ "foo" "out" ]` --
+             * alphabetical, not encounter order. Plain insertion sort:
+             * always a handful of outputs per derivation. */
+            for (size_t j = 1; j < e->noutputs; j++) {
+                size_t k = j;
+                while (k > 0 && strcmp(e->outputs[k - 1], e->outputs[k]) > 0) {
+                    const char *tmp = e->outputs[k - 1];
+                    e->outputs[k - 1] = e->outputs[k];
+                    e->outputs[k] = tmp;
+                    k--;
+                }
+            }
+            Value *olist = malloc(e->noutputs * sizeof(Value));
+            for (size_t j = 0; j < e->noutputs; j++) olist[j] = asnix_make_string_value(e->outputs[j], strlen(e->outputs[j]));
+            nsyms[nk] = sym_outputs;
+            nvals[nk] = asnix_bshared_make_list(olist, (int64_t)e->noutputs);
+            free(olist);
+            nk++;
+        }
+        top_syms[i] = asnix_intern(e->path, strlen(e->path));
+        top_vals[i] = asnix_bshared_make_attrs(nsyms, nvals, (int64_t)nk);
+        free(e->outputs);
+    }
+    free(entries);
+    Value result = asnix_bshared_make_attrs(top_syms, top_vals, (int64_t)nentries);
+    free(top_syms);
+    free(top_vals);
+    return result;
 }
 static Value build_getContext(void) { return asnix_bshared_make_primop((void *)prim_getContext, 1); }
 
+/* `builtins.hasContext` -- not in the original M54 batch (real Nix has
+ * it, `__hasContext`, context.cc) but trivial once `asnix_string_context_of`
+ * exists: `!context.empty()`, verbatim. */
+static Value prim_hasContext(const Value *args, int64_t argc) {
+    (void)argc;
+    ASNIX_REQUIRE_STRING(args[0], "hasContext");
+    const AsnixStringContext *ctx = asnix_string_context_of(args[0]);
+    return asnix_make_imm(asnix_ctx_is_empty(ctx) ? ASNIX_IMM_FALSE : ASNIX_IMM_TRUE);
+}
+static Value build_hasContext(void) { return asnix_bshared_make_primop((void *)prim_hasContext, 1); }
+
+/* `builtins.appendContext orig ctxAttrs` -- ported from context.cc's
+ * `prim_appendContext`: starts from `orig`'s OWN existing context (a
+ * no-op union if `orig` is context-free, the common case for every
+ * conformance fixture that calls this on a literal string), then adds
+ * one element per `ctxAttrs` key: `path=true` -> Opaque, `allOutputs=
+ * true` -> DrvDeep (key must look like a `.drv` path), `outputs=[...]`
+ * -> one Built element per name (same `.drv`-path requirement). Returns
+ * a FRESH string value (same bytes, new arena pointer) with the
+ * combined context attached -- never mutates/reuses `args[0]`'s own
+ * table entry. */
+static int ends_with_dot_drv(const char *s, size_t len) {
+    return len > 4 && memcmp(s + len - 4, ".drv", 4) == 0;
+}
 static Value appendContext2_impl(const Value *args, int64_t argc) {
     (void)argc;
     ASNIX_REQUIRE_STRING(args[0], "appendContext");
     ASNIX_REQUIRE_ATTRS(args[1], "appendContext");
-    return args[0];
+
+    int64_t orig_len;
+    const char *orig_bytes;
+    asnix_bshared_string_bytes(args[0], &orig_bytes, &orig_len, "appendContext");
+
+    AsnixStringContext ctx;
+    asnix_ctx_init(&ctx);
+    asnix_ctx_union_into(&ctx, asnix_string_context_of(args[0]));
+
+    uint32_t sym_path = asnix_intern("path", 4);
+    uint32_t sym_alloutputs = asnix_intern("allOutputs", 10);
+    uint32_t sym_outputs = asnix_intern("outputs", 7);
+
+    int64_t nattrs = asnix_bshared_attrs_count(args[1]);
+    for (int64_t i = 0; i < nattrs; i++) {
+        uint32_t key_sym = asnix_bshared_attrs_sym(args[1], i);
+        size_t key_len;
+        const char *key_name = asnix_sym_name(key_sym, &key_len);
+        if (!(key_len > 11 && memcmp(key_name, "/nix/store/", 11) == 0)) {
+            fprintf(stderr, "asnix: appendContext: context key '%.*s' is not a store path\n", (int)key_len,
+                    key_name);
+            exit(1);
+        }
+        char *path = strndup(key_name, key_len);
+        Value entry = asnix_force_for_print(asnix_bshared_attrs_value(args[1], i));
+        ASNIX_REQUIRE_ATTRS(entry, "appendContext");
+
+        int64_t idx = asnix_bshared_attrs_find(entry, sym_path);
+        if (idx >= 0) {
+            Value b = asnix_force_for_print(asnix_bshared_attrs_value(entry, idx));
+            if (asnix_tag_of(b) == ASNIX_TAG_IMM && asnix_imm_subtag(b) == ASNIX_IMM_TRUE) asnix_ctx_add_opaque(&ctx, path);
+        }
+        idx = asnix_bshared_attrs_find(entry, sym_alloutputs);
+        if (idx >= 0) {
+            Value b = asnix_force_for_print(asnix_bshared_attrs_value(entry, idx));
+            if (asnix_tag_of(b) == ASNIX_TAG_IMM && asnix_imm_subtag(b) == ASNIX_IMM_TRUE) {
+                if (!ends_with_dot_drv(path, key_len)) {
+                    fprintf(stderr,
+                            "asnix: appendContext: tried to add all-outputs context of %s, which is not a "
+                            "derivation, to a string\n",
+                            path);
+                    exit(1);
+                }
+                asnix_ctx_add_deep(&ctx, path);
+            }
+        }
+        idx = asnix_bshared_attrs_find(entry, sym_outputs);
+        if (idx >= 0) {
+            Value lst = asnix_force_for_print(asnix_bshared_attrs_value(entry, idx));
+            ASNIX_REQUIRE_LIST(lst, "appendContext");
+            int64_t ocount = asnix_bshared_list_count(lst);
+            const Value *oelems = asnix_bshared_list_elems(lst);
+            if (ocount > 0 && !ends_with_dot_drv(path, key_len)) {
+                fprintf(stderr,
+                        "asnix: appendContext: tried to add derivation output context of %s, which is not a "
+                        "derivation, to a string\n",
+                        path);
+                exit(1);
+            }
+            for (int64_t j = 0; j < ocount; j++) {
+                Value onm = asnix_force_for_print(oelems[j]);
+                ASNIX_REQUIRE_STRING(onm, "appendContext");
+                int64_t onlen;
+                const char *onbytes;
+                asnix_bshared_string_bytes(onm, &onbytes, &onlen, "appendContext");
+                char *oname = strndup(onbytes, (size_t)onlen);
+                asnix_ctx_add_built(&ctx, path, oname);
+                free(oname);
+            }
+        }
+        free(path);
+    }
+
+    Value out = asnix_make_string_value(orig_bytes, (size_t)orig_len);
+    asnix_string_attach_context(out, &ctx);
+    return out;
 }
 static Value build_appendContext(void) { return asnix_bshared_make_curried_native((void *)appendContext2_impl, 2); }
+
+/* `builtins.unsafeDiscardOutputDependency s` -- ported from context.cc's
+ * `prim_unsafeDiscardOutputDependency`: every DrvDeep element in `s`'s
+ * context becomes a plain Opaque element at the same path (Built/Opaque
+ * elements pass through unchanged). Always succeeds -- no size
+ * restriction on the context, unlike `addDrvOutputDependencies` below. */
+static Value prim_unsafeDiscardOutputDependency(const Value *args, int64_t argc) {
+    (void)argc;
+    ASNIX_REQUIRE_STRING(args[0], "unsafeDiscardOutputDependency");
+    int64_t len;
+    const char *bytes;
+    asnix_bshared_string_bytes(args[0], &bytes, &len, "unsafeDiscardOutputDependency");
+    const AsnixStringContext *src = asnix_string_context_of(args[0]);
+    if (asnix_ctx_is_empty(src)) return args[0];
+    AsnixStringContext ctx;
+    asnix_ctx_init(&ctx);
+    for (size_t i = 0; i < src->ndrvs; i++) asnix_ctx_add_built(&ctx, src->drvs[i].drv_path, src->drvs[i].output_name);
+    for (size_t i = 0; i < src->nsrcs; i++) asnix_ctx_add_opaque(&ctx, src->srcs[i]);
+    for (size_t i = 0; i < src->ndeep; i++) asnix_ctx_add_opaque(&ctx, src->deep[i]);
+    Value out = asnix_make_string_value(bytes, (size_t)len);
+    asnix_string_attach_context(out, &ctx);
+    return out;
+}
+static Value build_unsafeDiscardOutputDependency(void) {
+    return asnix_bshared_make_primop((void *)prim_unsafeDiscardOutputDependency, 1);
+}
+
+/* `builtins.addDrvOutputDependencies s` -- ported from context.cc's
+ * `prim_addDrvOutputDependencies`: `s`'s context must have EXACTLY one
+ * element; an Opaque element whose path ends `.drv` becomes DrvDeep, a
+ * DrvDeep element passes through unchanged (idempotent, confirmed
+ * directly against real `nix-instantiate --eval`: `addDrvOutputDependencies
+ * d.drvPath == addDrvOutputDependencies (addDrvOutputDependencies
+ * d.drvPath)`), and a Built element (a specific named output) is a hard
+ * error -- "can only act on derivations, not on a derivation output". */
+static Value prim_addDrvOutputDependencies(const Value *args, int64_t argc) {
+    (void)argc;
+    ASNIX_REQUIRE_STRING(args[0], "addDrvOutputDependencies");
+    int64_t len;
+    const char *bytes;
+    asnix_bshared_string_bytes(args[0], &bytes, &len, "addDrvOutputDependencies");
+    const AsnixStringContext *src = asnix_string_context_of(args[0]);
+    size_t total = src ? src->ndrvs + src->nsrcs + src->ndeep : 0;
+    if (total != 1) {
+        fprintf(stderr, "asnix: addDrvOutputDependencies: context must have exactly one element, but has %zu\n",
+                total);
+        exit(1);
+    }
+    AsnixStringContext ctx;
+    asnix_ctx_init(&ctx);
+    if (src->ndeep == 1) {
+        asnix_ctx_add_deep(&ctx, src->deep[0]);
+    } else if (src->nsrcs == 1) {
+        if (!ends_with_dot_drv(src->srcs[0], strlen(src->srcs[0]))) {
+            fprintf(stderr, "asnix: addDrvOutputDependencies: path '%s' is not a derivation\n", src->srcs[0]);
+            exit(1);
+        }
+        asnix_ctx_add_deep(&ctx, src->srcs[0]);
+    } else {
+        fprintf(stderr,
+                "asnix: addDrvOutputDependencies: can only act on derivations, not on a derivation output "
+                "such as '%s'\n",
+                src->drvs[0].output_name);
+        exit(1);
+    }
+    Value out = asnix_make_string_value(bytes, (size_t)len);
+    asnix_string_attach_context(out, &ctx);
+    return out;
+}
+static Value build_addDrvOutputDependencies(void) {
+    return asnix_bshared_make_primop((void *)prim_addDrvOutputDependencies, 1);
+}
 
 /* unsafeDiscardStringContext s (M58-adjacent, found via d.nix right
  * after M58's derivation fix let nixpkgs eval far enough to reach a
  * call to it -- `pkgs/build-support/fetchurl/default.nix` and friends
  * call it on `url`/`name`-shaped strings before using them as plain
- * env-var values). Same "no string-context tracking at all" situation
- * as getContext/appendContext right above: with no context ever
- * attached to any string in this evaluator, discarding it is already
- * a no-op -- returning `s` unchanged reproduces the one observable
- * property real Nix's own version has for a plain, context-free string
- * (confirmed: `builtins.unsafeDiscardStringContext "foo" == "foo"`). */
+ * env-var values). M80: now that `getContext` is real (above), this
+ * MUST return a genuinely context-free value, not `args[0]` unchanged
+ * -- the string-context side table is keyed by the Value's own arena
+ * POINTER (string_context.c), so returning the same pointer would leave
+ * `getContext (unsafeDiscardStringContext s)` finding `s`'s own
+ * still-attached context (confirmed needed directly against real
+ * `nix-instantiate --eval`'s `eval-okay-context-builtins.nix`: `discard
+ * = ctx (builtins.unsafeDiscardStringContext s);` must be `{}`, not
+ * `s`'s own non-empty context). A fresh `asnix_make_string_value` with
+ * the same bytes, under a NEW arena pointer, with nothing ever attached
+ * to it, is exactly that. */
 static Value prim_unsafeDiscardStringContext(const Value *args, int64_t argc) {
     (void)argc;
     ASNIX_REQUIRE_STRING(args[0], "unsafeDiscardStringContext");
-    return args[0];
+    int64_t len;
+    const char *bytes;
+    asnix_bshared_string_bytes(args[0], &bytes, &len, "unsafeDiscardStringContext");
+    return asnix_make_string_value(bytes, (size_t)len);
 }
 static Value build_unsafeDiscardStringContext(void) {
     return asnix_bshared_make_primop((void *)prim_unsafeDiscardStringContext, 1);
@@ -876,8 +1159,11 @@ const AsnixBuiltinM54Def ASNIX_M54_BUILTINS[] = {
     { "toXML", build_toXML },
     { "convertHash", build_convertHash },
     { "getContext", build_getContext },
+    { "hasContext", build_hasContext },
     { "appendContext", build_appendContext },
     { "unsafeDiscardStringContext", build_unsafeDiscardStringContext },
+    { "unsafeDiscardOutputDependency", build_unsafeDiscardOutputDependency },
+    { "addDrvOutputDependencies", build_addDrvOutputDependencies },
     { "scopedImport", build_scopedImport },
     { "unsafeGetAttrPos", build_unsafeGetAttrPos },
 };

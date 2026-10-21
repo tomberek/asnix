@@ -8,6 +8,7 @@
 #include "asnix/arena.h"
 #include "asnix/heap.h"
 #include "builtins_shared.h" /* asnix_bshared_type_name, see M50 */
+#include "string_context.h" /* M80: dynamic attr-name context rejection */
 #include "symtab.h"
 #include "value_util.h"
 
@@ -75,6 +76,23 @@ Value asnix_attrs_insert_dynamic(Value attrs, Value name_val, Value value) {
     if (asnix_tag_of(name_val) != ASNIX_TAG_PTR || asnix_value_is_path(name_val) || asnix_value_is_float(name_val)) {
         fprintf(stderr, "asnix: a dynamic '${...}' attribute name must be a string (got %s)\n",
                 asnix_bshared_type_name(name_val));
+        exit(1);
+    }
+    /* M80: a `${...}` attribute name cannot carry string context -- real
+     * Nix's own `ExprAttrs::eval` calls `state.forceStringNoCtx` on a
+     * dynamic attribute name (~/nix/src/libexpr/eval.cc), which hard-
+     * errors ("the string '...' is not allowed to refer to a store path")
+     * the moment the name's context is non-empty, confirmed directly:
+     * `{ ${"${derivation {...}}"} = 1; }` fails on real
+     * `nix-instantiate --eval` even though the same string, used as an
+     * ordinary VALUE, is perfectly fine. Only this one call site is
+     * patched (not e.g. `listToAttrs`) -- see this project's own
+     * standing scope-cut convention of fixing exactly the call site a
+     * failing fixture needs, not every symbol-from-string site at once. */
+    const AsnixStringContext *name_ctx = asnix_string_context_of(name_val);
+    if (!asnix_ctx_is_empty(name_ctx)) {
+        fprintf(stderr, "asnix: the string used as a dynamic '${...}' attribute name is not allowed to refer to a "
+                        "store path\n");
         exit(1);
     }
     int64_t name_len;

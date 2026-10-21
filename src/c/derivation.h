@@ -1,6 +1,8 @@
 #ifndef ASNIX_DERIVATION_H
 #define ASNIX_DERIVATION_H
 
+#include <stddef.h>
+
 #include "asnix/value.h"
 #include "builtins_misc.h" /* AsnixBuiltinMiscDef -- reused for ASNIX_DERIVATION_BUILTINS below,
                              * same shared-shape precedent builtins_attrs.h already set for
@@ -65,6 +67,21 @@
  * cut this builds on).
  */
 Value asnix_prim_derivation(const Value *args, int64_t argc);
+
+/* M80: real Nix's `makeFixedOutputPath` formula (M73's
+ * `asnix_compute_fixed_output_path`, ~/nix/src/libstore/
+ * store-dir-config.cc) -- exposed publicly so `builtins.path`'s
+ * `recursive=false`/pinned-`sha256` modes (builtins_path.c) can reuse
+ * it exactly rather than re-deriving the same formula a second time.
+ * `output_hash_mode` is `"recursive"` or `"flat"` (anything else is
+ * treated as `"flat"`, same as the derivation-attribute caller this
+ * was ported from); `algo`/`algo_len` name the hash algorithm (this
+ * project's own callers only ever pass `"sha256"`); `raw`/`raw_len` is
+ * that algorithm's raw digest bytes (a NAR hash for `"recursive"`, a
+ * flat content hash otherwise). */
+void asnix_compute_fixed_output_path(const char *output_hash_mode, const uint8_t raw[64], size_t raw_len,
+                                      const char *algo, size_t algo_len, const char *name, char *out,
+                                      size_t out_cap);
 
 /* The raw primop above, wrapped as a Value -- bound to the bare global
  * `derivationStrict` (and `builtins.derivationStrict`), exactly matching
