@@ -57,7 +57,8 @@ what's actually implemented and the scope decisions made along the way.
 | M42 — `__functor` protocol (calling an attrset via a `__functor` attribute) | done (see below) |
 | M43 — lambda-pattern-vs-attrset disambiguation miscounts `${` in default values | done (see below) |
 | M44 — `builtins.placeholder`/bare `placeholder` | done (see below) |
-| M45-M49 | not started |
+| M45 — `builtins.toFile` | done, **scoped** (see below) |
+| M46-M49 | not started |
 | M50 — name the specific value/field in 6 more generic fatal-path error messages | done (see below) |
 | M51 | in progress (parallel agent: float literals) |
 | M52 — fix `with`-frame leaking into a sibling expression (core evaluator fix) | done, **scoped** (see below) |
@@ -4342,3 +4343,67 @@ failed / 0 known / 62 skipped, identical to the stated baseline; after:
 636 passed / 166 failed / 0 known / 62 skipped. Diffing the two FAIL
 lists directly: exactly the three targeted tests flip from FAIL to
 passing, zero other tests change in either direction -- no regressions.
+
+## M45 scope notes: `builtins.toFile`
+
+Found continuing to chase `d.nix` right after M44: `builtins.toFile`
+was entirely missing. Confirmed via cppnix source (`~/nix/src/
+libexpr/primops.cc`: `.name = "__toFile"`) builtins-only, not a bare
+global.
+
+Computes the store path a `name`/`contents` pair would get -- ported
+directly from `~/nix/src/libstore/store-dir-config.cc`'s
+`makeFixedOutputPathFromCA`'s `TextInfo` case: `makeStorePath(makeType
+(store, "text", refs), sha256(contents), name)`. `makeType` only
+appends anything to the `"text"` type string when `contents` has
+references to OTHER store paths (via string context) -- this project
+tracks no string context at all (confirmed: no context/dependency
+machinery anywhere in this codebase, a separately tracked, larger
+scope cut), so every `contents` string asnix can represent is
+necessarily context-free, making the type string always exactly
+`"text"`. This is the *exact same* algorithm `derivation.c` already
+uses for a `.drv` file's own path (also a `"text"`-type hash) --
+`prim_toFile` reuses `store_path.h`'s public preimage/path-assembly
+helpers directly rather than duplicating `derivation.c`'s file-local
+`compute_store_path` wrapper. Registered via `make_curried_native`
+(arity 2, same curry-chain convention every other 2+-arg builtin in
+this file uses -- a direct 2-arg `make_primop_value` would be
+uncallable from ordinary `toFile "a" "b"` syntax, since `parser.c`'s
+`parse_app` always desugars that into nested arity-1 calls).
+
+Deliberately does NOT perform real Nix's actual filesystem side effect
+(writing `contents` into `/nix/store/...`) -- this project has no real
+content-addressed store at all; only the resulting path *string* is
+computed, matching what every reachable use in `d.nix`'s own
+evaluation (string manipulation on the result, never an actual build)
+needs.
+
+One self-inflicted bug caught before trusting this: initially called
+`free()` on the `char*` returned by `asnix_string_value_to_cstr`,
+which crashed with "free(): invalid pointer" -- that helper allocates
+from this project's own never-free arena (`asnix_arena_alloc`), not
+`malloc`, so it must never be `free()`'d (same convention every other
+arena-sourced pointer in this codebase already follows). Verified
+against real `nix-instantiate --eval` for two different name/content
+pairs: `builtins.toFile "hello.txt" "Hello World"` and `builtins.toFile
+"builder.sh" "#!/bin/sh\necho hi"`, both byte-for-byte matching real
+Nix's computed store paths.
+
+Known, accepted regression: `eval-fail-drv-tofile-output-reference.nix`
+(numtide/nix-conformance) flips from a coincidental PASS to a genuine
+FAIL. That test expects `builtins.toFile "t" "${derivationOutput}"` to
+throw ("files created by builtins.toFile may not reference
+derivations") -- detecting this requires string-context tracking,
+which doesn't exist in this project at all; it was only "passing"
+before because `toFile` itself didn't exist yet, so *any* call failed
+for an unrelated reason ("attribute missing") that happened to also
+satisfy the harness's "exit code != 0" check for an `eval-fail-*` test
+(confirmed by conformance triage: that check never compares error
+text). A real builtin that's actually usable for `d.nix`'s own
+evaluation is worth this one coincidental-pass loss.
+
+`make test`/`test-e2e` green (203 e2e, one new `m45_*` fixture);
+`test-conformance` 637 passed (net -1 vs. the 638 baseline right
+before this change, entirely accounted for by the one documented,
+accepted flip above -- not a regression in `toFile`'s own
+correctness).

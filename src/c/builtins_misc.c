@@ -12,6 +12,7 @@
 #include "base32.h"
 #include "builtins_shared.h"
 #include "hash_shim.h"
+#include "store_path.h"
 #include "value_util.h"
 
 /* ---------------------------------------------------------------------
@@ -450,6 +451,84 @@ static Value prim_placeholder(const Value *args, int64_t argc) {
 static Value build_placeholder(void) { return make_primop_value((void *)prim_placeholder, 1); }
 Value asnix_make_placeholder_primop(void) { return make_primop_value((void *)prim_placeholder, 1); }
 
+/* `builtins.toFile` (M45, `__toFile` in real Nix -- builtins-only,
+ * confirmed in `~/nix/src/libexpr/primops.cc`). Computes the store
+ * path a `name`/`contents` pair would get, ported directly from
+ * `~/nix/src/libstore/store-dir-config.cc`'s `makeFixedOutputPathFromCA`
+ * TextInfo case: `makeStorePath(makeType(store, "text", refs), sha256
+ * (contents), name)` -- `makeType` only appends anything to the `"text"`
+ * type string when `contents` has references to OTHER store paths
+ * (string context), which this project doesn't track at all (confirmed:
+ * no context/dependency machinery anywhere in this codebase), so the
+ * type string here is always exactly `"text"` -- the common case, and
+ * the only one asnix's `contents` strings (always context-free) can
+ * ever actually need. This is the exact same `type:sha256:<storeDir>:
+ * <name>`-preimage algorithm this project's own `derivation.c` already
+ * uses for a `.drv` file's own path (also a `"text"`-type hash) --
+ * reuses `store_path.h`'s public preimage/path-assembly helpers
+ * directly rather than duplicating derivation.c's file-local
+ * `compute_store_path` wrapper. Does NOT perform real Nix's actual
+ * filesystem side effect (writing `contents` into `/nix/store/...`) --
+ * this project has no real content-addressed store at all (a
+ * separately tracked, larger scope cut); only the resulting path
+ * *string* is computed, matching what every reachable use in this
+ * project's own evaluation (string manipulation on the result, never
+ * an actual build) needs. Verified against real `nix-instantiate
+ * --eval`: `builtins.toFile "hello.txt" "Hello World"` ==
+ * "/nix/store/5f20vz4zb4xixz2yrbyr7q8m8xcz0jzf-hello.txt". */
+static Value prim_toFile(const Value *args, int64_t argc) {
+    (void)argc;
+    ASNIX_REQUIRE_STRING(args[0], "toFile");
+    ASNIX_REQUIRE_STRING(args[1], "toFile");
+
+    char *name = asnix_string_value_to_cstr(args[0]);
+    asnix_check_store_path_name(name);
+
+    int64_t contents_len;
+    const char *contents_bytes;
+    asnix_bshared_string_bytes(args[1], &contents_bytes, &contents_len, "toFile");
+
+    uint8_t inner_digest[ASNIX_HASH_SHA256_LEN];
+    int64_t rc = asnix_hash_sha256(contents_bytes, (size_t)contents_len, inner_digest);
+    if (rc != 0) {
+        fprintf(stderr, "asnix: toFile: failed to load libcrypto (rc=%lld) -- enter the flake devShell\n",
+                (long long)rc);
+        exit(1);
+    }
+
+    static const char hexdigits[] = "0123456789abcdef";
+    char hashstr[7 + 64 + 1];
+    memcpy(hashstr, "sha256:", 7);
+    for (int i = 0; i < ASNIX_HASH_SHA256_LEN; i++) {
+        hashstr[7 + 2 * i] = hexdigits[inner_digest[i] >> 4];
+        hashstr[7 + 2 * i + 1] = hexdigits[inner_digest[i] & 0xf];
+    }
+    hashstr[7 + 64] = '\0';
+
+    char preimage[512];
+    size_t n = asnix_store_path_preimage("text", hashstr, name, preimage, sizeof(preimage));
+    if (n == 0) {
+        fprintf(stderr, "asnix: toFile: preimage too long\n");
+        exit(1);
+    }
+
+    uint8_t outer_digest[ASNIX_HASH_SHA256_LEN];
+    rc = asnix_hash_sha256(preimage, n, outer_digest);
+    if (rc != 0) {
+        fprintf(stderr, "asnix: toFile: failed to load libcrypto (rc=%lld) -- enter the flake devShell\n",
+                (long long)rc);
+        exit(1);
+    }
+
+    char out_path[300];
+    if (asnix_make_store_path_from_digest(outer_digest, name, out_path, sizeof(out_path)) == 0) {
+        fprintf(stderr, "asnix: toFile: computed store path too long\n");
+        exit(1);
+    }
+    return asnix_make_string_value(out_path, strlen(out_path));
+}
+static Value build_toFile(void) { return make_curried_native((void *)prim_toFile, 2); }
+
 static Value build_isNull(void) { return make_primop_value((void *)prim_isNull, 1); }
 
 /* `isNull` is one of real Nix's bare root-scope globals (verified against
@@ -508,6 +587,7 @@ const AsnixBuiltinMiscDef ASNIX_BUILTINS_MISC[] = {
     { "baseNameOf", build_baseNameOf },
     { "dirOf", build_dirOf },
     { "placeholder", build_placeholder },
+    { "toFile", build_toFile },
 };
 
 const size_t ASNIX_BUILTINS_MISC_COUNT = sizeof(ASNIX_BUILTINS_MISC) / sizeof(ASNIX_BUILTINS_MISC[0]);
