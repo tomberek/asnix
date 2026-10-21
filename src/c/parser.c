@@ -1250,13 +1250,24 @@ static Ast *parse_let_bindings(Parser *p) {
  * expression, parsed as such by parse_atom). Depth-counting on braces
  * alone is safe regardless of what's nested inside (parens, brackets, a
  * default expression that itself contains `{ }`) since braces are always
- * balanced in valid source independent of their semantic role. */
+ * balanced in valid source independent of their semantic role -- EXCEPT a
+ * string interpolation/dynamic-select's `${` lexes as its own distinct
+ * TOK_DOLLAR_LBRACE (not TOK_LBRACE), while its closing brace is an
+ * ordinary TOK_RBRACE like any other -- so it must also increment depth
+ * here, or every `${...}`/`.${...}` inside the scanned range (e.g. a
+ * formal's default-value expression) decrements depth one extra time
+ * with no matching increment, closing the scan early at the WRONG brace
+ * and misclassifying a genuine lambda pattern as a plain attrset literal
+ * (found evaluating real nixpkgs: `pkgs/stdenv/linux/default.nix`'s
+ * `bootstrapFiles ? let ... archLookupTable.${system} ... in ...`
+ * default value has three `.${...}` dynamic selects before the formals
+ * list's real closing `}`). */
 static size_t find_matching_rbrace(Parser *p, size_t open_idx) {
     size_t depth = 0;
     size_t i = open_idx;
     for (;;) {
         TokKind k = p->toks[i].kind;
-        if (k == TOK_LBRACE) {
+        if (k == TOK_LBRACE || k == TOK_DOLLAR_LBRACE) {
             depth++;
         } else if (k == TOK_RBRACE) {
             depth--;

@@ -55,7 +55,8 @@ what's actually implemented and the scope decisions made along the way.
 | M40 — `${null} = value;` silently omitted, not an error | done (see below) |
 | M41 — dynamic attrpath segments anywhere (`.${k}`, interpolated quoted strings) | done (see below) |
 | M42 — `__functor` protocol (calling an attrset via a `__functor` attribute) | done (see below) |
-| M43-M49 | not started |
+| M43 — lambda-pattern-vs-attrset disambiguation miscounts `${` in default values | done (see below) |
+| M44-M49 | not started |
 | M50 — name the specific value/field in 6 more generic fatal-path error messages | done (see below) |
 | M51-M54 | in progress (parallel agents: floats, with-scoping bug, foldl'/replaceStrings laziness, missing builtins) |
 | M55 — regex engine gaps triage (`builtins.match`/`builtins.split`, 39 conformance failures) | investigated, **no fix** (see below) |
@@ -3989,3 +3990,50 @@ run-to-run due to other agents' concurrent work landing in the shared
 known/62 skipped at the time of this pass, vs. the 633/169/0/62 figure
 quoted when this milestone was assigned, a +2 drift consistent with
 unrelated fixes landing elsewhere, not anything from this pass).
+
+## M43 scope notes: lambda-pattern-vs-attrset disambiguation miscounts `${` in default values
+
+Found continuing to chase `d.nix` right after M42: a parse error
+("expected '='") deep inside `pkgs/stdenv/linux/default.nix`. Root-
+caused via gdb (conditional breakpoint on the specific `expect(p,
+TOK_EQUALS, ...)` call site, printing nearby tokens): the parser had
+entered `parse_binding_stmt` trying to parse `lib` as an ordinary
+attrset-literal binding name (`lib = ...;`), then choked on a `,`
+where it expected `=` -- meaning the disambiguation between "this `{`
+starts a lambda pattern" and "this `{` starts a plain attrset literal"
+had already picked the WRONG answer for this file's actual top-level
+signature, `{ lib, localSystem, config, overlays, bootstrapFiles ?
+<huge default expr>, ... }: ...`.
+
+`find_matching_rbrace` (`parser.c`) implements this disambiguation by
+scanning forward from the opening `{`, tracking brace depth purely by
+counting `TOK_LBRACE`/`TOK_RBRACE`, to find the TRUE matching `}` and
+check whether a `:`/`@` follows it (lambda pattern) or not (attrset
+literal) -- without actually parsing the formals/default-value
+expressions in between. The bug: a string interpolation or dynamic
+attribute select (`${expr}`/`.${expr}`) lexes its OPENING `${` as its
+own distinct `TOK_DOLLAR_LBRACE` token (confirmed throughout this
+project's own string/dynamic-select parsing code, e.g.
+`parse_dquote_string`), which `find_matching_rbrace` never counted as
+a depth-increment -- but the interpolation's CLOSING brace is an
+ordinary `TOK_RBRACE`, which the scan DOES decrement on. Each `${...}`/
+`.${...}` inside the scanned range is therefore one spurious decrement
+with no matching increment, closing the scan early at the wrong `}` and
+corrupting the "what follows it" check. `bootstrapFiles`'s own default
+value (`let table = {...}; archLookupTable = table.${localSystem.libc}
+or (throw ...); files = archLookupTable.${localSystem.system} or
+(...); in (config.replaceBootstrapFiles or lib.id) files`) has three
+such dynamic selects before the formals list's real closing `}`,
+tripping this exactly.
+
+Fix: `find_matching_rbrace` now also increments depth on
+`TOK_DOLLAR_LBRACE`, treating it as an opening brace for counting
+purposes (its own closing `}` already decrements normally) --
+one-line change, no new token kind, no change to how `${...}` is
+parsed anywhere else. Verified with a minimal repro matching the real
+shape (a lambda pattern whose default value contains a `let ... in
+table.${k} or default` dynamic select) against real `nix-instantiate
+--eval --strict`.
+
+`make test`/`test-e2e` green (201 e2e, one new `m43_*` fixture);
+`test-conformance` 635 passed, no regressions.
