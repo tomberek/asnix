@@ -8,6 +8,26 @@
  * never drift apart, same dual-use-header convention as arena.h's
  * ASNIX_ARENA_OFF_* constants.
  */
+/*
+ * M80: left at the ORIGINAL sizes, unlike dispatch.S's own (see that
+ * file's ASNIX_VALSTACK_BYTES/ASNIX_RETSTACK_BYTES comment) -- a real
+ * high-water-mark measurement against five real nixpkgs packages found
+ * a tiny peak here too (1,680 bytes valstack / 960 bytes retstack), but
+ * two independent findings while verifying a shrink proved that sample
+ * isn't representative enough to size against, matching apply.S's own
+ * identical conclusion for its ASNIX_APPLY_VALSTACK_BYTES/
+ * ASNIX_APPLY_RETSTACK_BYTES (see that file's comment for the full
+ * reasoning -- this buffer is intentionally the same size, reused here
+ * rather than duplicating the same two numbers under a second name):
+ * `tests/e2e/m9_large_list.nix` needs ~120,000 bytes of valstack
+ * (a 15,000-element literal list is constructed *through this exact
+ * buffer*, since op_call.S forces every primop argument via
+ * asnix_force_for_print), and real Nix's own `max-call-depth` default
+ * of 10,000 function calls is already comfortably above this buffer's
+ * original 2,048-call-frame retstack capacity -- shrinking either
+ * further without real-usage evidence it's safe would only widen an
+ * already-known gap.
+ */
 #define ASNIX_FORCE_VALSTACK_BYTES 262144 /* 32,768 Values, 256 KiB */
 #define ASNIX_FORCE_RETSTACK_BYTES 65536  /* 2,048 call frames, 64 KiB */
 
@@ -82,8 +102,12 @@ void *asnix_apply_scratch_retstack(int64_t depth);
  * total_allocated figure, well above apply.S's own (already-fixed)
  * share.
  */
-#define ASNIX_EVAL_VALSTACK_BYTES 8388608 /* 1,048,576 Values, 8 MiB -- must match dispatch.S's own equ */
-#define ASNIX_EVAL_RETSTACK_BYTES 2097152 /* 65,536 call frames, 2 MiB -- must match dispatch.S's own equ */
+/* M80: right-sized, see dispatch.S's own equ (which this must match) for
+ * the measurement/margin reasoning (including the real-Nix
+ * `max-call-depth` cross-check that sized RETSTACK, not the raw
+ * per-package measurement alone). */
+#define ASNIX_EVAL_VALSTACK_BYTES 1048576 /* 131,072 Values, 1 MiB -- must match dispatch.S's own equ */
+#define ASNIX_EVAL_RETSTACK_BYTES 1048576 /* 32,768 call frames, 1 MiB -- must match dispatch.S's own equ */
 
 #ifndef __ASSEMBLER__
 void *asnix_eval_scratch_valstack(int64_t depth);

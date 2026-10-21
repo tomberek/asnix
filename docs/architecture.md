@@ -92,7 +92,8 @@ what's actually implemented and the scope decisions made along the way.
 | M77 — `make test-nixpkgs-hash`: a real-nixpkgs derivation-hash correctness regression test (non-gating, like `test-nix-conformance`), filling a gap the user flagged directly — M58-M76's entire bug-chase had zero automated coverage of its own actual target; found and fixed `builtins.toFile` never attaching self-referential string context (a second, independent M76-class gap) and a `curl.outPath` crash (registered as a known-failing case, not yet root-caused) | done (see below) |
 | M78 — `asnix_apply`/`asnix_eval` (dispatch.S's own main entry point) both had the exact never-free-arena scratch-buffer waste M74's own `asnix_force_for_print` fix had already fixed, just never applied to these two siblings; found chasing a direct "memory usage seems high" question | done (see below; `./asnix d.nix`'s `asnix_arena.total_allocated` 4.69 GB → 151 MB, peak RSS 226 MB → 169 MB, ~1.8x → ~1.35x of real Nix's own usage) |
 | M79 — **`./asnix d.nix` and `./asnix e.nix` now match real `nix-instantiate --eval --strict` byte-for-byte** (`hello.outPath`/`hello.drvPath` against real nixpkgs) — the standing bug-chase's own ultimate goal since it was set after M72. Three parallel investigations (`concatStringsSep` context-loss + missing per-element coercion, the `+` operator's `copyToStore` flag being wrongly tied to `check_path_exists`, `toJSON`'s Path handling never copying to the store) each independently traced different symptoms (missing `InputDrvs`, a `curl.outPath` crash, a stale `bash-interactive` `__json` blob) back to real, fixable asnix gaps; merging all three together (not any single one alone) closed the entire remaining bootstrap-chain gap at once | done (see below; `make test-nixpkgs-hash`: pass=1/fail=7 → **pass=8/fail=0**) |
-| M80+ | not started |
+| M80 — right-sized M78's scratch-buffer constants against a real measured high-water-mark instead of leaving them as round-number guesses; `asnix_eval`'s shrunk (8 MiB/2 MiB → 1 MiB/1 MiB), `asnix_apply`/`asnix_force_for_print`'s deliberately left unchanged after real-world cross-checks (a 15,000-element list literal test, real Nix's own 10,000-call `max-call-depth` default) proved the raw per-package measurement wasn't representative enough to shrink safely | done (see below; `asnix_arena.total_allocated` for `d.nix`: 151 MB → 126 MB, ~17%; zero regressions) |
+| M81+ | not started |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
 
@@ -8353,3 +8354,218 @@ milestone) → **`pass=8 fail=0`** -- every attribute path in the corpus
 (`hello`, `hello.src`, `bash`, `curl`, `.outPath`/`.drvPath` each) now
 matches real Nix exactly. `make test`/`test-e2e`/`test-conformance`/
 `test-nix-conformance` all green, zero regressions.
+## M80: right-sizing the M78 scratch buffers against a real measurement
+
+M78 fixed the *never-free-a-fresh-buffer-per-call* waste by caching one
+VALSTACK+RETSTACK pair per recursion depth, but left the per-buffer
+SIZES themselves exactly as they'd always been -- round-number guesses
+(`asnix_eval`: 8 MiB VALSTACK / 2 MiB RETSTACK; `asnix_apply`/
+`asnix_force_for_print`: 256 KiB / 64 KiB each) never checked against
+real usage. This milestone measures the real high-water mark each kind
+reaches and shrinks the constants with a safety margin, instead of
+guessing a second time -- and, after two real-world cross-checks each
+caught the measurement under-selling the true requirement, ends up only
+shrinking `asnix_eval`'s own buffers, leaving `asnix_apply`/
+`asnix_force_for_print` at their original sizes.
+
+**Measurement method**: temporary instrumentation (not committed --
+added, measured, then fully reverted), guarded by a `-DASNIX_HWM_DEBUG`
+build flag so it never touches a normal build. Three pieces, since every
+VALSTACK/RETSP push in this codebase funnels through
+`include/asnix/stackcheck.h`'s `ASNIX_CHECK_VALSTACK`/`ASNIX_CHECK_RETSP`
+macros (the one choke point shared by all three dispatch contexts):
+(1) three new globals (`asnix_hwm_kind`, `asnix_hwm_valstack_base`,
+`asnix_hwm_retstack_base`) set/restored at each of
+`dispatch.S`/`apply.S`/`force.S`'s own entry and exit points, exactly
+mirroring the existing `asnix_valstack_limit`/`asnix_retsp_limit`
+save/restore discipline those files already have (same reasoning: each
+context can run nested inside another); (2) the two check macros,
+extended to call a small helper (`asnix_hwm_track`) that computes
+`current_pointer - base` and keeps a running max per kind (eval=0/
+apply=1/force=2); (3) a print at `main`'s exit. Two real bugs surfaced
+and were fixed *in the instrumentation itself* before it produced
+trustworthy numbers (both reverted along with everything else,
+documented here so a future attempt doesn't repeat them):
+- The entry-point save blocks push an odd number of extra qwords (3:
+  kind/valstack_base/retstack_base), breaking the carefully-maintained
+  16-byte stack alignment every `call` mid-dispatch relies on --
+  segfaulted inside unrelated libc code (`asnix_lex`) the instant any
+  op handler made a `call` after the push. Fixed by padding to 4 qwords.
+- `builtins.tryEval`'s `longjmp` catch path (`src/c/builtins_tryeval.c`)
+  already has to explicitly save/restore `asnix_valstack_limit`/
+  `asnix_retsp_limit` around its `setjmp`, with a comment explaining
+  exactly why: a caught `throw`/`assert` skips the normal epilogue that
+  would otherwise restore them. The new debug globals needed the
+  identical explicit save/restore, or a caught exception permanently
+  left `asnix_hwm_valstack_base` pointing at the abandoned nested
+  force's buffer -- the next check anywhere computed a bogus huge
+  distance from that stale base and permanently poisoned that kind's
+  running max (observed directly: one single reading of 16 MB that
+  never moved again, traced via a conditional breakpoint to a
+  `prim_tryEval` frame on the stack).
+
+**Measured peaks**, running `./asnix -A <attr>.<outPath|drvPath>
+tests/nixpkgs-hash/pkgs.nix` against real nixpkgs for `hello`,
+`hello.src`, `bash`, `gcc`, and `stdenv` (chosen for dependency-chain
+diversity; `curl`/`ffmpeg` already fail for unrelated pre-existing
+reasons, see `test-nixpkgs-hash`'s own known failures):
+
+| kind  | valstack max | retstack max | old size (V/R)  |
+|-------|-------------:|-------------:|-----------------|
+| eval  | 28,944 B     | 5,312 B      | 8 MiB / 2 MiB   |
+| apply | 352 B        | 864 B        | 256 KiB / 64 KiB|
+| force | 1,680 B      | 960 B        | 256 KiB / 64 KiB|
+
+Every attribute/field combination produced *identical* numbers --
+strong evidence the measurement is dominated by the shared nixpkgs/lib/
+overlay bootstrap common to all of them, not the specific package, but
+also a strong signal (confirmed twice over, below) that five packages'
+worth of measurement doesn't exercise every real usage pattern.
+
+**Cross-check #1 -- VALSTACK, caught by this project's own test suite**:
+the first attempt shrank ALL FOUR buffer pairs using only the table
+above (e.g. `asnix_apply`/`asnix_force_for_print`'s VALSTACK: 256 KiB ->
+64 KiB, a ~40x margin over the 1,680-byte measured peak). `make
+test-e2e` immediately caught a real regression: `tests/e2e/
+m9_large_list.nix` (a literal 15,000-element list passed straight to
+`builtins.length`, a deliberate M9-era stress test for VALSTACK/RETSP's
+bounds check -- see that milestone's "Known bugs" entry) failed with a
+genuine `asnix: value stack overflow` abort. Root cause: `op_call.S`'s
+primop-call path forces every argument via `asnix_force_for_print`
+(M25's comment on that call site) *before* handing it to the native C
+function -- so a primop argument that's a large literal list/attrset
+gets *constructed* (every element's `OP_MK_THUNK` push, replaced by one
+`OP_MK_LIST` pop) entirely inside `force.S`'s own nested dispatch
+context, using its VALSTACK, not `dispatch.S`'s much larger top-level
+one. 15,000 elements at 8 bytes each needs ~120,000 bytes -- far more
+than the tiny 1,680-byte peak the five real packages above ever touched
+(none of them happens to pass a large literal straight into a primop).
+Bisected directly (binary-searching `ASNIX_APPLY_VALSTACK_BYTES`/
+`ASNIX_FORCE_VALSTACK_BYTES` with everything else held fixed): 65536
+fails, 131072 passes, confirming ~120 KiB is a real hard floor for this
+one visible case alone.
+
+**Cross-check #2 -- RETSTACK, caught by comparing against real Nix's
+own source**: mid-session, asked directly whether real Nix has an
+analogous limit worth emulating. It doesn't have a literal VALSTACK/
+RETSTACK pair -- real Nix (`nix-instantiate`/`nix eval`, C++
+`libexpr`) is a recursive tree-walking evaluator, not a bytecode-VM
+with an explicit operand/call-frame stack; every `Expr::eval` call and
+every intermediate `Value` lives directly on the native C++ call stack.
+But it has two closely analogous, deliberately-chosen limits, confirmed
+directly from a local checkout of the real Nix source
+(`/home/tbereknyei/gnix/nix`, not from memory):
+- `src/libexpr/eval.cc`'s `EvalState` constructor calls
+  `nix::ensureStackSizeAtLeast(60 * 1024 * 1024)` once per process --
+  real Nix bumps its OWN native stack (`setrlimit(RLIMIT_STACK, ...)`,
+  `src/libutil/unix/current-process.cc`) to 60 MiB specifically because
+  the default OS stack (commonly 8 MiB) isn't enough for its own
+  recursive evaluation style. This is the rough analog of asnix's
+  *combined* VALSTACK+RETSTACK budget (both serve the same underlying
+  purpose -- bounding how deep/wide one evaluation can recurse/branch
+  before something has to give -- just split into two separate
+  explicit heap buffers in asnix's bytecode-VM design instead of one
+  native stack).
+  - `src/libexpr/include/nix/expr/eval-settings.hh`'s `maxCallDepth`
+  `Setting<unsigned int>` defaults the `max-call-depth` nix.conf option
+  to **10,000** function calls -- a deliberately *friendlier*,
+  explicit-counter guard (`EvalState::addCallDepth`/`callDepth`,
+  `eval-inline.hh`) that fires well before the 60 MiB native stack
+  would actually be exhausted, so a deeply-recursive (or infinitely
+  recursive) Nix program gets a clean `StackOverflowError` instead of a
+  SIGSEGV. `print.cc`/`print-ambiguous.cc` reuse the same
+  `maxCallDepth` setting to bound recursive *printing* depth too (the
+  direct analog of asnix's own `force.S`-driven nested-value forcing).
+  Notably, ordinary thunk-forcing (`EvalState::forceValue`'s
+  `expr->eval(...)` call for a plain, non-`App` thunk) does NOT
+  increment `callDepth` at all -- only actual function applications
+  do -- so a long `let`-chain of dependent bindings is bounded only by
+  the raw 60 MiB stack, not the friendlier 10,000 counter; a nuance
+  that didn't change anything here but is worth knowing before trusting
+  `max-call-depth` as a universal proxy for "how deep can recursion go."
+
+  This directly exposed a problem with the first attempt's RETSTACK
+  numbers: `asnix_eval`'s own RETSTACK (meant to hold ordinary
+  in-language `OP_CALL` recursion -- the same role `maxCallDepth`
+  plays) had been shrunk to 8,192 call frames, which is *smaller* than
+  real Nix's own 10,000-call default -- meaning a real, deeply recursive
+  Nix program real Nix would accept right up to its own configured
+  limit could now get rejected by asnix with a tighter cap than before
+  this milestone (the original 65,536-frame RETSTACK was comfortably
+  above 10,000). Separately, `asnix_apply`/`asnix_force_for_print`'s own
+  RETSTACK (2,048 frames originally) was ALREADY below Nix's 10,000-call
+  guarantee even before this milestone touched anything -- a
+  pre-existing gap (deeply recursive user code invoked *through*
+  `map`/`filter`/`foldl'`, an entirely ordinary nixpkgs pattern, runs
+  its own `OP_CALL` chain against this smaller nested RETSTACK, not
+  `asnix_eval`'s) -- and the first attempt's further shrink to 512
+  frames would have made that pre-existing gap 4x worse with no
+  real-usage evidence it was safe to.
+
+**Final sizes chosen**, after both cross-checks:
+- `asnix_eval` (`dispatch.S`'s `ASNIX_VALSTACK_BYTES`/
+  `ASNIX_RETSTACK_BYTES`, mirrored in `force_scratch.h`'s
+  `ASNIX_EVAL_*_BYTES`): VALSTACK 8 MiB -> **1 MiB** (131,072 Values,
+  >35x margin over the 28,944-byte measured peak, independently
+  confirmed to still hold `m9_large_list.nix`'s ~120,000-byte literal
+  with >8x headroom); RETSTACK 2 MiB -> **1 MiB** (32,768 call frames,
+  sized against real Nix's own 10,000-call `max-call-depth` default
+  rather than the 5,312-byte/166-frame measured peak -- >3.2x margin
+  over that much better-grounded reference point, still a 2x reduction
+  from the original).
+- `asnix_apply`/`asnix_force_for_print`: **left at their original
+  sizes** (256 KiB VALSTACK / 64 KiB RETSTACK each) -- both
+  cross-checks above landed on this same context, and with no
+  real-usage evidence covering either failure mode (large literals
+  passed to primops; deep recursion inside a `map`/`filter`/`foldl'`
+  callback), shrinking either further wasn't defensible this
+  milestone.
+
+**Verification**: `make test`/`test-e2e`/`test-conformance` all green;
+`make test-nix-conformance` pass=628/fail=30/skip=148, identical to the
+pre-change baseline (confirmed across repeated runs -- the corpus has a
+`timeout 10`-per-file ceiling that occasionally flakes under system load
+regardless of this change, reproduced identically on the unmodified
+baseline too); `make test-nixpkgs-hash` pass=1/fail=7 with the exact
+same 7 failures as baseline. `./asnix d.nix`/`./asnix e.nix`
+(`hello.outPath`/`hello.drvPath`) byte-identical to their pre-change
+output; `tests/e2e/m9_large_list.nix`/`m9_large_attrset.nix`/
+`m9_deep_let_chain.nix` (the project's own existing stress tests for
+exactly these buffers) all still pass.
+
+**Memory impact**: `asnix_arena.total_allocated` evaluating `d.nix`
+(`hello.outPath`): 151 MB -> **126 MB** (~17% reduction) -- a real cut
+to the virtual-allocation footprint, smaller than the first (reverted)
+attempt's ~24% since only `asnix_eval`'s own buffers shrank in the end.
+Peak RSS (`/usr/bin/time -v`) and `/proc/<pid>/smaps_rollup`'s
+`Rss`/`Pss_Anon` (same gdb-breakpoint-then-`shell sleep`-then-read-
+from-another-shell technique M78 used), however, showed **no
+measurable change** for this specific workload: ~169,080 KiB -> ~169,224
+KiB RSS, within noise. This matches M78's own precedent exactly ("no
+further RSS change expected or seen, since the remaining waste was
+already almost entirely unwritten pages"): `hello.outPath` only ever
+reaches a handful of distinct recursion depths (consistent with the
+tiny measured peaks above), so most of the *old*, larger per-depth
+buffers were already virtual/untouched rather than resident --
+shrinking them reduces bookkeeping and address-space reservation, not
+pages that were actually costing real memory for *this* shallow
+workload. A deeper/wider real evaluation that touches many more
+distinct depths (more nested `import`s specifically, since that's the
+one buffer kind that did shrink) would be expected to show a more
+visible RSS win from this change, proportional to how many of those
+per-depth slots actually get written into; not independently
+re-measured here beyond `d.nix`/`e.nix` and the full test suite.
+
+**Confidence caveat** (per this project's own stated preference for a
+conservative, honest partial win over an aggressive unverified one):
+this milestone's real deliverable ended up being narrower than its
+starting goal -- only `asnix_eval` shrank, and even that was corrected
+mid-session once real Nix's own `max-call-depth` reference exposed the
+first RETSTACK number as too aggressive. `asnix_apply`/
+`asnix_force_for_print` are UNCHANGED from before this milestone,
+including the pre-existing (not newly introduced) gap where their own
+RETSTACK (2,048 frames) is already smaller than real Nix's 10,000-call
+default -- a real, narrow limitation this milestone surfaced but didn't
+fix, left as-is because fixing it defensibly would need either a wider
+real-usage sample than five packages or a deliberate decision to just
+match real Nix's number outright, neither of which this session did.

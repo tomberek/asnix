@@ -54,6 +54,39 @@ asnix_apply_depth:
     // the main dispatch loop and force.S use, so a pathological closure
     // body (e.g. one that builds a huge list) fails loudly instead of
     // silently corrupting the arena.
+    // M80: BOTH left at their original sizes, deliberately NOT shrunk
+    // to match the tiny measured peaks a real-nixpkgs sample showed
+    // (352 bytes valstack / 864 bytes retstack -- see
+    // docs/architecture.md's M80 scope notes for the full measurement).
+    // Two independent reasons this sample isn't trustworthy enough to
+    // size against here, unlike dispatch.S's own (much larger, and
+    // independently cross-checked) buffers:
+    //
+    // VALSTACK: `tests/e2e/m9_large_list.nix` (a literal 15,000-element
+    // list passed straight to `builtins.length`) is constructed
+    // entirely *inside this exact buffer*, not dispatch.S's -- op_call.S
+    // forces every primop argument via asnix_force_for_print, which
+    // shares this file's ASNIX_APPLY_VALSTACK_BYTES/
+    // ASNIX_APPLY_RETSTACK_BYTES value with force.S's own ASNIX_FORCE_*
+    // (see force_scratch.h) -- needing ~120,000 bytes for that one test
+    // alone, far more than the tiny per-package measurement ever
+    // touched (none of those five packages happens to pass a large
+    // literal straight into a primop). A shrink to 64 KiB (briefly
+    // tried) regressed that test with a real "value stack overflow"
+    // abort.
+    //
+    // RETSTACK: real Nix's own `max-call-depth` default is 10,000
+    // function calls (see dispatch.S's own comment on
+    // ASNIX_RETSTACK_BYTES for the exact source reference) -- a
+    // deeply-recursive user function invoked *through* `map`/`filter`/
+    // `foldl'` (an extremely ordinary nixpkgs pattern) runs its own
+    // recursive OP_CALLs against THIS RETSTACK, not dispatch.S's, since
+    // once inside this dispatch context further calls stay in it. The
+    // original 64 KiB (2,048 frames) is already below Nix's own 10,000-
+    // call guarantee -- a pre-existing gap, not one this milestone
+    // introduces -- but a further shrink (16 KiB/512 frames, briefly
+    // tried) would have made that gap 4x worse with no real-usage
+    // evidence that it's safe to.
     .equ ASNIX_APPLY_VALSTACK_BYTES, 262144 // 32,768 Values, 256 KiB
     .equ ASNIX_APPLY_RETSTACK_BYTES, 65536  // 2,048 call frames, 64 KiB
 

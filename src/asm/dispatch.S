@@ -34,8 +34,39 @@
     // silently corrupting whatever the arena allocated next past that
     // point instead of failing loudly; see docs/architecture.md's "Known
     // bugs" list.
-    .equ ASNIX_VALSTACK_BYTES, 8388608 // 1,048,576 Values, 8 MiB
-    .equ ASNIX_RETSTACK_BYTES, 2097152 // 65,536 call frames (ASNIX_RETFRAME_SIZE=32), 2 MiB
+    // M80: right-sized against a real high-water-mark measurement (see
+    // docs/architecture.md's M80 scope notes) -- previously 8 MiB/2 MiB,
+    // a round-number guess never checked against real usage. Measured
+    // peak evaluating `hello`/`hello.src`/`bash`/`gcc`/`stdenv`
+    // outPath/drvPath against real nixpkgs (tests/nixpkgs-hash/pkgs.nix):
+    // ~28.3 KiB valstack / ~5.2 KiB retstack, consistent across every
+    // attribute tried (dominated by the shared nixpkgs/lib/overlay
+    // bootstrap common to all of them, not the specific package).
+    //
+    // VALSTACK: 1 MiB gives a >35x margin over that measured peak, and
+    // is independently confirmed to still hold `tests/e2e/
+    // m9_large_list.nix`'s 15,000-element literal (~120,000 bytes) with
+    // room to spare -- see apply.S's own comment on why that specific
+    // test mattered for sizing this project's scratch buffers.
+    //
+    // RETSTACK: NOT sized off the tiny ~5.2 KiB measured peak -- real
+    // Nix (github.com/NixOS/nix, checked directly:
+    // src/libexpr/include/nix/expr/eval-settings.hh's `maxCallDepth`
+    // Setting) defaults its own `max-call-depth` function-call-nesting
+    // guard to 10,000 calls (enforced in `EvalState::addCallDepth`,
+    // eval-inline.hh), well below the 60 MiB native C++ stack it
+    // separately bumps itself to (`ensureStackSizeAtLeast` in eval.cc)
+    // -- i.e. real Nix's own *deliberately friendly* recursion-depth
+    // limit is a MUCH better-grounded reference for "how deep can a
+    // real recursive Nix program legitimately go" than five packages'
+    // worth of measurement, which only reached ~166 RetFrames deep and
+    // said nothing about how much deeper a real recursive user function
+    // (e.g. called via a naively-recursive `lib` helper over a long
+    // list) might need. 1 MiB (32,768 call frames) gives a >3.2x margin
+    // over Nix's own 10,000-call default, while still an 2x reduction
+    // from the original 2 MiB.
+    .equ ASNIX_VALSTACK_BYTES, 1048576 // 131,072 Values, 1 MiB
+    .equ ASNIX_RETSTACK_BYTES, 1048576 // 32,768 call frames (ASNIX_RETFRAME_SIZE=32), 1 MiB
 
     // asnix_eval's own nested-recursion depth (every `import` of an
     // uncached file, eval_file.c, re-enters asnix_eval, and imports can
