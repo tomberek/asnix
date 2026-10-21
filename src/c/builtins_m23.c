@@ -1,0 +1,491 @@
+/*
+ * seq, deepSeq, pathExists, readFile, readFileType, readDir, toPath,
+ * getEnv, intersectAttrs, groupBy -- see builtins_m23.h. Verified
+ * against real `nix-instantiate --eval` (2.35.2) before being trusted;
+ * see each function's own comment for the specific expressions checked.
+ */
+#define _DEFAULT_SOURCE /* lstat() is POSIX, not C11 -- same feature-test macro
+                          * eval_file.c's own realpath() needs under -std=c11 */
+#include "builtins_m23.h"
+
+#include <ctype.h>
+#include <dirent.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+
+#include "asnix/arena.h"
+#include "asnix/heap.h"
+#include "asnix/ir.h"
+#include "builtins_shared.h"
+#include "symtab.h"
+#include "value_util.h"
+
+/* ---------------------------------------------------------------------
+ * seq/deepSeq -- `seq e1 e2` forces e1 (shallow -- if it's a thunk,
+ * evaluate it; its own nested fields stay lazy) then returns e2 (also
+ * only shallow-forced, matching real Nix's `prim_seq`:
+ * `state.forceValue(*args[0]); state.forceValue(*args[1]); v = *args[1];`
+ * -- NOT deep on either side). `deepSeq e1 e2` instead walks e1
+ * recursively (into every list element / attrset value), matching real
+ * Nix's `forceValueDeep`, but still only shallow-forces e2. Verified:
+ * `builtins.seq (abort "x") 1` aborts (e1 is forced); `builtins.seq { a
+ * = abort "x"; } 1` does NOT abort (only the outer set is forced, not
+ * its fields) -- `builtins.deepSeq { a = abort "x"; } 1` DOES abort.
+ *
+ * deepSeq's recursion needs cycle detection: real Nix's own
+ * `forceValueDeep` keeps a `seen` set specifically because a self-
+ * referential value (`let as = { x = 123; y = as; }; in as`) is legal,
+ * lazy Nix and must not infinite-loop just because `deepSeq` walks it
+ * (numtide/nix-conformance's eval-okay-deepseq.nix tests exactly this).
+ * This version dedups by the forced heap-object pointer identity
+ * (Attrs/List address) rather than real Nix's by-Value-slot-address
+ * scheme (a different but equally correct mechanism given asnix's
+ * value model: `y`'s thunk forces to the *same* Attrs pointer as the
+ * outer value being walked, so pointer-identity dedup catches the cycle
+ * the first time that pointer is seen a second time). Not hot-path, so
+ * a plain linear-scan growable array is fine (test fixtures are tiny).
+ * --------------------------------------------------------------------- */
+typedef struct {
+    const void **items;
+    size_t len, cap;
+} PtrSet;
+
+static int ptrset_contains_or_add(PtrSet *s, const void *p) {
+    for (size_t i = 0; i < s->len; i++) {
+        if (s->items[i] == p) return 1;
+    }
+    if (s->len == s->cap) {
+        s->cap = s->cap ? s->cap * 2 : 16;
+        s->items = realloc(s->items, s->cap * sizeof(const void *));
+    }
+    s->items[s->len++] = p;
+    return 0;
+}
+
+static void deep_force_rec(Value v, PtrSet *seen) {
+    v = asnix_force_for_print(v);
+    int tag = asnix_tag_of(v);
+    if (tag != ASNIX_TAG_ATTRS && tag != ASNIX_TAG_LIST) return;
+    const void *ptr = (const void *)(uintptr_t)(v.raw & ~(uint64_t)ASNIX_TAG_MASK);
+    if (ptrset_contains_or_add(seen, ptr)) return; /* already visited this object -- a cycle */
+    if (tag == ASNIX_TAG_ATTRS) {
+        int64_t n = asnix_bshared_attrs_count(v);
+        for (int64_t i = 0; i < n; i++) deep_force_rec(asnix_bshared_attrs_value(v, i), seen);
+    } else {
+        int64_t n = asnix_bshared_list_count(v);
+        const Value *elems = asnix_bshared_list_elems(v);
+        for (int64_t i = 0; i < n; i++) deep_force_rec(elems[i], seen);
+    }
+}
+
+static Value seq2_impl(const Value *args, int64_t argc) {
+    (void)argc;
+    asnix_force_for_print(args[0]);
+    return asnix_force_for_print(args[1]);
+}
+static Value build_seq(void) { return asnix_bshared_make_curried_native((void *)seq2_impl, 2); }
+
+static Value deepSeq2_impl(const Value *args, int64_t argc) {
+    (void)argc;
+    PtrSet seen = { 0 };
+    deep_force_rec(args[0], &seen);
+    free(seen.items);
+    return asnix_force_for_print(args[1]);
+}
+static Value build_deepSeq(void) { return asnix_bshared_make_curried_native((void *)deepSeq2_impl, 2); }
+
+/* ---------------------------------------------------------------------
+ * Filesystem path resolution shared by pathExists/readFile/readFileType/
+ * readDir/toPath: accepts a Path, an absolute-path String, or anything
+ * asnix_coerce_to_string's __toString/outPath protocol can turn into one
+ * (same acceptance rule prim_import, builtins.c, already established) --
+ * fatal on anything else or a non-absolute string, matching real Nix's
+ * own wording for this exact situation (verified: `nix-instantiate --eval
+ * -E 'builtins.toPath "foo/bar"'` -> "string 'foo/bar' doesn't represent
+ * an absolute path"). Returns a NUL-terminated, arena-owned C string.
+ * --------------------------------------------------------------------- */
+static char *resolve_fs_path(Value v, const char *who) {
+    Value coerced = asnix_coerce_to_string(v); /* fatal on anything uncoercible */
+    int64_t len;
+    const char *bytes = asnix_ptr_bytes(coerced, &len);
+    if (len == 0 || bytes[0] != '/') {
+        fprintf(stderr, "asnix: %s: string '%.*s' doesn't represent an absolute path\n", who, (int)len, bytes);
+        exit(1);
+    }
+    char *path = asnix_arena_alloc((size_t)len + 1);
+    memcpy(path, bytes, (size_t)len);
+    path[len] = '\0';
+    return path;
+}
+
+/* `builtins.pathExists p` -- real Nix's one wrinkle: when `p` is a
+ * String ending in "/" or "/." it must resolve to a DIRECTORY
+ * specifically (not just exist), using a symlink-following `stat`;
+ * otherwise plain `lstat` (so a *broken* symlink still counts as
+ * "exists", matching real Nix -- verified via numtide/nix-conformance's
+ * eval-okay-symlink-resolution fixtures, e.g. `pathExists
+ * ./symlink-resolution/broken` => true even though the link's target
+ * doesn't exist). Never fatal on a missing path -- only on an
+ * uncoercible/non-absolute argument, same as every other path builtin
+ * here. */
+static Value prim_pathExists(const Value *args, int64_t argc) {
+    (void)argc;
+    Value v = asnix_force_for_print(args[0]);
+    int must_be_dir = 0;
+    if (asnix_tag_of(v) == ASNIX_TAG_PTR && !asnix_value_is_path(v)) {
+        int64_t slen;
+        const char *s = asnix_ptr_bytes(v, &slen);
+        if (slen >= 1 && s[slen - 1] == '/') must_be_dir = 1;
+        else if (slen >= 2 && s[slen - 2] == '/' && s[slen - 1] == '.') must_be_dir = 1;
+    }
+    char *path = resolve_fs_path(v, "pathExists");
+    struct stat st;
+    int exists;
+    if (must_be_dir) {
+        exists = (stat(path, &st) == 0 && S_ISDIR(st.st_mode));
+    } else {
+        exists = (lstat(path, &st) == 0);
+    }
+    return asnix_make_imm(exists ? ASNIX_IMM_TRUE : ASNIX_IMM_FALSE);
+}
+
+/* `builtins.readFile p` -- fatal if the file can't be opened/read
+ * (matching real Nix's hard error on a missing file, unlike
+ * pathExists). Same ftell()==-1-on-a-directory defensive check
+ * eval_file.c's own read_file() already established (see its comment --
+ * a directory "succeeds" opening via fopen on Linux but can't seek). */
+static Value prim_readFile(const Value *args, int64_t argc) {
+    (void)argc;
+    char *path = resolve_fs_path(args[0], "readFile");
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        fprintf(stderr, "asnix: readFile: cannot open '%s'\n", path);
+        exit(1);
+    }
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    if (size < 0) {
+        fprintf(stderr, "asnix: readFile: cannot read '%s' (not a regular file?)\n", path);
+        exit(1);
+    }
+    fseek(f, 0, SEEK_SET);
+    char *buf = malloc((size_t)size);
+    size_t n = size > 0 ? fread(buf, 1, (size_t)size, f) : 0;
+    fclose(f);
+    Value result = asnix_make_string_value(buf, n);
+    free(buf);
+    return result;
+}
+
+static const char *stat_type_str(const struct stat *st) {
+    if (S_ISDIR(st->st_mode)) return "directory";
+    if (S_ISREG(st->st_mode)) return "regular";
+    if (S_ISLNK(st->st_mode)) return "symlink";
+    return "unknown";
+}
+
+/* `builtins.readFileType p` -- uses `lstat` (does NOT follow the final
+ * symlink component -- a symlink reports "symlink" regardless of its
+ * target's type, verified: numtide/nix-conformance's
+ * eval-okay-readFileType.nix expects both a symlink-to-a-file and a
+ * symlink-to-a-directory to report "symlink", not their targets' types). */
+static Value prim_readFileType(const Value *args, int64_t argc) {
+    (void)argc;
+    char *path = resolve_fs_path(args[0], "readFileType");
+    struct stat st;
+    if (lstat(path, &st) != 0) {
+        fprintf(stderr, "asnix: readFileType: cannot stat '%s'\n", path);
+        exit(1);
+    }
+    const char *kind = stat_type_str(&st);
+    return asnix_make_string_value(kind, strlen(kind));
+}
+
+/* `builtins.readDir p` -- an attrset of directory-entry-name -> file-type
+ * string (same four strings as readFileType, same lstat-not-following
+ * convention for each entry). `.`/`..` are skipped, matching real Nix. */
+static Value prim_readDir(const Value *args, int64_t argc) {
+    (void)argc;
+    char *path = resolve_fs_path(args[0], "readDir");
+    DIR *dir = opendir(path);
+    if (!dir) {
+        fprintf(stderr, "asnix: readDir: cannot open directory '%s'\n", path);
+        exit(1);
+    }
+    uint32_t *syms = NULL;
+    Value *vals = NULL;
+    size_t n = 0, cap = 0;
+    struct dirent *ent;
+    while ((ent = readdir(dir)) != NULL) {
+        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) continue;
+        size_t namelen = strlen(ent->d_name);
+        char *entpath = malloc(strlen(path) + 1 + namelen + 1);
+        snprintf(entpath, strlen(path) + 1 + namelen + 1, "%s/%s", path, ent->d_name);
+        struct stat st;
+        const char *kind = (lstat(entpath, &st) == 0) ? stat_type_str(&st) : "unknown";
+        free(entpath);
+        if (n == cap) {
+            cap = cap ? cap * 2 : 16;
+            syms = realloc(syms, cap * sizeof(uint32_t));
+            vals = realloc(vals, cap * sizeof(Value));
+        }
+        syms[n] = asnix_intern(ent->d_name, namelen);
+        vals[n] = asnix_make_string_value(kind, strlen(kind));
+        n++;
+    }
+    closedir(dir);
+    Value result = asnix_bshared_make_attrs(syms, vals, (int64_t)n);
+    free(syms);
+    free(vals);
+    return result;
+}
+
+/* `builtins.toPath p` -- DEPRECATED even in real Nix (its own docs say
+ * so): despite the name, it returns a plain STRING (not a Path value),
+ * just the resolved absolute-path text -- verified: `builtins.typeOf
+ * (builtins.toPath "/foo/bar")` => "string", not "path". */
+static Value prim_toPath(const Value *args, int64_t argc) {
+    (void)argc;
+    Value coerced = asnix_coerce_to_string(args[0]);
+    int64_t len;
+    const char *bytes = asnix_ptr_bytes(coerced, &len);
+    if (len == 0 || bytes[0] != '/') {
+        fprintf(stderr, "asnix: string '%.*s' doesn't represent an absolute path\n", (int)len, bytes);
+        exit(1);
+    }
+    return asnix_make_string_value(bytes, (size_t)len);
+}
+
+/* `builtins.getEnv name` -- real Nix gates this behind pure-eval mode
+ * (erroring instead of reading the real environment); asnix has no such
+ * mode, so this always reads the real environment, matching the
+ * `--impure`/default-mode behavior. Empty string if unset, matching
+ * real Nix either way. */
+static Value prim_getEnv(const Value *args, int64_t argc) {
+    (void)argc;
+    ASNIX_REQUIRE_STRING(args[0], "getEnv");
+    int64_t len;
+    const char *bytes = asnix_ptr_bytes(args[0], &len);
+    char *name = asnix_arena_alloc((size_t)len + 1);
+    memcpy(name, bytes, (size_t)len);
+    name[len] = '\0';
+    const char *val = getenv(name);
+    if (!val) return asnix_make_string_value("", 0);
+    return asnix_make_string_value(val, strlen(val));
+}
+
+/* ---------------------------------------------------------------------
+ * intersectAttrs e1 e2 -- the subset of e2 whose NAMES also appear in
+ * e1, keeping e2's (still-lazy) values -- e1's values are never forced,
+ * only its attribute *names* are consulted (verified:
+ * numtide/nix-conformance's eval-okay-intersectAttrs.nix deliberately
+ * fills e1 with `abort`-valued entries to check exactly this). Both
+ * inputs are already sorted by symbol id, so a straight merge-style walk
+ * (not a binary search per entry) is both correct and the simplest -- a
+ * subsequence of a sorted sequence is still sorted, so the output needs
+ * no re-sort either.
+ * --------------------------------------------------------------------- */
+static Value intersectAttrs2_impl(const Value *args, int64_t argc) {
+    (void)argc;
+    Value e1 = args[0], e2 = args[1];
+    ASNIX_REQUIRE_ATTRS(e1, "intersectAttrs");
+    ASNIX_REQUIRE_ATTRS(e2, "intersectAttrs");
+    int64_t n2 = asnix_bshared_attrs_count(e2);
+    uint32_t *syms = n2 > 0 ? malloc((size_t)n2 * sizeof(uint32_t)) : NULL;
+    Value *vals = n2 > 0 ? malloc((size_t)n2 * sizeof(Value)) : NULL;
+    int64_t out_n = 0;
+    for (int64_t i = 0; i < n2; i++) {
+        uint32_t sym = asnix_bshared_attrs_sym(e2, i);
+        if (asnix_bshared_attrs_find(e1, sym) >= 0) {
+            syms[out_n] = sym;
+            vals[out_n] = asnix_bshared_attrs_value(e2, i);
+            out_n++;
+        }
+    }
+    Value result = asnix_bshared_make_attrs(syms, vals, out_n); /* already sorted -- re-sort is a cheap no-op */
+    free(syms);
+    free(vals);
+    return result;
+}
+static Value build_intersectAttrs(void) {
+    return asnix_bshared_make_curried_native((void *)intersectAttrs2_impl, 2);
+}
+
+/* ---------------------------------------------------------------------
+ * groupBy f list -- buckets `list`'s elements by `f elem` (which must
+ * force to a string -- real Nix: "value is $type while a string was
+ * expected"), preserving each bucket's original relative order.
+ * Verified: `builtins.groupBy (n: if n < 0 then "neg" else "pos") [ -1 2
+ * -3 4 ]` == `{ neg = [ -1 -3 ]; pos = [ 2 4 ]; }`. Not hot-path, so a
+ * plain O(n * distinct-keys) linear bucket-search is fine for anything
+ * this project's fixtures exercise.
+ * --------------------------------------------------------------------- */
+typedef struct {
+    uint32_t sym;
+    Value *items;
+    size_t len, cap;
+} GroupBucket;
+
+static Value groupBy2_impl(const Value *args, int64_t argc) {
+    (void)argc;
+    Value f = args[0], list = args[1];
+    ASNIX_REQUIRE_LIST(list, "groupBy");
+    int64_t n = asnix_bshared_list_count(list);
+    const Value *elems = asnix_bshared_list_elems(list);
+    GroupBucket *buckets = NULL;
+    size_t nbuckets = 0, bcap = 0;
+    for (int64_t i = 0; i < n; i++) {
+        Value key = asnix_apply(f, &elems[i], 1);
+        key = asnix_force_for_print(key);
+        if (asnix_tag_of(key) != ASNIX_TAG_PTR || asnix_value_is_path(key)) {
+            fprintf(stderr, "asnix: groupBy: key function must return a string\n");
+            exit(1);
+        }
+        int64_t klen;
+        const char *kbytes = asnix_ptr_bytes(key, &klen);
+        uint32_t sym = asnix_intern(kbytes, (size_t)klen);
+        GroupBucket *b = NULL;
+        for (size_t j = 0; j < nbuckets; j++) {
+            if (buckets[j].sym == sym) {
+                b = &buckets[j];
+                break;
+            }
+        }
+        if (!b) {
+            if (nbuckets == bcap) {
+                bcap = bcap ? bcap * 2 : 8;
+                buckets = realloc(buckets, bcap * sizeof(GroupBucket));
+            }
+            b = &buckets[nbuckets++];
+            b->sym = sym;
+            b->items = NULL;
+            b->len = 0;
+            b->cap = 0;
+        }
+        if (b->len == b->cap) {
+            b->cap = b->cap ? b->cap * 2 : 8;
+            b->items = realloc(b->items, b->cap * sizeof(Value));
+        }
+        b->items[b->len++] = elems[i];
+    }
+    uint32_t *syms = nbuckets > 0 ? malloc(nbuckets * sizeof(uint32_t)) : NULL;
+    Value *vals = nbuckets > 0 ? malloc(nbuckets * sizeof(Value)) : NULL;
+    for (size_t j = 0; j < nbuckets; j++) {
+        syms[j] = buckets[j].sym;
+        vals[j] = asnix_bshared_make_list(buckets[j].items, (int64_t)buckets[j].len);
+        free(buckets[j].items);
+    }
+    free(buckets);
+    Value result = asnix_bshared_make_attrs(syms, vals, (int64_t)nbuckets);
+    free(syms);
+    free(vals);
+    return result;
+}
+static Value build_groupBy(void) { return asnix_bshared_make_curried_native((void *)groupBy2_impl, 2); }
+
+/* `builtins.parseDrvName s` -- splits a derivation-name-style string
+ * into `{ name; version; }`, ported directly from real Nix's own
+ * `DrvName::DrvName` (~/nix/src/libstore/names.cc): the split point is
+ * the FIRST '-' immediately followed by a non-letter (not just any
+ * '-'), so "xf86-video-i810-1.7.4" splits at the dash before "1.7.4"
+ * (the two earlier dashes are followed by letters, so skipped), and a
+ * doubled "--" splits at the FIRST of the pair (since '-' itself isn't
+ * a letter) -- verified against every case in numtide/nix-conformance's
+ * eval-okay-versions.nix, including the "name-that-ends-with-dash--1.0"
+ * edge case (=> name "name-that-ends-with-dash", version "-1.0"). No
+ * matching dash at all means the whole string is the name, version "". */
+static Value prim_parseDrvName(const Value *args, int64_t argc) {
+    (void)argc;
+    ASNIX_REQUIRE_STRING(args[0], "parseDrvName");
+    int64_t len;
+    const char *s = asnix_ptr_bytes(args[0], &len);
+    int64_t split = -1;
+    for (int64_t i = 0; i < len - 1; i++) {
+        if (s[i] == '-' && !isalpha((unsigned char)s[i + 1])) {
+            split = i;
+            break;
+        }
+    }
+    Value name_val, version_val;
+    if (split < 0) {
+        name_val = asnix_make_string_value(s, (size_t)len);
+        version_val = asnix_make_string_value("", 0);
+    } else {
+        name_val = asnix_make_string_value(s, (size_t)split);
+        version_val = asnix_make_string_value(s + split + 1, (size_t)(len - split - 1));
+    }
+    uint32_t syms[2] = { asnix_intern("name", 4), asnix_intern("version", 7) };
+    Value vals[2] = { name_val, version_val };
+    /* order doesn't matter -- asnix_bshared_make_attrs sorts by sym id */
+    return asnix_bshared_make_attrs(syms, vals, 2);
+}
+
+/* `builtins.add`/`sub`/`mul`/`div` -- plain two-int-argument arithmetic,
+ * exposed as builtins (distinct from the `+`/`-`/`*`/`/` *operators*,
+ * which compile to IR ops directly -- see compiler.c/op_arith.S). Scope
+ * cut matching every other arithmetic entry point in this project: INT
+ * operands only, fatal on a float (asnix has no float type at all yet)
+ * or any other type -- verified `builtins.add 2 3` => 5,
+ * `builtins.sub 0 1` => -1 against nix-instantiate. */
+static Value add2_impl(const Value *args, int64_t argc) {
+    (void)argc;
+    ASNIX_REQUIRE_INT(args[0], "add");
+    ASNIX_REQUIRE_INT(args[1], "add");
+    return asnix_make_int(asnix_int_value(args[0]) + asnix_int_value(args[1]));
+}
+static Value sub2_impl(const Value *args, int64_t argc) {
+    (void)argc;
+    ASNIX_REQUIRE_INT(args[0], "sub");
+    ASNIX_REQUIRE_INT(args[1], "sub");
+    return asnix_make_int(asnix_int_value(args[0]) - asnix_int_value(args[1]));
+}
+static Value mul2_impl(const Value *args, int64_t argc) {
+    (void)argc;
+    ASNIX_REQUIRE_INT(args[0], "mul");
+    ASNIX_REQUIRE_INT(args[1], "mul");
+    return asnix_make_int(asnix_int_value(args[0]) * asnix_int_value(args[1]));
+}
+static Value div2_impl(const Value *args, int64_t argc) {
+    (void)argc;
+    ASNIX_REQUIRE_INT(args[0], "div");
+    ASNIX_REQUIRE_INT(args[1], "div");
+    int64_t rhs = asnix_int_value(args[1]);
+    if (rhs == 0) {
+        fprintf(stderr, "asnix: division by zero, aborting\n");
+        exit(1);
+    }
+    return asnix_make_int(asnix_int_value(args[0]) / rhs);
+}
+static Value build_add(void) { return asnix_bshared_make_curried_native((void *)add2_impl, 2); }
+static Value build_sub(void) { return asnix_bshared_make_curried_native((void *)sub2_impl, 2); }
+static Value build_mul(void) { return asnix_bshared_make_curried_native((void *)mul2_impl, 2); }
+static Value build_div(void) { return asnix_bshared_make_curried_native((void *)div2_impl, 2); }
+
+const AsnixBuiltinMiscDef ASNIX_M23_BUILTINS[] = {
+    { "seq", build_seq },
+    { "deepSeq", build_deepSeq },
+    { "intersectAttrs", build_intersectAttrs },
+    { "groupBy", build_groupBy },
+    { "add", build_add },
+    { "sub", build_sub },
+    { "mul", build_mul },
+    { "div", build_div },
+};
+
+const size_t ASNIX_M23_BUILTINS_COUNT = sizeof(ASNIX_M23_BUILTINS) / sizeof(ASNIX_M23_BUILTINS[0]);
+
+/* pathExists/readFile/readFileType/readDir/toPath/getEnv are plain
+ * arity-1 PrimOps -- registered directly in builtins.c's own BUILTINS[]
+ * table (the {name, fn, arity} shape) rather than through this file's
+ * {name, build()} table, since they don't need currying. Exposed here
+ * for that registration. */
+Value asnix_prim_pathExists(const Value *args, int64_t argc) { return prim_pathExists(args, argc); }
+Value asnix_prim_readFile(const Value *args, int64_t argc) { return prim_readFile(args, argc); }
+Value asnix_prim_readFileType(const Value *args, int64_t argc) { return prim_readFileType(args, argc); }
+Value asnix_prim_readDir(const Value *args, int64_t argc) { return prim_readDir(args, argc); }
+Value asnix_prim_toPath(const Value *args, int64_t argc) { return prim_toPath(args, argc); }
+Value asnix_prim_getEnv(const Value *args, int64_t argc) { return prim_getEnv(args, argc); }
+Value asnix_prim_parseDrvName(const Value *args, int64_t argc) { return prim_parseDrvName(args, argc); }

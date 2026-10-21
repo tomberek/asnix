@@ -123,4 +123,25 @@ int asnix_bshared_value_lt(Value a, Value b, const char *who);
  * OP_SELECT's laziness. */
 Value asnix_bshared_select_dynamic(Value target, Value name_val);
 
+/* M23: builds a genuinely LAZY Thunk that, when first forced, computes
+ * `f arg` (asnix_bshared_make_lazy_call1) or the curried `(f arg1) arg2`
+ * (asnix_bshared_make_lazy_call2) -- NOT an eager asnix_apply call made
+ * right now. Fixes a real, previously-undiscovered strictness bug:
+ * `map`/`mapAttrs` were calling their function argument immediately,
+ * once per element, while building their result, instead of deferring
+ * each call into its own thunk the way real Nix does (confirmed:
+ * `builtins.length (map (x: throw "boom") [1 2 3])` => 3 on real Nix,
+ * aborted here; numtide/nix-conformance's eval-okay-intersectAttrs.nix
+ * relies on exactly this laziness via `builtins.mapAttrs throw alphabet`
+ * as a "canary" that must NOT fire just from being built). Implemented
+ * by reusing this project's own existing `make_curried2`/
+ * `build_curry2_body` trick (builtins_attrs.c) one level further: a
+ * small, singleton (built once, cached) IR body that reads its captured
+ * values back out of a fresh per-call Env via plain OP_VAR_REF/OP_CALL,
+ * wrapped in an OP_MK_THUNK-shaped heap Thunk object built directly here
+ * in C (same four words op_mk_thunk.S itself writes) rather than
+ * compiled bytecode -- no new IR op, no asm changes. */
+Value asnix_bshared_make_lazy_call1(Value f, Value arg);
+Value asnix_bshared_make_lazy_call2(Value f, Value arg1, Value arg2);
+
 #endif /* ASNIX_BUILTINS_SHARED_H */

@@ -10,6 +10,7 @@
 #include "asnix/heap.h"
 #include "asnix/ir.h"
 #include "asnix/irbuild.h"
+#include "builtins_shared.h" /* asnix_bshared_make_lazy_call2 -- see prim_mapAttrs_apply2's comment */
 #include "symtab.h"
 #include "value_util.h"
 
@@ -293,18 +294,21 @@ Value asnix_make_removeAttrs_primop(void) {
  *
  * Real Nix's `builtins.mapAttrs f set` is lazy (each output value is a
  * fresh thunk wrapping `f name set.${name}`, only forced on demand).
- * Building a genuine asnix Thunk here would need its own tiny IR body
- * capturing (f, name, origvalue) the same way build_curry2_body's body
- * captures two values -- doable, but not needed for this task's
- * observable behavior: every consumer that would ever see the result
- * (the printer, or another strict builtin) forces each attrset value
- * immediately anyway (see op_select.S / asnix_force_for_print), so eager
- * vs. lazy mapAttrs is unobservable here. This computes eagerly, calling
- * `f name value` via asnix_apply (src/asm/apply.S) once per entry. If a
- * later change makes some consumer actually rely on laziness (e.g. an
- * attribute whose mapped value would throw but is never selected), this
- * eagerness would be a real behavioral gap -- worth revisiting then.
- */
+ * M18-era version of this comment judged eager-vs-lazy "unobservable"
+ * here since the printer forces everything anyway -- that reasoning was
+ * wrong: numtide/nix-conformance's eval-okay-intersectAttrs.nix builds
+ * `alphabetFail = builtins.mapAttrs throw alphabet` specifically as a
+ * "canary" (every value throws when forced) and then only ever touches
+ * its attribute *names*, never its values (via `intersectAttrs`) -- with
+ * the old eager version, just *constructing* alphabetFail aborted
+ * immediately, before intersectAttrs or the printer ever got a chance to
+ * touch anything (confirmed directly: `builtins.attrNames
+ * (builtins.mapAttrs throw { a = 1; })` aborted here but => `[ "a" ]` on
+ * real Nix). Fixed the same way M23 also fixed plain `map`'s identical
+ * bug (builtins_list.c's prim_map_stage2): each value is now a genuine
+ * lazy Thunk wrapping the curried `(f name) origvalue` call
+ * (asnix_bshared_make_lazy_call2, builtins_shared.c), not an
+ * already-computed Value. */
 static Value prim_mapAttrs_apply2(const Value *args, int64_t argc) {
     (void)argc;
     Value f = args[0];
@@ -319,9 +323,8 @@ static Value prim_mapAttrs_apply2(const Value *args, int64_t argc) {
         const char *name = asnix_sym_name(sym, &len);
         Value name_val = asnix_make_string_value(name, len);
         Value orig = attrs_entry_value(attrs, i);
-        Value step1 = asnix_apply(f, &name_val, 1);
         syms[i] = sym;
-        vals[i] = asnix_apply(step1, &orig, 1);
+        vals[i] = asnix_bshared_make_lazy_call2(f, name_val, orig);
     }
     return make_attrs_from_sorted(syms, vals, n);
 }

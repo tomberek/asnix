@@ -1,3 +1,4 @@
+#include <ctype.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -52,6 +53,26 @@ static void print_string_bytes(const char *bytes, int64_t len) {
         }
     }
     putchar('"');
+}
+
+/* Real Nix's printer quotes an attrset key that isn't a valid bare
+ * identifier (`[a-zA-Z_][a-zA-Z0-9_'-]*`, matching lexer.c's own
+ * ident_start/ident_cont rules post-M23's hyphen fix) -- e.g. a purely
+ * numeric key like "1" prints as `"1" = ...` not `1 = ...` (confirmed:
+ * `nix-instantiate --eval -E 'builtins.groupBy (x: toString x) [1]'`
+ * => `{ "1" = [ 1 ]; }`). Previously unconditionally bare (M9's original
+ * printer never had a reason to hit a non-bare key until M23's groupBy
+ * started producing numeric-string keys) -- found via
+ * numtide/nix-conformance's eval-okay-groupBy.nix. */
+static int is_bare_ident(const char *s, int64_t len) {
+    if (len == 0) return 0;
+    char c0 = s[0];
+    if (!(isalpha((unsigned char)c0) || c0 == '_')) return 0;
+    for (int64_t i = 1; i < len; i++) {
+        char c = s[i];
+        if (!(isalnum((unsigned char)c) || c == '_' || c == '\'' || c == '-')) return 0;
+    }
+    return 1;
 }
 
 static void print_value_inner(Value v) {
@@ -130,7 +151,12 @@ static void print_value_inner(Value v) {
             }
             printf("{ ");
             for (int64_t i = 0; i < n; i++) {
-                printf("%.*s = ", (int)name_lens[i], names[i]);
+                if (is_bare_ident(names[i], (int64_t)name_lens[i])) {
+                    printf("%.*s = ", (int)name_lens[i], names[i]);
+                } else {
+                    print_string_bytes(names[i], (int64_t)name_lens[i]);
+                    printf(" = ");
+                }
                 print_value_inner(vals[i]);
                 printf("; ");
             }

@@ -213,3 +213,50 @@ int asnix_bshared_value_lt(Value a, Value b, const char *who) {
             who);
     exit(1);
 }
+
+/* See builtins_shared.h's long comment on these two. `env_slots` is a
+ * fresh, 2-or-3-slot Env private to this one thunk (never shared, so no
+ * aliasing risk even though the IR body is a shared singleton). */
+static Value make_thunk_from(IrProgram *prog, Env *env) {
+    void *mem = asnix_arena_alloc(ASNIX_THUNK_SIZE);
+    *(int64_t *)((char *)mem + ASNIX_THUNK_OFF_STATE) = ASNIX_THUNK_STATE_UNFORCED;
+    *(void **)((char *)mem + ASNIX_THUNK_OFF_ENV) = env;
+    *(void **)((char *)mem + ASNIX_THUNK_OFF_BODY) = prog->ops;
+    *(void **)((char *)mem + ASNIX_THUNK_OFF_POOL) = prog->pool;
+    return (Value){ .raw = (uint64_t)(uintptr_t)mem | ASNIX_TAG_THUNK };
+}
+
+Value asnix_bshared_make_lazy_call1(Value f, Value arg) {
+    static IrProgram *prog = NULL;
+    if (!prog) {
+        IrBuilder *b = ib_new();
+        ib_var_ref(b, 0, 0); /* f */
+        ib_var_ref(b, 0, 1); /* arg */
+        ib_call(b, 1);
+        ib_ret(b);
+        prog = ib_finish(b);
+    }
+    Env *env = asnix_env_alloc(NULL, 2);
+    env->values[0] = f;
+    env->values[1] = arg;
+    return make_thunk_from(prog, env);
+}
+
+Value asnix_bshared_make_lazy_call2(Value f, Value arg1, Value arg2) {
+    static IrProgram *prog = NULL;
+    if (!prog) {
+        IrBuilder *b = ib_new();
+        ib_var_ref(b, 0, 0); /* f */
+        ib_var_ref(b, 0, 1); /* arg1 */
+        ib_call(b, 1);       /* -> step1 = f arg1 */
+        ib_var_ref(b, 0, 2); /* arg2 (step1 stays underneath on VALSTACK) */
+        ib_call(b, 1);       /* -> step1 arg2 */
+        ib_ret(b);
+        prog = ib_finish(b);
+    }
+    Env *env = asnix_env_alloc(NULL, 3);
+    env->values[0] = f;
+    env->values[1] = arg1;
+    env->values[2] = arg2;
+    return make_thunk_from(prog, env);
+}

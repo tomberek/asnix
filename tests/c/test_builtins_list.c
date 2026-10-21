@@ -22,6 +22,7 @@
 #include "asnix/arena.h"
 #include "asnix/env.h"
 #include "asnix/heap.h"
+#include "asnix/ir.h" /* asnix_force_for_print */
 #include "asnix/irbuild.h"
 #include "asnix/value.h"
 #include "builtins_list.h"
@@ -113,7 +114,11 @@ static int64_t list_count_of(Value v) {
 static int64_t list_elem_int(Value v, int64_t i) {
     const char *base = (const char *)(uintptr_t)(v.raw & ~(uint64_t)ASNIX_TAG_MASK);
     const Value *elems = (const Value *)(base + ASNIX_LIST_OFF_ELEMS);
-    return asnix_int_value(elems[i]);
+    /* `map`'s result elements are genuinely lazy Thunks (M23 fix -- see
+     * builtins_list.c's prim_map_stage2 comment), so this must force
+     * before reading the raw int, unlike before that fix when `map`
+     * itself had already computed every element eagerly. */
+    return asnix_int_value(asnix_force_for_print(elems[i]));
 }
 
 /* map (x: x+1) [1 2 3] == [2 3 4] -- verified against

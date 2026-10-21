@@ -59,6 +59,7 @@
 #include "asnix/heap.h"
 #include "asnix/ir.h"
 #include "asnix/value.h"
+#include "builtins_shared.h" /* asnix_bshared_make_lazy_call1 -- see prim_map_stage2's comment */
 
 /* Plain, non-capturing PrimOp (ASNIX_PRIMOP_SIZE bytes, heap.h). */
 static Value make_primop0(void *fn, int64_t arity) {
@@ -141,6 +142,18 @@ static Value apply2(Value fn, Value a, Value b) {
 /* map f list                                                            */
 /* --------------------------------------------------------------------- */
 
+/* `map` must be LAZY per resulting element -- real Nix builds a list of
+ * thunks, each calling `f elem` only once actually forced (verified:
+ * `builtins.length (map (x: throw "boom") [1 2 3])` => 3, never
+ * triggering the throw at all since nothing forces the elements here).
+ * A prior version of this function called `asnix_apply(f, &elem, 1)`
+ * immediately for every element while *building* the result list --
+ * a real, previously-undiscovered strictness bug (not a cosmetic
+ * printing difference), found via numtide/nix-conformance's
+ * eval-okay-intersectAttrs.nix exposing the identical bug in `mapAttrs`
+ * (see builtins_attrs.c's own fix). Each element is now a genuinely
+ * lazy Thunk (asnix_bshared_make_lazy_call1, builtins_shared.c) instead
+ * of an already-computed Value. */
 static Value prim_map_stage2(const Value *args, int64_t argc) {
     (void)argc;
     Value f = self_captures(args)[0];
@@ -151,8 +164,7 @@ static Value prim_map_stage2(const Value *args, int64_t argc) {
 
     Value *out = count > 0 ? malloc((size_t)count * sizeof(Value)) : NULL;
     for (int64_t i = 0; i < count; i++) {
-        Value elem = elems[i];
-        out[i] = asnix_apply(f, &elem, 1);
+        out[i] = asnix_bshared_make_lazy_call1(f, elems[i]);
     }
     Value result = make_list(count, out);
     free(out);
