@@ -9,7 +9,9 @@
 #include "asnix/heap.h"
 #include "asnix/ir.h"
 #include "asnix/irbuild.h"
+#include "base32.h"
 #include "builtins_shared.h"
+#include "hash_shim.h"
 #include "value_util.h"
 
 /* ---------------------------------------------------------------------
@@ -404,6 +406,50 @@ static Value build_dirOf(void) { return make_primop_value((void *)prim_dirOf, 1)
 Value asnix_make_baseNameOf_primop(void) { return make_primop_value((void *)prim_baseNameOf, 1); }
 Value asnix_make_dirOf_primop(void) { return make_primop_value((void *)prim_dirOf, 1); }
 
+/* `builtins.placeholder` (M44) -- one of real Nix's bare root-scope
+ * globals (confirmed in `~/nix/src/libexpr/primops.cc`: `.name =
+ * "placeholder"`, no `__` prefix). Computes an output placeholder
+ * string for a derivation output name, ported directly from
+ * `~/nix/src/libstore/derivations.cc`'s `hashPlaceholder`: `"/" +
+ * base32(sha256("nix-output:" + outputName))` (Nix's own base32
+ * variant, no hash-type prefix) -- reuses this project's existing
+ * `asnix_hash_sha256`/`asnix_base32_encode` (already relied on for
+ * store-path hashing, M8) rather than adding any new hashing
+ * machinery. Verified against real `nix-instantiate --eval`:
+ * `builtins.placeholder "out"` ==
+ * "/1rz4g4znpzjwh1xymhjpm42vipw92pr73vdgl6xs1hycac8kf2n9". */
+static Value prim_placeholder(const Value *args, int64_t argc) {
+    (void)argc;
+    ASNIX_REQUIRE_STRING(args[0], "placeholder");
+    int64_t name_len;
+    const char *name_bytes;
+    asnix_bshared_string_bytes(args[0], &name_bytes, &name_len, "placeholder");
+
+    size_t preimage_len = 11 + (size_t)name_len; /* "nix-output:" */
+    char *preimage = malloc(preimage_len);
+    memcpy(preimage, "nix-output:", 11);
+    memcpy(preimage + 11, name_bytes, (size_t)name_len);
+
+    uint8_t digest[ASNIX_HASH_SHA256_LEN];
+    int64_t rc = asnix_hash_sha256(preimage, preimage_len, digest);
+    free(preimage);
+    if (rc != 0) {
+        fprintf(stderr, "asnix: placeholder: failed to load libcrypto (rc=%lld) -- enter the flake devShell\n",
+                (long long)rc);
+        exit(1);
+    }
+
+    size_t b32_len = asnix_base32_encoded_length(ASNIX_HASH_SHA256_LEN);
+    char *out = malloc(1 + b32_len);
+    out[0] = '/';
+    asnix_base32_encode(digest, ASNIX_HASH_SHA256_LEN, out + 1);
+    Value result = asnix_make_string_value(out, 1 + b32_len);
+    free(out);
+    return result;
+}
+static Value build_placeholder(void) { return make_primop_value((void *)prim_placeholder, 1); }
+Value asnix_make_placeholder_primop(void) { return make_primop_value((void *)prim_placeholder, 1); }
+
 static Value build_isNull(void) { return make_primop_value((void *)prim_isNull, 1); }
 
 /* `isNull` is one of real Nix's bare root-scope globals (verified against
@@ -461,6 +507,7 @@ const AsnixBuiltinMiscDef ASNIX_BUILTINS_MISC[] = {
     { "currentSystem", build_currentSystem },
     { "baseNameOf", build_baseNameOf },
     { "dirOf", build_dirOf },
+    { "placeholder", build_placeholder },
 };
 
 const size_t ASNIX_BUILTINS_MISC_COUNT = sizeof(ASNIX_BUILTINS_MISC) / sizeof(ASNIX_BUILTINS_MISC[0]);

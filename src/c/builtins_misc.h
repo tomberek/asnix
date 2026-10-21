@@ -41,5 +41,6 @@ Value asnix_make_isNull_primop(void);
  * full curated list). */
 Value asnix_make_baseNameOf_primop(void);
 Value asnix_make_dirOf_primop(void);
+Value asnix_make_placeholder_primop(void);
 
 #endif /* ASNIX_BUILTINS_MISC_H */

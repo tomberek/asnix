@@ -56,7 +56,8 @@ what's actually implemented and the scope decisions made along the way.
 | M41 — dynamic attrpath segments anywhere (`.${k}`, interpolated quoted strings) | done (see below) |
 | M42 — `__functor` protocol (calling an attrset via a `__functor` attribute) | done (see below) |
 | M43 — lambda-pattern-vs-attrset disambiguation miscounts `${` in default values | done (see below) |
-| M44-M49 | not started |
+| M44 — `builtins.placeholder`/bare `placeholder` | done (see below) |
+| M45-M49 | not started |
 | M50 — name the specific value/field in 6 more generic fatal-path error messages | done (see below) |
 | M51-M54 | in progress (parallel agents: floats, with-scoping bug, foldl'/replaceStrings laziness, missing builtins) |
 | M55 — regex engine gaps triage (`builtins.match`/`builtins.split`, 39 conformance failures) | investigated, **no fix** (see below) |
@@ -4037,3 +4038,40 @@ table.${k} or default` dynamic select) against real `nix-instantiate
 
 `make test`/`test-e2e` green (201 e2e, one new `m43_*` fixture);
 `test-conformance` 635 passed, no regressions.
+
+## M44 scope notes: `builtins.placeholder`/bare `placeholder`
+
+Found continuing to chase `d.nix` right after M43: `placeholder` was
+entirely missing (an "undefined variable" error, not "attribute
+missing" -- confirming it's a bare global, not builtins-only).
+Confirmed via cppnix source (`~/nix/src/libexpr/primops.cc`: `.name =
+"placeholder"`, no `__` prefix) -- this project's own `eval_file.c`
+comment had already flagged `placeholder` by name as a known-but-not-
+yet-implemented bare global, left over from an earlier pass.
+
+Computes an output placeholder string for a derivation output name --
+ported directly from `~/nix/src/libstore/derivations.cc`'s
+`hashPlaceholder`: `"/" + base32(sha256("nix-output:" + outputName))`
+(Nix's own base32 variant, no hash-type prefix). Reuses this project's
+existing `asnix_hash_sha256`/`asnix_base32_encode` (already relied on
+for store-path hashing since M8) rather than adding any new hashing
+machinery -- `prim_placeholder` is a ~15-line function. Registered
+both ways real Nix exposes every non-`__`-prefixed primop: under
+`builtins.placeholder` (added to `ASNIX_BUILTINS_MISC`) and as a bare
+root-scope global (`eval_file.c`'s root `Env` grew from 12 to 13 slots;
+`compiler.c`'s matching root `ScopeFrame` name list updated in lockstep,
+same pattern every earlier bare-global addition in this project's
+history has followed).
+
+Verified against real `nix-instantiate --eval`: `builtins.placeholder
+"out"` and bare `placeholder "out"` both produce the exact same real
+Nix output,
+`"/1rz4g4znpzjwh1xymhjpm42vipw92pr73vdgl6xs1hycac8kf2n9"`.
+
+`make test`/`test-e2e` green (202 e2e, one new `m44_*` fixture);
+`test-conformance` still 635 passed (the one conformance test that
+exercises this, `eval-okay-drv-placeholder.nix`, needs real derivation/
+content-addressing support beyond just this builtin to pass in full --
+a separately tracked, larger scope cut -- so no conformance-count
+change from this fix alone, but it's still a real, verified gap this
+project needed fixed for `d.nix`), no regressions.

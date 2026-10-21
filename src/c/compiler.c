@@ -928,22 +928,23 @@ static void compile_expr(IrBuilder *b, Ast *node, ScopeFrame *scope) {
 IrProgram *asnix_compile(Ast *root, const char *base_dir) {
     g_compile_base_dir = base_dir;
     IrBuilder *b = ib_new();
-    /* The root env (constructed by eval_file.c) has twelve slots: the
+    /* The root env (constructed by eval_file.c) has thirteen slots: the
      * `builtins` attrset, plus `import`/`map`/`abort`/`toString`/
      * `removeAttrs`/`isNull`/`throw`/`derivation`/`baseNameOf`/`dirOf`/
-     * `fromTOML` bare -- names real Nix exposes as bare globals in
-     * addition to `builtins.X` (see builtins.h's asnix_make_import_primop
-     * comment). This scope frame makes `builtins.toString 5` and bare
-     * `import ./x`/`map f xs`/`abort "msg"`/`toString 5`/`removeAttrs set
-     * ["a"]`/`isNull x`/`throw "msg"`/`derivation {...}`/`baseNameOf x`/
-     * `dirOf x`/`fromTOML s` all resolve like any other variable
+     * `fromTOML`/`placeholder` bare -- names real Nix exposes as bare
+     * globals in addition to `builtins.X` (see builtins.h's
+     * asnix_make_import_primop comment). This scope frame makes
+     * `builtins.toString 5` and bare `import ./x`/`map f xs`/`abort
+     * "msg"`/`toString 5`/`removeAttrs set ["a"]`/`isNull x`/`throw
+     * "msg"`/`derivation {...}`/`baseNameOf x`/`dirOf x`/`fromTOML s`/
+     * `placeholder "out"` all resolve like any other variable
      * reference. */
-    static const char *builtins_names[12] = {
+    static const char *builtins_names[13] = {
         "builtins", "import", "map", "abort", "toString", "removeAttrs", "isNull", "throw", "derivation",
-        "baseNameOf", "dirOf", "fromTOML" };
-    static size_t builtins_name_lens[12] = { 8, 6, 3, 5, 8, 11, 6, 5, 10, 10, 5, 8 };
+        "baseNameOf", "dirOf", "fromTOML", "placeholder" };
+    static size_t builtins_name_lens[13] = { 8, 6, 3, 5, 8, 11, 6, 5, 10, 10, 5, 8, 11 };
     ScopeFrame builtins_frame = {
-        .up = NULL, .names = builtins_names, .name_lens = builtins_name_lens, .count = 12 };
+        .up = NULL, .names = builtins_names, .name_lens = builtins_name_lens, .count = 13 };
     compile_expr(b, root, &builtins_frame);
     ib_halt(b);
     return ib_finish(b);
