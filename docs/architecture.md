@@ -57,7 +57,9 @@ what's actually implemented and the scope decisions made along the way.
 | M42 — `__functor` protocol (calling an attrset via a `__functor` attribute) | done (see below) |
 | M43-M49 | not started |
 | M50 — name the specific value/field in 6 more generic fatal-path error messages | done (see below) |
-| M51+ | in progress (parallel agents: floats, with-scoping bug, foldl'/replaceStrings laziness, missing builtins, regex, fromTOML/overflow, misc backlog) |
+| M51-M54 | in progress (parallel agents: floats, with-scoping bug, foldl'/replaceStrings laziness, missing builtins) |
+| M55 — regex engine gaps triage (`builtins.match`/`builtins.split`, 39 conformance failures) | investigated, **no fix** (see below) |
+| M56-M57 | in progress (parallel agents: fromTOML/overflow, misc backlog) |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
 
@@ -3870,3 +3872,120 @@ unchanged).
 `make test`/`test-e2e` green (200 e2e, two new `m42_*` fixtures, one
 per call path); `test-conformance` 635 passed (up from 633, +2 as
 expected, no regressions).
+
+## M55 scope notes: regex engine gaps triage (39 conformance failures, no fix)
+
+A triage pass over `src/c/builtins_regex.c` (`builtins.match`/`split`),
+following up on a conformance triage agent's report of 39 failing
+`eval-okay-regex-*`/`eval-fail-regex-invalid-*` tests split into three
+classes. Net result: **no code change**. All three classes turned out
+to be genuine behavioral differences between glibc's `<regex.h>`
+(`regcomp`/`regexec`, what `builtins_regex.c` actually calls) and
+libstdc++'s `std::regex` (what real Nix's `primops.cc` calls) -- not
+bugs in how asnix drives the library. Each claim below was checked by
+calling `regcomp`/`regexec` directly from a standalone C program (not
+through asnix), to separate "glibc itself behaves this way" from "asnix
+is misusing glibc".
+
+**Class A (27 tests, `(a*)*`-style nested/optional capture-group
+ambiguity)**: confirmed a genuine glibc engine limitation, not an
+asnix calling-convention bug. `builtins.match "(a*)*" "aa"` should give
+`[ "" ]` (POSIX leftmost-longest's tie-break: the empty match on the
+final iteration wins) but asnix gives `[ "aa" ]`. Calling `regexec`
+directly, bypassing asnix entirely, on `(a*)*` against `aa` reports
+group 1 as `[0,2) = "aa"` -- i.e. **glibc's own `regexec` returns the
+"wrong" (non-libstdc++-matching) capture**, with no flag combination
+that changes this (checked `REG_EXTENDED` is already the only relevant
+compile flag; no `regexec` flag affects subexpression tie-breaking).
+Reproduced the same divergence directly against glibc for 4 more shapes
+spanning the full list's variety (`(a?)*`, `(|a)*`, `((a*)(b*))*`,
+`(a*a*)*b`, `((a)*)*`) -- all consistent, all glibc-is-the-source
+cases. This is a known class of glibc regex behavior (it does not
+correctly implement POSIX leftmost-longest tie-breaking for
+subexpressions under repetition/optionality) with no fix available
+short of a different regex engine (e.g. vendoring `std::regex`-like
+backtracking semantics or writing a custom ERE matcher) -- out of
+scope for this pass, left exactly as the existing `match2_impl`/
+`split2_impl` comments already describe (no change needed to those
+comments; they don't claim correctness here, they describe the POSIX
+leftmost-longest *whole-match* property, which does hold and is what
+`match2_impl`'s own anchoring trick correctly relies on -- the bug is
+specifically in subexpression/capture-group tie-breaking, a different
+and narrower property).
+
+**Class B (6 tests, bracket-expression extensions)**: also a genuine
+glibc limitation, confirmed per-feature:
+- Named collating symbols (`[.hyphen.]`, `[.space.]`, `[.tilde.]`,
+  `[.period.]`): `regcomp` itself rejects these with `REG_ECOLLATE`
+  ("Invalid collation character") under both the `C` and the
+  process's actual `en_US.UTF-8` locale -- glibc's locale collating-
+  symbol tables don't define ASCII character names like "hyphen"/
+  "space" as named collating elements (these aren't POSIX-mandated;
+  libstdc++'s regex traits hardcode a fixed table of such names
+  independent of the C library's locale database). Not something
+  asnix's call site controls.
+- GNU-ish character-class names (`[:w:]`, `[:ALPHA:]`): `regcomp`
+  rejects both with `REG_ECTYPE` ("Invalid character class name").
+  glibc only recognizes the 12 standard lowercase POSIX names
+  (confirmed `[[:alpha:]]` already works correctly in asnix today);
+  `w` isn't a POSIX name at all (a Perl/PCRE-ism), and `ALPHA`
+  (uppercase) isn't accepted case-insensitively by glibc even though
+  it's otherwise a valid name -- libstdc++'s regex traits accept both
+  as an extension, glibc's `wctype`-based class lookup does not.
+- Equivalence classes (`[=a=]`): syntactically **accepted** by
+  `regcomp` (unlike the two above), but the execution semantics still
+  diverge: real Nix's `[[=a=]]+` matches "aA" in full (case-insensitive
+  equivalence, consistent with `en_US.UTF-8` collation treating case
+  variants as equivalent), but calling `regexec` directly on the
+  compiled pattern against `"aA"` only matches the first char (`[0,1)
+  = "a"`) -- glibc's own equivalence-class matching does NOT fold case
+  here even under the process's real `en_US.UTF-8` locale. So this
+  isn't a missing-feature gap closable by just not rejecting the
+  syntax; the matching behavior itself is different from libstdc++'s.
+Per the task's own guidance not to hack around genuine engine
+limitations (e.g. preprocessing named collating symbols into literal
+characters, or special-casing GNU class-name aliases before calling
+`regcomp`), left unfixed and documented here instead.
+
+**Class C (6 tests, invalid patterns silently accepted)**: already
+*mostly* fixed in a prior pass -- `pattern_rejected_by_real_nix` (added
+before this milestone; see its own long comment above
+`compile_or_fatal`) already pre-rejects the escape-whitelist violations,
+missing-lower-bound intervals, and unmatched-paren cases that make up
+the bulk of `corpora/regex-invalid.nix`. Re-derived the exact mapping
+from the conformance test names to corpus entries (`builtins.elemAt
+(import ./corpora/regex-invalid.nix) N` with 0-based `N`, confirmed
+directly via `nix-instantiate`) since the triage report's example
+patterns for indices 34/37/40 (`"a{1,2,3}"`/`"a{99994}"`/`"[a--]"`) do
+not match what's actually at those indices in the live corpus
+(`(a){24998}`/`[[.-.]]`/`[a-[.c.]]` respectively) -- those three
+patterns the report named are, in fact, *already* correctly rejected
+(confirmed: `regcomp` itself returns `REG_BADBR`/"Invalid content of
+\{\}" for `a{1,2,3}`, `REG_ESPACE`/"Regular expression too big" for
+`a{99994}`, `REG_ERANGE`/"Invalid range end" for `[a--]"`, and
+`compile_or_fatal` already propagates any nonzero `regcomp` return as
+fatal). The three *actually*-still-failing pairs
+(`eval-fail-regex-invalid-034/037/040-{match,split}`) are exactly the
+two cases the existing comment above `pattern_rejected_by_real_nix`
+already calls out as "Deliberately NOT chased": `(a){24998}` compiles
+fine under glibc (`regcomp` accepts it, `nsub=1`) -- real Nix's
+rejection is libstdc++ hitting some internal NFA-state-count/
+complexity threshold for repeated *groups* specifically, well below
+glibc's own much larger `RE_DUP_MAX`-class limit, and that threshold
+isn't POSIX-specified or otherwise discoverable short of probing
+libstdc++'s source/binary search over `nix-instantiate` itself (which
+would then be an arbitrary magic number baked into asnix, not a real
+rule); `[[.-.]]`/`[a-[.c.]]` (collating symbol used as a bracket-range
+endpoint) also compile fine under glibc but are a libstdc++-specific
+grammar restriction with no glibc equivalent to inspect. Confirmed via
+direct `regcomp` calls (bypassing asnix) that glibc accepts all three
+patterns -- this is not a missed error-check in `compile_or_fatal`,
+there is no error to check for.
+
+No code changes resulted from this pass. Regression baseline unchanged
+(verified `make test`, `make test-e2e` green; conformance count varies
+run-to-run due to other agents' concurrent work landing in the shared
+`~/asnix` worktree the adapter targets -- saw 635 passed/167 failed/0
+known/62 skipped at the time of this pass, vs. the 633/169/0/62 figure
+quoted when this milestone was assigned, a +2 drift consistent with
+unrelated fixes landing elsewhere, not anything from this pass).
