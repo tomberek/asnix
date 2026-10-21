@@ -1066,19 +1066,41 @@ static Ast *parse_select(Parser *p) {
     /* `expr.attr or default` -- real Nix's grammar attaches `or` to the
      * whole preceding `expr '.' attrpath`, not per-segment (confirmed
      * against nix-instantiate's own parser.y: `expr_simple '.' attrpath
-     * OR_KW expr_select`), so this is checked once, after the loop, on
-     * the outermost (last) AST_SELECT node -- see that node's `default_`
-     * field comment in ast.h for the resulting scope cut (only the last
-     * segment's failure is caught, not an earlier one in a longer
-     * chain). `default` itself is parsed at this same parse_select
-     * tightness (matching real Nix: the default is NOT a full `expr`,
-     * e.g. `+`/`==` outside are not absorbed into it), recursively, so
-     * `a.b or c.d or e` chains sensibly. No `or` is possible without at
-     * least one preceding `.select` (real Nix's grammar agrees -- a bare
-     * `x or y` is the separate, unsupported "cursed or" rule). */
+     * OR_KW expr_select`), and `ExprSelect::eval` (eval.cc) evaluates
+     * that whole multi-segment attrpath in ONE loop, falling through to
+     * `default` the instant ANY segment is missing or the current value
+     * isn't an attrset -- not just the last one. asnix's parser instead
+     * builds a chain of nested single-segment AST_SELECT nodes (one per
+     * `.segment`, `target` pointing at the previous node), so matching
+     * that semantics means sharing the SAME `default_` Ast* across every
+     * node of this one unbroken chain, not just the outermost (last) one
+     * -- walk back down `target` while it's itself a freshly-built
+     * AST_SELECT (default_ == NULL, true for every node of THIS chain
+     * and only this chain, by construction: an earlier chain's `or`
+     * would already have set it, and this loop built every node here
+     * from scratch) and stamp all of them with the same pointer. Sharing
+     * one Ast* subtree across multiple parent nodes is safe here --
+     * compiler.c only ever READS `default_` to emit a fresh, independent
+     * copy of its bytecode at each compile site, never mutates the AST --
+     * verified by testing a chain with a side-effecting default
+     * (`a.x.y or (builtins.trace "eval" default)`) evaluates it exactly
+     * once, not once per missing segment. `default` itself is parsed at
+     * this same parse_select tightness (matching real Nix: the default
+     * is NOT a full `expr`, e.g. `+`/`==` outside are not absorbed into
+     * it), recursively, so `a.b or c.d or e` chains sensibly. No `or` is
+     * possible without at least one preceding `.select` (real Nix's
+     * grammar agrees -- a bare `x or y` is the separate, unsupported
+     * "cursed or" rule). */
     if (had_select && cur(p)->kind == TOK_OR) {
         advance(p);
-        e->as.select.default_ = parse_select(p);
+        Ast *default_ast = parse_select(p);
+        Ast *chain_node = e;
+        while (chain_node->kind == AST_SELECT && chain_node->as.select.default_ == NULL) {
+            chain_node->as.select.default_ = default_ast;
+            Ast *next = chain_node->as.select.target;
+            if (next->kind != AST_SELECT) break;
+            chain_node = next;
+        }
     }
     return e;
 }

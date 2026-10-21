@@ -191,10 +191,18 @@ struct Ast {
                                        OP_SELECT_DYNAMIC_OR (ir.h) and
                                        src/asm/ops/op_select_dynamic_or.S. */
             Ast *default_; /* `expr.attr or default` -- NULL for a plain select (fatal if
-                              * missing/wrong type, see compiler.c's AST_SELECT case). Scope
-                              * cut: only the single select this node represents is covered,
-                              * not every segment of a longer chain -- see
-                              * src/asm/ops/op_select_or.S's header comment. */
+                              * missing/wrong type, see compiler.c's AST_SELECT case). M70: a
+                              * multi-segment chain (`a.b.c or default`) shares the SAME
+                              * `default_` `Ast*` across every node of the chain (stamped by
+                              * parse_select's post-loop walk, parser.c) -- compiler.c's
+                              * AST_SELECT case recognizes that sharing (by pointer identity)
+                              * and compiles the whole chain as one unit against a single
+                              * landing pad, matching real Nix's `ExprSelect::eval`, which
+                              * falls through to `default` on ANY segment's failure, not just
+                              * this node's own. See compiler.c's AST_SELECT case comment for
+                              * the full mechanism, and M70's scope notes (docs/
+                              * architecture.md) for why the parser and compiler halves of
+                              * this had to move together. */
         } select; /* AST_SELECT */
         struct {
             Ast *lhs, *rhs;

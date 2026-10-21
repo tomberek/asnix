@@ -1161,49 +1161,97 @@ static void compile_expr(IrBuilder *b, Ast *node, ScopeFrame *scope) {
             return;
         }
         case AST_SELECT: {
-            compile_expr(b, node->as.select.target, scope);
-            if (node->as.select.attr_expr) {
-                /* Dynamic `.${expr}` -- the attribute name isn't known
-                 * until runtime, so there's no sym to intern here; the
-                 * name expr's *value* (a string) is pushed and
-                 * OP_SELECT_DYNAMIC (src/asm/ops/op_select_dynamic.S)
-                 * interns/looks it up at runtime (see
-                 * asnix_bshared_select_dynamic, builtins_shared.c). */
-                compile_expr(b, node->as.select.attr_expr, scope);
-                if (!node->as.select.default_) {
+            if (!node->as.select.default_) {
+                compile_expr(b, node->as.select.target, scope);
+                if (node->as.select.attr_expr) {
+                    /* Dynamic `.${expr}` -- the attribute name isn't known
+                     * until runtime, so there's no sym to intern here; the
+                     * name expr's *value* (a string) is pushed and
+                     * OP_SELECT_DYNAMIC (src/asm/ops/op_select_dynamic.S)
+                     * interns/looks it up at runtime (see
+                     * asnix_bshared_select_dynamic, builtins_shared.c). */
+                    compile_expr(b, node->as.select.attr_expr, scope);
                     ib_select_dynamic(b);
                     return;
                 }
-                /* `.${expr} or default` (M28) -- same try/jmp/default
-                 * shape as the static OP_SELECT_OR case below, just
-                 * emitting OP_SELECT_DYNAMIC_OR instead (see that op's
-                 * own comment, ir.h). */
-                size_t try_site = ib_select_dynamic_or(b);
-                size_t jmp_site = ib_jmp(b);
-                size_t default_idx = ib_len(b);
-                ib_patch_delta(b, try_site, default_idx);
-                compile_expr(b, node->as.select.default_, scope);
-                size_t end_idx = ib_len(b);
-                ib_patch_delta(b, jmp_site, end_idx);
-                return;
-            }
-            uint32_t sym = asnix_intern(node->as.select.attr, node->as.select.attr_len);
-            if (!node->as.select.default_) {
+                uint32_t sym = asnix_intern(node->as.select.attr, node->as.select.attr_len);
                 ib_select(b, sym);
                 return;
             }
-            /* `expr.attr or default`: OP_SELECT_OR falls through in-line
-             * on a hit (value already on VALSTACK); on a miss it jumps
-             * (by the delta patched below) straight to the default's
-             * code. The OP_JMP right after is only reached on the hit
-             * path, skipping over the default's code to the shared end --
-             * same two-site patch-after-the-fact shape AST_IF already
-             * uses for its then/else branches. */
-            size_t try_site = ib_select_or(b, sym);
+            /* `expr.attr or default` -- real Nix's grammar (`parser.y`:
+             * `expr_simple '.' attrpath OR_KW expr_select`) attaches `or`
+             * to the WHOLE preceding dotted chain, and `ExprSelect::eval`
+             * (eval.cc) walks EVERY segment in one loop, falling through
+             * to `default` the instant any one of them misses or the
+             * current value isn't an attrset -- not just the last
+             * segment. parse_select (parser.c) builds a chain of nested
+             * single-segment AST_SELECT nodes (one per `.segment`,
+             * `target` pointing at the previous node) and, on seeing a
+             * trailing `or`, stamps the SAME `default_` Ast* onto every
+             * node of that one unbroken chain. So the first time we see a
+             * non-NULL default_ here, `node` may be the OUTERMOST of a
+             * multi-segment chain, not a lone single-segment select --
+             * walk back down `target` while it's itself an AST_SELECT
+             * with the exact same `default_` pointer (true for every
+             * node of *this* chain and only this chain, by construction)
+             * to collect every segment, outermost first. Interior/
+             * innermost chain members are never visited by compile_expr
+             * directly (nothing recurses into them except this walk,
+             * which bypasses the normal `compile_expr(target)` call
+             * below) -- that's what keeps `default` from being compiled
+             * (and potentially evaluated) more than once per chain. A
+             * lone `a.x or d` is just the one-segment case of this same
+             * walk (loop body runs once). */
+            Ast *default_ast = node->as.select.default_;
+            size_t seg_cap = 4, seg_len = 0;
+            Ast **segments = malloc(seg_cap * sizeof(Ast *));
+            Ast *chain_node = node;
+            for (;;) {
+                if (seg_len == seg_cap) {
+                    seg_cap *= 2;
+                    segments = realloc(segments, seg_cap * sizeof(Ast *));
+                }
+                segments[seg_len++] = chain_node;
+                Ast *next = chain_node->as.select.target;
+                if (next->kind != AST_SELECT || next->as.select.default_ != default_ast) {
+                    /* `next` is the chain's true base expression (not
+                     * part of this shared-default chain) -- compile it
+                     * once, before any segment's select-or op. */
+                    compile_expr(b, next, scope);
+                    break;
+                }
+                chain_node = next;
+            }
+            /* `segments` was collected outermost-first (descending via
+             * `target`), but real Nix evaluates a dotted chain left to
+             * right -- base, then innermost segment, ..., then outermost
+             * -- so emit in reverse. */
+            size_t *try_sites = malloc(seg_len * sizeof(size_t));
+            for (size_t i = 0; i < seg_len; i++) {
+                Ast *seg = segments[seg_len - 1 - i];
+                if (seg->as.select.attr_expr) {
+                    compile_expr(b, seg->as.select.attr_expr, scope);
+                    try_sites[i] = ib_select_dynamic_or(b);
+                } else {
+                    uint32_t sym = asnix_intern(seg->as.select.attr, seg->as.select.attr_len);
+                    try_sites[i] = ib_select_or(b, sym);
+                }
+            }
+            free(segments);
+            /* Every segment's miss-jump (OP_SELECT_OR/OP_SELECT_DYNAMIC_OR's
+             * delta) shares this ONE landing pad: if every segment hit,
+             * execution falls through all of them in sequence and must
+             * jump PAST the default's code to the shared end; if any one
+             * segment misses, it jumps straight here instead -- same
+             * two-site patch-after-the-fact shape AST_IF uses for
+             * then/else, just with N try-sites instead of one. */
             size_t jmp_site = ib_jmp(b);
             size_t default_idx = ib_len(b);
-            ib_patch_delta(b, try_site, default_idx);
-            compile_expr(b, node->as.select.default_, scope);
+            for (size_t i = 0; i < seg_len; i++) {
+                ib_patch_delta(b, try_sites[i], default_idx);
+            }
+            free(try_sites);
+            compile_expr(b, default_ast, scope);
             size_t end_idx = ib_len(b);
             ib_patch_delta(b, jmp_site, end_idx);
             return;

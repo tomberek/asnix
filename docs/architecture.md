@@ -82,7 +82,8 @@ what's actually implemented and the scope decisions made along the way.
 | M67 — external-conformance grab-bag: derivation `==` by `outPath`, dynamic-attrs scope fixes (rec-sibling visibility, attrpath-merge-into-a-dynamic-key, `${"literal"}` in `let`), `or` as an ordinary identifier, path-interpolation existence check, `fromJSON` deep-nesting stack fix, printer `<PRIMOP>`/`<LAMBDA>` | done, **scoped** (see below; function/slot-identity equality, `__curPos`, `tryEval` thunk re-eval, multi-segment `or default`, and `<PRIMOP-APP>` skipped) |
 | M68 — a hand-written POSIX-ERE backtracking engine (`src/c/regex_engine.c`) to fix the 33 real behavioral gaps M55 triaged-but-didn't-fix between glibc's `<regex.h>` and real Nix's libstdc++ `std::regex` | done, **scoped** (see below; the 6 already-known-unfixable Class C patterns from M55 are still unfixed, deliberately) |
 | M69 — `derivation`/`derivationStrict`'s `__structuredAttrs = true;` mode (JSON-serialized input attrs instead of per-attribute stringified env vars) | done, **scoped** (see below) |
-| M70+ | not started |
+| M70 — multi-segment `a.b.c or default`: every segment of a dotted chain now shares ONE `or` guard, matching real Nix's `ExprSelect::eval` (M67's documented residual gap, blocking `./asnix d.nix` on real nixpkgs) | done (see below) |
+| M71+ | not started |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
 
@@ -7448,3 +7449,117 @@ exits nonzero and didn't time out", not *which* error occurred, so
 this isn't a behavioral claim that asnix now has real recursion-depth
 guards anywhere in this path (it doesn't; same pre-existing gap as
 every other unbounded-recursion C function in this codebase).
+
+## M70 scope notes: multi-segment `a.b.c or default` -- every segment of a chain now shares ONE `or` guard
+
+The live blocker on `./asnix d.nix`
+((`builtins.import /home/tbereknyei/nixpkgs/default.nix {}).hello.outPath`):
+`asnix: attribute 'stdenv' missing, aborting`. Root-caused directly with
+gdb: broke at `asnix_bshared_select_missing_fatal`, dumped the target
+attrset's keys -- it's `pkgs/top-level/config.nix`'s settings attrset,
+not a package set -- then grepped real nixpkgs for the exact selection:
+`pkgs/stdenv/generic/make-derivation.nix:191`, `userHook = config.stdenv.userHook
+or null;`. Minimal repro, verified directly against real Nix:
+```
+let a = { b = { c = 1; }; }; in a.x.y or "default"
+```
+Real Nix: `"default"`. Pre-fix asnix: `asnix: attribute 'x' missing,
+aborting` -- crashed on the FIRST missing segment instead of falling
+through to the default.
+
+This is exactly the gap M67e's own notes already flagged as the
+remaining `eval-okay-attrs5.nix` failure (see that section, and
+`parser.c`'s `parse_select` comment at the time): real Nix's grammar
+(`parser.y`: `expr_simple '.' attrpath OR_KW expr_select`) attaches
+`or default` to the WHOLE preceding dotted chain, and `ExprSelect::eval`
+(`~/nix/src/libexpr/eval.cc`) walks EVERY segment of that one
+multi-segment attrpath in a single loop, falling through to `default`
+the instant ANY segment is missing or the current value isn't an
+attrset -- not just the last one. asnix's parser instead built a chain
+of nested single-segment `AST_SELECT` nodes (one per `.segment`,
+`target` pointing at the previous node), attaching `default_` only to
+the OUTERMOST (last) node after the loop. So `a.x.y or "default"`
+compiled as: a hard, unguarded select of `x` on `a`, feeding a guarded
+select of `y` on that -- the first hard select had nothing to fall back
+to, hence the crash.
+
+**Fix.** Two coordinated halves, since fixing only one in isolation is
+actively dangerous (see the double-select risk noted below):
+
+- **Parser (`parse_select`, `src/c/parser.c`)**: when the trailing `or`
+  is seen after the segment-collecting loop, instead of stamping
+  `default_` only on the outermost node, walk back down the just-built
+  chain via `target` while it's itself a freshly-built `AST_SELECT`
+  with `default_ == NULL` (true for every node of *this* chain, and
+  only this chain, by construction -- an earlier chain's `or` would
+  already have set its own nodes' `default_`) and stamp the SAME
+  `default_` `Ast*` onto every node. Sharing one `Ast*` subtree across
+  multiple parent nodes is safe here: `compiler.c` only ever READS
+  `default_` to emit a fresh, independent copy of its bytecode at each
+  compile site, never mutates the AST.
+- **Compiler (`AST_SELECT` case, `src/c/compiler.c`)**: a non-NULL
+  `default_` no longer means "lone single-segment select" -- it now
+  collects the WHOLE chain sharing that one `default_` pointer (walking
+  `target` the same way, stopping at the first node whose target isn't
+  an `AST_SELECT` with the identical pointer, which is the chain's true
+  base expression), compiles the base once, then emits one
+  `OP_SELECT_OR`/`OP_SELECT_DYNAMIC_OR` per segment in source order
+  (innermost first -- the chain is built innermost-first as nested AST
+  but must execute `a`, then `.x`, then `.y`, so the collected,
+  outermost-first array is walked in reverse), with every segment's
+  miss-jump delta patched to the SAME shared landing pad. One
+  `OP_JMP` right after the last segment skips the landing pad on a full
+  hit; the landing pad itself compiles `default_` exactly once and
+  falls through to the shared end, which the hit-path jump targets --
+  same two-site patch-after-the-fact shape `AST_IF` already uses for
+  then/else, generalized from one try-site to N. No new IR ops needed:
+  this is entirely a reuse of the existing `OP_SELECT_OR`/
+  `OP_SELECT_DYNAMIC_OR` "jump offset to the default code" mechanism
+  against one shared target instead of one-per-node.
+
+  The reason both halves had to move together: stamping `default_` on
+  every chain node in the parser while leaving the compiler's old
+  per-node-independent-wrap logic in place would have been WORSE than
+  the original bug, not better -- a node whose `target` is itself
+  select-or-guarded would, under the old compiler logic, first let its
+  target's own wrap catch a miss and substitute the *whole default
+  value* in place of the target, then go on to apply its OWN select to
+  THAT value (`.y` selected from `default`, not `default` itself used
+  directly) -- silently wrong whenever `default` happens to have a
+  same-named attribute, and a second, independent evaluation of
+  `default_`'s bytecode (visible as a doubled side effect) whenever it
+  doesn't. Confirmed this exact failure mode never occurs with the
+  combined fix.
+
+Verified against real `nix-instantiate --eval --strict` beyond the one
+minimal repro: a 3-segment chain missing at each possible position
+(`a.x.y.z`/`a.q.y.z`/`a.x.q.z`/`a.x.y.q or "d"`), a dynamic segment
+mixed with a static one (`a.${k}.y or d`, both hit and miss), nested
+`or` chains (`a.b or c.d or e`, both the first- and both-miss cases),
+and a `builtins.trace`-wrapped default (`a.x.y or (builtins.trace
+"eval-default-once" "d")`) confirmed to fire the trace exactly once,
+matching real Nix exactly in every case.
+
+**`./asnix d.nix`**: confirmed the exact "attribute 'stdenv' missing"
+blocker is gone; `d.nix` now progresses to a new, later blocker
+(`asnix: attribute 'storeDir' missing, aborting`) -- the next iteration
+of this standing chase, not pursued further here per this task's
+explicit scope.
+
+`make test`/`make test-e2e` both green, zero regressions, plus four new
+`tests/e2e/m70_or_chain_*.nix` fixtures (all verified against real
+`nix-instantiate --eval --strict` first): the 2-segment minimal repro,
+a 3+-segment chain with a miss at every position, a mixed static/
+dynamic-segment chain, and a case (`builtins.attrNames (a.x.y or d)`
+with `d = { y = 5; w = 6; }`) that would return the WRONG value
+(`d.y` = `5` instead of `attrNames d` = `["w" "y"]`) under exactly the
+double-select regression described above, making that failure mode
+automatically checkable via stdout diffing rather than only via manual
+trace-count inspection.
+
+`make test-nix-conformance`: `pass=623 fail=35 skip=148` ->
+`pass=624 fail=34 skip=148` (net **+1**, confirmed via a full
+before/after diff of the failed-file list, not just the aggregate
+counts, that the one flip is exactly `eval-okay-attrs5.nix` -- the file
+M67e's own notes predicted this fix would resolve -- and nothing else
+regressed or newly failed).

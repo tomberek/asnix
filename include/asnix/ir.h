@@ -200,9 +200,10 @@ enum {
                      * missing key both fall through to the delta jump (not fatal, unlike
                      * plain OP_SELECT -- see op_select_or.S). Found: forces the entry if
                      * it's an unforced thunk (same as OP_SELECT) and falls through
-                     * in-line. Scope cut: only protects the single select this op
-                     * corresponds to, not every segment of a longer `a.b.c` chain --
-                     * see op_select_or.S's header comment. */
+                     * in-line. M70: a multi-segment chain (`a.b.c or default`) emits ONE
+                     * of these per segment, all patched to the SAME shared landing pad --
+                     * see compiler.c's AST_SELECT case -- so the whole chain is protected,
+                     * not just the single select any one of these ops corresponds to. */
     OP_SELECT_DYNAMIC, /* `expr.${nameExpr}`: pops the attribute-name Value then the select
                           * target (reverse push order); interns the name (must be a string,
                           * fatal otherwise) and looks it up at runtime, since (unlike plain
