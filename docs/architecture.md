@@ -58,7 +58,8 @@ what's actually implemented and the scope decisions made along the way.
 | M43 — lambda-pattern-vs-attrset disambiguation miscounts `${` in default values | done (see below) |
 | M44 — `builtins.placeholder`/bare `placeholder` | done (see below) |
 | M45 — `builtins.toFile` | done, **scoped** (see below) |
-| M46-M49 | not started |
+| M46 — `<nix/fetchurl.nix>` virtual-corepkgs special case | done, **scoped** (see below) |
+| M47-M49 | not started |
 | M50 — name the specific value/field in 6 more generic fatal-path error messages | done (see below) |
 | M51 | in progress (parallel agent: float literals) |
 | M52 — fix `with`-frame leaking into a sibling expression (core evaluator fix) | done, **scoped** (see below) |
@@ -4602,3 +4603,44 @@ pass's checks run through on every call (`m56_int_arith_bounds.nix`,
 633/169 baseline, +20 (4 overflow + 2 fromTOML over/underflow + 14
 fromTOML invalid-input cases), confirmed via a fail-list diff to be
 *exactly* those 20 and nothing else.
+
+## M46 scope notes: `<nix/fetchurl.nix>` virtual-corepkgs special case
+
+Found continuing to chase `d.nix` right after M45: `<nix/fetchurl.nix>`
+("file 'nix/fetchurl.nix' was not found in the Nix search path")
+imported from `pkgs/build-support/fetchurl/default.nix`. Root-caused
+via cppnix source (`~/nix/src/libexpr/eval.cc`): `<nix/...>` is NOT an
+ordinary `NIX_PATH` search-path lookup at all in real Nix -- it's
+special-cased to a tiny in-memory virtual filesystem (`corepkgsFS`)
+that has exactly ONE file ever added to it, `fetchurl.nix`, whose
+bytes are embedded directly into the `nix` binary at compile time
+(`#embed "fetchurl.nix"`) -- there is no real `corepkgs` directory on
+disk anywhere this project could point `NIX_PATH` at, confirmed by
+checking the real installed binary's own closure.
+
+Ported the file's content verbatim from cppnix's own source
+(`~/nix/src/libexpr/fetchurl.nix`, byte-for-byte, confirmed via `diff`)
+rather than reconstructing it, to avoid any behavioral drift.
+`asnix_resolve_search_path_value` now special-cases the exact name
+`"nix/fetchurl.nix"` (checked before the ordinary `resolve_search_path`
+`NIX_PATH`-walking logic ever runs, matching real Nix's own ordering)
+by writing the embedded content out to a fixed, stable temp path
+(`/tmp/.asnix-corepkgs-fetchurl.nix`, overwritten idempotently every
+time -- content never changes, so a concurrent-process race is
+harmless) and returning THAT as the resolved Path -- reuses 100% of
+the existing Path/import machinery rather than teaching it about
+virtual, non-filesystem content. Verified this resolves and imports
+correctly even with `NIX_PATH` entirely unset (matching real Nix
+exactly, since the virtual-FS special case bypasses `NIX_PATH` lookup
+altogether) and that the written file is byte-identical to cppnix's
+source.
+
+Documented scope cut: `toString <nix/fetchurl.nix>` would print the
+real temp path instead of real Nix's special `"<nix" .. ">"` display
+convention -- not hit by anything this project has evaluated so far
+(every real use just `import`s it and calls the result).
+
+`make test`/`test-e2e` green (204 e2e, one new `m46_*` fixture);
+`test-conformance` still 657 passed, no regressions (not exercised by
+the numtide/nix-conformance `lang` corpus, which has no filesystem
+fixture tree shaped like this).

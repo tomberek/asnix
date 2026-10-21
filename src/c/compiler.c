@@ -141,6 +141,116 @@ static char *resolve_search_path(const char *name, size_t name_len) {
     asnix_tryeval_raise_or_fatal(formatted, (size_t)needed);
 }
 
+/* `<nix/fetchurl.nix>` (M46) is NOT an ordinary search-path lookup in
+ * real Nix at all -- confirmed in cppnix's source
+ * (`~/nix/src/libexpr/eval.cc`): `corepkgsFS`, an in-memory virtual
+ * filesystem, has exactly ONE file ever added to it
+ * (`corepkgsFS->addFile(CanonPath("fetchurl.nix"), {#embed
+ * "fetchurl.nix"})`, the file's bytes baked directly into the `nix`
+ * binary at compile time), and any `<nix/...>` path is routed to this
+ * virtual FS (`path.substr(3)`) BEFORE the ordinary `NIX_PATH`-walking
+ * logic `resolve_search_path` implements ever runs -- there is no real
+ * `corepkgs` directory on disk to point `NIX_PATH` at. Ported the exact
+ * file content verbatim from cppnix's own source
+ * (`~/nix/src/libexpr/fetchurl.nix`) rather than reconstructing it, to
+ * avoid any behavioral drift from what real Nix actually embeds.
+ * Written out to a fixed, stable temp path once per process and
+ * imported from there like any other path -- reuses 100% of the
+ * existing Path/import machinery rather than teaching it about virtual,
+ * non-filesystem content; externally indistinguishable for every
+ * reachable use (`import <nix/fetchurl.nix> {...}`, never `toString
+ * <nix/fetchurl.nix>` itself, which WOULD print differently from real
+ * Nix's special `"<nix" .. ">"` display -- a documented, narrower scope
+ * cut, not hit by anything this project has evaluated so far). Found
+ * needed evaluating real nixpkgs: `pkgs/build-support/fetchurl/
+ * default.nix` imports this. */
+static const char ASNIX_FETCHURL_NIX_SOURCE[] =
+    "{\n"
+    "  system ? \"\", # obsolete\n"
+    "  url,\n"
+    "  hash ? \"\", # an SRI hash\n"
+    "\n"
+    "  # Legacy hash specification\n"
+    "  md5 ? \"\",\n"
+    "  sha1 ? \"\",\n"
+    "  sha256 ? \"\",\n"
+    "  sha512 ? \"\",\n"
+    "  outputHash ?\n"
+    "    if hash != \"\" then\n"
+    "      hash\n"
+    "    else if sha512 != \"\" then\n"
+    "      sha512\n"
+    "    else if sha1 != \"\" then\n"
+    "      sha1\n"
+    "    else if md5 != \"\" then\n"
+    "      md5\n"
+    "    else\n"
+    "      sha256,\n"
+    "  outputHashAlgo ?\n"
+    "    if hash != \"\" then\n"
+    "      \"\"\n"
+    "    else if sha512 != \"\" then\n"
+    "      \"sha512\"\n"
+    "    else if sha1 != \"\" then\n"
+    "      \"sha1\"\n"
+    "    else if md5 != \"\" then\n"
+    "      \"md5\"\n"
+    "    else\n"
+    "      \"sha256\",\n"
+    "\n"
+    "  executable ? false,\n"
+    "  unpack ? false,\n"
+    "  name ? baseNameOf (toString url),\n"
+    "  impure ? false,\n"
+    "}:\n"
+    "\n"
+    "derivation (\n"
+    "  {\n"
+    "    builder = \"builtin:fetchurl\";\n"
+    "\n"
+    "    # New-style output content requirements.\n"
+    "    outputHashMode = if unpack || executable then \"recursive\" else \"flat\";\n"
+    "\n"
+    "    inherit\n"
+    "      name\n"
+    "      url\n"
+    "      executable\n"
+    "      unpack\n"
+    "      ;\n"
+    "\n"
+    "    system = \"builtin\";\n"
+    "\n"
+    "    # No need to double the amount of network traffic\n"
+    "    preferLocalBuild = true;\n"
+    "\n"
+    "    # This attribute does nothing; it's here to avoid changing evaluation results.\n"
+    "    impureEnvVars = [\n"
+    "      \"http_proxy\"\n"
+    "      \"https_proxy\"\n"
+    "      \"ftp_proxy\"\n"
+    "      \"all_proxy\"\n"
+    "      \"no_proxy\"\n"
+    "    ];\n"
+    "\n"
+    "    # To make \"nix-prefetch-url\" work.\n"
+    "    urls = [ url ];\n"
+    "  }\n"
+    "  // (if impure then { __impure = true; } else { inherit outputHashAlgo outputHash; })\n"
+    ")\n";
+
+#define ASNIX_FETCHURL_TEMP_PATH "/tmp/.asnix-corepkgs-fetchurl.nix"
+
+static const char *write_fetchurl_nix(void) {
+    FILE *f = fopen(ASNIX_FETCHURL_TEMP_PATH, "w");
+    if (!f) {
+        fprintf(stderr, "asnix: could not write '%s' for <nix/fetchurl.nix>\n", ASNIX_FETCHURL_TEMP_PATH);
+        exit(1);
+    }
+    fwrite(ASNIX_FETCHURL_NIX_SOURCE, 1, sizeof(ASNIX_FETCHURL_NIX_SOURCE) - 1, f);
+    fclose(f);
+    return ASNIX_FETCHURL_TEMP_PATH;
+}
+
 /* `<name>` search-path resolution, called from OP_RESOLVE_SEARCH_PATH
  * (M31) -- unlike an ordinary path literal (`./foo.nix`, `/abs/path`,
  * resolved once at *compile* time, fixed by where it's written, see
@@ -158,6 +268,10 @@ static char *resolve_search_path(const char *name, size_t name_len) {
 Value asnix_resolve_search_path_value(Value name_val) {
     int64_t len;
     const char *bytes = asnix_ptr_bytes(name_val, &len);
+    if (len == 16 && memcmp(bytes, "nix/fetchurl.nix", 16) == 0) {
+        const char *path = write_fetchurl_nix();
+        return asnix_make_path_value(path, strlen(path));
+    }
     char *resolved = canon_path(resolve_search_path(bytes, (size_t)len));
     Value v = asnix_make_path_value(resolved, strlen(resolved));
     free(resolved);
