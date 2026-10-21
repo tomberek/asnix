@@ -1,9 +1,13 @@
+#define _DEFAULT_SOURCE /* lstat() -- same feature-test macro builtins_m23.c uses */
+
 #include "value_util.h"
 
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#include <sys/stat.h>
 
 #include "asnix/arena.h"
 #include "asnix/heap.h"
@@ -217,7 +221,20 @@ Value asnix_coerce_to_string(Value v) {
  * verification step (checked against real nix-instantiate before
  * trusting it) caught that bare interpolation of a non-string is
  * supposed to be a hard error, not silently stringified. */
-static Value coerce_to_string_for_interp(Value v) {
+/* M61: `check_path_exists` -- true for genuine `"${...}"` string
+ * interpolation (OP_STR_CONCAT, via `asnix_concat_strings` below), false
+ * for the UNRELATED internal reuse of this same coercion logic by the
+ * `+` operator's path-concat case (`asnix_add_values`, via
+ * `concat_strings_impl` below). Real Nix's own path-existence
+ * requirement is specific to interpolation (string coercion that would
+ * trigger a copy-to-store) -- `+` on a Path is ordinary text
+ * concatenation with no such requirement (confirmed against real
+ * `nix-instantiate --eval`: `toString (/foo/bar + "/x")` succeeds even
+ * when `/foo/bar` doesn't exist, while `"${./bar}"` on the same
+ * nonexistent path fails) -- found as a regression this fix introduced
+ * (`tests/e2e/m57g_path_canon_concat.nix`, path `+` string, broke when
+ * the existence check below was first added unconditionally). */
+static Value coerce_to_string_for_interp(Value v, int check_path_exists) {
     if (asnix_tag_of(v) == ASNIX_TAG_PTR) {
         /* A Path is a second, differently-shaped ASNIX_TAG_PTR kind (see
          * value_util.h) -- returning it unchanged, as if every TAG_PTR were
@@ -232,7 +249,42 @@ static Value coerce_to_string_for_interp(Value v) {
          * AddToStore yet, see docs/architecture.md's import/path-literals
          * scope notes) -- so this produces the plain path text instead,
          * a known, documented behavioral gap, not a crash. */
-        if (asnix_value_is_path(v)) return asnix_coerce_to_string(v);
+        if (asnix_value_is_path(v)) {
+            /* M61: real Nix additionally requires the path *exist* on
+             * disk at this specific call site -- string interpolation of
+             * a bare path triggers "copy to store" coercion (unlike
+             * `builtins.toString`, which just formats the text and never
+             * checks existence: confirmed `toString ./nonexistent`
+             * succeeds against real `nix-instantiate --eval`, while
+             * `"${./nonexistent}"` fails with `error: path '...' does
+             * not exist`). No actual store-copy is implemented here (see
+             * this function's own comment just above), but the
+             * existence check that gates it is cheap and independently
+             * observable, so add just that much: `eval-fail-nonexist-
+             * path.nix` (`"${./fnord}/xyzzy"`) and `eval-fail-bad-
+             * string-interpolation-2.nix` (`"${./fnord}"`) both expect a
+             * fatal error here, verified against real Nix. `lstat`, not
+             * `stat`, so a dangling symlink still counts as "exists" --
+             * matches `builtins.pathExists`'s own existing convention in
+             * builtins_m23.c. Gated on `check_path_exists` -- see this
+             * function's own header comment for why `+`'s reuse of this
+             * same coercion needs to skip it. */
+            if (check_path_exists) {
+                int64_t len;
+                const char *bytes = asnix_ptr_bytes(v, &len);
+                char *nul_terminated = malloc((size_t)len + 1);
+                memcpy(nul_terminated, bytes, (size_t)len);
+                nul_terminated[len] = '\0';
+                struct stat st;
+                int missing = (lstat(nul_terminated, &st) != 0);
+                if (missing) {
+                    fprintf(stderr, "asnix: path '%s' does not exist\n", nul_terminated);
+                }
+                free(nul_terminated);
+                if (missing) exit(1);
+            }
+            return asnix_coerce_to_string(v);
+        }
         /* M51: a bare Float is a THIRD such kind -- same memory-corruption
          * risk as Path if returned unchanged (its marker+double bytes
          * would be misread as a string length+content). Unlike Path, a
@@ -296,13 +348,18 @@ static Value coerce_to_string_for_interp(Value v) {
     exit(1);
 }
 
-Value asnix_concat_strings(const Value *parts, int64_t count) {
+/* Shared by `asnix_concat_strings` (real `"${...}"` interpolation,
+ * `check_path_exists=1`) and `asnix_add_values`'s path-concat case (`+`,
+ * `check_path_exists=0`) -- see `coerce_to_string_for_interp`'s own
+ * header comment for why the two need different existence-checking
+ * behavior despite sharing every other coercion rule. */
+static Value concat_strings_impl(const Value *parts, int64_t count, int check_path_exists) {
     if (count <= 0) return asnix_make_string_value("", 0);
 
     Value *coerced = malloc((size_t)count * sizeof(Value));
     int64_t total_len = 0;
     for (int64_t i = 0; i < count; i++) {
-        coerced[i] = coerce_to_string_for_interp(parts[i]);
+        coerced[i] = coerce_to_string_for_interp(parts[i], check_path_exists);
         const char *s = (const char *)(coerced[i].raw & ~0x7ULL);
         total_len += *(const int64_t *)(s + ASNIX_STRING_OFF_LEN);
     }
@@ -318,6 +375,10 @@ Value asnix_concat_strings(const Value *parts, int64_t count) {
     }
     free(coerced);
     return (Value){ .raw = (uint64_t)(uintptr_t)mem | ASNIX_TAG_PTR };
+}
+
+Value asnix_concat_strings(const Value *parts, int64_t count) {
+    return concat_strings_impl(parts, count, 1);
 }
 
 Value asnix_add_values(Value lhs, Value rhs) {
@@ -348,7 +409,7 @@ Value asnix_add_values(Value lhs, Value rhs) {
         exit(1);
     }
     Value parts[2] = { lhs, rhs };
-    Value result = asnix_concat_strings(parts, 2);
+    Value result = concat_strings_impl(parts, 2, 0); /* M61: `+` never requires a Path to exist */
     if (asnix_value_is_path(lhs)) {
         /* M57g: canonicalize `.`/`..`/doubled-slash segments the result
          * may now have (e.g. `/foo/bar + "/../xyzzy/./foo.txt"` ==

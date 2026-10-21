@@ -129,6 +129,16 @@ test-conformance: asnix
 # (signal, e.g. a segfault) also counts as "pass" here, same coincidental-
 # pass caveat already documented for a few mined fixtures in
 # tests/conformance/, not a true clean-error pass.
+#
+# M61: `TEST_VAR=foo` -- the real numtide/nix-conformance `run` script
+# exports this (plus `NIX_PATH`/`HOME`, not replicated here -- nothing in
+# this sweep needs them yet) before running any case (its own
+# `run:173`/README.md:84); eval-okay-getenv.nix reads it. Without this,
+# that one test's `.exp` ("foobar") can never match either implementation
+# -- confirmed directly: real `nix-instantiate --eval` on that same file,
+# run without TEST_VAR set, also gives a different result ("bar") -- an
+# environment-setup artifact of this lightweight sweep script, not an
+# asnix bug.
 NIX_CONFORMANCE_DIR ?= /tmp/nix-conformance
 test-nix-conformance: asnix
 	@dir="$(NIX_CONFORMANCE_DIR)/lang"; \
@@ -141,6 +151,7 @@ test-nix-conformance: asnix
 	fi; \
 	pass=0; fail=0; skip=0; failed=""; \
 	cd "$$dir" && \
+	export TEST_VAR=foo; \
 	for f in eval-okay-*.nix; do \
 		base="$${f%.nix}"; \
 		if [ -f "$$base.flags" ]; then skip=$$((skip+1)); continue; fi; \

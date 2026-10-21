@@ -260,6 +260,52 @@ static void print_value_inner(Value v) {
             print_active_pop();
             return;
         }
+        /* M61: real Nix's printer (print.cc) shows `<PRIMOP>` for an
+         * unapplied builtin and `<LAMBDA>` for a bytecode closure (and
+         * `<PRIMOP-APP>` for a *partially*-applied multi-arg builtin --
+         * see this case's own note below on why that third one isn't
+         * replicated here). Previously both tags fell to the generic
+         * `default:` branch below and printed `<unprintable value,
+         * tag=N>` -- found via eval-okay-print.nix (`builtins.trace
+         * [...] [ null toString (deepSeq "x") (a: a) ... ]`), verified
+         * against real `nix-instantiate --eval`.
+         *
+         * ASNIX_TAG_PRIMOP is always a *fully unapplied* native builtin:
+         * every multi-arg builtin visible from Nix source is pre-curried
+         * into a chain of ordinary closures (asnix_bshared_make_curried_
+         * native, builtins_shared.c) precisely because Nix's call syntax
+         * is always unary (`f a b` parses as `(f a) b`) -- a bare
+         * arity-N ASNIX_TAG_PRIMOP value only ever exists for the N==1
+         * case (e.g. `toString`), where "0 args applied" is the only
+         * state reachable before the single call fully invokes it. So
+         * this is unconditionally correct, not an approximation. */
+        case ASNIX_TAG_PRIMOP:
+            printf("<PRIMOP>");
+            return;
+        /* ASNIX_TAG_CLOSURE is NOT always a genuine user-written lambda
+         * -- a *partially*-applied multi-arg native builtin (e.g.
+         * `deepSeq "x"`, one of two args bound) is, per the above,
+         * ALSO represented as one of make_curried_native's synthetic
+         * wrapper closures, which is bit-for-bit indistinguishable at
+         * this tag from an ordinary closure: same ASNIX_TAG_CLOSURE,
+         * same closure layout, no spare field anywhere in it currently
+         * marks "I am a curry stage of a native builtin, not user
+         * code" (its `formals`/`up` fields take the same values an
+         * ordinary top-level lambda's can legitimately take too, so
+         * neither is a safe signal). Reliably telling the two apart
+         * would need a dedicated marker threaded through the closure
+         * heap layout (heap.h) and every .S site that builds one --
+         * out of proportion for this pass. So every ASNIX_TAG_CLOSURE,
+         * applied-native-builtin-stage or not, prints as `<LAMBDA>`;
+         * `eval-okay-print.nix` specifically expects `<PRIMOP-APP>` for
+         * its `(deepSeq "x")` case and so still fails on that one
+         * element (a known, documented approximation, not a crash --
+         * the rest of that test's output, including the `<PRIMOP>`/
+         * `<LAMBDA>` elements and the self-referential-list "«repeated»"
+         * case, is correct). */
+        case ASNIX_TAG_CLOSURE:
+            printf("<LAMBDA>");
+            return;
         default:
             printf("<unprintable value, tag=%d>", asnix_tag_of(v));
             return;

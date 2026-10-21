@@ -44,6 +44,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ucontext.h> /* M61: run_json_parse_on_big_stack -- see its own comment */
 
 #include "asnix/value.h"
 #include "builtins_shared.h"
@@ -404,12 +405,78 @@ static Value asnix_json_parse(const char *src, size_t len) {
     return out;
 }
 
+/* M61: this parser uses one native C stack frame per nesting level (see
+ * parse_json_array/parse_json_object/parse_json_value's mutual
+ * recursion above) -- fine at ordinary depths, but a sufficiently deep
+ * literal (`eval-okay-fromjson-deep.nix` builds `[[[...]]]]` 100,000
+ * deep, checking against the real nlohmann-backed `nix-instantiate`'s
+ * own comment that it "has no nesting limit") blew the default 8 MiB
+ * thread stack and segfaulted -- confirmed directly: the same file's
+ * shallower 20,000-deep case already fit and passed, and manually
+ * running the whole process under `ulimit -s 65536` (64 MiB) made the
+ * 100,000 case pass too, with zero other change.
+ *
+ * Globally raising the process's own stack (`setrlimit(RLIMIT_STACK,
+ * ...)` at startup) was tried first and reverted: it also deepened
+ * `builtins.toJSON`'s OWN (unrelated, separate-function) recursive
+ * serializer enough to let `eval-fail-toJSON-stack-overflow.nix`
+ * actually *finish* instead of crashing -- that conformance case
+ * deliberately relies on hitting a stack limit (real Nix has an
+ * explicit, interpreter-level max-call-depth counter *independent* of
+ * native stack size; this project has no equivalent, so its only
+ * "stack overflow" at all is a native one) to prove a controlled
+ * failure, so letting it succeed instead flips a passing case to
+ * failing. Scoping the bigger stack to ONLY this parser's own
+ * recursion -- via a `ucontext.h` side stack, not a new OS thread (no
+ * actual concurrency; the caller is suspended for the `swapcontext`
+ * duration, same single-threaded execution this whole codebase already
+ * assumes elsewhere, e.g. the global arena allocator) -- fixes
+ * fromjson-deep without touching toJSON's unrelated call path at all. */
+#define ASNIX_JSON_PARSE_STACK_BYTES (64 * 1024 * 1024) /* 64 MiB, see above */
+
+typedef struct {
+    const char *src;
+    size_t len;
+    Value result;
+} JsonParseCtx;
+
+/* Single global, not re-entrancy-safe for nested concurrent use -- fine
+ * here since `swapcontext` below runs this to completion (and any
+ * further `fromJSON` calls IT makes, if ever nested, would each get
+ * their own fresh JsonParseCtx/stack further down this same call chain,
+ * never two live at once from unrelated callers) before the caller
+ * resumes. */
+static JsonParseCtx *g_json_parse_ctx;
+
+static void json_parse_trampoline(void) {
+    g_json_parse_ctx->result = asnix_json_parse(g_json_parse_ctx->src, g_json_parse_ctx->len);
+}
+
+static Value run_json_parse_on_big_stack(const char *src, size_t len) {
+    JsonParseCtx ctx = { src, len, asnix_make_imm(ASNIX_IMM_NULL) };
+    JsonParseCtx *saved_ctx = g_json_parse_ctx; /* restore on return, supporting nested fromJSON calls */
+    g_json_parse_ctx = &ctx;
+
+    void *stack_mem = malloc(ASNIX_JSON_PARSE_STACK_BYTES);
+    ucontext_t caller_ctx, parse_ctx;
+    getcontext(&parse_ctx);
+    parse_ctx.uc_stack.ss_sp = stack_mem;
+    parse_ctx.uc_stack.ss_size = ASNIX_JSON_PARSE_STACK_BYTES;
+    parse_ctx.uc_link = &caller_ctx;
+    makecontext(&parse_ctx, json_parse_trampoline, 0);
+    swapcontext(&caller_ctx, &parse_ctx);
+    free(stack_mem);
+
+    g_json_parse_ctx = saved_ctx;
+    return ctx.result;
+}
+
 static Value prim_fromJSON(const Value *args, int64_t argc) {
     (void)argc;
     const char *bytes;
     int64_t len;
     asnix_bshared_string_bytes(args[0], &bytes, &len, "fromJSON");
-    return asnix_json_parse(bytes, (size_t)len);
+    return run_json_parse_on_big_stack(bytes, (size_t)len);
 }
 
 static Value build_fromJSON(void) { return asnix_bshared_make_primop((void *)prim_fromJSON, 1); }
