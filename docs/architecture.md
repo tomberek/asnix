@@ -8569,3 +8569,85 @@ default -- a real, narrow limitation this milestone surfaced but didn't
 fix, left as-is because fixing it defensibly would need either a wider
 real-usage sample than five packages or a deliberate decision to just
 match real Nix's number outright, neither of which this session did.
+
+## M81: nix-conformance sweep -- 7 parallel fixes merged
+
+Seven background agents each independently triaged a disjoint slice of
+`numtide/nix-conformance`'s remaining failures in isolated worktrees;
+their changes were merged into one tree, resolving overlaps by hand
+where two agents touched the same function (builtins_shared.c's
+curry-stage marker, main.c's printer, derivation.c's per-attribute
+loop, and -- the one real design conflict -- `builtins.path`, where
+two independent full implementations existed and the more complete one
+(context-aware, with `filterSource`, reusing M73's
+`asnix_compute_fixed_output_path` formula) was kept and extended with
+the other's base32/"nix32" `sha256` decoding to satisfy both agents'
+target fixtures). `make test-nix-conformance`: `pass=628 fail=30
+skip=148` before this sweep -> see the commit history immediately
+below this section for the exact final count. `make test-nixpkgs-hash`
+stayed `pass=8 fail=0` throughout -- none of these fixes touch
+`derivation.c`'s hash-computation path in an incompatible way (the one
+`derivation.c` change that's new, the literal `__json` attribute's
+parse+renormalize step and the `drvPath` self-referential `DrvDeep`
+context tag, are both additive and don't affect `asnix_collect_input_
+refs` or the ATerm serialization any existing fixed-output/hash-parity
+test depends on).
+
+Six genuine fixes landed:
+
+1. **Real string-context introspection** -- `getContext`/
+   `appendContext`/`addDrvOutputDependencies`/
+   `unsafeDiscardOutputDependency`/`hasContext` (ported from Nix's
+   `context.cc`), context propagation added to `baseNameOf`/`dirOf`/
+   `substring`/`replaceStrings`/`toJSON`, a third context kind
+   (`DrvDeep`, "allOutputs") attached to a derivation's own `drvPath`,
+   `${...}` dynamic attribute names rejecting string context, and
+   `builtins.toFile` rejecting non-opaque context while folding opaque
+   references into its own store-path formula. New `builtins.path`/
+   `builtins.filterSource` (previously entirely absent), accepting
+   `sha256` in either hex or nix32 form. New bare-URL-literal lexing
+   (`http://example.com`), ported from Nix's own `lexer.l` URI regex,
+   including its `x:x+1`-lexes-as-a-URL footgun.
+   **Left out of scope:** `eval-okay-context-inputs.nix`'s `drvPath`/
+   `both` cases need a real store-reference-graph + transitive-closure
+   walk (`computeFSClosure`) this codebase doesn't have.
+2. **`==`/`!=` own direct operands never pointer-hack-equal two
+   functions** -- real Nix's `ExprOpEq::eval` always fresh-copies its
+   own two operands, so two function values are never `==` at that
+   level even `let f = x: x; in f == f`.
+   **Left out of scope:** the `maybeThunk` slot-identity-sharing cases
+   (`eval-okay-eq-slot-elem/identity.nix`) need a real identity-bearing
+   allocation layer this codebase's flat `Value` representation
+   doesn't have.
+3. **Printer distinguishes `<PRIMOP>`/`<PRIMOP-APP>`/`<LAMBDA>`** for
+   multi-arg native builtins, via one shared canonical marker `Value`
+   every native-currying constructor stamps into its `Closure`'s
+   `OFF_FORMALS` field.
+4. **`inherit (expr) a b;` evaluates `expr` once, shared** (a new
+   synthetic hidden `AstBinding`, filtered out of the compiled
+   attrset), the pretty-printer's ATTRS `«repeated»` dedup is now
+   whole-print-call scoped (matching real Nix's `printAttrs`) instead
+   of ancestor-only, `__curPos` is a real non-shadowable special form,
+   and `unsafeGetAttrPos` on a native builtin returns `null`.
+   **Left out of scope:** per-attribute/per-formal source positions
+   (`eval-okay-getattrpos*.nix`, `eval-okay-inherit-attr-pos.nix`) need
+   runtime `Attr`/`AstFormal` growth across every attrs-producing op.
+5. **`derivation {...}`'s literal `__json` attribute** is now parsed
+   and re-dumped in normalized form (sorted keys, shortest-roundtrip
+   numbers, last-wins duplicate keys) instead of stored verbatim,
+   matching real Nix's `StructuredAttrs::parse`/`unparse`. Also fixed a
+   pre-existing duplicate-key bug in the JSON parser's object handling.
+6. **Regex engine rejects two obscure POSIX collating-symbol forms**
+   libstdc++'s `std::regex(extended)` rejects but glibc's `regcomp`
+   accepts: a non-alphabetic single-character `[.name.]`, and any
+   collating symbol used as a range's high endpoint.
+
+Also left out of scope by the agents, confirmed rather than assumed,
+and not revisited during the merge: `eval-okay-print.nix`'s
+self-referential-list `«repeated»`-nesting-depth gap,
+`eval-okay-tryeval-failed-thunk-reeval.nix` (thunk-failure memoization),
+`eval-fail-fromTOML-timestamps.nix` (a real-Nix build-time library
+quirk, not a language fact -- "fixing" it would regress asnix's own
+already-correct TOML date support), and `(a){24998}`-shaped regex
+inputs real Nix rejects via libstdc++'s internal NFA-state-count limit
+with no equivalent signal in glibc's `regcomp` to repurpose.
