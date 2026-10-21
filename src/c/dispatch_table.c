@@ -53,6 +53,7 @@ extern void asnix_op_concat(void);
 extern void asnix_op_div(void);
 extern void asnix_op_insert_dynamic_attr(void);
 extern void asnix_op_select_dynamic_or(void);
+extern void asnix_op_resolve_search_path(void);
 
 void *asnix_handler_table[OP_COUNT] = {
     [OP_PUSH_INT] = (void *)asnix_op_push_int,
@@ -100,6 +101,7 @@ void *asnix_handler_table[OP_COUNT] = {
     [OP_DIV] = (void *)asnix_op_div,
     [OP_INSERT_DYNAMIC_ATTR] = (void *)asnix_op_insert_dynamic_attr,
     [OP_SELECT_DYNAMIC_OR] = (void *)asnix_op_select_dynamic_or,
+    [OP_RESOLVE_SEARCH_PATH] = (void *)asnix_op_resolve_search_path,
 };
 
 void ir_link(IrOp *ops, size_t n) {

@@ -11,6 +11,7 @@
 #include "asnix/irbuild.h"
 #include "asnix/value.h"
 #include "symtab.h"
+#include "tryeval.h"
 #include "value_util.h"
 
 /* AST_PATH resolution (import-paths). `base_dir` is constant for one whole
@@ -121,18 +122,53 @@ static char *resolve_search_path(const char *name, size_t name_len) {
         free(copy);
     }
 
-    fprintf(stderr, "asnix: file '%.*s' was not found in the Nix search path (set $NIX_PATH)\n",
-            (int)name_len, name);
-    exit(1);
+    /* M31: routed through the catchable-throw mechanism, not a direct
+     * exit -- real Nix's own `findFile` internally throws `ThrownError`
+     * for this exact case (`~/nix/src/libexpr/eval.cc`, confirmed in
+     * source: `error<ThrownError>("file '%s' was not found...")`), the
+     * same exception class `throw` itself uses, which is why
+     * `builtins.tryEval (toString <nameNotInNIX_PATH>)` successfully
+     * catches it in real Nix (confirmed directly: nixpkgs's own
+     * `pkgs/top-level/impure-overlays.nix` relies on exactly this to
+     * fail gracefully when `$NIX_PATH` doesn't define
+     * `nixpkgs-overlays`). Falls back to identical write+exit(1)
+     * behavior when no `tryEval` is active. */
+    static const char fmt[] = "asnix: file '%.*s' was not found in the Nix search path (set $NIX_PATH)\n";
+    int needed = snprintf(NULL, 0, fmt, (int)name_len, name); /* exact length first, not guessed */
+    char *formatted = malloc((size_t)needed + 1);
+    snprintf(formatted, (size_t)needed + 1, fmt, (int)name_len, name);
+    asnix_tryeval_raise_or_fatal(formatted, (size_t)needed);
 }
 
-/* Resolves one AST_PATH node's raw lexeme to an absolute, canonicalized
- * path string (malloc'd, NUL-terminated). */
+/* `<name>` search-path resolution, called from OP_RESOLVE_SEARCH_PATH
+ * (M31) -- unlike an ordinary path literal (`./foo.nix`, `/abs/path`,
+ * resolved once at *compile* time, fixed by where it's written, see
+ * resolve_path_literal below), a `<name>` search path must resolve
+ * *lazily*, at evaluation time: real Nix's own `findFile` internally
+ * throws the exact same `ThrownError` class `throw` uses when nothing
+ * matches (confirmed in cppnix's source), which is why `builtins.tryEval
+ * (toString <nameNotInNIX_PATH>)` can catch it there -- resolving this
+ * eagerly at compile time (the original, simpler design) would fire the
+ * fatal before any `tryEval` could possibly be active yet, making it
+ * uncatchable regardless of resolve_search_path's own tryEval-aware
+ * fallback above. Pops nothing extra here; takes the name directly as a
+ * Value (already pushed as an ordinary compile-time string constant by
+ * compile_expr's AST_PATH case, exactly like a plain string literal). */
+Value asnix_resolve_search_path_value(Value name_val) {
+    int64_t len;
+    const char *bytes = asnix_ptr_bytes(name_val, &len);
+    char *resolved = canon_path(resolve_search_path(bytes, (size_t)len));
+    Value v = asnix_make_path_value(resolved, strlen(resolved));
+    free(resolved);
+    return v;
+}
+
+/* Resolves one ordinary (non-search, see asnix_resolve_search_path_value
+ * above for that case) AST_PATH node's raw lexeme to an absolute,
+ * canonicalized path string (malloc'd, NUL-terminated). */
 static char *resolve_path_literal(Ast *node) {
     const char *text = node->as.path.text;
     size_t len = node->as.path.len;
-
-    if (node->as.path.is_search) return canon_path(resolve_search_path(text, len));
 
     if (len > 0 && text[len - 1] == '/') {
         fprintf(stderr, "asnix: path has a trailing slash\n");
@@ -824,6 +860,23 @@ static void compile_expr(IrBuilder *b, Ast *node, ScopeFrame *scope) {
             return;
         }
         case AST_PATH: {
+            if (node->as.path.is_search) {
+                /* `<name>` (M31): unlike an ordinary path literal below,
+                 * this must resolve LAZILY, at evaluation time, not here
+                 * at compile time -- see asnix_resolve_search_path_value's
+                 * own comment above for why (real Nix's own `findFile`
+                 * throws a catchable-by-tryEval exception on failure,
+                 * which only makes sense if the lookup happens during
+                 * evaluation). Pushes the search name as an ordinary
+                 * compile-time string constant (same mechanism AST_STRING
+                 * uses for an all-literal string), then
+                 * OP_RESOLVE_SEARCH_PATH performs the actual lookup at
+                 * runtime. */
+                Value name_v = asnix_make_string_value(node->as.path.text, node->as.path.len);
+                ib_push_const(b, (int64_t)name_v.raw);
+                ib_resolve_search_path(b);
+                return;
+            }
             /* Resolved once, here, against g_compile_base_dir -- not at
              * eval time -- matching real Nix (a path literal's absolute
              * form is fixed by where it's *written*, verified against

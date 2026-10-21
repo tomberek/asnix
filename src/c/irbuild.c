@@ -171,6 +171,9 @@ size_t ib_insert_dynamic_attr(IrBuilder *b) {
 size_t ib_select_dynamic_or(IrBuilder *b) {
     return ib_emit(b, OP_SELECT_DYNAMIC_OR, 0, 0);
 }
+size_t ib_resolve_search_path(IrBuilder *b) {
+    return ib_emit(b, OP_RESOLVE_SEARCH_PATH, 0, 0);
+}
 
 size_t ib_assert_fail(IrBuilder *b, const char *msg, size_t len) {
     size_t pool_idx = ib_pool_add(b, (int64_t)(intptr_t)msg);

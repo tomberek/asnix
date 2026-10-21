@@ -43,7 +43,8 @@ what's actually implemented and the scope decisions made along the way.
 | M28 — dynamic attrset-literal keys (`{${k} = v;}`) + `expr.${k} or default` | done, **scoped** (see below) |
 | M29 — `rec {}` eagerly forced every field on construction (core evaluator fix) | done (see below) |
 | M30 — `builtins.tryEval` (catchable `throw`/failed `assert`) | done, **scoped** (see below) |
-| M31+ | not started |
+| M31 — lazy `<name>` search-path resolution (catchable by `tryEval`) | done (see below) |
+| M32+ | not started |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
 
@@ -3150,3 +3151,56 @@ rolling back every thunk touched since the matching `setjmp`, a much
 larger undertaking; not attempted, since every real pattern seen so far
 treats a throwing `tryEval`'d expression as a disposable one-off whose
 intermediate thunks are never touched again.
+
+## M31 scope notes: lazy `<name>` search-path resolution
+
+Found immediately after M30: `d.nix` still hit "file 'nixpkgs-overlays'
+was not found in the Nix search path" even with `tryEval` implemented --
+`pkgs/top-level/impure-overlays.nix`'s own `try (toString
+<nixpkgs-overlays>) ""` still didn't catch it. Root cause: asnix resolves
+a `<name>` search path *eagerly, at compile time* (`compiler.c`'s
+`resolve_search_path`, called from `AST_PATH`'s `compile_expr` case),
+baking the resolved absolute path directly into the IR as a constant --
+so the fatal fires before evaluation (and therefore before `tryEval`'s
+`setjmp`) ever starts. Confirmed in cppnix's own source that this must
+be lazy: `~/nix/src/libexpr/eval.cc`'s `findFile` throws `ThrownError` --
+the *exact same* exception class `throw` itself uses -- on a miss, which
+only makes sense if the lookup genuinely happens *during* evaluation,
+inside whatever `tryEval` scope is active at the time. An *ordinary*
+path literal (`./foo.nix`, `/abs/path`) is correctly unaffected: real
+Nix fixes an ordinary path literal's absolute form by where it's
+*written* (verified against `nix-instantiate` back when M15 first
+implemented path literals), genuinely resolved once, at compile/parse
+time -- only the `<name>` search-path form needed to change.
+
+Fixed by splitting `AST_PATH`'s compilation: an ordinary path literal is
+untouched (still resolved eagerly, exactly as before); a `<name>`
+literal now pushes its search name as an ordinary compile-time string
+constant (the same mechanism `AST_STRING` already uses for an all-
+literal string) and emits a new op, `OP_RESOLVE_SEARCH_PATH`, which
+performs the actual `NIX_PATH`-scanning lookup at *evaluation* time
+(`asnix_resolve_search_path_value`, reusing the exact same `resolve_
+search_path`/`canon_path` logic, just called later) -- on a miss, it
+routes through the same `asnix_tryeval_raise_or_fatal` M30 added for
+`throw`/failed `assert`, falling back to identical behavior when no
+`tryEval` is active.
+
+**A real bug found and fixed while implementing this**: the new fatal-
+message formatter initially used a guessed buffer size (`name_len + 64`)
+instead of computing the exact required length, which `snprintf` quietly
+truncates to fit -- but the *return value* `asnix_tryeval_raise_or_fatal`
+was given as the byte count to `write()` is `snprintf`'s "how many bytes
+this *would* have taken" value, not how many were actually written,
+so passing it against the undersized buffer was a real out-of-bounds
+heap read (confirmed directly: the error message printed visibly
+garbled/truncated instead of complete). Fixed by calling `snprintf(NULL,
+0, ...)` first to get the exact needed length, then allocating exactly
+that before formatting for real -- no guessing.
+
+**Verified**: the exact `impure-overlays.nix` `try` pattern, with
+`$NIX_PATH` genuinely unset, now returns the fallback value end-to-end,
+matching real Nix exactly; an ordinary successful `<name>` lookup and an
+uncaught (no active `tryEval`) miss both still behave identically to
+before. `make test`/`test-e2e`/`test-conformance` all green (172 e2e, 19
+conformance, full unit suite). numtide/nix-conformance's `lang/`: 627 ->
+628 (small additional gain on top of M30's own +239, no regression).

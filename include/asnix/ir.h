@@ -216,6 +216,15 @@ enum {
                      * falls through with it on top of VALSTACK, same shape as
                      * OP_SELECT_OR. See asnix_bshared_select_dynamic_or,
                      * builtins_shared.c. */
+    OP_RESOLVE_SEARCH_PATH, /* `<name>` (M31): pops a String (the search name, pushed as
+                     * an ordinary compile-time constant by compiler.c's AST_PATH case),
+                     * pushes the resolved, canonicalized Path -- or never returns,
+                     * routing through the same catchable-throw mechanism `throw`/failed
+                     * `assert` use (real Nix's own `findFile` throws the same exception
+                     * class on a miss, confirmed in cppnix's source -- see
+                     * asnix_resolve_search_path_value, compiler.c). Deliberately resolved
+                     * at *evaluation* time, not compile time like an ordinary path
+                     * literal, specifically so this can be caught. */
     OP_COUNT
 };
 
