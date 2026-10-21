@@ -42,6 +42,20 @@
 #define ASNIX_IMM_TRUE      2
 #define ASNIX_IMM_BLACKHOLE 3
 
+/* 61-bit signed immediate integer range (M56): the ±2^60 window a
+ * TAG_INT word can actually hold. Spelled as plain decimal literals (no
+ * INT64_C/shift, no `LL` suffix) specifically so this is usable *both*
+ * from C and as a GAS immediate operand after cpp substitution -- GAS's
+ * own expression parser reads a bare decimal literal like
+ * `1152921504606846975` directly, but chokes on C integer-suffix syntax.
+ * Needed in asm now because op_push_int/op_arith.S's add/sub/mul/div
+ * fast paths inline the overflow check directly (see those files) rather
+ * than paying a `call` into asnix_make_int per op -- same inlining
+ * tradeoff value.h's own header comment already describes for the
+ * tagging bit tricks themselves. */
+#define ASNIX_INT_MAX 1152921504606846975
+#define ASNIX_INT_MIN (-1152921504606846976)
+
 #ifndef __ASSEMBLER__
 
 #include <stdint.h>
@@ -49,11 +63,6 @@
 typedef struct {
     uint64_t raw;
 } Value;
-
-/* 61-bit signed immediate integer range: C-side only, never used as a GAS
- * immediate directly, so literal suffixes are fine here. */
-#define ASNIX_INT_MIN (-(INT64_C(1) << 60))
-#define ASNIX_INT_MAX ((INT64_C(1) << 60) - 1)
 
 /*
  * Implemented in src/asm/value.S, not as C inline functions: these are the

@@ -500,7 +500,20 @@ static Value mul2_impl(const Value *args, int64_t argc) {
     (void)argc;
     ASNIX_REQUIRE_INT(args[0], "mul");
     ASNIX_REQUIRE_INT(args[1], "mul");
-    return asnix_make_int(asnix_int_value(args[0]) * asnix_int_value(args[1]));
+    /* M56: unlike add/sub (operands already bounded to +-2^60, so plain
+     * int64 `+`/`-` can never themselves overflow), two such operands'
+     * *product* genuinely can overflow int64 -- true signed-overflow UB
+     * in C, not just a value asnix_make_int could catch after the fact.
+     * __builtin_mul_overflow computes the product without that UB and
+     * reports it; asnix_make_int (src/asm/value.S) still re-checks the
+     * narrower +-2^60 window for a product that fits in 64 bits but not
+     * that window. */
+    int64_t a = asnix_int_value(args[0]), b = asnix_int_value(args[1]), r;
+    if (__builtin_mul_overflow(a, b, &r)) {
+        fprintf(stderr, "asnix: integer overflow in multiplying %lld * %lld\n", (long long)a, (long long)b);
+        exit(1);
+    }
+    return asnix_make_int(r);
 }
 static Value div2_impl(const Value *args, int64_t argc) {
     (void)argc;
