@@ -86,7 +86,9 @@ static Value prim_listToAttrs(const Value *args, int64_t argc) {
     int64_t out_n = 0;
 
     for (int64_t i = 0; i < n; i++) {
-        Value elem = elems[i];
+        /* Lazy list elements (M23's `map`, etc.) -- force before checking
+         * the tag, same class of fix M23's own concatLists needed. */
+        Value elem = asnix_force_for_print(elems[i]);
         ASNIX_REQUIRE_ATTRS(elem, "listToAttrs");
         int64_t name_idx = asnix_bshared_attrs_find(elem, sym_name);
         if (name_idx < 0) asnix_bshared_fatal("listToAttrs", "an element is missing the 'name' attribute");
@@ -148,7 +150,9 @@ static Value attrByPath3_impl(const Value *args, int64_t argc) {
     Value cur = set;
     for (int64_t i = 0; i < n; i++) {
         if (asnix_tag_of(cur) != ASNIX_TAG_ATTRS) return deflt;
-        Value comp = comps[i];
+        /* Lazy list elements (M23's `map`, etc.) -- force before checking
+         * the tag, same class of fix M23's own concatLists needed. */
+        Value comp = asnix_force_for_print(comps[i]);
         ASNIX_REQUIRE_STRING(comp, "attrByPath");
         int64_t clen;
         const char *cbytes;

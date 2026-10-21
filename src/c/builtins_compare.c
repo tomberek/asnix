@@ -206,8 +206,14 @@ static Value replaceStrings3_impl(const Value *args, int64_t argc) {
     const char **to_bytes = nfrom > 0 ? malloc((size_t)nfrom * sizeof(char *)) : NULL;
     int64_t *to_lens = nfrom > 0 ? malloc((size_t)nfrom * sizeof(int64_t)) : NULL;
     for (int64_t i = 0; i < nfrom; i++) {
-        asnix_bshared_string_bytes(from_elems[i], &from_bytes[i], &from_lens[i], "replaceStrings");
-        asnix_bshared_string_bytes(to_elems[i], &to_bytes[i], &to_lens[i], "replaceStrings");
+        /* List elements are lazy (e.g. a `map`-produced list's elements are
+         * deliberately unforced thunks, M23) -- force each one before
+         * reading its bytes, same as OP_SELECT/OP_VAR_REF do for attrs/vars
+         * on read. Found via real nixpkgs: `replaceStrings [...] (map f
+         * someList) s`-shaped calls crashed with "expected a string
+         * argument" on an unforced Thunk. */
+        asnix_bshared_string_bytes(asnix_force_for_print(from_elems[i]), &from_bytes[i], &from_lens[i], "replaceStrings");
+        asnix_bshared_string_bytes(asnix_force_for_print(to_elems[i]), &to_bytes[i], &to_lens[i], "replaceStrings");
     }
 
     int64_t slen;

@@ -87,7 +87,9 @@ static Value prim_genericClosure(const Value *args, int64_t argc) {
 
     size_t head = 0;
     while (head < queue.len) {
-        Value item = queue.data[head++];
+        /* Lazy list elements (M23's `map`, etc.) -- force before checking
+         * the tag, same class of fix M23's own concatLists needed. */
+        Value item = asnix_force_for_print(queue.data[head++]);
         if (asnix_tag_of(item) != ASNIX_TAG_ATTRS) {
             asnix_bshared_fatal("genericClosure", "a work-set element is not an attrset");
         }

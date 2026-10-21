@@ -46,7 +46,8 @@ what's actually implemented and the scope decisions made along the way.
 | M31 — lazy `<name>` search-path resolution (catchable by `tryEval`) | done (see below) |
 | M32 — dotted attrpath after `?` (`x ? a.b.c`) | done (see below) |
 | M33 — dynamic `?` segment (`x ? ${name}`, anywhere in the chain) | done (see below) |
-| M34+ | not started |
+| M34 — unforced list elements reaching 6 builtins as raw scalars | done (see below) |
+| M35+ | not started |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
 
@@ -3301,3 +3302,78 @@ not-yet-diagnosed issue).
 
 `make test`/`test-e2e` green (177 e2e); `test-conformance` 629 passed
 (up from 628, no regressions).
+
+## M34 scope notes: unforced list elements reaching 6 builtins as raw scalars
+
+Found continuing to chase `d.nix` right after M33: `builtins.replaceStrings`
+crashed with "expected a string argument" even though the real nixpkgs
+call passed well-typed string lists. Root-caused with gdb (broke at the
+fatal site, read the live IP register to recover the symbol id that
+`OP_SELECT` was about to reject, then separately read the raw tagged
+`Value` reaching `replaceStrings`'s fatal check directly): the "to" list
+argument was the result of a `map` call, and `map`'s elements are
+*deliberately* unforced Thunks (M23's own laziness fix, confirmed
+`builtins.length (map (x: throw "boom") [1 2 3])` must not fire the
+throw) -- `replaceStrings` read `to_elems[i]`'s raw bytes directly via
+`asnix_bshared_string_bytes` without forcing first, so an unforced Thunk
+(tag `ASNIX_TAG_THUNK`, confirmed via gdb: `to_elems[0].raw & 7 == 6`)
+hit the "not a `ASNIX_TAG_PTR`" fatal instead of being forced down to
+the string it actually was.
+
+This is the *exact* bug class M23 already found and fixed once for
+`concatLists` (see that function's own comment, `builtins_list.c`:
+"`concatLists (map (x: map f strings) algos)` aborted with a bogus
+'element N is not a list'") -- but the fix was never generalized to
+every other builtin that reads a list's elements directly as C-array
+values. List literals in source (`[...]`) don't exhibit this (every
+element is compiled eagerly via plain `compile_expr`, no thunk wrapping,
+so a literal's elements are already fully evaluated Values by
+construction -- confirmed separately: `builtins.elemAt [(abort "boom")
+1] 1` does abort here, a documented, different, narrower scope gap than
+this milestone, not the thing fixed here); only builtins that build
+*lazy* elements on purpose (`map`/`mapAttrs`, M23) can hand back an
+actual unforced Thunk sitting in list storage, and any OTHER builtin
+reading that same list's elements raw inherits the hazard.
+
+Audited every direct list-element read across the codebase (grepped for
+`_elems[i]`/`comps[i]`/`queue.data[...]`-shaped access feeding a type
+check or raw byte/int read, as opposed to lazy pass-through uses like
+`map`/`elemAt`/`head`/`tail`/`sort`'s own element copies, or uses as a
+function-call argument, both of which are correctly left unforced --
+the callee's own `OP_VAR_REF` forces on read if it actually inspects the
+argument). Found and fixed five more real instances of the same gap,
+each verified against real `nix-instantiate --eval` with a `map (x: x)
+[...]`-wrapped repro before and after:
+- `replaceStrings` (`builtins_compare.c`): both the `from`/`to` list
+  elements.
+- `catAttrs` (`builtins_list2.c`): the attrset-typed list elements.
+- `listToAttrs` (`builtins_attrs2.c`): the attrset-typed list elements.
+- `attrByPath` (`builtins_attrs2.c`): the string-typed path-component
+  elements.
+- `genericClosure` (`builtins_closure.c`): the work-queue items (popped
+  from a `ValueVec` fed directly by the list's raw elements).
+- `concatStringsSep` (`builtins_misc.c`): the string-typed list elements
+  (two separate loops -- a length-totaling pass and the actual byte-copy
+  pass -- both needed the fix).
+
+Fix in every case: force via the existing, already-idempotent
+`asnix_force_for_print` (a cheap no-op on an already-forced Value, same
+one `OP_SELECT`'s asm uses) immediately before the first tag check or
+byte/int read, mirroring exactly what `concatLists` already does.
+Deliberately did *not* attempt a blanket structural fix (e.g. wrapping
+every list literal's elements in thunks, mirroring M25/M29) -- that
+would change a working, deliberate design decision (list literals are
+eagerly evaluated by construction) for every one of the ~40 other list-
+element read sites in the codebase found during the audit, almost all of
+which are legitimate lazy-pass-through uses that must *not* force
+(`map`, `elemAt`, `head`, `tail`, `sort`'s copy, every function-argument
+pass). Fixing only the confirmed-broken consumers is the smaller,
+lower-risk change that matches the actual (narrow) laziness contract
+list storage has in this project: elements *can* be unforced Thunks
+(only ever placed there by `map`/`mapAttrs`), and any consumer reading
+them as scalars must force first -- consumers that only copy/forward
+elements are correctly exempt.
+
+`make test`/`test-e2e` green (183 e2e, six new `m34_lazy_list_elem_*`
+fixtures, each a `map (x: x) [...]`-wrapped repro of one fixed builtin);
+`test-conformance` still 629 passed, no regressions.

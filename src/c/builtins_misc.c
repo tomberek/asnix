@@ -199,7 +199,9 @@ static Value concatStringsSep2_impl(const Value *args, int64_t argc) {
     for (int64_t i = 0; i < count; i++) {
         const char *b;
         int64_t l;
-        as_string(elems[i], &b, &l, "concatStringsSep");
+        /* Lazy list elements (M23's `map`, etc.) -- force before reading
+         * bytes, same class of fix M23's own concatLists needed. */
+        as_string(asnix_force_for_print(elems[i]), &b, &l, "concatStringsSep");
         total += l;
         if (i + 1 < count) total += sep_len;
     }
@@ -209,7 +211,7 @@ static Value concatStringsSep2_impl(const Value *args, int64_t argc) {
     for (int64_t i = 0; i < count; i++) {
         const char *b;
         int64_t l;
-        as_string(elems[i], &b, &l, "concatStringsSep");
+        as_string(asnix_force_for_print(elems[i]), &b, &l, "concatStringsSep");
         memcpy(cur, b, (size_t)l);
         cur += l;
         if (i + 1 < count) {

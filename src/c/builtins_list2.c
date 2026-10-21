@@ -298,9 +298,14 @@ static Value catAttrs2_impl(const Value *args, int64_t argc) {
     Value *out = n > 0 ? malloc((size_t)n * sizeof(Value)) : NULL;
     int64_t nout = 0;
     for (int64_t i = 0; i < n; i++) {
-        ASNIX_REQUIRE_ATTRS(elems[i], "catAttrs");
-        int64_t idx = asnix_bshared_attrs_find(elems[i], sym);
-        if (idx >= 0) out[nout++] = asnix_bshared_attrs_value(elems[i], idx);
+        /* List elements are lazy (a `map`-produced list's elements are
+         * deliberately unforced Thunks, M23) -- force before checking the
+         * tag, same fix M23's own concatLists needed (see its comment,
+         * builtins_list.c). */
+        Value elem = asnix_force_for_print(elems[i]);
+        ASNIX_REQUIRE_ATTRS(elem, "catAttrs");
+        int64_t idx = asnix_bshared_attrs_find(elem, sym);
+        if (idx >= 0) out[nout++] = asnix_bshared_attrs_value(elem, idx);
     }
     Value result = asnix_bshared_make_list(out, nout);
     free(out);
