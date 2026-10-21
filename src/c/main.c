@@ -114,6 +114,43 @@ static void print_attr_name(const char *name, size_t len) {
     }
 }
 
+/* M59: real Nix's printer tracks which ATTRS/LIST heap objects are
+ * currently *active* -- on the stack of values being printed right
+ * now, i.e. an actual ancestor in the DFS -- and prints `«repeated»`
+ * instead of recursing when a value already on that stack comes back
+ * around (confirmed directly: `nix-instantiate --eval` on M58's new
+ * self-referential `derivation` result prints `out = «repeated»;` for
+ * the genuine `drv.out.out == drv.out` cycle, but still prints
+ * `drvAttrs = {...}` in full even though the same attrset also
+ * reachable elsewhere -- it's only a TRUE cycle (an ancestor, not
+ * merely "seen before anywhere") that gets collapsed). Before this
+ * fix, `print_value_inner` had no cycle guard at all: M58 made
+ * `derivation`'s result genuinely self-referential (`drv.out` is now
+ * the whole output object, not a bare string), so printing one all the
+ * way (`d.all`, or bare `d`) recursed forever and segfaulted -- not
+ * hit by anything in tests/e2e or tests/conformance (which only ever
+ * print leaf fields like `.outPath`), but a real, now-reachable crash
+ * for any future caller that *does* print a whole derivation. A fixed-
+ * size stack of currently-active base pointers (ATTRS/LIST raw,
+ * already untagged) is checked on entry to those two cases and
+ * popped on exit -- same "small, bounded, defensive cap" convention
+ * this file's attrset printer already uses for its 64-entry cap. */
+#define ASNIX_PRINT_MAX_DEPTH 4096
+static const void *g_print_active[ASNIX_PRINT_MAX_DEPTH];
+static int g_print_active_count = 0;
+
+static int print_active_push(const void *base) {
+    for (int i = 0; i < g_print_active_count; i++) {
+        if (g_print_active[i] == base) return 0; /* already an ancestor -- caller must not recurse */
+    }
+    if (g_print_active_count < ASNIX_PRINT_MAX_DEPTH) g_print_active[g_print_active_count++] = base;
+    return 1;
+}
+
+static void print_active_pop(void) {
+    if (g_print_active_count > 0) g_print_active_count--;
+}
+
 static void print_value_inner(Value v) {
     v = asnix_force_for_print(v); /* list elements and attrset values are lazy (M6) */
     switch (asnix_tag_of(v)) {
@@ -159,6 +196,7 @@ static void print_value_inner(Value v) {
         }
         case ASNIX_TAG_LIST: {
             const char *base = (const char *)(v.raw & ~0x7ULL);
+            if (!print_active_push(base)) { printf("«repeated»"); return; }
             int64_t count = *(const int64_t *)(base + ASNIX_LIST_OFF_COUNT);
             const Value *elems = (const Value *)(base + ASNIX_LIST_OFF_ELEMS);
             printf("[ ");
@@ -167,6 +205,7 @@ static void print_value_inner(Value v) {
                 printf(" ");
             }
             printf("]");
+            print_active_pop();
             return;
         }
         case ASNIX_TAG_ATTRS: {
@@ -179,6 +218,7 @@ static void print_value_inner(Value v) {
              * }`). Re-sort by name for display only; the stored order is
              * untouched. */
             const char *base = (const char *)(v.raw & ~0x7ULL);
+            if (!print_active_push(base)) { printf("«repeated»"); return; }
             int64_t count = *(const int64_t *)(base + ASNIX_ATTRS_OFF_COUNT);
             const char *names[64];
             size_t name_lens[64];
@@ -217,6 +257,7 @@ static void print_value_inner(Value v) {
                 printf("; ");
             }
             printf("}");
+            print_active_pop();
             return;
         }
         default:

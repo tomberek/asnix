@@ -5822,19 +5822,45 @@ Root env/builtins-name-list bookkeeping: the root `Env` grew from 14 to
 15 slots (`derivationStrict` is new, slot 14); `compiler.c`'s
 `init_builtins_frame` scope-name list grew to match.
 
-**Known, pre-existing limitation surfaced (not caused) by this fix**:
-asnix's printer has no cycle/sharing detection (real Nix prints
+**Known, pre-existing limitation surfaced (not caused) by this fix, fixed
+immediately after as a small follow-up (same milestone, no new number)**:
+asnix's printer had no cycle/sharing detection at all (real Nix prints
 `«repeated»` for a value it's already printed higher up the same
 structure, see `nix-instantiate --eval`'s own output on
 `(derivation {...}).all`). Since `derivation`'s result is now
 genuinely self-referential (`drv.out.out == drv.out`, matching real
 Nix exactly), printing the WHOLE structure (`d.all`, or bare `d`
-itself) recurses forever and segfaults on asnix, where real Nix
+itself) recursed forever and segfaulted on asnix, where real Nix
 produces a finite, `«repeated»`-marked printout. Not hit by `d.nix`
 (which only ever selects `.outPath`, a plain string leaf, never prints
 the whole derivation object) or by anything in `test-e2e`/
-`test-conformance`; a separately tracked gap (cycle-aware printing),
-out of scope for this fix.
+`test-conformance` -- found verifying this milestone by hand, not by
+either test suite.
+
+Fixed in `main.c`'s `print_value_inner`: a small fixed-size stack
+(`g_print_active`, 4096 entries, same "small bounded cap" convention
+this file's attrset printer already uses) of currently-active
+ATTRS/LIST base pointers (an actual DFS-ancestor check, not a broader
+"seen anywhere" dedup -- pushed on entering that case, popped on
+leaving it), printing `«repeated»` instead of recursing when a value
+already on that stack comes back around. Verified directly: both a
+genuine list self-cycle (`let a = [ 1 a ]; in a`) and M58's
+derivation self-reference now print a finite result with no crash on
+asnix. Does NOT byte-for-byte match real Nix's exact repeat points in
+every case -- confirmed real Nix's own dedup is keyed by `Value*`
+*slot* identity (whether two attribute bindings happen to share the
+literal same `Value` cell after a `//`-merge), not by the underlying
+heap object's identity the way this fix does, so a value reachable via
+two *different* Value slots that both resolve to the same shared heap
+list/attrs can print as fully expanded on real Nix (one such case:
+`derivation {...}`'s `commonAttrs.all` field) where asnix's simpler,
+purely-structural check correctly collapses it to `«repeated»` one
+level earlier -- never produces a wrong *value*, no crash either way,
+just a cosmetic difference in exactly where the ellipsis lands,
+undetectable by anything that doesn't print a self-referential value
+in full. `make test`/`test-e2e`/`test-conformance` all still green,
+zero regressions (nothing in either suite constructs a genuinely
+cyclic value today).
 
 Verified directly against real Nix (`/tmp/m58_check.nix`-style
 fixture): `builtins.typeOf d.out == "set"`, `d.out.outPath == d.outPath`,
