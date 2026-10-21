@@ -185,9 +185,27 @@ static Env *make_root_env(Env *up) {
     return root_env;
 }
 
+/* M59: see eval_file.h's own comment on asnix_eval_top_level_file. Set
+ * once (guarded), from a strdup'd copy -- NOT the `resolved` pointer
+ * asnix_eval_file itself frees before returning -- so it stays valid for
+ * the rest of the process, including during main.c's post-return
+ * print_value(), which can still force thunks (and therefore still run
+ * `unsafeGetAttrPos`) after asnix_eval_file's own `resolved`/`base_dir`
+ * have already been freed. */
+static char *g_top_level_file = NULL;
+
+const char *asnix_eval_top_level_file(void) {
+    return g_top_level_file;
+}
+
 Value asnix_eval_file(const char *path) {
     char *resolved, *base_dir;
     Ast *ast = parse_file(path, &resolved, &base_dir);
+    if (!g_top_level_file) {
+        size_t len = strlen(resolved);
+        g_top_level_file = malloc(len + 1);
+        memcpy(g_top_level_file, resolved, len + 1);
+    }
     IrProgram *prog = asnix_compile(ast, base_dir);
     Env *root_env = make_root_env(NULL);
     Value result = asnix_eval(prog, root_env);

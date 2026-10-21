@@ -46,4 +46,29 @@ Value asnix_eval_file_scoped(const char *path, Value scope);
  * value has no "containing file" of its own to resolve against). */
 Value asnix_eval_expr_source(const char *src);
 
+/* M59: the resolved absolute path of the OUTERMOST file passed to
+ * asnix_eval_file (i.e. argv's <file.nix>, main.c) -- captured once, the
+ * first time asnix_eval_file runs, and never overwritten by any nested
+ * `import`/`scopedImport` (which re-enters asnix_eval_file/
+ * asnix_eval_file_scoped recursively but finds this already non-NULL).
+ * NULL if no file has been evaluated yet (shouldn't happen in practice:
+ * main.c's only entry point is asnix_eval_file) or if the process only
+ * ever ran asnix_eval_expr_source (a `--arg`/`--argstr` value expression
+ * has no file of its own).
+ *
+ * This exists for exactly one caller: `builtins.unsafeGetAttrPos`
+ * (builtins_m54.c) -- see that function's own comment and
+ * docs/architecture.md's M59 scope notes for the full rationale. It is a
+ * deliberately coarse approximation of "which file defines this
+ * attribute": real Nix tracks the position of the SPECIFIC binding that
+ * built the attribute's value, which can be any file an attrset literal
+ * was ever written in and then passed/merged/imported across any number
+ * of boundaries before reaching the attrset `unsafeGetAttrPos` is called
+ * on; asnix's runtime Attrs representation has no such back-pointer (and
+ * growing it to add one is explicitly out of scope for M59), so this
+ * reports "the file asnix was originally told to evaluate" uniformly for
+ * every attribute that exists, regardless of which file actually wrote
+ * it. */
+const char *asnix_eval_top_level_file(void);
+
 #endif /* ASNIX_EVAL_FILE_H */
