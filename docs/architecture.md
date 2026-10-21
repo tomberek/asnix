@@ -4076,6 +4076,57 @@ are correctly left untouched. One new e2e fixture
 e2e); `test-conformance` 645 passed (+1), 157 failed (-1), 0 known, 62
 skipped.
 
+### M57h: import path resolution no longer over-resolves symlinks
+
+`asnix_eval_file` (eval_file.c) resolved every import target with
+`realpath()`, which does two things at once: makes the path absolute,
+AND fully resolves every symlink on disk along the way. The second
+part is wrong for computing the BASE DIRECTORY used to resolve a
+*subsequent* relative import inside that file: `eval-okay-symlink-
+resolution.nix`'s fixture tree has `symlink-resolution/foo/overlays ->
+../overlays` (a symlink) with `symlink-resolution/foo/overlays/
+overlay.nix` (the real file, reached THROUGH that symlink) containing
+`import ../lib`. Real Nix resolves that `..` against the file's path
+AS WRITTEN (`.../foo/overlays/overlay.nix`'s own directory,
+`.../foo/overlays`), landing on `.../foo/lib` (exists) -- confirmed
+directly against `nix-instantiate --eval` on this exact fixture tree.
+`realpath()` instead fully resolved the `foo/overlays` symlink FIRST,
+landing the base directory on the symlink's physical TARGET
+(`symlink-resolution/overlays`, since `overlays -> ../overlays`), so
+the same `../lib` resolved to the nonexistent `symlink-resolution/lib`
+-- "asnix: cannot resolve path" (one level down, inside the nested
+`import`, not the top-level file itself).
+
+Fixed by replacing `realpath()` with a new `resolve_import_path`:
+makes the path absolute (prepending `getcwd()` if relative) and runs
+it through the now-shared `asnix_canon_path` (M57g) -- pure text-level
+`.`/`..`/doubled-slash collapsing, no filesystem access, so a symlink
+anywhere in the chain is left exactly as named. Nothing downstream
+needed `realpath`'s symlink-following for its own sake: `stat()`
+(the `import somedir` => `somedir/default.nix` directory check) and
+`fopen()` (actually reading the file) both already follow symlinks
+transparently at the OS level regardless of whether this project
+pre-resolves them itself. Lost, deliberately: `realpath()`'s own
+"does this path exist at all" check -- a nonexistent import now fails
+one step later, inside `read_file`'s `fopen` ("asnix: cannot open
+'...'"), which was already a graceful, non-crashing exit(1) path, just
+with a slightly different message.
+
+Verified: `eval-okay-symlink-resolution.nix` now returns `"test"`,
+matching its `.exp`; `eval-okay-readDir-symlinked-directory.nix` (a
+different symlink case, `readDir` not `import`) was already passing
+and still is, confirming this change didn't touch anything it didn't
+need to; `eval-okay-import-follows-symlink.nix` still fails, but for an
+unrelated reason (`scopedImport`/`__curPos`, not implemented at all --
+not a regression, not touched by this fix). Diffed the full
+conformance fail list before/after: only the five tests from M57d
+through M57h moved from fail to pass, nothing else changed. One new
+e2e fixture (`m57h_symlink_resolution.nix` + a `m57h_symlink_fixtures/`
+tree with a real symlink committed to the repo, mirroring numtide's
+own fixture shape). `make test`/`test-e2e` green (209 e2e);
+`test-conformance` 646 passed (+1), 156 failed (-1), 0 known, 62
+skipped.
+
 ### M57: items investigated and explicitly skipped
 
 - **Function/derivation equality quirks** (item 3 in the original
@@ -4101,15 +4152,13 @@ skipped.
   equality's `isDerivation`-style eager `type`-forcing during `==` was
   not investigated in depth given the above; left for a future pass.
 
-- **Symlink resolution** (item 7) and **CLI flag plumbing** (item 8):
-  not reached in this pass -- time went to the higher-priority items
-  above instead, per the task's own suggested ordering
-  (`compareVersions`'s int-overflow-to-string quirk, item 3's other
-  half, and path normalization, item 6, WERE both reached -- see M57f/
-  M57g above). Neither of these two was investigated beyond reading
-  the task description, so there's no "turned out to be harder than
-  expected" verdict for them; they're simply undone, left for a
-  follow-up M58+.
+- **CLI flag plumbing** (item 8, `--arg`/`--argstr`/`-A`/`-I`): not
+  reached in this pass -- time went to the higher-priority items above
+  instead, per the task's own suggested ordering (items 3's
+  `compareVersions` half, 6, and 7 WERE all reached -- see M57f/M57g/
+  M57h above). Not investigated beyond reading the task description,
+  so there's no "turned out to be harder than expected" verdict for
+  it; simply undone, left for a follow-up M58+.
 
 - **Context-attr-name throwing on a string-with-context dynamic
   attribute name** (item 5's third sub-item): confirmed string-context
