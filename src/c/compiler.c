@@ -890,6 +890,18 @@ static void compile_expr(IrBuilder *b, Ast *node, ScopeFrame *scope) {
             ib_with(b);
             ScopeFrame frame = { .up = scope, .names = NULL, .name_lens = NULL, .count = 0, .is_with = 1 };
             compile_expr(b, node->as.with1.body, &frame);
+            /* M52: undo the OP_WITH above, mirroring AST_LET's
+             * ib_frame_exit(). Without this, a non-tail `with` (e.g. one
+             * sibling among several `with`s in the same list/attrset/call
+             * position) leaves its 1-slot with-frame installed as ENV for
+             * whatever gets compiled next, so a sibling's own OP_MK_THUNK
+             * captures that leftover frame instead of the true enclosing
+             * scope -- confirmed bug: `let foo = {bar=1;}; baz = {qux=2;};
+             * in [ (with foo; bar) (with baz; qux) ]` aborted with "`with'
+             * value is not an attrset" because the second `with`'s attrs
+             * thunk, built while ENV was still the first with's leftover
+             * frame, read the wrong slot once forced. */
+            ib_with_exit(b);
             return;
         }
         case AST_PATH: {

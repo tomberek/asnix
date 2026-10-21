@@ -59,7 +59,9 @@ what's actually implemented and the scope decisions made along the way.
 | M44 — `builtins.placeholder`/bare `placeholder` | done (see below) |
 | M45-M49 | not started |
 | M50 — name the specific value/field in 6 more generic fatal-path error messages | done (see below) |
-| M51-M54 | in progress (parallel agents: floats, with-scoping bug, foldl'/replaceStrings laziness, missing builtins) |
+| M51 | in progress (parallel agent: float literals) |
+| M52 — fix `with`-frame leaking into a sibling expression (core evaluator fix) | done, **scoped** (see below) |
+| M53-M54 | in progress (parallel agents: foldl'/replaceStrings laziness, missing builtins) |
 | M55 — regex engine gaps triage (`builtins.match`/`builtins.split`, 39 conformance failures) | investigated, **no fix** (see below) |
 | M56-M57 | in progress (parallel agents: fromTOML/overflow, misc backlog) |
 
@@ -4075,3 +4077,142 @@ content-addressing support beyond just this builtin to pass in full --
 a separately tracked, larger scope cut -- so no conformance-count
 change from this fix alone, but it's still a real, verified gap this
 project needed fixed for `d.nix`), no regressions.
+
+## M52 scope notes: `with`-frame leaking into a sibling expression (core evaluator fix)
+
+A background triage agent investigating numtide/nix-conformance's
+`eval-okay-eq-slot-identity.nix` bisected its failure by hand and found
+the real cause had nothing to do with equality: two **sibling** (not
+nested) `with` expressions corrupt each other. Minimal repro, verified
+against `nix-instantiate --eval --strict` first:
+
+```nix
+let foo = { bar = 1; }; baz = { qux = 2; }; in
+[ (with foo; bar) (with baz; qux) ]
+```
+
+Real Nix: `[ 1 2 ]`. Pre-fix asnix: `asnix: \`with' value is not an
+attrset, aborting`. Each `with` alone (`with foo; bar`, or `with baz;
+qux`) worked fine in isolation -- only having two side-by-side `with`s
+in the same enclosing expression (e.g. both elements of one list)
+triggered it.
+
+**Root cause.** `compiler.c`'s `AST_WITH` case compiles `with expr;
+body` as: build `expr`'s thunk against the *outer* scope, emit
+`OP_WITH` (allocates a new 1-slot `Env` frame tagged
+`ASNIX_ENV_WITH_TAG`, installs it as the current `ENV`, binds the
+with-expr's thunk into slot 0 -- see `op_with.S`), then compile `body`
+against a `ScopeFrame` chain that has this with-frame on top. That part
+is correct. What's missing: unlike `AST_LET` (which calls
+`ib_frame_exit()` right after compiling its body, emitting
+`OP_FRAME_EXIT` to restore `ENV = ENV->up` once the `let` is done being
+consumed -- see `op_frame.S`'s own header comment, "a non-tail use of
+`let`/`rec {}` doesn't leak its frame into whatever depth-relative
+`OP_VAR_REF` the compiler emitted next assuming the *original*
+(pre-frame) scope depths"), `AST_WITH` compiled `OP_WITH` + body with
+**no matching exit op**. `OP_WITH`'s own continuation logic inlines
+straight into the body's bytecode and never restores `ENV` -- so once
+a non-tail `with`'s body finishes, `ENV` is permanently left one frame
+too deep for whatever the compiler emits next in the same linear IR
+stream.
+
+Concretely, for the repro above: compiling list element 2
+(`with baz; qux`) builds `baz`'s attrs-thunk via `OP_MK_THUNK`, which
+captures *whatever `ENV` currently is* at that point in the bytecode.
+Compile-time, element 2's `baz` reference is correctly resolved as
+depth 0 relative to the enclosing `let` frame (`ScopeFrame`s are a
+separate, correctly-scoped C-stack structure, never corrupted). But at
+*runtime*, by the time element 2's `OP_MK_THUNK` executes, `ENV` is
+still element 1's leftover with-frame (from `with foo; bar`, never
+exited) -- one real frame deeper than the `let` frame the compile-time
+depth assumed. The captured thunk's `env` is therefore wrong, and when
+forced later (`OP_VAR_REF(depth=0, slot=1)` expecting the `let`
+frame's `baz` slot) it instead reads past the 1-slot with-frame's
+single value, producing garbage that happens to fail the `TAG_ATTRS`
+check in `OP_WITH_TRY` -- hence the "`with' value is not an attrset"
+abort. (A second repro from the same bucket, using closures through
+equality instead of plain values, aborted with "undefined variable"
+for the same underlying reason -- see the fixture list below.)
+
+**Fix.** Added a new op, `OP_WITH_EXIT` (`ir.h`/`irbuild.h`/
+`irbuild.c`/`dispatch_table.c`/`op_with.S`'s `asnix_op_with_exit`),
+emitted by `compiler.c`'s `AST_WITH` case right after compiling the
+body -- the exact `OP_FRAME_EXIT` pattern `AST_LET` already uses,
+specialized for `with`: `ENV = ENV->up` **with `ASNIX_ENV_WITH_TAG`
+masked off** (`andq $-2, %rdi`). The mask is the one real difference
+from `OP_FRAME_EXIT`: a with-frame's own `up` field has the tag bit
+OR'd in (see `env.h`), so reusing plain `OP_FRAME_EXIT` (which never
+masks, correctly, since ordinary `let`/`rec{}`/lambda frames are never
+tagged) would leave `ENV` holding a tagged, odd-valued pointer --
+masking a never-tagged pointer elsewhere is a no-op, so one op handles
+both the with-exit and (if ever reused) the ordinary case safely.
+
+**Verified against `nix-instantiate --eval --strict`**, both the
+crash going away and the *values* being correct (not just "doesn't
+abort" -- a leaked frame can accidentally read the right slot by luck,
+e.g. a disabled first cut of this fix order-of-magnitude-tested clean
+on the plain-`let`-sibling case but not on `with`):
+
+- The two repros in the task (sibling `with`s over plain attrsets, and
+  over closures compared with `==`) now run instead of aborting.
+- `let a = { x = 1; }; b = { y = 2; }; in with a; with b; [ x y ]` --
+  true *nested* `with` (one chain, not siblings) -- still `[ 1 2 ]`,
+  unaffected by the new exit op.
+- `let a = {x=1;}; b={y=2;}; c={z=3;}; in [ (with a; with b; [x y])
+  (with c; z) ]` -- nested-*then*-sibling -- `[ [ 1 2 ] 3 ]`, matching
+  real Nix: confirms `OP_WITH_EXIT` only undoes exactly its own
+  `OP_WITH`, not the whole chain.
+- `let a = 1; b = 2; in [ (with { x = 99; }; a) (with { y = 100; }; b)
+  ]` -- the disambiguating case that would catch a leak even if it
+  didn't crash: element 2's body reads the *outer* `let`-bound `b`,
+  not anything from either `with`. Pre-fix this returned garbage
+  (reading into the first with-frame's single slot); post-fix,
+  `[ 1 2 ]`, matching real Nix.
+
+**Scope cut: did NOT fix (confirmed separate root causes, not forced
+into one fix).**
+
+- `[ foo.bar ] == [ foo.bar ]` evaluates to `true` in asnix but `false`
+  in real Nix (confirmed with no `with` involved at all, i.e.
+  independent of this bug). Real Nix's `==` on functions/closures
+  distinguishes "the exact same `Value` slot referenced twice" (a bare
+  variable like `[ id ] == [ id ]`, or `with`-fallback-independent
+  direct refs -- these ARE `true`) from "two independently-constructed
+  copies of an equivalent closure" (via `.`-select or `with`-fallback,
+  which copy the attribute's value out rather than alias its storage
+  -- these are `false` even though the underlying closure is
+  identical). asnix's `OP_EQ` doesn't implement this copy-vs-alias
+  distinction at all, so this milestone's fix does NOT make
+  `eval-okay-eq-slot-identity.nix` pass (its expected array mixes both
+  patterns); that gap is a separate, deeper equality-semantics
+  milestone, out of scope here.
+- `eval-okay-delayed-with.nix` (self-referential lazy `with` through a
+  `pkgs // packageOverrides pkgs` pattern) still aborts with "infinite
+  recursion forcing a thunk (blackhole)", and `eval-okay-delayed-with-
+  inherit.nix` still aborts with "attribute 'b' missing" -- both
+  byte-for-byte the same errors as before this fix. Traced far enough
+  to confirm it's unrelated to the sibling-leak above (no sibling
+  `with`s involved; it's a single self-referential `with pkgs;` whose
+  value thunk ends up re-entered while still `IN_PROGRESS`, where real
+  Nix's shallow, keys-only `//` forcing avoids re-entering it) --
+  genuinely a separate laziness bug, left as a documented, uninvestigated-
+  further scope cut.
+
+**Fixtures:** `tests/e2e/m52_with_siblings.nix` (the minimal plain-
+attrset repro), `m52_with_siblings_outer_ref.nix` (the disambiguating
+outer-reference case), `m52_with_nested_then_sibling.nix` (nested-
+*then*-sibling regression guard). All three generated via
+`nix-instantiate --eval --strict` and green.
+
+**Regression:** `make test` (unit) and `make test-e2e` (now 201 e2e
+fixtures) both green, no regressions. `test-conformance` (`cd
+/tmp/nix-conformance && ./run adapters/asnix lang`, run against this
+fix twice for stability, and against a stashed pre-fix rebuild for an
+exact diff): **633 passed, 169 failed, 0 known, 62 skipped both before
+and after** -- byte-identical `FAIL`/`SKIP` name lists; this fix
+changes behavior (crash -> correct value, or crash -> still-wrong-but-
+no-longer-crashing value per the scope cut above) only on cases not
+otherwise exercised by the numtide/nix-conformance `lang` corpus as a
+pass/fail flip, so the aggregate numbers don't move even though the
+underlying bug is real and independently verified against
+`nix-instantiate`.

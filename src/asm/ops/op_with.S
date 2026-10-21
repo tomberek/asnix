@@ -179,3 +179,27 @@ asnix_op_with_miss:
     movq $ASNIX_MSG_UNDEFINED_VAR_LEN, %rsi
     jmp asnix_fatal
     .size asnix_op_with_miss, . - asnix_op_with_miss
+
+    // M52: no operands; ENV = ENV->up with ASNIX_ENV_WITH_TAG masked off --
+    // the with-frame counterpart of OP_FRAME_EXIT (op_frame.S). compiler.c's
+    // AST_WITH case emits this right after compiling the `with` body so a
+    // non-tail `with` (e.g. one sibling among several in the same list/
+    // attrset/call-arg position) doesn't leave its 1-slot with-frame
+    // installed as ENV for whatever compiles next -- that leak was M52's
+    // bug: a second, sibling `with`'s OP_MK_THUNK (building its own
+    // with-expr) would capture the first with's leftover frame instead of
+    // the enclosing scope, so every depth-relative OP_VAR_REF inside that
+    // thunk walked one frame too many once the second `with`'s value was
+    // actually forced. Without the mask, ENV would become a tagged (odd)
+    // pointer -- a plain OP_FRAME_EXIT, whose frames are never tagged,
+    // can't be reused here.
+    .globl asnix_op_with_exit
+    .type asnix_op_with_exit, @function
+asnix_op_with_exit:
+    movq ASNIX_ENV_OFF_UP(%rdi), %rdi
+    andq $-2, %rdi                       // mask off ASNIX_ENV_WITH_TAG (bit 0)
+
+    addq $ASNIX_IROP_SIZE, %rsi
+    movq (%rsi), %rax
+    jmp *%rax
+    .size asnix_op_with_exit, . - asnix_op_with_exit
