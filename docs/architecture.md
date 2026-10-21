@@ -56,7 +56,9 @@ what's actually implemented and the scope decisions made along the way.
 | M41 — dynamic attrpath segments anywhere (`.${k}`, interpolated quoted strings) | done (see below) |
 | M42-M49 | not started |
 | M50 — name the specific value/field in 6 more generic fatal-path error messages | done (see below) |
-| M51+ | not started |
+| M51-M56 | not started |
+| M57 — conformance grab-bag: `lessThan`/`sort` on lists, `genericClosure` key-comparability checks, `__overrides` propagation, `import`'s `__toString` coercion, `toJSON` UTF-8 validation, `compareVersions`' int-overflow-to-string quirk | done, **in progress** (sub-items, see below) |
+| M58+ | not started |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
 
@@ -3813,3 +3815,47 @@ No new e2e fixtures (error-message-only change, same precedent M36
 itself set). `make test`/`test-e2e` green, no regressions;
 `test-conformance` still 633 passed, 169 failed, 0 known, 62 skipped --
 identical to the pre-change baseline.
+
+## M57 scope notes: conformance grab-bag
+
+A "pick off what you can" pass over a list of smaller numtide/
+nix-conformance gaps, sub-numbered M57a/b/... per item (one commit
+each).
+
+### M57a: `lessThan`/`sort` ordering of lists
+
+`asnix_bshared_value_lt` (builtins_shared.c, backs both `builtins.
+lessThan` and `builtins.sort`'s default-ish comparator usage) only
+handled int-vs-int and string-vs-string; real Nix also orders lists
+lexicographically (`CompareValues::operator()`'s `nList` case in
+`~/nix/src/libexpr/primops.cc`): walk both lists pairwise, and at the
+first index where the elements aren't *equal* (full structural `==`,
+not `<`), recurse `lessThan` on just that pair; if one list runs out
+first while still equal on the common prefix, the shorter one is less;
+equal-length all-equal lists are not less (false, matching the
+`lessThan [1 2] [1 2] == false` / `[] [] == false` real-Nix results
+confirmed below).
+
+Added a `ASNIX_TAG_LIST`-vs-`ASNIX_TAG_LIST` branch to `asnix_bshared_
+value_lt` doing exactly this: force both top-level args and each
+element pair (lists are lazy, same as every other list-consuming
+builtin already does via `asnix_force_for_print`), use the existing
+`asnix_bshared_value_eq` to decide "equal, move on" vs. "recurse `lt`
+on this differing pair", and fall back to the prior fatal "cannot
+compare" error (now mentioning list-vs-list in its message) for any
+other type combination -- including a type mismatch discovered only
+once two elements are reached, matching real Nix's `lessThan [1]
+["a"]` => `error: cannot compare an integer with a string`.
+
+Verified against real `nix-instantiate --eval`: `lessThan [1 2] [1
+3]` => true, `[1 2] [1 2]` => false, `[1] [1 2]` => true, `[1 2] [1]`
+=> false, `[] []` => false, `[] [1]` => true, `[1] ["a"]` => throws.
+`eval-okay-sort.nix` (asnix's own output byte-for-byte matches its
+`.exp`, including the list-of-lists case) and `eval-okay-eq-slot-sort.
+nix` (relies on `builtins.lessThan`'s list case falling through to
+`asnix_bshared_value_eq`'s existing pointer-identity fast path for a
+shared closure value referenced from two different list literals --
+already correct, unchanged by this fix) both now pass. Two new e2e
+fixtures: `m57a_lessthan_lists.nix`/`m57a_sort_lists.nix`. `make
+test`/`test-e2e` green (200 e2e); `test-conformance` 635 passed (+2),
+167 failed (-2), 0 known, 62 skipped -- no other test's result moved.
