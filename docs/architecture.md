@@ -39,7 +39,8 @@ what's actually implemented and the scope decisions made along the way.
 | M24 — quoted-string attrpath segments (`"a b"` as a binding/select/has-attr key) | done, **scoped** (see below) |
 | M25 — real call-by-need for function arguments (core evaluator fix) | done (see below) |
 | M26 — unary `-` (negate) | done (see below) |
-| M27+ | not started |
+| M27 — `fromTOML` bare global + corrected understanding of real Nix's bare-global rule | done (see below) |
+| M28+ | not started |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
 
@@ -2886,3 +2887,46 @@ right-recursive (allows `--x`, harmless) and desugars directly to the
 existing binary `-` (`AST_BINOP` op `'-'`) with a literal `0` as the
 left-hand side, exactly the same `sub 0 $2` desugaring real Nix's own
 grammar action uses -- no new AST node or IR op needed.
+
+## M27 scope notes: `fromTOML` bare global + the real bare-global rule
+
+Found continuing to chase `d.nix`: `lib/trivial.nix` calls bare
+`fromTOML` directly (`importTOML = path: fromTOML (readFile path);`),
+and asnix's `builtins.fromTOML` (M23) had never been exposed as a bare
+global.
+
+**This also corrected a previously-incomplete understanding of real
+Nix's bare-global rule** (M18's original research, repeated and extended
+piecemeal in M22/M23 by testing individual names against
+`nix-instantiate` one at a time): it is not actually a small, hand-
+curated list at all. Read directly from cppnix's source this time
+instead of guessing further names to test: `EvalState::addPrimOp`
+(`~/nix/src/libexpr/eval.cc`) exposes **every** primop whose registered
+name does *not* start with `__` as a bare global under that exact name,
+automatically, in addition to registering it under `builtins.<name>`
+(a `__`-prefixed primop, e.g. `toJSON`'s real registered name is
+`__toJSON`, is bare-accessible only under that `__`-prefixed form --
+confirmed directly: `toJSON {}` bare is "undefined variable", matching
+this rule exactly). Grepping every `RegisterPrimOp`/`.name = "..."` site
+across `~/nix/src/libexpr/primops.cc` and `~/nix/src/libexpr/primops/
+*.cc` for non-`__`-prefixed names gives the complete, authoritative set:
+`import abort throw map removeAttrs isNull toString baseNameOf dirOf
+fetchTarball fetchGit fetchMercurial fetchTree fetchFinalTree fromTOML
+placeholder scopedImport derivationStrict break` (plus `derivation`,
+`builtins`, `true`, `false`, `null`, `__curPos`, which aren't ordinary
+`addPrimOp`-registered primops at all and were already known/handled
+separately). Of the primops in that list not yet implemented in asnix
+at all (`fetchTarball`/`fetchGit`/`fetchMercurial`/`fetchTree`/
+`fetchFinalTree`, `placeholder`, `scopedImport`, `derivationStrict`,
+`break`), none are added here -- the fetch-family needs real network
+I/O, `derivationStrict`/`scopedImport` are moderate undertakings of their
+own, and `break`/`placeholder` simply haven't been hit by anything this
+project has actually evaluated yet. Documented here as the complete
+picture rather than re-discovered one name at a time again, but
+deliberately not implemented speculatively (same "need-driven, not
+speculative" discipline as every other builtin added so far).
+
+Fixed by adding `asnix_make_fromTOML_primop()` (`builtins_toml.c`,
+alongside the existing `prim_fromTOML`) -- same established pattern as
+every other bare-global wrapper. Root `Env`/`ScopeFrame` grew from 11 to
+12 slots.

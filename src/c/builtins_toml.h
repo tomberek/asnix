@@ -21,4 +21,10 @@
 extern const AsnixBuiltinMiscDef ASNIX_TOML_BUILTINS[];
 extern const size_t ASNIX_TOML_BUILTINS_COUNT;
 
+/* Exposes `fromTOML` as a bare root-scope global (see eval_file.c's root
+ * Env / compiler.c's root ScopeFrame) -- one of real Nix's bare globals,
+ * see this function's own comment in builtins_toml.c for the full
+ * cppnix-source-level justification. */
+Value asnix_make_fromTOML_primop(void);
+
 #endif /* ASNIX_BUILTINS_TOML_H */

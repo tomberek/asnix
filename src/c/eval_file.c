@@ -15,6 +15,7 @@
 #include "builtins_attrs.h"
 #include "builtins_list.h"
 #include "builtins_misc.h"
+#include "builtins_toml.h"
 #include "compiler.h"
 #include "lexer.h"
 #include "parser.h"
@@ -99,13 +100,19 @@ Value asnix_eval_file(const char *path) {
 
     /* Fresh root env/builtins every call -- an imported file does not
      * inherit the importing file's local scope (see eval_file.h). Slots
-     * 1-10 (`import`, `map`, `abort`, `toString`, `removeAttrs`, `isNull`,
-     * `throw`, `derivation`, `baseNameOf`, `dirOf`) are ten of the small
-     * set of names real Nix exposes as bare globals in addition to
-     * `builtins.X` -- see builtins.h's asnix_make_import_primop comment
-     * for the full list checked; compiler.c's root ScopeFrame must list
-     * the same names in the same order. */
-    Env *root_env = asnix_env_alloc(NULL, 11);
+     * 1-11 (`import`, `map`, `abort`, `toString`, `removeAttrs`, `isNull`,
+     * `throw`, `derivation`, `baseNameOf`, `dirOf`, `fromTOML`) are the
+     * names real Nix exposes as bare globals in addition to `builtins.X`
+     * -- every primop cppnix registers WITHOUT a `__` prefix gets this
+     * treatment automatically (`EvalState::addPrimOp`, `eval.cc`); see
+     * builtins.h's asnix_make_import_primop comment and
+     * builtins_toml.c's asnix_make_fromTOML_primop comment for the fuller
+     * picture (including real ones not yet implemented at all:
+     * `fetchTarball`/`fetchGit`/`fetchMercurial`/`fetchTree`/
+     * `scopedImport`/`placeholder`/`derivationStrict`/`break`).
+     * compiler.c's root ScopeFrame must list the same names in the same
+     * order. */
+    Env *root_env = asnix_env_alloc(NULL, 12);
     root_env->values[0] = asnix_make_builtins_attrs();
     root_env->values[1] = asnix_make_import_primop();
     root_env->values[2] = asnix_make_map_primop();
@@ -117,6 +124,7 @@ Value asnix_eval_file(const char *path) {
     root_env->values[8] = asnix_make_derivation_primop();
     root_env->values[9] = asnix_make_baseNameOf_primop();
     root_env->values[10] = asnix_make_dirOf_primop();
+    root_env->values[11] = asnix_make_fromTOML_primop();
 
     Value result = asnix_eval(prog, root_env);
 
