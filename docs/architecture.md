@@ -72,7 +72,8 @@ what's actually implemented and the scope decisions made along the way.
 | M57 — conformance grab-bag (9 sub-items a-i): `lessThan`/`sort` on lists, `genericClosure` key-comparability, `__overrides` propagation, `toJSON` UTF-8 validation, `import`'s `__toString` coercion, `compareVersions`' int-overflow quirk, path-concat canonicalization, import symlink resolution, CLI `--arg`/`--argstr`/`-A` | done, **scoped** (see below; function/derivation-equality, `-I`, and context-attr-name skipped) |
 | M58 — `derivation` is a real Nix-level wrapper around `derivationStrict`, giving self-referential multi-output objects (`drv.out.outPath`, etc.) | done (see below) |
 | M59 — `builtins.unsafeGetAttrPos`: a deliberately narrow, approximate implementation (no Attr-record growth, no lexer changes) | done, **scoped** (see below) |
-| M60+ | not started |
+| M60 — `builtins.unsafeDiscardStringContext` (no-op, matching M54's getContext/appendContext scope cut) | done (see below) |
+| M61+ | not started |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
 
@@ -6014,3 +6015,26 @@ pass/fail lists -- expected and unsurprising: no `lang/` corpus file
 exercises `unsafeGetAttrPos` (it needs `__curPos`-adjacent exact
 position tracking to be a meaningful differential test, which is
 exactly the feature this pass does not attempt).
+
+## M60 scope notes: `builtins.unsafeDiscardStringContext`
+
+Found continuing to chase `d.nix` right after M58/M59: once nixpkgs'
+bootstrap chain evaluates far enough (M58 having fixed `derivation`'s
+self-reference), the next blocker was "attribute
+'unsafeDiscardStringContext' missing" -- real nixpkgs code (e.g.
+`pkgs/build-support/fetchurl/default.nix`-adjacent helpers) calls this
+on `url`/`name`-shaped strings before using them as plain env-var
+values. Same situation M54's `getContext`/`appendContext` already
+documented: asnix has no string-context tracking at all anywhere in
+this codebase, so with nothing ever attached to any string, discarding
+context is already a no-op. Implemented as a straight identity
+function (`builtins`-only, confirmed via `nix-instantiate --eval
+--strict -E 'builtins.isFunction unsafeDiscardStringContext'` failing
+with "undefined variable" -- not a bare global), added right next to
+`getContext`/`appendContext` in `builtins_m54.c`'s existing table.
+Verified against real Nix: `builtins.unsafeDiscardStringContext "foo"
+== "foo"`.
+
+`make test`/`test-e2e` green (one new `m60_*` fixture), `test-conformance`
+(mined subset) unchanged. `d.nix` progresses past this exact blocker to
+the next one.

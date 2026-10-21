@@ -701,6 +701,25 @@ static Value appendContext2_impl(const Value *args, int64_t argc) {
 }
 static Value build_appendContext(void) { return asnix_bshared_make_curried_native((void *)appendContext2_impl, 2); }
 
+/* unsafeDiscardStringContext s (M58-adjacent, found via d.nix right
+ * after M58's derivation fix let nixpkgs eval far enough to reach a
+ * call to it -- `pkgs/build-support/fetchurl/default.nix` and friends
+ * call it on `url`/`name`-shaped strings before using them as plain
+ * env-var values). Same "no string-context tracking at all" situation
+ * as getContext/appendContext right above: with no context ever
+ * attached to any string in this evaluator, discarding it is already
+ * a no-op -- returning `s` unchanged reproduces the one observable
+ * property real Nix's own version has for a plain, context-free string
+ * (confirmed: `builtins.unsafeDiscardStringContext "foo" == "foo"`). */
+static Value prim_unsafeDiscardStringContext(const Value *args, int64_t argc) {
+    (void)argc;
+    ASNIX_REQUIRE_STRING(args[0], "unsafeDiscardStringContext");
+    return args[0];
+}
+static Value build_unsafeDiscardStringContext(void) {
+    return asnix_bshared_make_primop((void *)prim_unsafeDiscardStringContext, 1);
+}
+
 /* ---------------------------------------------------------------------
  * scopedImport scope path (M54) -- one of real Nix's bare root-scope
  * globals (confirmed via cppnix source, ~/nix/src/libexpr/primops.cc:
@@ -827,6 +846,7 @@ const AsnixBuiltinM54Def ASNIX_M54_BUILTINS[] = {
     { "convertHash", build_convertHash },
     { "getContext", build_getContext },
     { "appendContext", build_appendContext },
+    { "unsafeDiscardStringContext", build_unsafeDiscardStringContext },
     { "scopedImport", build_scopedImport },
     { "unsafeGetAttrPos", build_unsafeGetAttrPos },
 };
