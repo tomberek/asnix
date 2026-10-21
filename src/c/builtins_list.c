@@ -284,10 +284,25 @@ static Value prim_concatLists(const Value *args, int64_t argc) {
     Value outer = args[0];
     check_list(outer, "concatLists");
     int64_t ocount = list_count(outer);
-    const Value *oelems = list_elems(outer);
+    const Value *oelems_raw = list_elems(outer);
 
+    /* Each outer element must be FORCED before checking its tag --
+     * list elements are always lazy by design (same as attrset values),
+     * so an unforced Thunk here is completely ordinary, not an error;
+     * only forcing reveals whether it's actually a list. A prior
+     * version of this function checked `asnix_tag_of()` on the raw,
+     * possibly-still-thunked element directly, which happened to "work"
+     * only because every list producer up to M23 always left already-
+     * computed values in a list -- M23's `map` fix (now genuinely lazy
+     * per element, matching real Nix) exposed this as a real bug:
+     * `concatLists (map (x: map f strings) algos)` aborted with a bogus
+     * "element N is not a list" instead of forcing the inner map's
+     * still-lazy result first (found via numtide/nix-conformance's
+     * eval-okay-hashstring.nix/eval-okay-hashfile.nix). */
+    Value *oelems = ocount > 0 ? malloc((size_t)ocount * sizeof(Value)) : NULL;
     int64_t total = 0;
     for (int64_t i = 0; i < ocount; i++) {
+        oelems[i] = asnix_force_for_print(oelems_raw[i]);
         if (asnix_tag_of(oelems[i]) != ASNIX_TAG_LIST) {
             fprintf(stderr, "asnix: concatLists: element %lld is not a list\n", (long long)i);
             exit(1);
@@ -306,6 +321,7 @@ static Value prim_concatLists(const Value *args, int64_t argc) {
         }
         pos += icount;
     }
+    free(oelems);
     return (Value){ .raw = (uint64_t)(uintptr_t)mem | ASNIX_TAG_LIST };
 }
 
