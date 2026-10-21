@@ -71,6 +71,24 @@ void asnix_bshared_fatal(const char *who, const char *msg) {
     exit(1);
 }
 
+/* OP_SELECT's (op_select.S) static-attribute-missing fatal path -- names
+ * the attribute, matching real Nix's own "attribute 'x' missing" wording
+ * (confirmed via `nix-instantiate --eval '{ a = 1; }.b'`). Previously a
+ * single generic "attribute missing, aborting" line with no indication of
+ * *which* attribute or selection site -- found to cost real debugging time
+ * (every "attribute missing" abort chasing real nixpkgs needed a one-off
+ * gdb session reading the symbol id out of the live IP register to find
+ * out). Only ever called immediately before `exit(1)`, so the extra
+ * `asnix_sym_name` call/format here costs nothing on the hot (successful
+ * select) path -- op_select.S's own `.Lselect_found`/`.Lselect_push`
+ * never reach this function at all. */
+_Noreturn void asnix_bshared_select_missing_fatal(uint32_t sym) {
+    size_t len;
+    const char *name = asnix_sym_name(sym, &len);
+    fprintf(stderr, "asnix: attribute '%.*s' missing, aborting\n", (int)len, name);
+    exit(1);
+}
+
 void asnix_bshared_require_tag(Value v, int tag, const char *who, const char *what) {
     if (asnix_tag_of(v) != tag) {
         fprintf(stderr, "asnix: %s: argument is not %s\n", who, what);

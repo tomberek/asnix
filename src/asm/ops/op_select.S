@@ -7,9 +7,6 @@
 .Lmsg_select_type:
     .ascii "asnix: '.' selection target is not an attrset, aborting\n"
     .equ ASNIX_MSG_SELECT_TYPE_LEN, . - .Lmsg_select_type
-.Lmsg_select_missing:
-    .ascii "asnix: attribute missing, aborting\n"
-    .equ ASNIX_MSG_SELECT_MISSING_LEN, . - .Lmsg_select_missing
 .Lmsg_blackhole:
     .ascii "asnix: infinite recursion forcing a thunk (blackhole), aborting\n"
     .equ ASNIX_MSG_BLACKHOLE_LEN, . - .Lmsg_blackhole
@@ -97,9 +94,17 @@ asnix_op_select:                        // a = symbol id; pops an attrset, pushe
     movq $ASNIX_MSG_SELECT_TYPE_LEN, %rsi
     jmp asnix_fatal
 .Lselect_missing:
-    leaq .Lmsg_select_missing(%rip), %rdi
-    movq $ASNIX_MSG_SELECT_MISSING_LEN, %rsi
-    jmp asnix_fatal
+    // Names the attribute (real Nix's own "attribute 'x' missing"
+    // wording) -- a real `call` into C (not a tail `jmp` like the other
+    // two fatal paths below), safe here because %rsp is already 16-byte
+    // aligned entering this handler (same standing dispatch-loop
+    // invariant op_call.S/op_mk_thunk.S's own direct C calls rely on) and
+    // asnix_bshared_select_missing_fatal is _Noreturn, so the harmless
+    // pushed return address is never used. Only reached immediately
+    // before exit(1), so this costs nothing on the hot (successful
+    // select) path above.
+    movq %rdx, %rdi
+    call asnix_bshared_select_missing_fatal
 .Lselect_blackhole:
     leaq .Lmsg_blackhole(%rip), %rdi
     movq $ASNIX_MSG_BLACKHOLE_LEN, %rsi

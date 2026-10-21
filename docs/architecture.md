@@ -48,7 +48,8 @@ what's actually implemented and the scope decisions made along the way.
 | M33 — dynamic `?` segment (`x ? ${name}`, anywhere in the chain) | done (see below) |
 | M34 — unforced list elements reaching 6 builtins as raw scalars | done (see below) |
 | M35 — `builtins.currentSystem`, `builtins.isPath` + `isString` path bug | done (see below) |
-| M36+ | not started |
+| M36 — name the attribute in `.` selection's "attribute missing" error | done (see below) |
+| M37+ | not started |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
 
@@ -3408,3 +3409,47 @@ implemented `isPath` as the mirror-image check (tag is `ASNIX_TAG_PTR`
 
 `make test`/`test-e2e` green (185 e2e, two new `m35_*` fixtures);
 `test-conformance` 632 passed (up from 629, no regressions).
+
+## M36 scope notes: name the attribute in `.` selection's "attribute missing" error
+
+Prompted by the user noticing the pattern: M33/M35's investigations each
+needed a one-off gdb session (break on `OP_SELECT`'s miss branch, read
+the symbol id out of the live `%rdx`/IP register, resolve it via
+`asnix_sym_name`) just to find out *which* attribute a plain "asnix:
+attribute missing, aborting" was complaining about -- real Nix's own
+message already names it (`nix-instantiate --eval '{ a = 1; }.b'` =>
+"attribute 'b' missing"). Confirmed real Nix does NOT let `builtins.
+tryEval` catch this particular error (`tryEval ({a=1;}.b)` still
+surfaces as a top-level uncaught `error:`, unlike `throw`/failed
+`assert`/search-path-not-found, M30/M31) -- so this stays a plain fatal
+path, no interaction with the tryeval.c catch mechanism.
+
+Added `asnix_bshared_select_missing_fatal(uint32_t sym)`
+(builtins_shared.c): resolves the symbol via the existing
+`asnix_sym_name` and formats "asnix: attribute 'NAME' missing,
+aborting", matching real Nix's quoting style. `op_select.S`'s
+`.Lselect_missing` now does a real `call` into this function (passing
+the symbol id already sitting in `%rdx` at that point) instead of a
+tail `jmp asnix_fatal` with a static message -- safe without extra
+stack padding since `%rsp` is already 16-byte aligned entering any op
+handler (the same standing invariant `op_call.S`/`op_mk_thunk.S`'s own
+direct C calls already rely on) and the function is `_Noreturn`, so the
+call's pushed return address is simply never used (same reasoning M30's
+op_assert.S fix already established for `jmp`-vs-`call` into a real C
+function).
+
+Zero cost on the hot path: only `.Lselect_missing` changed -- the
+successful-select path (`.Lselect_found`/`.Lselect_push`, the actual hot
+loop) is untouched, and the new `call` only ever executes one
+instruction before the process would have exited anyway.
+`OP_SELECT_DYNAMIC`'s own miss path already named the attribute (M28);
+this brings the static `OP_SELECT` path to parity. Did not extend this
+to `OP_SELECT`'s type-error/blackhole paths or `OP_CHECK_FORMALS`'s
+missing/extra-field errors in this pass -- same idea would apply
+there, but this fix specifically targeted the exact friction just hit
+three times in a row (M33/M35's `currentSystem`/`isPath`/
+`functionArgs` lookups).
+
+`make test`/`test-e2e` green (no new fixtures -- this is an error-
+message-only change, verified by hand against `nix-instantiate --eval`);
+`test-conformance` still 632 passed, no regressions.

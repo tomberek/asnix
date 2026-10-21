@@ -55,6 +55,9 @@ Value asnix_bshared_make_curried_native(void *native_fn, int64_t arity);
 Value asnix_bshared_apply2(Value fn, Value a, Value b);
 
 void asnix_bshared_fatal(const char *who, const char *msg);
+/* OP_SELECT's (op_select.S) static-attribute-missing path -- see the
+ * full comment in builtins_shared.c. */
+_Noreturn void asnix_bshared_select_missing_fatal(uint32_t sym);
 void asnix_bshared_require_tag(Value v, int tag, const char *who, const char *what);
 #define ASNIX_REQUIRE_ATTRS(v, who) asnix_bshared_require_tag((v), ASNIX_TAG_ATTRS, (who), "an attrset")
 #define ASNIX_REQUIRE_STRING(v, who) asnix_bshared_require_tag((v), ASNIX_TAG_PTR, (who), "a string")
