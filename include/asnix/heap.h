@@ -33,6 +33,28 @@
 #define ASNIX_PATH_OFF_LEN    8
 #define ASNIX_PATH_OFF_BYTES  16
 
+/* Float (M51): a THIRD `ASNIX_TAG_PTR` kind, alongside String/Path above --
+ * there is still no free tag bit for a dedicated `ASNIX_TAG_FLOAT` (all 8
+ * slots in value.h are spent, `ASNIX_TAG_PRIMOP` having claimed the last
+ * one back in M7), so this follows the exact same "reserved negative
+ * marker in the leading word" precedent M15 established for Path:
+ *   Float{int64_t marker == ASNIX_FLOAT_MARKER (-2); double value;}
+ * Unlike Path (which just shifts its own same-shape payload out one slot
+ * after the marker), a double needs the full 64 bits, so this is a
+ * genuine second word, not a repurposing -- there is no way to shrink a
+ * double into the 61 usable bits an immediate encoding would offer
+ * without losing precision, so heap-boxing it (same as every other
+ * PTR-tagged kind here) is the only honest option. `asnix_value_is_path`
+ * (value_util.c) already dispatches on marker value alone, so `-2` here
+ * is automatically distinguished from both a genuine String (whose
+ * leading word is always its own non-negative length) and a Path
+ * (marker `-1`) with no changes needed there. Use
+ * asnix_make_float_value()/asnix_value_is_float()/asnix_float_value()
+ * (value_util.h) -- never poke these offsets directly. */
+#define ASNIX_FLOAT_MARKER     (-2)
+#define ASNIX_FLOAT_OFF_MARKER 0
+#define ASNIX_FLOAT_OFF_VALUE  8
+
 /* List: {int64_t count; Value elems[count];} */
 #define ASNIX_LIST_OFF_COUNT 0
 #define ASNIX_LIST_OFF_ELEMS 8

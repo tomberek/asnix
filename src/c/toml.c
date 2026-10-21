@@ -1,17 +1,13 @@
 /*
- * builtins.fromTOML -- M23. A scoped, hand-written recursive-descent TOML
- * parser modeled on this project's existing lexer.c/parser.c style (plain
- * index-into-buffer scanning, no external dependency, fatal on error).
+ * builtins.fromTOML -- M23 (M51 added float/inf/nan support). A scoped,
+ * hand-written recursive-descent TOML parser modeled on this project's
+ * existing lexer.c/parser.c style (plain index-into-buffer scanning, no
+ * external dependency, fatal on error).
  *
  * Ground truth for every shape decision below was numtide/nix-conformance's
  * actual differential corpus (lang/corpora/toml.nix, 77 documents) and its
  * corresponding real-Nix-produced lang/eval-okay-fromTOML-NNN.exp files --
- * see docs/architecture.md's "M23 scope notes" for the full writeup,
- * including the exact list of corpus entries this subset cannot pass and
- * why (floats/inf/nan -- asnix's Value representation has no float tag at
- * all, see include/asnix/value.h, so there is no honest way to represent
- * one; this parser detects them and fails loudly rather than guessing an
- * approximation).
+ * see docs/architecture.md's "M23 scope notes" for the full writeup.
  *
  * Implemented: key = value pairs (bare/quoted/dotted keys), [table] and
  * [[array of tables]] headers (with correct "navigate into the *last*
@@ -21,18 +17,22 @@
  * literal strings ('...', no escapes), multi-line basic/literal strings
  * (triple-quoted, with the opening-newline-trim and line-ending-backslash
  * splicing rules), integers (decimal/0x/0o/0b, underscore separators,
- * leading +/-), booleans, and TOML date/time literals -- which real Nix's
- * own fromTOML represents as `{ _type = "timestamp"; value = "<text>"; }`
- * (confirmed directly against lang/eval-okay-fromTOML-062..076.exp), which
- * is just a string wrapped in an attrset and so, unlike floats, fully
- * representable in asnix's integer-only tower without any approximation.
+ * leading +/-), floats and inf/nan (M51, see classify_bare_token/
+ * parse_float_token below -- asnix now has a real float Value kind, see
+ * include/asnix/value.h/heap.h, so this is no longer a "no honest way to
+ * represent it" case the way it was before that milestone), booleans,
+ * and TOML date/time literals -- which real Nix's own fromTOML represents
+ * as `{ _type = "timestamp"; value = "<text>"; }` (confirmed directly
+ * against lang/eval-okay-fromTOML-062..076.exp), which is just a string
+ * wrapped in an attrset and so is fully representable in asnix's tower
+ * either way.
  *
- * NOT implemented (see docs/architecture.md): TOML floats and inf/nan
- * (fatal, by design, not a silent truncation -- the task instructions for
- * this milestone are explicit that truncating e.g. `3.0` to the int `3`
- * would be a silently wrong value, not an acceptable scope cut, even
- * though it happens to print identically to real Nix's float `3.0` in
- * that one specific whole-number case -- lang/eval-okay-fromTOML-060's
+ * Previously NOT implemented, before M51 (see docs/architecture.md): TOML
+ * floats and inf/nan (fatal, by design, not a silent truncation -- the
+ * task instructions for THAT milestone were explicit that truncating e.g.
+ * `3.0` to the int `3` would be a silently wrong value, not an acceptable
+ * scope cut, even though it happens to print identically to real Nix's
+ * float `3.0` in that one specific whole-number case -- lang/eval-okay-fromTOML-060's
  * `3.0` inside `[1, "two", true, 3.0]` is therefore one of the documented
  * unsupported corpus entries).
  */
@@ -54,13 +54,6 @@ static void toml_fatal(const char *msg) {
     exit(1);
 }
 
-static void toml_fatal_float(void) {
-    fprintf(stderr,
-            "asnix: fromTOML: TOML floating-point numbers (and inf/nan) are not supported -- "
-            "asnix's Value representation is integer-only, see docs/architecture.md's "
-            "\"M23 scope notes\"\n");
-    exit(1);
-}
 
 /* ---------------------------------------------------------------------
  * Parser cursor
@@ -715,6 +708,30 @@ static Value parse_decimal_or_prefixed_int(const char *digits, size_t n, int bas
     return asnix_make_int((int64_t)val);
 }
 
+/* M51: a TOML float, `inf`, or `nan` bare token (`rem`/`rem_n` already has
+ * any leading sign stripped into `neg` by the caller, classify_bare_token
+ * below). Underscores are stripped the same way parse_decimal_or_prefixed_int
+ * already does for integers, then the whole (sign-prefixed) buffer is
+ * handed to strtod -- NOT applying `neg` by negating the parsed double
+ * afterwards, since glibc's strtod already gets the sign right for "nan"
+ * vs "-nan" (verified directly: `strtod("nan",0)` has a positive sign
+ * bit, `strtod("-nan",0)` negative), and real Nix's own fromTOML
+ * preserves exactly that written sign on a NaN (confirmed against
+ * eval-okay-nan-to-string.nix's own header comment: "A NaN from TOML has
+ * the sign it is written with", unlike a NaN from arithmetic). */
+static Value parse_float_token(const char *rem, size_t rem_n, int neg) {
+    char buf[160];
+    size_t o = 0;
+    if (neg) buf[o++] = '-';
+    for (size_t i = 0; i < rem_n; i++) {
+        if (rem[i] == '_') continue;
+        if (o >= sizeof(buf) - 1) toml_fatal("float literal too long");
+        buf[o++] = rem[i];
+    }
+    buf[o] = '\0';
+    return asnix_make_float_value(strtod(buf, NULL));
+}
+
 static Value classify_bare_token(const char *tok, size_t n) {
     if (n == 4 && memcmp(tok, "true", 4) == 0) return asnix_make_imm(ASNIX_IMM_TRUE);
     if (n == 5 && memcmp(tok, "false", 5) == 0) return asnix_make_imm(ASNIX_IMM_FALSE);
@@ -744,14 +761,19 @@ static Value classify_bare_token(const char *tok, size_t n) {
         if (rem[i] == ':') toml_fatal("invalid or incomplete TOML local-time value (requires HH:MM:SS)");
     }
 
-    if ((rem_n == 3 && memcmp(rem, "inf", 3) == 0) || (rem_n == 3 && memcmp(rem, "nan", 3) == 0)) toml_fatal_float();
+    /* M51: real float/inf/nan support now exists (see value_util.c) --
+     * supersedes this project's earlier deliberate "floats unsupported"
+     * rejection (`toml_fatal_float()`) for inf/nan specifically. */
+    if ((rem_n == 3 && memcmp(rem, "inf", 3) == 0) || (rem_n == 3 && memcmp(rem, "nan", 3) == 0)) {
+        return parse_float_token(rem, rem_n, neg);
+    }
 
     if (rem_n > 2 && rem[0] == '0' && (rem[1] == 'x' || rem[1] == 'X')) return parse_decimal_or_prefixed_int(rem + 2, rem_n - 2, 16, neg);
     if (rem_n > 2 && rem[0] == '0' && rem[1] == 'o') return parse_decimal_or_prefixed_int(rem + 2, rem_n - 2, 8, neg);
     if (rem_n > 2 && rem[0] == '0' && rem[1] == 'b') return parse_decimal_or_prefixed_int(rem + 2, rem_n - 2, 2, neg);
 
     for (size_t i = 0; i < rem_n; i++) {
-        if (rem[i] == '.' || rem[i] == 'e' || rem[i] == 'E') toml_fatal_float();
+        if (rem[i] == '.' || rem[i] == 'e' || rem[i] == 'E') return parse_float_token(rem, rem_n, neg);
     }
     return parse_decimal_or_prefixed_int(rem, rem_n, 10, neg);
 }

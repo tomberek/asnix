@@ -15,17 +15,18 @@
 // Not a hot path concern worth hand-rolling in asm: see op_update.S's
 // identical save-IP/ENV-around-a-plain-C-call convention, reused as-is.
 //
-// Ordering (< > <= >=) is scoped to TAG_INT only (see docs/architecture.md):
-// comparing anything else is a fatal type error, matching this project's
-// existing "trusted IR, clear fatal on real type errors" style (op_if.S,
-// op_call.S, op_select.S).
+// Ordering (< > <= >=): the all-int fast path below is unchanged since
+// before M51; M51 extended the slow path (anything not plain-INT/INT) to
+// call a dedicated C fallback per operator (asnix_cmp_{lt,gt,le,ge}_values,
+// value_util.c) instead of an immediate fatal, so an int/float or
+// float/float pair now compares correctly (real Nix promotes exactly the
+// same way, see value_util.h's comment) while a genuine type error still
+// fatals, just from C instead of asm now -- same save-IP/ENV-around-a-
+// plain-C-call convention as op_update.S/==/!= above.
 #include "asnix/ir.h"
 #include "asnix/value.h"
 
     .section .rodata
-.Lmsg_cmp_type:
-    .ascii "asnix: comparison (< > <= >=) operands must both be integers, aborting\n"
-    .equ ASNIX_MSG_CMP_TYPE_LEN, . - .Lmsg_cmp_type
 .Lmsg_not_type:
     .ascii "asnix: '!' operand is not a boolean, aborting\n"
     .equ ASNIX_MSG_NOT_TYPE_LEN, . - .Lmsg_not_type
@@ -96,26 +97,32 @@ asnix_op_lt:
     movq %rax, %r8
     andq $ASNIX_TAG_MASK, %r8
     cmpq $ASNIX_TAG_INT, %r8
-    jne .Llt_type_error
+    jne .Llt_slow
     movq %rcx, %r8
     andq $ASNIX_TAG_MASK, %r8
     cmpq $ASNIX_TAG_INT, %r8
-    jne .Llt_type_error
+    jne .Llt_slow
     sarq $ASNIX_TAG_BITS, %rax          // sign-extending shift: real int64 value
     sarq $ASNIX_TAG_BITS, %rcx
     cmpq %rcx, %rax                     // flags := (lhs cmp rhs)
     movq $((ASNIX_IMM_FALSE << ASNIX_TAG_BITS) | ASNIX_TAG_IMM), %rax
     movq $((ASNIX_IMM_TRUE << ASNIX_TAG_BITS) | ASNIX_TAG_IMM), %rdx
     cmovlq %rdx, %rax                   // lhs < rhs ?
+    jmp .Llt_store
+.Llt_slow:
+    pushq %rsi
+    pushq %rdi
+    movq %rax, %rdi
+    movq %rcx, %rsi
+    call asnix_cmp_lt_values
+    popq %rdi
+    popq %rsi
+.Llt_store:
     movq %rax, (%r12)
     addq $8, %r12
     addq $ASNIX_IROP_SIZE, %rsi
     movq (%rsi), %rax
     jmp *%rax
-.Llt_type_error:
-    leaq .Lmsg_cmp_type(%rip), %rdi
-    movq $ASNIX_MSG_CMP_TYPE_LEN, %rsi
-    jmp asnix_fatal
     .size asnix_op_lt, . - asnix_op_lt
 
     .globl asnix_op_gt
@@ -128,26 +135,32 @@ asnix_op_gt:
     movq %rax, %r8
     andq $ASNIX_TAG_MASK, %r8
     cmpq $ASNIX_TAG_INT, %r8
-    jne .Lgt_type_error
+    jne .Lgt_slow
     movq %rcx, %r8
     andq $ASNIX_TAG_MASK, %r8
     cmpq $ASNIX_TAG_INT, %r8
-    jne .Lgt_type_error
+    jne .Lgt_slow
     sarq $ASNIX_TAG_BITS, %rax
     sarq $ASNIX_TAG_BITS, %rcx
     cmpq %rcx, %rax
     movq $((ASNIX_IMM_FALSE << ASNIX_TAG_BITS) | ASNIX_TAG_IMM), %rax
     movq $((ASNIX_IMM_TRUE << ASNIX_TAG_BITS) | ASNIX_TAG_IMM), %rdx
     cmovgq %rdx, %rax                   // lhs > rhs ?
+    jmp .Lgt_store
+.Lgt_slow:
+    pushq %rsi
+    pushq %rdi
+    movq %rax, %rdi
+    movq %rcx, %rsi
+    call asnix_cmp_gt_values
+    popq %rdi
+    popq %rsi
+.Lgt_store:
     movq %rax, (%r12)
     addq $8, %r12
     addq $ASNIX_IROP_SIZE, %rsi
     movq (%rsi), %rax
     jmp *%rax
-.Lgt_type_error:
-    leaq .Lmsg_cmp_type(%rip), %rdi
-    movq $ASNIX_MSG_CMP_TYPE_LEN, %rsi
-    jmp asnix_fatal
     .size asnix_op_gt, . - asnix_op_gt
 
     .globl asnix_op_le
@@ -160,26 +173,32 @@ asnix_op_le:
     movq %rax, %r8
     andq $ASNIX_TAG_MASK, %r8
     cmpq $ASNIX_TAG_INT, %r8
-    jne .Lle_type_error
+    jne .Lle_slow
     movq %rcx, %r8
     andq $ASNIX_TAG_MASK, %r8
     cmpq $ASNIX_TAG_INT, %r8
-    jne .Lle_type_error
+    jne .Lle_slow
     sarq $ASNIX_TAG_BITS, %rax
     sarq $ASNIX_TAG_BITS, %rcx
     cmpq %rcx, %rax
     movq $((ASNIX_IMM_FALSE << ASNIX_TAG_BITS) | ASNIX_TAG_IMM), %rax
     movq $((ASNIX_IMM_TRUE << ASNIX_TAG_BITS) | ASNIX_TAG_IMM), %rdx
     cmovleq %rdx, %rax                  // lhs <= rhs ?
+    jmp .Lle_store
+.Lle_slow:
+    pushq %rsi
+    pushq %rdi
+    movq %rax, %rdi
+    movq %rcx, %rsi
+    call asnix_cmp_le_values
+    popq %rdi
+    popq %rsi
+.Lle_store:
     movq %rax, (%r12)
     addq $8, %r12
     addq $ASNIX_IROP_SIZE, %rsi
     movq (%rsi), %rax
     jmp *%rax
-.Lle_type_error:
-    leaq .Lmsg_cmp_type(%rip), %rdi
-    movq $ASNIX_MSG_CMP_TYPE_LEN, %rsi
-    jmp asnix_fatal
     .size asnix_op_le, . - asnix_op_le
 
     .globl asnix_op_ge
@@ -192,26 +211,32 @@ asnix_op_ge:
     movq %rax, %r8
     andq $ASNIX_TAG_MASK, %r8
     cmpq $ASNIX_TAG_INT, %r8
-    jne .Lge_type_error
+    jne .Lge_slow
     movq %rcx, %r8
     andq $ASNIX_TAG_MASK, %r8
     cmpq $ASNIX_TAG_INT, %r8
-    jne .Lge_type_error
+    jne .Lge_slow
     sarq $ASNIX_TAG_BITS, %rax
     sarq $ASNIX_TAG_BITS, %rcx
     cmpq %rcx, %rax
     movq $((ASNIX_IMM_FALSE << ASNIX_TAG_BITS) | ASNIX_TAG_IMM), %rax
     movq $((ASNIX_IMM_TRUE << ASNIX_TAG_BITS) | ASNIX_TAG_IMM), %rdx
     cmovgeq %rdx, %rax                  // lhs >= rhs ?
+    jmp .Lge_store
+.Lge_slow:
+    pushq %rsi
+    pushq %rdi
+    movq %rax, %rdi
+    movq %rcx, %rsi
+    call asnix_cmp_ge_values
+    popq %rdi
+    popq %rsi
+.Lge_store:
     movq %rax, (%r12)
     addq $8, %r12
     addq $ASNIX_IROP_SIZE, %rsi
     movq (%rsi), %rax
     jmp *%rax
-.Lge_type_error:
-    leaq .Lmsg_cmp_type(%rip), %rdi
-    movq $ASNIX_MSG_CMP_TYPE_LEN, %rsi
-    jmp asnix_fatal
     .size asnix_op_ge, . - asnix_op_ge
 
     // Unary `!`: operates in place on the top of VALSTACK (pop+push the

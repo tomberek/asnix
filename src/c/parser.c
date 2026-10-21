@@ -479,7 +479,7 @@ static Token *expect(Parser *p, TokKind kind, const char *what) {
 }
 
 static int starts_atom(TokKind k) {
-    return k == TOK_INT || k == TOK_IDENT || k == TOK_TRUE || k == TOK_FALSE || k == TOK_NULL ||
+    return k == TOK_INT || k == TOK_FLOAT || k == TOK_IDENT || k == TOK_TRUE || k == TOK_FALSE || k == TOK_NULL ||
            k == TOK_LPAREN || k == TOK_STR_START || k == TOK_ISTR_START || k == TOK_LBRACKET ||
            k == TOK_LBRACE || k == TOK_REC || k == TOK_PATH || k == TOK_SEARCH_PATH;
 }
@@ -792,6 +792,12 @@ static Ast *parse_atom(Parser *p) {
             advance(p);
             Ast *n = asnix_ast_new(AST_INT);
             n->as.int_val = t->int_val;
+            return n;
+        }
+        case TOK_FLOAT: {
+            advance(p);
+            Ast *n = asnix_ast_new(AST_FLOAT);
+            n->as.float_val = t->float_val;
             return n;
         }
         case TOK_TRUE: {

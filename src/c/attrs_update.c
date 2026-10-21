@@ -72,7 +72,7 @@ Value asnix_attrs_insert_dynamic(Value attrs, Value name_val, Value value) {
     if (asnix_tag_of(name_val) == ASNIX_TAG_IMM && asnix_imm_subtag(name_val) == ASNIX_IMM_NULL) {
         return attrs;
     }
-    if (asnix_tag_of(name_val) != ASNIX_TAG_PTR || asnix_value_is_path(name_val)) {
+    if (asnix_tag_of(name_val) != ASNIX_TAG_PTR || asnix_value_is_path(name_val) || asnix_value_is_float(name_val)) {
         fprintf(stderr, "asnix: a dynamic '${...}' attribute name must be a string (got %s)\n",
                 asnix_bshared_type_name(name_val));
         exit(1);

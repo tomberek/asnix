@@ -284,8 +284,11 @@ static Value prim_isString(const Value *args, int64_t argc) {
     (void)argc;
     /* Paths and strings share ASNIX_TAG_PTR (see heap.h) -- isString must
      * exclude paths (found via d.nix: `builtins.isString ./.` wrongly
-     * returned true here; real Nix returns false). */
-    return asnix_make_imm(asnix_tag_of(args[0]) == ASNIX_TAG_PTR && !asnix_value_is_path(args[0])
+     * returned true here; real Nix returns false). M51: a Float is a
+     * THIRD such kind -- excluded the same way (verified against
+     * `nix-instantiate --eval`: `isString 1.5` is false). */
+    return asnix_make_imm(asnix_tag_of(args[0]) == ASNIX_TAG_PTR && !asnix_value_is_path(args[0]) &&
+                                   !asnix_value_is_float(args[0])
                                ? ASNIX_IMM_TRUE
                                : ASNIX_IMM_FALSE);
 }
@@ -294,6 +297,14 @@ static Value prim_isPath(const Value *args, int64_t argc) {
     return asnix_make_imm(asnix_tag_of(args[0]) == ASNIX_TAG_PTR && asnix_value_is_path(args[0])
                                ? ASNIX_IMM_TRUE
                                : ASNIX_IMM_FALSE);
+}
+/* `builtins.isFloat` (M51) -- verified against `nix-instantiate --eval`:
+ * `isFloat 1.2` is true, `isFloat (1 + 1.0)` is true (the `+` operator's
+ * own int/float promotion, see op_arith.S/value_util.c), `isFloat 1` is
+ * false. */
+static Value prim_isFloat(const Value *args, int64_t argc) {
+    (void)argc;
+    return asnix_make_imm(asnix_value_is_float(args[0]) ? ASNIX_IMM_TRUE : ASNIX_IMM_FALSE);
 }
 static Value prim_isList(const Value *args, int64_t argc) {
     (void)argc;
@@ -333,6 +344,46 @@ static Value prim_isBool(const Value *args, int64_t argc) {
     if (asnix_tag_of(args[0]) != ASNIX_TAG_IMM) return asnix_make_imm(ASNIX_IMM_FALSE);
     int sub = asnix_imm_subtag(args[0]);
     return asnix_make_imm(sub == ASNIX_IMM_TRUE || sub == ASNIX_IMM_FALSE ? ASNIX_IMM_TRUE : ASNIX_IMM_FALSE);
+}
+
+/* `builtins.floor`/`builtins.ceil` (M51). Real Nix (~/nix's primops.cc
+ * `prim_floor`/`prim_ceil`) accepts either an int or a float and always
+ * returns an INT: an int argument passes through completely unmodified
+ * (never even round-tripped through a double, which would risk precision
+ * loss for a huge int -- not that this matters much given asnix's own
+ * pre-existing 60-bit int range, but it's what real Nix does and it's
+ * free to match); a float argument is floor()'d/ceil()'d and truncated
+ * to int64. Implemented via plain casts rather than libm's floor()/
+ * ceil() (`(int64_t)d` already truncates toward zero for a finite
+ * double, same as C's own int conversion -- floor is "truncate toward
+ * zero, then step one more negative if that truncated anything off a
+ * negative value"; ceil is the positive-side mirror of the same rule),
+ * so this needs no new link dependency. Verified against
+ * numtide/nix-conformance's eval-okay-floor-ceil.nix: `floor 23.5` ==
+ * 23, `ceil 23.5` == 24, `floor 23` == 23, `ceil 23` == 23 (note: ALL
+ * FOUR results print as plain ints via `toString`, confirming these
+ * really do return INT, not a float that happens to look integral). Out
+ * of range (NixInt overflow) is not specially handled, matching this
+ * project's existing documented 60-bit-int-range scope cut elsewhere. */
+static Value prim_floor(const Value *args, int64_t argc) {
+    (void)argc;
+    Value v = args[0];
+    if (asnix_tag_of(v) == ASNIX_TAG_INT) return v;
+    if (!asnix_value_is_float(v)) fatal("floor: argument is not a number");
+    double d = asnix_float_value(v);
+    int64_t t = (int64_t)d; /* truncates toward zero */
+    if (d < 0 && (double)t != d) t -= 1;
+    return asnix_make_int(t);
+}
+static Value prim_ceil(const Value *args, int64_t argc) {
+    (void)argc;
+    Value v = args[0];
+    if (asnix_tag_of(v) == ASNIX_TAG_INT) return v;
+    if (!asnix_value_is_float(v)) fatal("ceil: argument is not a number");
+    double d = asnix_float_value(v);
+    int64_t t = (int64_t)d; /* truncates toward zero */
+    if (d > 0 && (double)t != d) t += 1;
+    return asnix_make_int(t);
 }
 
 /* `baseNameOf`/`dirOf` (M23) -- two of real Nix's bare root-scope globals
@@ -544,6 +595,9 @@ static Value build_isAttrs(void) { return make_primop_value((void *)prim_isAttrs
 static Value build_isFunction(void) { return make_primop_value((void *)prim_isFunction, 1); }
 static Value build_isInt(void) { return make_primop_value((void *)prim_isInt, 1); }
 static Value build_isBool(void) { return make_primop_value((void *)prim_isBool, 1); }
+static Value build_isFloat(void) { return make_primop_value((void *)prim_isFloat, 1); }
+static Value build_floor(void) { return make_primop_value((void *)prim_floor, 1); }
+static Value build_ceil(void) { return make_primop_value((void *)prim_ceil, 1); }
 
 /* `builtins.nixVersion` -- a plain string constant, not a function (real
  * Nix's is a build-time-baked version string, not computed). This
@@ -582,6 +636,9 @@ const AsnixBuiltinMiscDef ASNIX_BUILTINS_MISC[] = {
     { "isFunction", build_isFunction },
     { "isInt", build_isInt },
     { "isBool", build_isBool },
+    { "isFloat", build_isFloat },
+    { "floor", build_floor },
+    { "ceil", build_ceil },
     { "nixVersion", build_nixVersion },
     { "currentSystem", build_currentSystem },
     { "baseNameOf", build_baseNameOf },

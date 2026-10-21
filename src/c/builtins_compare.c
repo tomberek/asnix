@@ -424,6 +424,50 @@ static int utf8_is_valid(const char *bytes, int64_t len) {
     return 1;
 }
 
+/* M51: JSON number formatting for a Float value -- matches real Nix's
+ * `toJSON`, which hands the double to `nlohmann::json` (value-to-json.cc:
+ * `out = v.fpoint()`) and lets THAT library's own `dump()` format it,
+ * NOT either of this project's other two float-formatting rules
+ * (print.cc's "%.6g"-style top-level printer, or coerceToString's
+ * "%f"-style `toString`) -- confirmed directly against
+ * `nix-instantiate --eval`: `builtins.toJSON 1.0` == "1.0" (NOT "1" the
+ * way the top-level printer would show it, and NOT "1.000000" the way
+ * toString would) and `builtins.toJSON 1.7976931348623157e308` ==
+ * "1.7976931348623157e+308" (full round-trip precision, not 6
+ * significant digits). nlohmann's actual algorithm is a shortest-
+ * round-trip float-to-string (think Grisu/Ryu); approximated here by
+ * trying `%.*g` at increasing precision until the result parses back to
+ * the exact same double (same technique real-world "shortest repr"
+ * implementations bottom out to when a dedicated algorithm isn't
+ * available) -- verified this reproduces the exact two examples above,
+ * plus `builtins.toJSON 1.44` == "1.44" (this project's actual tested
+ * case, eval-okay-tojson.nix). nlohmann additionally guarantees the
+ * output always contains a `.` or an `e` (so re-parsing it in a
+ * language that distinguishes int/float literals still yields a float),
+ * which a bare "%.*g" can lose for an integral value (e.g. precision-1
+ * formats `1.0` as "1") -- restored by appending ".0" when neither
+ * character appears in the shortest match found. */
+static size_t format_json_float(double d, char *buf, size_t bufsize) {
+    int n = 0;
+    for (int prec = 1; prec <= 17; prec++) {
+        n = snprintf(buf, bufsize, "%.*g", prec, d);
+        if (strtod(buf, NULL) == d) break;
+    }
+    if (n < 0) return 0;
+    size_t len = (size_t)n;
+    if (len + 3 > bufsize) return len; /* defensive -- buf is always sized generously by the caller */
+    int has_dot_or_exp = 0;
+    for (size_t i = 0; i < len; i++) {
+        if (buf[i] == '.' || buf[i] == 'e' || buf[i] == 'E') { has_dot_or_exp = 1; break; }
+    }
+    if (!has_dot_or_exp) {
+        buf[len++] = '.';
+        buf[len++] = '0';
+        buf[len] = '\0';
+    }
+    return len;
+}
+
 static int json_name_cmp(const char *an, size_t al, const char *bn, size_t bl) {
     size_t n = al < bl ? al : bl;
     int c = n > 0 ? memcmp(an, bn, n) : 0;
@@ -481,6 +525,12 @@ static void json_encode(Value v, JsonBuf *out) {
             }
             break;
         case ASNIX_TAG_PTR: {
+            if (asnix_value_is_float(v)) {
+                char buf[64];
+                size_t n = format_json_float(asnix_float_value(v), buf, sizeof(buf));
+                jb_puts(out, buf, n);
+                break;
+            }
             int64_t len;
             const char *bytes = asnix_ptr_bytes(v, &len); /* string or path, see header comment */
             if (!utf8_is_valid(bytes, len)) {
@@ -500,9 +550,27 @@ static void json_encode(Value v, JsonBuf *out) {
             jb_putc(out, ']');
             break;
         }
-        case ASNIX_TAG_ATTRS:
-            json_encode_attrs(v, out);
+        case ASNIX_TAG_ATTRS: {
+            /* An attrset with a `__toString`/`outPath` attribute encodes
+             * as whatever THAT coerces to (a JSON string), not as a JSON
+             * object -- matches real Nix's `printValueAsJSON`
+             * (value-to-json.cc), which "peels" via exactly this
+             * mechanism before ever treating a set as a JSON object
+             * (confirmed directly: `builtins.toJSON { outPath.foo =
+             * true; }` == `"{\"foo\":true}"` there, i.e. the WHOLE
+             * attrset becomes the peeled value, not a `{"outPath":...}`
+             * object). Reuses asnix_coerce_to_string, which already
+             * implements this exact __toString/outPath lookup (M23) for
+             * `toString`/`"${...}"`. */
+            uint32_t sym_tostring = asnix_intern("__toString", 10);
+            uint32_t sym_outpath = asnix_intern("outPath", 7);
+            if (asnix_bshared_attrs_find(v, sym_tostring) >= 0 || asnix_bshared_attrs_find(v, sym_outpath) >= 0) {
+                json_encode(asnix_coerce_to_string(v), out);
+            } else {
+                json_encode_attrs(v, out);
+            }
             break;
+        }
         default:
             asnix_bshared_fatal("toJSON", "cannot convert a function to JSON");
     }

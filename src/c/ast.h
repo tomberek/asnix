@@ -16,6 +16,7 @@
 
 typedef enum {
     AST_INT,
+    AST_FLOAT, /* M51: a `1.5`/`0.5e-3`-shaped literal -- see lexer.c's TOK_FLOAT. */
     AST_BOOL,
     AST_NULL,
     AST_STRING,
@@ -96,6 +97,7 @@ struct Ast {
     AstKind kind;
     union {
         int64_t int_val;   /* AST_INT */
+        double float_val;  /* AST_FLOAT */
         int bool_val;       /* AST_BOOL */
         struct {
             const char *name;

@@ -206,6 +206,7 @@ static void codegen_expr(CodeBuf *cb, Ast *node, ScopeFrame2 *scope, size_t dept
         case AST_SELECT:
         case AST_HAS_ATTR:
         case AST_PATH:
+        case AST_FLOAT: /* M51: heap-boxed, same "interpreter-only so far" reason as the rest of this group */
             fprintf(stderr,
                     "asnix: M4.5 native codegen does not yet support strings/lists/attrsets/paths "
                     "(M5+ feature, interpreter-only so far -- see docs/architecture.md)\n");
