@@ -73,7 +73,8 @@ what's actually implemented and the scope decisions made along the way.
 | M58 — `derivation` is a real Nix-level wrapper around `derivationStrict`, giving self-referential multi-output objects (`drv.out.outPath`, etc.) | done (see below) |
 | M59 — `builtins.unsafeGetAttrPos`: a deliberately narrow, approximate implementation (no Attr-record growth, no lexer changes) | done, **scoped** (see below) |
 | M60 — `builtins.unsafeDiscardStringContext` (no-op, matching M54's getContext/appendContext scope cut) | done (see below) |
-| M61+ | not started |
+| M61 — real string-context tracking (`getContext`/`appendContext`/derivation-input propagation) | investigated, **no fix** (see below) |
+| M62+ | not started |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
 
@@ -6038,3 +6039,103 @@ Verified against real Nix: `builtins.unsafeDiscardStringContext "foo"
 `make test`/`test-e2e` green (one new `m60_*` fixture), `test-conformance`
 (mined subset) unchanged. `d.nix` progresses past this exact blocker to
 the next one.
+
+## M61 scope notes: real string-context tracking -- investigated, no fix
+
+A follow-up triage pass, prompted by a cluster of `numtide/nix-
+conformance` failures, on whether asnix can add *real* (non-empty)
+string-context tracking -- the Nix feature where a string's own
+construction carries forward an invisible set of store-path
+dependencies (`"${drv}/bin/foo"`'s context includes `drv`'s output) --
+as opposed to the no-op `getContext`/`appendContext`/
+`unsafeDiscardStringContext` M54/M60 already ship (correctly, those
+comments say, "given nothing is ever tracked"). **Net result: no code
+change**, same category of outcome as M55's regex triage.
+
+**Categorizing the 14 named candidate files** (read every `.nix` +
+`.exp`/`.err.exp` pair, cross-checked live against
+`nix-instantiate --eval --strict`, not just trusted against the
+corpus's own `.exp`, per this pass's own brief -- corpora do drift):
+7 of the 14 are unrelated to context at all and were left alone:
+`eval-fail-drv-outputs-duplicate.nix`/`eval-fail-drv-fixed-two-
+outputs.nix` (derivation multi-output *validation*, squarely another
+concurrent agent's `derivation.c` territory -- not touched, to avoid
+collision); `eval-fail-elem-derivation-type-throws.nix`/`eval-fail-eq-
+derivation-type-throws.nix` (an unrelated `isDerivation`/`type`-
+forcing-during-equality exception-propagation bug, nothing to do with
+strings); `eval-fail-json-attr-not-json.nix`/`eval-okay-json-attr-
+normalised.nix` (JSON-parsing/canonicalization of `__json`, `fromJSON`
+already exists and is the relevant code, not context); `eval-fail-bad-
+string-interpolation-2.nix` (a nonexistent path literal failing at
+path resolution, before context would ever enter the picture).
+
+The other **7 genuinely do need real context tracking**:
+`eval-okay-context.nix`, `eval-okay-context-builtins.nix`, `eval-okay-
+context-inputs.nix`, `eval-okay-context-introspection.nix`, `eval-okay-
+substring-context.nix`, `eval-fail-context-attr-name.nix` (a context-
+carrying string used as a dynamic attribute name must throw -- M57's
+own notes already flagged this exact file as skipped), and `eval-fail-
+drv-tofile-output-reference.nix` (M45's own notes already flagged this
+exact file as a known, accepted regression once `toFile` existed,
+"detecting this requires string-context tracking, which doesn't exist
+in this project at all").
+
+**Why this is disproportionate, not just "more work than one pass"**:
+this is the third time this codebase's own history has independently
+reached for this conclusion (M45, M54, M60 each separately call it "a
+substantially larger, separate feature" / "a substantially larger
+scope cut") -- this pass re-verified *why*, concretely, rather than
+taking that on faith:
+- **Representation** is the easy part and does fit the project's
+  established precedent: a fourth marker-tagged `ASNIX_TAG_PTR` kind
+  (`ContextString`, alongside Path/Float) carrying a trailing list of
+  context-element strings, dispatched in `asnix_ptr_bytes`/
+  `asnix_value_is_*` exactly the way Path/Float already are. Not where
+  the size is.
+- **Propagation is the real surface area.** `eval-okay-context-
+  builtins.nix` alone enumerates, by name, which string builtins must
+  *keep*, *drop*, or *transform* context: string interpolation,
+  `substring` (including the "empty substring keeps context" case),
+  `replaceStrings` (both as source AND when a replacement value itself
+  carries context), `concatStringsSep`, `toJSON`, `toString`,
+  `baseNameOf`, `dirOf`, `hashString` (drops), `match`/`split` (drops,
+  "on purpose"), plus `unsafeDiscardStringContext`,
+  `unsafeDiscardOutputDependency`, and `addDrvOutputDependencies` --
+  the latter two don't exist in this codebase at all yet (confirmed:
+  zero hits), and real Nix's semantics for them require a genuine
+  tagged-union context-ELEMENT type (`Built{drvPath,outputs}` /
+  `DrvDeep` / `Opaque{path}`), not just "a set of strings" --
+  `appendContext`'s own test constructs exactly these three shapes
+  (`{outputs=[...];}`, `{allOutputs=true;}`, `{path=true;}`) and
+  expects them preserved distinctly. `asnix_ptr_bytes`/
+  `asnix_make_string_value` alone have 101 call sites across
+  `src/c/*.c`; every one that *builds* a new string from pieces would
+  need an explicit context-union decision, verified correct per-
+  builtin against the list above, not just "doesn't crash."
+- **Origination reaches into derivation.c's hashing, which is live,
+  contended territory.** `eval-okay-context-inputs.nix` requires a
+  derivation's `drvPath`/`outPath` to change depending on which
+  context a string *attribute value* passed to `derivation {...}`
+  carries (context flows into `inputDrvs`/`inputSrcs` in the `.drv`
+  ATerm, changing its hash) -- i.e. the fix's biggest single piece
+  lands directly inside `derivation.c`'s output-hash computation,
+  which another agent is concurrently rewriting for multi-output
+  support in this same batch. Doing this properly here risks either
+  duplicating or directly conflicting with that work.
+
+Per this task's own step 4 ("if this needs a genuinely large change
+disproportionate to the handful of files it would fix -- STOP and
+report"): stopping here. A correct narrow slice (e.g. "only track
+context through plain `${drv}` interpolation, nothing else") was
+considered and rejected -- `eval-okay-context-builtins.nix` would still
+fail on effectively every other line, since it checks *all* the
+builtins above in one file, so a narrow slice buys close to nothing
+against the one richest test while still adding a new heap-object kind
+and an `asnix_ptr_bytes` dispatch path that every one of those 101
+call sites now has to be re-reasoned about for correctness (silently
+dropping or silently retaining context wrongly is worse than today's
+honest, documented no-op). No files changed; `eval-fail-context-attr-
+name.nix` and `eval-fail-drv-tofile-output-reference.nix` remain
+exactly the documented, accepted gaps M57/M45 already called out.
+`make test`/`test-e2e`/`test-nix-conformance` all unchanged (no code
+touched).
