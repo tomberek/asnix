@@ -20,6 +20,7 @@
 #include "asnix/heap.h"
 #include "asnix/ir.h"
 #include "builtins_shared.h"
+#include "hash_shim.h"
 #include "symtab.h"
 #include "value_util.h"
 
@@ -152,30 +153,40 @@ static Value prim_pathExists(const Value *args, int64_t argc) {
     return asnix_make_imm(exists ? ASNIX_IMM_TRUE : ASNIX_IMM_FALSE);
 }
 
-/* `builtins.readFile p` -- fatal if the file can't be opened/read
- * (matching real Nix's hard error on a missing file, unlike
- * pathExists). Same ftell()==-1-on-a-directory defensive check
- * eval_file.c's own read_file() already established (see its comment --
- * a directory "succeeds" opening via fopen on Linux but can't seek). */
-static Value prim_readFile(const Value *args, int64_t argc) {
-    (void)argc;
-    char *path = resolve_fs_path(args[0], "readFile");
+/* Shared by readFile/hashFile: reads the whole file at `path` into a
+ * freshly malloc'd buffer (caller frees), fatal on any failure --
+ * same ftell()==-1-on-a-directory defensive check eval_file.c's own
+ * read_file() already established (a directory "succeeds" opening via
+ * fopen on Linux but can't seek). */
+static char *read_whole_file(const char *path, const char *who, size_t *out_len) {
     FILE *f = fopen(path, "rb");
     if (!f) {
-        fprintf(stderr, "asnix: readFile: cannot open '%s'\n", path);
+        fprintf(stderr, "asnix: %s: cannot open '%s'\n", who, path);
         exit(1);
     }
     fseek(f, 0, SEEK_END);
     long size = ftell(f);
     if (size < 0) {
-        fprintf(stderr, "asnix: readFile: cannot read '%s' (not a regular file?)\n", path);
+        fprintf(stderr, "asnix: %s: cannot read '%s' (not a regular file?)\n", who, path);
         exit(1);
     }
     fseek(f, 0, SEEK_SET);
     char *buf = malloc((size_t)size);
     size_t n = size > 0 ? fread(buf, 1, (size_t)size, f) : 0;
     fclose(f);
-    Value result = asnix_make_string_value(buf, n);
+    *out_len = n;
+    return buf;
+}
+
+/* `builtins.readFile p` -- fatal if the file can't be opened/read
+ * (matching real Nix's hard error on a missing file, unlike
+ * pathExists). */
+static Value prim_readFile(const Value *args, int64_t argc) {
+    (void)argc;
+    char *path = resolve_fs_path(args[0], "readFile");
+    size_t len;
+    char *buf = read_whole_file(path, "readFile", &len);
+    Value result = asnix_make_string_value(buf, len);
     free(buf);
     return result;
 }
@@ -276,6 +287,49 @@ static Value prim_getEnv(const Value *args, int64_t argc) {
     if (!val) return asnix_make_string_value("", 0);
     return asnix_make_string_value(val, strlen(val));
 }
+
+/* `builtins.hashFile algo path` -- reads the whole file then hashes it,
+ * same four algorithms and hex encoding as `builtins.hashString`
+ * (hash_shim.h) -- deliberately NOT sharing builtins.c's own hashString
+ * dispatch code (that file's `hash_apply` takes an in-memory string, not
+ * a filesystem path), but using the exact same underlying
+ * asnix_hash_md5/sha1/sha256/sha512 + asnix_hash_to_hex primitives. */
+static Value hashFile_apply(const char *path, int64_t (*hash_fn)(const void *, size_t, unsigned char *),
+                             size_t raw_len) {
+    size_t len;
+    char *buf = read_whole_file(path, "hashFile", &len);
+    unsigned char raw[ASNIX_HASH_SHA512_LEN];
+    int64_t rc = hash_fn(buf, len, raw);
+    free(buf);
+    if (rc != 0) {
+        fprintf(stderr, "asnix: hashFile: failed to load libcrypto (rc=%lld) -- "
+                         "enter the flake devShell (needs ASNIX_LIBCRYPTO_LIB / openssl)\n",
+                (long long)rc);
+        exit(1);
+    }
+    char hex[2 * ASNIX_HASH_SHA512_LEN];
+    asnix_hash_to_hex(raw, raw_len, hex);
+    return asnix_make_string_value(hex, 2 * raw_len);
+}
+
+static Value hashFile2_impl(const Value *args, int64_t argc) {
+    (void)argc;
+    ASNIX_REQUIRE_STRING(args[0], "hashFile");
+    int64_t len;
+    const char *name = asnix_ptr_bytes(args[0], &len);
+    char *path = resolve_fs_path(args[1], "hashFile");
+
+    if (len == 3 && memcmp(name, "md5", 3) == 0) return hashFile_apply(path, asnix_hash_md5, ASNIX_HASH_MD5_LEN);
+    if (len == 4 && memcmp(name, "sha1", 4) == 0) return hashFile_apply(path, asnix_hash_sha1, ASNIX_HASH_SHA1_LEN);
+    if (len == 6 && memcmp(name, "sha256", 6) == 0)
+        return hashFile_apply(path, asnix_hash_sha256, ASNIX_HASH_SHA256_LEN);
+    if (len == 6 && memcmp(name, "sha512", 6) == 0)
+        return hashFile_apply(path, asnix_hash_sha512, ASNIX_HASH_SHA512_LEN);
+    fprintf(stderr, "asnix: hashFile: unsupported algorithm \"%.*s\" (expected md5/sha1/sha256/sha512)\n", (int)len,
+            name);
+    exit(1);
+}
+static Value build_hashFile(void) { return asnix_bshared_make_curried_native((void *)hashFile2_impl, 2); }
 
 /* ---------------------------------------------------------------------
  * intersectAttrs e1 e2 -- the subset of e2 whose NAMES also appear in
@@ -473,6 +527,7 @@ const AsnixBuiltinMiscDef ASNIX_M23_BUILTINS[] = {
     { "sub", build_sub },
     { "mul", build_mul },
     { "div", build_div },
+    { "hashFile", build_hashFile },
 };
 
 const size_t ASNIX_M23_BUILTINS_COUNT = sizeof(ASNIX_M23_BUILTINS) / sizeof(ASNIX_M23_BUILTINS[0]);
