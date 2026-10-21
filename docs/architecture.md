@@ -56,7 +56,9 @@ what's actually implemented and the scope decisions made along the way.
 | M41 — dynamic attrpath segments anywhere (`.${k}`, interpolated quoted strings) | done (see below) |
 | M42-M49 | not started |
 | M50 — name the specific value/field in 6 more generic fatal-path error messages | done (see below) |
-| M51+ | not started |
+| M51-M55 | not started |
+| M56 — integer-overflow detection (`+`/`-`/`*`/`/`, `builtins.add/sub/mul/div`) + `fromTOML` validation gaps (bare/incomplete time literals, calendar-range checks, duplicate table headers, leading-zero/double-underscore integers, invalid bare tokens, embedded NUL bytes, integer-literal overflow) | done (see below) |
+| M57+ | not started |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
 
@@ -3813,3 +3815,197 @@ No new e2e fixtures (error-message-only change, same precedent M36
 itself set). `make test`/`test-e2e` green, no regressions;
 `test-conformance` still 633 passed, 169 failed, 0 known, 62 skipped --
 identical to the pre-change baseline.
+
+## M56 scope notes: integer-overflow detection + `fromTOML` validation gaps
+
+Two related "accepts invalid input silently" bug classes found by
+conformance triage, both about asnix not detecting error conditions real
+Nix detects.
+
+### Part 1: integer overflow
+
+`include/asnix/value.h` already documented asnix's `TAG_INT` as a
+**61-bit** immediate (`ASNIX_INT_MIN`/`MAX` = ±2^60), narrower than real
+Nix's full 64-bit `int64_t` -- and M23's own "Known Bugs" list had
+already flagged this exact gap by name (`asnix_make_int`/`op_arith.S`
+did *no* overflow checking at all, confirmed via
+`eval-fail-overflowing-add.nix`/`-mul.nix`), with the fix sketched out
+almost verbatim: "check the native overflow flag after each op, then
+re-check the narrower `ASNIX_INT_MIN`/`MAX` window, fatal on either."
+This pass implements exactly that, plus one thing the sketch didn't
+anticipate: **the literal itself** can already be the overflow. `let a =
+9223372036854775807; in a` (real Nix's `INT64_MAX`) was silently
+round-tripping to `-1` at the `OP_PUSH_INT` handler -- `salq
+$ASNIX_TAG_BITS` dropping the literal's own top 3 bits with no check at
+all, *before* any arithmetic ever ran. Confirmed against
+`nix-instantiate --eval`: real Nix accepts that literal fine (it fits
+int64) but errors on `a + 1`; asnix was corrupting the literal itself,
+unrelated to the `+`.
+
+Fixed at every point a raw `int64_t` becomes a `TAG_INT` Value:
+
+- **`include/asnix/value.h`**: `ASNIX_INT_MIN`/`MAX` moved above the
+  `__ASSEMBLER__` guard and respelled as plain decimal literals
+  (`1152921504606846975` / `-1152921504606846976`) instead of
+  `INT64_C(1) << 60`-style C syntax, specifically so GAS's own
+  expression parser can read them as an immediate operand after cpp
+  substitution (GAS chokes on C integer-suffix syntax). `cmpq` can't
+  take a 64-bit immediate directly (`cmp r/m64, imm32` only
+  sign-extends a 32-bit immediate) -- every check below loads the bound
+  into a scratch register first (`movq $ASNIX_INT_MAX, %r9; cmpq %r9,
+  %rax`), confirmed against `as`+`objdump` to assemble as `movabs`+`cmp`.
+- **`src/asm/ops/op_push.S`** (`asnix_op_push_int`): range-checks the
+  literal's raw `int64_t` against `ASNIX_INT_MIN`/`MAX` *before*
+  shifting, fatal otherwise -- fixes the literal-corruption case above
+  directly. (Unary `-` compiles to `0 - x`, M26, so a negated huge
+  literal like `eval-fail-overflowing-sub.nix`'s `-9223372036854775807`
+  already fatals here on the un-negated literal, before `op_sub` ever
+  runs.)
+- **`src/asm/ops/op_arith.S`** (`asnix_op_add`/`sub`/`mul`/`div`'s
+  all-int fast paths): `+`/`-` only need the narrower range re-check
+  (operands are always already within ±2^60, far inside int64, so a
+  64-bit `addq`/`subq` of two such operands can never trip the CPU's
+  own `OF` flag -- only the *narrower* window catches e.g. `2^59 + 2^59
+  = 2^60` landing one past `ASNIX_INT_MAX`). `*` is the opposite case:
+  two ±2^60 operands genuinely can overflow a 64-bit `imulq` (confirmed
+  by `eval-fail-overflowing-mul.nix`'s `4294967297^2` alone, let alone
+  cubed), so `jo` right after `imulq` is load-bearing and checked
+  *first* -- a tripped 64-bit multiply leaves garbage in the low 64
+  bits, which the range check alone could coincidentally pass. `/`'s
+  quotient can only ever exceed the ±2^60 window in the
+  `ASNIX_INT_MIN / -1` edge case (never a genuine `idivq` CPU trap,
+  since both operands are already bounded), so it only needs the range
+  re-check, no `jo`.
+- **`src/asm/value.S`** (`asnix_make_int`): the shared C-callable
+  reference implementation gets the same ±2^60 range check. This is the
+  single highest-leverage fix in the whole pass -- every C call site
+  that builds an int `Value` (`builtins.add/sub/mul/div` in
+  `builtins_m23.c`, `fromTOML`'s own integer-literal parsing in
+  `toml.c`, `asnix_add_values`'s int+int fallback in `value_util.c`,
+  etc.) funnels through here, so **`eval-fail-fromTOML-overflow.nix`/
+  `-underflow.nix` started passing with zero changes to `toml.c`** --
+  reusing this one check instead of duplicating overflow logic in the
+  TOML integer parser, per the task brief's own suggestion.
+- **`src/c/builtins_m23.c`** (`mul2_impl`, `builtins.mul`): the one spot
+  needing a *separate* fix beyond `asnix_make_int`'s after-the-fact
+  check, because the overflow there happens *before* that check ever
+  runs -- `asnix_int_value(args[0]) * asnix_int_value(args[1])` as plain
+  C `int64_t` multiplication is genuine signed-overflow **undefined
+  behavior** the moment the mathematical product exceeds int64 (e.g.
+  `4294967297 * 4294967297 ≈ 1.8e19 > INT64_MAX`), regardless of what
+  any later range check would say. Rewritten with
+  `__builtin_mul_overflow` (computes the product without the UB and
+  reports whether it overflowed), still followed by `asnix_make_int` for
+  the narrower-window check. `add2_impl`/`sub2_impl`/`div2_impl` did NOT
+  need this: operands are always already bounded to ±2^60, so plain
+  `int64_t` `+`/`-`/`/` of two such values can never itself overflow
+  int64 -- `asnix_make_int`'s own check is sufficient there.
+
+Verified against `nix-instantiate --eval`: `let a = 9223372036854775807;
+b = 1; in a + b` errors in real Nix ("integer overflow in adding ...");
+ordinary arithmetic at/near the ±2^60 boundary (`maxInt = 2^60 - 1`,
+`1000000 + 2000000`, etc., both via operators and
+`builtins.add/sub/mul/div`) still matches real Nix exactly --
+`tests/e2e/m56_int_arith_bounds.nix`.
+
+### Part 2: `fromTOML` validation gaps
+
+M23's own scope notes already flagged real Nix's `fromTOML` (built on
+`toml11`) as the ground truth, cross-checked entry-by-entry against
+`lang/corpora/toml.nix`/`toml-invalid.nix`. This pass worked through the
+16 still-failing `eval-fail-fromTOML-*` cases, each mapped to its exact
+`corpora/toml-invalid.nix` entry by running the failing test directly
+(`./asnix lang/eval-fail-fromTOML-invalid-NNN.nix`) to see what was
+wrongly accepted, then finding the matching corpus line -- all in
+`src/c/toml.c`:
+
+- **Entries 15/19/20** (`"a = 07:32"`, and the same shape nested in an
+  inline table / array): a bare `HH:MM` local-time (missing the
+  required seconds) isn't a valid TOML value at all, but
+  `classify_bare_token` had no way to tell it apart from a malformed
+  number -- it fell straight through to `parse_decimal_or_prefixed_int`,
+  whose `strtoll` simply stopped at the first `:` and silently returned
+  the truncated leading digits (`07:32` -> the int `7`). Fixed with a
+  `:` guard in `classify_bare_token`: a colon can only ever appear in a
+  *complete* `HH:MM:SS` local-time (which `looks_like_date_or_time`
+  would already have claimed above), so reaching the bare-value
+  dispatch with a `:` still in the token is unambiguously invalid --
+  fatal there instead of falling through to the integer parser.
+- **Entries 16/17/18** (`"1979-05-27T07:32"`[`Z`/`+07:00`]): a
+  date-*time* whose time half is truncated below `HH:MM:SS`.
+  `classify_date_or_time`'s call into `normalize_time` did an
+  *unconditional* `memcpy(out, s, 8)` with no length check at all -- an
+  out-of-bounds read on the 5-byte `"07:32"`, silently fabricating a
+  seconds field from whatever memory followed. Fixed by validating the
+  time half (new `valid_time_value` helper, shape *and* range) before
+  ever calling `normalize_time`, for both the date-time case and the
+  bare-local-time case (`classify_date_or_time`'s `else` branch).
+- **Entries 34/35** (`"1979-13-01"`, `"25:00:00"`): calendar/clock
+  values were shape-checked (correct digit/separator positions) but
+  never range-checked at all. New `valid_date_value` (month 1-12, day
+  1-31) and `valid_time_value` (hour 0-23, minute 0-59, second 0-60,
+  allowing a leap second) helpers, called from `classify_date_or_time`
+  for both the date and time halves.
+- **Entry 26** (`"[a]\n[a]"`): TOML forbids declaring the same table
+  twice. `tnode_enter_table` happily re-returned the existing `TN_TABLE`
+  on a second `[a]` header with no check. Added a `declared_as_table`
+  flag to `TNode`, set only when a `[table]` header *itself* targets a
+  node (not when `tnode_get_or_create_table_child` merely steps through
+  it as an ancestor while navigating a dotted/header path, which stays
+  legal per TOML's own implicit-table rules) -- fatal if already set.
+- **Entry 32** (`"a = 01"`): decimal integers may not have a leading
+  zero (except `"0"` itself); hex/octal/binary are exempt (`"0x01"` is
+  fine). Checked in `parse_decimal_or_prefixed_int` only when `base ==
+  10`, after underscores are stripped.
+- **Entry 33** (`"a = 1__0"`): digit separators must be single and
+  strictly between two digits, never leading/trailing/doubled. The old
+  code just unconditionally skipped every `_` while stripping them with
+  no adjacency check. New `validate_digit_separators` scans the *raw*
+  digit run (before stripping, the only point the original separator
+  positions are still visible) and fatals on any `_` that isn't flanked
+  by digits on both sides -- shared by all four integer bases (decimal
+  and the three prefixed ones all funnel through the same function).
+- **Entry 38** (`"a = tru"`, a truncated `true`): fell through every
+  other bare-value case to `parse_decimal_or_prefixed_int`, whose
+  `strtoll` converted zero digits and silently returned `0`. Fixed by
+  capturing `strtoll`'s `endptr` and fataling when `endptr == buf`
+  (nothing at all was consumed as a number).
+- **`eval-fail-fromTOML-{key,value}WithNullByte.nix`**: a backslash-u0000
+  escape (or a literal NUL byte in the document) decodes to an embedded
+  NUL with no complaint, in either a quoted key or a string value (both
+  paths run through the same `parse_toml_string`) -- but real Nix
+  strings can't carry one. Fixed with one `memchr` check at the end of
+  `parse_toml_string`, covering both keys and values in one place.
+- **`eval-fail-fromTOML-{overflow,underflow}.nix`**: as noted in Part
+  1, these needed **zero changes to `toml.c`** -- `asnix_make_int`'s new
+  range check (shared with `builtins.add/sub/mul/div`) already rejects
+  any TOML integer literal outside asnix's representable range, which a
+  true `int64_t` overflow/underflow trivially always is (asnix's window
+  is ±2^60, real Nix's is ±2^63-ish) -- exactly the "reuse, don't
+  duplicate" the task brief suggested.
+
+Every fix re-verified against the *valid* corpus too (not just the
+invalid one it was meant to reject), both the full differential sweep
+(`lang/eval-okay-fromTOML-*`, unchanged pass/fail set) and by hand
+(`nix-instantiate --eval`): `0`, `-0`, `0x01`/`0o01`/`0b01` (leading
+zero fine for prefixed bases), `1_000_000` (single underscores fine) --
+`tests/e2e/m56_fromtoml_valid_edges.nix`. The float/inf/nan-related
+`fromTOML` cases (`eval-okay-fromTOML-006/007/008/060.nix`,
+`-timestamps.nix`, the un-numbered `eval-okay-fromTOML.nix`) are the
+same pre-existing, documented M23 scope cut (no float type at all) --
+untouched, still failing exactly as before.
+
+No e2e fixtures for the fatal paths themselves -- same reason M36 set
+the precedent: `make test-e2e`'s harness only diffs `stdout`, and
+`set -e` means a fixture whose `./asnix` invocation exits non-zero
+aborts the *entire* `test-e2e` run rather than reporting one failure.
+Added two fixtures instead that lock in the *successful* paths this
+pass's checks run through on every call (`m56_int_arith_bounds.nix`,
+`m56_fromtoml_valid_edges.nix`), verified by hand against
+`nix-instantiate --eval` otherwise.
+
+`make test`/`test-e2e` green, no regressions. `test-conformance`
+(`lang/`): 653 passed, 149 failed, 0 known, 62 skipped -- up from the
+633/169 baseline, +20 (4 overflow + 2 fromTOML over/underflow + 14
+fromTOML invalid-input cases), confirmed via a fail-list diff to be
+*exactly* those 20 and nothing else.

@@ -2,12 +2,31 @@
 #include "asnix/stackcheck.h"
 #include "asnix/value.h"
 
+    .section .rodata
+.Lmsg_push_int_overflow:
+    .ascii "asnix: integer literal out of asnix's representable range, aborting\n"
+    .equ ASNIX_MSG_PUSH_INT_OVERFLOW_LEN, . - .Lmsg_push_int_overflow
+
     .text
 
+    /* M56: a literal whose true int64 value falls outside the ±2^60
+     * ASNIX_INT_MIN/MAX window (include/asnix/value.h) used to get
+     * silently corrupted right here -- `salq $ASNIX_TAG_BITS` drops the
+     * literal's own top bits with no check at all, e.g. the literal
+     * `9223372036854775807` (INT64_MAX) round-tripped to `-1`. Checked
+     * inline (not via a `call asnix_make_int`) for the same hot-path
+     * reason this op already inlines the tagging bit trick instead of
+     * calling asnix_make_int -- see value.S's header comment. */
     .globl asnix_op_push_int
     .type asnix_op_push_int, @function
 asnix_op_push_int:
     movq ASNIX_IROP_OFF_A(%rsi), %rax
+    movq $ASNIX_INT_MAX, %r9
+    cmpq %r9, %rax
+    jg .Lpush_int_overflow
+    movq $ASNIX_INT_MIN, %r9
+    cmpq %r9, %rax
+    jl .Lpush_int_overflow
     salq $ASNIX_TAG_BITS, %rax
     orq $ASNIX_TAG_INT, %rax
     ASNIX_CHECK_VALSTACK %rcx           // %rcx is unused in this handler
@@ -16,6 +35,10 @@ asnix_op_push_int:
     addq $ASNIX_IROP_SIZE, %rsi
     movq (%rsi), %rax
     jmp *%rax
+.Lpush_int_overflow:
+    leaq .Lmsg_push_int_overflow(%rip), %rdi
+    movq $ASNIX_MSG_PUSH_INT_OVERFLOW_LEN, %rsi
+    jmp asnix_fatal
     .size asnix_op_push_int, . - asnix_op_push_int
 
     .globl asnix_op_push_true

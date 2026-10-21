@@ -5,16 +5,41 @@
 // reference implementation the inlined copies must match.
 #include "asnix/value.h"
 
+    .section .rodata
+.Lmsg_make_int_overflow:
+    .ascii "asnix: integer literal/result out of asnix's representable range, aborting\n"
+    .equ ASNIX_MSG_MAKE_INT_OVERFLOW_LEN, . - .Lmsg_make_int_overflow
+
     .text
 
+    /* M56: every C call site that builds a Value int (builtins.add/sub/
+     * mul/div -- builtins_m23.c; fromTOML's own integer-literal parsing
+     * -- toml.c; asnix_add_values's int+int fallback -- value_util.c;
+     * etc.) funnels through here, so checking the ±2^60 ASNIX_INT_MIN/
+     * MAX window once in this single reference implementation covers
+     * all of them without duplicating the check at each call site. The
+     * hot inlined-asm copies of this same bit trick (op_push_int,
+     * op_arith.S's add/sub/mul/div) carry their own copy of this check
+     * instead, per this file's own header comment on why they don't
+     * just `call` this function. */
     .globl asnix_make_int
     .type asnix_make_int, @function
 asnix_make_int:                        // Value asnix_make_int(int64_t n)
     .cfi_startproc
     movq %rdi, %rax
+    movq $ASNIX_INT_MAX, %r9
+    cmpq %r9, %rax
+    jg .Lmake_int_overflow
+    movq $ASNIX_INT_MIN, %r9
+    cmpq %r9, %rax
+    jl .Lmake_int_overflow
     salq $ASNIX_TAG_BITS, %rax
     orq  $ASNIX_TAG_INT, %rax
     ret
+.Lmake_int_overflow:
+    leaq .Lmsg_make_int_overflow(%rip), %rdi
+    movq $ASNIX_MSG_MAKE_INT_OVERFLOW_LEN, %rsi
+    jmp asnix_fatal
     .cfi_endproc
     .size asnix_make_int, . - asnix_make_int
 

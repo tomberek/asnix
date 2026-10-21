@@ -139,6 +139,15 @@ struct TNode {
     TNode **items;
     size_t n_items, cap_items; /* TN_ARRTABLE */
     Value leaf;                /* TN_LEAF */
+    int declared_as_table;     /* TN_TABLE only (M56): set the moment an
+                                 * explicit `[table]` header (not just
+                                 * implicit creation while stepping through
+                                 * a dotted/table-header path) targets this
+                                 * node -- TOML forbids declaring the same
+                                 * table twice (corpora/toml-invalid.nix
+                                 * entry 26, "[a]\n[a]"), which
+                                 * tnode_enter_table used to allow silently
+                                 * (re-returning the existing table). */
 };
 
 static TNode *tnode_new(TNKind k) {
@@ -216,7 +225,14 @@ static TNode *tnode_enter_table(TNode *root, const uint32_t *syms, size_t n) {
         tnode_add_child(cur, last, child);
     } else if (child->kind != TN_TABLE) {
         toml_fatal("[table] header redefines a non-table key");
+    } else if (child->declared_as_table) {
+        /* M56: "[a]\n[a]" -- a table may only be *declared* (via its own
+         * [table] header) once; implicitly stepping through it as an
+         * ancestor of some other header/dotted-key is fine and doesn't
+         * set this flag (see tnode_get_or_create_table_child above). */
+        toml_fatal("[table] header redefines an already-declared table");
     }
+    child->declared_as_table = 1;
     return child;
 }
 
@@ -462,6 +478,13 @@ static char *parse_toml_string(Parser *p, size_t *out_len) {
         decoded_len = raw_len;
     }
     p->i = content_end + delim_len;
+    /* M56: real Nix's strings can't carry an embedded NUL byte; a TOML
+     * backslash-u0000 escape (or a literal NUL byte straight in the
+     * document) decodes to one here with no complaint otherwise, in
+     * either a quoted key or a string value -- both paths run through
+     * this one function (parse_key_segment calls this for quoted keys
+     * too). eval-fail-fromTOML-{key,value}WithNullByte.nix. */
+    if (memchr(decoded, '\0', decoded_len)) toml_fatal("string contains a null byte");
     *out_len = decoded_len;
     return decoded;
 }
@@ -539,6 +562,38 @@ static int looks_like_date_or_time(const char *tok, size_t n) {
     return 0;
 }
 
+/* M56: shape *and* value range for a local-time's required `HH:MM:SS`
+ * prefix (any `.frac`/offset after the 8th byte is validated/normalized
+ * separately by normalize_time -- not this function's concern). Used
+ * both for a bare local-time value and for the time half of a
+ * date-time, since TOML 1.0.0 requires the *full* HH:MM:SS -- a
+ * date-time truncated to just HH:MM (corpora/toml-invalid.nix entries
+ * 16-18, e.g. "1979-05-27T07:32") is invalid, not shorthand, and was
+ * previously accepted by normalize_time's unconditional `memcpy(out, s,
+ * 8)` (an out-of-bounds read on a <8-byte input, too). Also rejects
+ * out-of-range HH/MM/SS (entry 35, "a = 25:00:00") -- shape-only
+ * checking previously let any correctly-*placed* digit through
+ * regardless of value. */
+static int valid_time_value(const char *s, size_t n) {
+    if (!(n >= 8 && is_digit_run(s, 2) && s[2] == ':' && is_digit_run(s + 3, 2) && s[5] == ':' &&
+          is_digit_run(s + 6, 2)))
+        return 0;
+    int hh = (s[0] - '0') * 10 + (s[1] - '0');
+    int mm = (s[3] - '0') * 10 + (s[4] - '0');
+    int ss = (s[6] - '0') * 10 + (s[7] - '0');
+    return hh <= 23 && mm <= 59 && ss <= 60; /* <=60 allows a leap second */
+}
+
+/* M56: calendar-range check for a `YYYY-MM-DD` token already shape-
+ * validated by looks_like_date_or_time's first branch (digit runs and
+ * dashes confirmed in place) -- entry 34, "a = 1979-13-01", had no
+ * month/day range check at all before this. */
+static int valid_date_value(const char *s) {
+    int mo = (s[5] - '0') * 10 + (s[6] - '0');
+    int dd = (s[8] - '0') * 10 + (s[9] - '0');
+    return mo >= 1 && mo <= 12 && dd >= 1 && dd <= 31;
+}
+
 /* Fractional seconds are normalized the way real Nix's toml11-backed
  * fromTOML does (verified against lang/eval-okay-fromTOML-064.exp's
  * `.5` -> `.500`, and -065/-066's 6- and 9-digit fractions left exactly
@@ -601,21 +656,40 @@ static Value classify_date_or_time(const char *tok, size_t n) {
     char buf[96];
     size_t o;
     if (n >= 10 && tok[4] == '-' && tok[7] == '-') {
+        if (!valid_date_value(tok)) toml_fatal("invalid calendar date in TOML document");
         memcpy(buf, tok, 10);
         o = 10;
         if (n > 10) {
             char sep = tok[10];
             if (sep != 'T' && sep != 't' && sep != ' ') toml_fatal("malformed TOML date-time separator");
+            if (!valid_time_value(tok + 11, n - 11))
+                toml_fatal("invalid or incomplete time-of-day in TOML date-time (requires HH:MM:SS)");
             buf[o++] = 'T';
             o += normalize_time(tok + 11, n - 11, buf + o);
         }
     } else {
+        if (!valid_time_value(tok, n)) toml_fatal("invalid or incomplete TOML local-time value (requires HH:MM:SS)");
         o = normalize_time(tok, n, buf);
     }
     return make_timestamp_value(buf, o);
 }
 
+/* M56: `_` digit separators must be single and strictly between two
+ * digits -- never leading, trailing, or doubled (corpora/toml-invalid.nix
+ * entry 33, "a = 1__0"); the old code just unconditionally skipped every
+ * `_` with no adjacency check at all. Checked on the raw `digits`/`n`
+ * (before underscores are stripped out below), since that's the only
+ * point the original separator positions are still visible. */
+static void validate_digit_separators(const char *digits, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        if (digits[i] != '_') continue;
+        if (i == 0 || i + 1 >= n || digits[i - 1] == '_' || digits[i + 1] == '_')
+            toml_fatal("invalid digit separator placement in TOML integer literal");
+    }
+}
+
 static Value parse_decimal_or_prefixed_int(const char *digits, size_t n, int base, int neg) {
+    validate_digit_separators(digits, n);
     char buf[160];
     size_t o = 0;
     for (size_t i = 0; i < n; i++) {
@@ -625,7 +699,18 @@ static Value parse_decimal_or_prefixed_int(const char *digits, size_t n, int bas
     }
     buf[o] = '\0';
     if (o == 0) toml_fatal("invalid integer literal");
-    long long val = strtoll(buf, NULL, base);
+    /* M56: decimal integers may not have a leading zero (except "0"
+     * itself) -- entry 32, "a = 01". Hex/octal/binary literals are
+     * exempt (TOML permits e.g. "0x01"): only `base == 10` is checked. */
+    if (base == 10 && o > 1 && buf[0] == '0') toml_fatal("leading zero in decimal TOML integer literal");
+    char *endptr;
+    long long val = strtoll(buf, &endptr, base);
+    /* M56: a bare token that isn't true/false, a date/time, or a
+     * properly-formed number (e.g. "tru", entry 38 -- a truncated
+     * "true") used to fall all the way through to here, where strtoll
+     * simply converts zero digits and silently returns 0. `endptr ==
+     * buf` means nothing was consumed at all. */
+    if (endptr == buf) toml_fatal("invalid TOML value");
     if (neg) val = -val;
     return asnix_make_int((int64_t)val);
 }
@@ -645,6 +730,19 @@ static Value classify_bare_token(const char *tok, size_t n) {
     const char *rem = tok + idx;
     size_t rem_n = n - idx;
     if (rem_n == 0) toml_fatal("invalid TOML value");
+
+    /* M56: `:` never belongs in a number -- it's only valid as part of a
+     * full `HH:MM:SS` local-time, which looks_like_date_or_time already
+     * would have caught above. Reaching here with a `:` still in the
+     * token means a malformed/incomplete time value (e.g. "07:32", a
+     * bare hour:minute missing seconds -- corpora/toml-invalid.nix entry
+     * 15, and entries 19/20's same shape nested in a table/array)
+     * previously fell through into parse_decimal_or_prefixed_int, whose
+     * strtoll just stopped at the first `:` and silently returned the
+     * truncated leading digits (e.g. "07:32" -> the int 7). */
+    for (size_t i = 0; i < rem_n; i++) {
+        if (rem[i] == ':') toml_fatal("invalid or incomplete TOML local-time value (requires HH:MM:SS)");
+    }
 
     if ((rem_n == 3 && memcmp(rem, "inf", 3) == 0) || (rem_n == 3 && memcmp(rem, "nan", 3) == 0)) toml_fatal_float();
 
