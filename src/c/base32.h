@@ -23,4 +23,15 @@ size_t asnix_base32_encoded_length(size_t n);
  * (NOT null-terminated -- caller sizes/terminates the buffer). */
 void asnix_base32_encode(const uint8_t *data, size_t len, char *out);
 
+/* M54: the decode half, needed by `builtins.convertHash`'s "nix32"/
+ * "base32" input case -- ported directly from real Nix's own
+ * `BaseNix32::decode` (~/nix/src/libutil/base-nix-32.cc), which reads
+ * characters MOST-significant first (from the end of the string backward)
+ * -- the mirror image of asnix_base32_encode above. `out_len` must be
+ * exactly the expected decoded byte count (known ahead of time by the one
+ * caller, convertHash, from the hash algorithm's fixed digest size); `out`
+ * is zeroed first since the bit-packing writes with `|=`, not `=`. Returns
+ * 0 on success, -1 if `s` contains a character outside the Nix32 alphabet. */
+int asnix_base32_decode(const char *s, size_t len, uint8_t *out, size_t out_len);
+
 #endif /* ASNIX_BASE32_H */

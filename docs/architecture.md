@@ -64,7 +64,7 @@ what's actually implemented and the scope decisions made along the way.
 | M51 | in progress (parallel agent: float literals) |
 | M52 — fix `with`-frame leaking into a sibling expression (core evaluator fix) | done, **scoped** (see below) |
 | M53 — `foldl'`/`replaceStrings` forced values real Nix never would (plus a core list-literal laziness fix) | done (see below) |
-| M54 | in progress (parallel agent: missing builtins) |
+| M54 — a batch of missing builtins: `bitAnd`/`bitOr`/`bitXor`, `trace`, `zipAttrsWith`, `toXML`, `convertHash`, `getContext`/`appendContext`, `scopedImport` | done, **scoped** (see below) |
 | M55 — regex engine gaps triage (`builtins.match`/`builtins.split`, 39 conformance failures) | investigated, **no fix** (see below) |
 | M56 — integer-overflow detection (`+`/`-`/`*`/`/`, `builtins.add/sub/mul/div`) + `fromTOML` validation gaps (bare/incomplete time literals, calendar-range checks, duplicate table headers, leading-zero/double-underscore integers, invalid bare tokens, embedded NUL bytes, integer-literal overflow) | done (see below) |
 | M57 | in progress (parallel agent: misc backlog) |
@@ -4644,3 +4644,254 @@ convention -- not hit by anything this project has evaluated so far
 `test-conformance` still 657 passed, no regressions (not exercised by
 the numtide/nix-conformance `lang` corpus, which has no filesystem
 fixture tree shaped like this).
+
+## M54 scope notes: a batch of missing builtins
+
+A conformance-triage pass found these entirely missing (`attribute 'X'
+missing, aborting`): `bitAnd`/`bitOr`/`bitXor`, `trace`, `zipAttrsWith`,
+`toXML`, `convertHash`, `getContext`/`appendContext`, `scopedImport`.
+All confirmed against cppnix's own source (`~/nix/src/libexpr/
+primops.cc`/`primops/context.cc`): every one is registered `__`-prefixed
+(builtins-only) EXCEPT `scopedImport`, which -- like `import`/`map`/
+`abort`/etc -- has no `__` prefix and is therefore also a bare root-
+scope global (M27's bare-global rule). Kept in one new translation unit,
+`builtins_m54.{c,h}` (plus two small new standalone modules, `base64.
+{c,h}` and a decode-only addition to the existing `base32.{c,h}`), all
+registered through a new `ASNIX_M54_BUILTINS[]` table merged into
+`asnix_make_builtins_attrs()` (`builtins.c`) the same way every prior
+builtins-expansion pass's table is.
+
+**`bitAnd`/`bitOr`/`bitXor`** (`__bitAnd`/`__bitOr`/`__bitXor`): plain
+arity-2 integer bitwise ops, curried via the established
+`asnix_bshared_make_curried_native` idiom. Verified against
+`nix-instantiate --eval`: `bitAnd 6 3 == 2`, `bitOr 6 3 == 7`, `bitXor 6
+3 == 5`.
+
+**`trace`** (`__trace`): forces and prints `msg` to stderr, returns
+`value` completely unforced (same "lazy pass-through" idiom as
+`getAttr`, M23) -- real Nix's own `prim_trace` forces `msg` but never
+touches `value`. This needed its own small twist on the curry-chain
+machinery: the REAL native call (the one that actually executes `trace`'s
+body) is reached through an ordinary `OP_CALL` into a `PrimOp`, and
+`OP_CALL`'s primop branch unconditionally FORCES every argument before
+calling the native function (M25/M38) unless `ASNIX_PRIMOP_OFF_NOFORCE`
+is set -- without that flag, `value` would get forced (and could already
+abort/throw) before `msg` is even printed, backwards from real Nix's
+timing. Fixed by building `trace`'s real 2-arg native primop via
+`asnix_bshared_make_primop_noforce` instead of the forcing default (a
+small local `make_curried_native_noforce`, parallel to
+`builtins_shared.c`'s own curry-chain builder) -- `OP_CALL`'s
+UNCONDITIONAL post-call force of the RETURN value (M23/M38, independent
+of `NOFORCE`) still forces the returned `value` to WHNF once the overall
+`trace msg value` application is itself forced, exactly mirroring
+`getAttr`'s existing "lazy passthrough" shape. Verified against 4
+separate `nix-instantiate --eval` cases, including the one genuinely
+subtle formatting rule: a top-level STRING `msg` prints its raw bytes
+unquoted (`trace: hi`), while every other type (including a string
+*nested* inside a list/attrset) uses an ordinary quoted/structural
+printer (`trace: { a = "x"; }`) -- confirmed this is the exact rule
+cppnix's own `prim_trace` uses (`if (args[0]->type() == nString) ...
+string_view() ... else ... printValue(...)`). The nested-container
+printer (`trace_print_value`, `builtins_m54.c`) is a best-effort
+fallback, not fully faithful to real Nix's own repl-style printer (no
+attrset-name quoting/reserved-keyword handling, no `<PRIMOP>`/`<LAMBDA>`/
+cycle-detection notation) -- not worth more fidelity here since all 4 of
+this builtin's actual conformance callers only ever trace a plain
+top-level string.
+
+Of the 4 conformance tests named as needing `trace`, only
+`eval-okay-sort-peeksort.nix` now fully passes. The other 3 reach
+evaluation successfully (no longer hard-abort on the missing builtin)
+but still fail for separate, pre-existing, unrelated reasons:
+- `eval-okay-inherit-from.nix` needs the top-level printer's own
+  self-reference/cycle-detection notation (`«repeated»`) for a `rec {}`
+  that refers to itself through an `__overrides`-merge pattern -- a
+  printer gap that predates this pass (same class of gap `toXML`'s own
+  scope notes below hit for `<LAMBDA>`/`<PRIMOP>`).
+- `eval-okay-print.nix`'s own primary subject is an even fancier printer
+  representation (`<PRIMOP>`, `<PRIMOP-APP>`, `<LAMBDA>`, cycle
+  detection on a genuinely self-referential list `x = [x]`) that asnix's
+  printer has no path to at all -- unreachable regardless of `trace`.
+- `eval-okay-tryeval-failed-thunk-reeval.nix` surfaced a genuine,
+  previously-undiscovered bug one layer down, in `tryEval` (M30) itself,
+  not in `trace`: the test's `let foo = trace "throwing" throw "nope";
+  in tryEval foo; ...; tryEval foo` expects a failed thunk's forcing
+  attempt to be safely *re-triable* (real Nix 2.34+ memoizes the
+  failure so the second `tryEval foo` is a no-op, printing `trace:
+  throwing` exactly once) -- confirmed `trace` itself does exactly the
+  right thing (`trace: throwing` prints once, matching the expected
+  `.err.exp`), but asnix's own thunk-forcing protocol marks a thunk
+  `IN_PROGRESS` (blackhole) before running its body and only clears
+  that back to `FORCED` via `OP_RET`'s normal return path (`op_call.S`)
+  -- a `longjmp` out of a caught `throw` (`tryeval.c`'s setjmp/longjmp
+  mechanism) skips `OP_RET` entirely, so the thunk is left stuck
+  `IN_PROGRESS` forever. The second `tryEval foo` then hits the
+  existing (correct, M23-era) blackhole-detection fatal path and aborts
+  the whole process instead of returning `{success=false;...}` again.
+  Fixing this properly needs an actual `Failed`-thunk state (real Nix's
+  own memoized-failure representation) that doesn't exist anywhere in
+  this codebase yet -- a separate, non-trivial core-evaluator feature,
+  not a "missing builtin"; documented here as a genuine, newly-found gap
+  rather than attempted as part of this batch.
+
+**`zipAttrsWith`** (`__zipAttrsWith`): for each distinct key across all
+attrsets in the given list, collects every value present under that key
+(in the LIST's own order) into a list, then calls `f key thatList`
+lazily per key (`asnix_bshared_make_lazy_call2`, same M23 laziness
+convention as `mapAttrs`/`map`). Verified against `nix-instantiate
+--eval`: `zipAttrsWith (n: v: v) [{a=1;b=2;} {a=3;c=4;}] == { a = [ 1 3
+]; b = [ 2 ]; c = [ 4 ]; }`, and the empty-list case `== {}`. Fully
+passes its own conformance test, `eval-okay-zipAttrsWith.nix`.
+
+**`toXML`** (`__toXML`): ported field-for-field from real Nix's own
+`printValueAsXML`/`XMLWriter` (`~/nix/src/libexpr/value-to-xml.cc`,
+`~/nix/src/libutil/xml-writer.cc`) -- 2-space indent per level, a
+self-closing `<tag attr="val" />` for leaves, alphabetical attrset-key
+order, and the exact `<?xml version='1.0' encoding='utf-8'?>` header.
+Verified byte-for-byte against both `eval-okay-toxml.nix`/
+`eval-okay-toxml2.nix`'s expected output -- both now fully pass.
+Deliberately scoped out (neither target test needs them, and each would
+need infrastructure this project doesn't have): the `isDerivation`-
+special-cased `<derivation>` element (asnix's own derivation support is
+itself a narrower M8 scope cut), position attributes (`prim_toXML`
+always passes `location=false` in real Nix too, so nothing is lost), and
+a fully faithful `<function>`/`<varpat name="...">` (a plain,
+non-pattern lambda's single argument NAME isn't tracked anywhere in this
+project's `Closure` representation, only pattern-style formals are, see
+M37's `functionArgs`) -- closures print an empty `<varpat name="" />`
+and primops print `<unevaluated />`, matching real Nix's own "FIXME:
+Serialize primops and primopapps" fallback, just applied to lambdas too.
+
+**`convertHash`** (`__convertHash`): ported from real Nix's own
+`Hash::parseAny`/`Hash::to_string` (`~/nix/src/libutil/hash.cc`) --
+`hash` may be bare (format detected from decoded length against the
+algorithm's known digest size), `algo:body`-prefixed, or SRI
+(`algo-base64body`); `hashAlgo` is required unless the algo is readable
+from one of those two prefixes (and the two must agree if both given).
+`toHashFormat` is `base16`/`nix32`/`base32` (alias)/`base64`/`sri` (the
+only one that's ever algo-prefixed in the OUTPUT, with `-`, confirmed
+directly against real Nix). Needed two new small decode routines not
+previously in this codebase: `asnix_base32_decode` (added to the
+existing `base32.c`/`.h`, the mirror image of its own `asnix_base32_
+encode`) and a brand-new standard-RFC-4648 `base64.c`/`.h` (encode AND
+decode -- nothing in this codebase had ever needed base64 before,
+`hashString`'s own output is always hex). Verified against
+numtide/nix-conformance's own `eval-okay-convertHash.nix`, which
+exercises all 4 hash algorithms x all 5 output formats x bare/colon-
+prefixed input in one file -- passes byte-for-byte, including the two
+real-Nix doc examples quoted in `__convertHash`'s own docstring
+(`hash="e3b0c4..."` sha256 base16 -> sri, and the reverse).
+
+**`getContext`/`appendContext`** (`__getContext`/`__appendContext`):
+asnix has NO string-context tracking anywhere in this codebase at all
+(confirmed: grepping every C source file for "context" turns up only
+unrelated hits -- `addErrorContext`'s error-trace sense, M39; parser/
+lexer "context"; register-save "context") -- derivation-output string
+context (which attrset keys a string's value transitively depends on)
+is a substantially larger, separate feature this pass does not attempt.
+Scoped to exactly the one case realistically supportable without it: a
+value with no actual context. `getContext` always returns `{}`;
+`appendContext msg ctxAttrs` validates its second argument is an
+attrset (matching real Nix's own type check) but otherwise ignores it,
+returning `msg` completely unchanged -- since nothing in this evaluator
+ever tracks OR consults context, this already reproduces every
+observable plain-string case (`getContext "plain" == {}`, `appendContext
+"plain" {} == "plain"`, verified against `nix-instantiate --eval`). The
+three conformance tests naming these (`eval-okay-context-builtins.nix`,
+`eval-okay-substring-context.nix`, `eval-okay-context-inputs.nix`) each
+fundamentally depend on real derivation-output context propagating
+through `${drv}`/`drv.outPath`/`builtins.toFile`/`builtins.
+unsafeDiscardStringContext`/etc -- confirmed `eval-okay-substring-
+context.nix` still fails here, but for a DIFFERENT, equally out-of-scope
+reason (`unsafeDiscardStringContext` itself is entirely missing, not
+just context-unaware) -- expected to keep failing regardless of this
+pass, documented rather than chased further.
+
+**`scopedImport`** (bare global AND `builtins.scopedImport`, confirmed
+`.name = "scopedImport"` with no `__` prefix in `~/nix/src/libexpr/
+primops.cc`): `scope`'s attribute NAMES become extra bare identifiers
+inside `path`'s own file, taking priority over (shadowing) any bare
+global/`builtins.X` of the same name -- confirmed directly in real
+Nix's own doc comment ("Variables from scope shadow built-ins with the
+same name") and cppnix's actual implementation (`scopedImport`,
+`primops.cc`): it builds a brand-new, INNERMOST `StaticEnv` seeded from
+`scope`'s own keys, whose `up` is the ordinary base/global `StaticEnv` --
+a plain LEXICAL binding (closer to `let` than `with`), not a `with`-style
+runtime fallback. This distinction matters: a `with`-shaped
+implementation would have given `scope`'s names the WRONG priority here
+(this codebase's own `with` semantics, confirmed in `op_with.S`'s header
+comment, deliberately let a lexical/named-frame binding win over any
+enclosing `with`'s fallback regardless of nesting depth -- exactly
+backwards from what `scopedImport` needs).
+
+Implemented by actually mirroring cppnix's own mechanism, not faking it:
+`compiler.c` gained `asnix_compile_scoped(root, base_dir, extra_names,
+extra_lens, extra_count)`, which splices one more NAMED (not `is_with`)
+`ScopeFrame` in between the ordinary root `builtins_frame` (factored out
+into a new shared `init_builtins_frame` helper, also used by the
+ordinary `asnix_compile`) and the file's own top-level expression.
+`eval_file.c` gained the matching runtime half, `asnix_eval_file_scoped`
+(path, scope)`: reads `scope`'s attribute NAMES (via the already-
+existing `asnix_bshared_attrs_*` accessors) to build that extra
+`ScopeFrame`, then builds a matching extra, innermost `Env` frame (its
+own field VALUES, left completely unforced -- same laziness as any
+other attrset field) wrapped around the ordinary root `Env` (grown to
+14 slots to add this bare global -- 13 immediately before this
+milestone, since M44's `placeholder` had just grown it from 12;
+`compiler.c`'s `init_builtins_frame`/`eval_file.c`'s `make_root_env`
+list the same 14 names in the same order, as the existing convention
+requires -- both files needed hand-merging when this milestone's
+worktree and M44/M45's were integrated, since both independently
+claimed the same next slot index). `scopedImport`'s own native half
+(`scopedImport2_impl`, arity-2 curried like every other true-arity-2
+builtin here) accepts the same two path shapes `builtins.import` already
+does (a `Path`, or an absolute-path `String`), reusing that exact
+rejection logic for a relative-path string.
+
+Verified against numtide/nix-conformance's own `eval-okay-import.nix`
+(which exercises both basic name-shadowing AND a recursive `scopedImport
+(overrides // s) fn`-via-overridden-bare-`import` pattern) -- passes
+byte-for-byte; also checked directly against `nix-instantiate --eval`
+with a minimal two-file repro (`scopedImport { extra = 41; } ./target.
+nix` where `target.nix` is just `extra + 1`) before trusting the
+mechanism at all.
+
+One off-by-one bug found and fixed while wiring this up: the new 13th
+root-scope name's LENGTH was initially hardcoded wrong (`13`, an
+actual-string-length miscount -- `"scopedImport"` is 12 characters, not
+13) in `compiler.c`'s `init_builtins_frame` -- since name resolution
+requires an EXACT length match (`name_eq`, `compiler.c`), this silently
+made `scopedImport` entirely unresolvable as a bare identifier (compiled
+straight through to "undefined variable", never a crash) until caught
+by this pass's own `scopedImport`-specific e2e fixture failing. Fixed
+by simply correcting the length constant.
+
+**Skipped entirely, as scoped by the task**: `flakeRefToString`/
+`parseFlakeRef`/`derivationStrict`/`outputOf`/`placeholder`/`builtins.
+path` (flake/derivation-system features needing infrastructure this
+project doesn't have, left for a separate pass) and `unsafeGetAttrPos`/
+`__curPos` (this codebase has zero position tracking anywhere, confirmed
+again here -- a stub `null` return was considered but not attempted,
+since nothing in this batch's actual target tests exercises either one;
+left for the same future, larger position-tracking effort M31's own
+notes already flag).
+
+`make test` green (22/22 binaries); `make test-e2e` green (205/205,
+7 new `m54_*` fixtures: `m54_bitops`, `m54_trace`, `m54_zipAttrsWith`,
+`m54_toxml`, `m54_convertHash`, `m54_context`, `m54_scopedImport` --
+the last with its own `m54_scopedimport_fixtures/target.nix`, same
+sibling-file convention `m11_import_fixtures`/`m18_bareglobals_
+fixtures` already established). `test-conformance` (run against this
+worktree's own built binary, via a scratch adapter pointed at it rather
+than the shared `~/asnix/asnix` checkout the repo's default adapter
+targets -- see the isolation note at the top of this pass's own task
+brief) 639 passed (up from 633), 163 failed (down from 169), 0 known, 62
+skipped -- no regressions; the +6 is `eval-okay-import.nix`,
+`eval-okay-zipAttrsWith.nix`, `eval-okay-toxml.nix`,
+`eval-okay-toxml2.nix`, `eval-okay-convertHash.nix`, and
+`eval-okay-sort-peeksort.nix`. `eval-okay-arithmetic.nix` still fails
+despite `bitAnd`/`bitOr`/`bitXor` now being correct and verified -- that
+file *also* exercises `"aa" < "ab"` (string ordering via `<`), a
+separate, pre-existing, already-documented scope cut (this codebase's
+`<`/`>` operators are INT-only, see `asnix_bshared_value_lt`'s own
+comment) that this batch does not attempt to lift.

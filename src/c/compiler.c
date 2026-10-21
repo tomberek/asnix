@@ -1086,27 +1086,75 @@ static void compile_expr(IrBuilder *b, Ast *node, ScopeFrame *scope) {
     }
 }
 
+/* The root env (constructed by eval_file.c) has thirteen slots: the
+ * `builtins` attrset, plus `import`/`map`/`abort`/`toString`/
+ * `removeAttrs`/`isNull`/`throw`/`derivation`/`baseNameOf`/`dirOf`/
+ * `fromTOML`/`scopedImport` bare -- names real Nix exposes as bare globals
+ * in addition to `builtins.X` (see builtins.h's asnix_make_import_primop
+ * comment). This scope frame makes `builtins.toString 5` and bare
+ * `import ./x`/`map f xs`/`abort "msg"`/`toString 5`/`removeAttrs set
+ * ["a"]`/`isNull x`/`throw "msg"`/`derivation {...}`/`baseNameOf x`/
+ * `dirOf x`/`fromTOML s`/`placeholder "out"`/`scopedImport scope path`
+ * all resolve like any other variable reference. Shared by asnix_compile
+ * and asnix_compile_scoped (M54) below -- both need exactly this same
+ * outermost frame, just with a possible extra frame spliced in front of
+ * it for the latter. */
+static void init_builtins_frame(ScopeFrame *f) {
+    static const char *builtins_names[14] = {
+        "builtins", "import", "map", "abort", "toString", "removeAttrs", "isNull", "throw", "derivation",
+        "baseNameOf", "dirOf", "fromTOML", "placeholder", "scopedImport" };
+    static size_t builtins_name_lens[14] = { 8, 6, 3, 5, 8, 11, 6, 5, 10, 10, 5, 8, 11, 12 };
+    f->up = NULL;
+    f->names = builtins_names;
+    f->name_lens = builtins_name_lens;
+    f->count = 14;
+    f->is_with = 0;
+}
+
 IrProgram *asnix_compile(Ast *root, const char *base_dir) {
     g_compile_base_dir = base_dir;
     IrBuilder *b = ib_new();
-    /* The root env (constructed by eval_file.c) has thirteen slots: the
-     * `builtins` attrset, plus `import`/`map`/`abort`/`toString`/
-     * `removeAttrs`/`isNull`/`throw`/`derivation`/`baseNameOf`/`dirOf`/
-     * `fromTOML`/`placeholder` bare -- names real Nix exposes as bare
-     * globals in addition to `builtins.X` (see builtins.h's
-     * asnix_make_import_primop comment). This scope frame makes
-     * `builtins.toString 5` and bare `import ./x`/`map f xs`/`abort
-     * "msg"`/`toString 5`/`removeAttrs set ["a"]`/`isNull x`/`throw
-     * "msg"`/`derivation {...}`/`baseNameOf x`/`dirOf x`/`fromTOML s`/
-     * `placeholder "out"` all resolve like any other variable
-     * reference. */
-    static const char *builtins_names[13] = {
-        "builtins", "import", "map", "abort", "toString", "removeAttrs", "isNull", "throw", "derivation",
-        "baseNameOf", "dirOf", "fromTOML", "placeholder" };
-    static size_t builtins_name_lens[13] = { 8, 6, 3, 5, 8, 11, 6, 5, 10, 10, 5, 8, 11 };
-    ScopeFrame builtins_frame = {
-        .up = NULL, .names = builtins_names, .name_lens = builtins_name_lens, .count = 13 };
+    ScopeFrame builtins_frame;
+    init_builtins_frame(&builtins_frame);
     compile_expr(b, root, &builtins_frame);
+    ib_halt(b);
+    return ib_finish(b);
+}
+
+/*
+ * M54: `builtins.scopedImport scope path` -- like `asnix_compile` above,
+ * but with one extra NAMED (not `with`-style fallback) ScopeFrame spliced
+ * in between the root `builtins_frame` and `root`'s own top-level
+ * expression, holding `scope`'s attribute names. This mirrors cppnix's
+ * own implementation exactly (`scopedImport`, ~/nix/src/libexpr/
+ * primops.cc): it builds a brand-new innermost StaticEnv seeded from
+ * `vScope->attrs()`'s names, whose `up` is the ordinary base/global
+ * StaticEnv -- i.e. a plain lexical binding (closer to `let` than
+ * `with`), which is why `scope`'s names take priority over (shadow) the
+ * ordinary bare globals/builtins with the same name (confirmed directly:
+ * "Variables from scope shadow built-ins with the same name" in
+ * `scopedImport`'s own real-Nix doc comment, and exercised by
+ * numtide/nix-conformance's eval-okay-import.nix, which overrides bare
+ * `import`/`scopedImport`/`builtins` this way). A real `with` (is_with=1)
+ * would NOT give this shadowing priority -- compile_expr's AST_VAR case
+ * (above) always lets a lexical/named-frame match win over any enclosing
+ * `with`'s fallback regardless of relative nesting, but a `with`'s own
+ * fallback never beats an outer NAMED frame either, which is the wrong
+ * priority order for this feature. `extra_names`/`extra_lens` must stay
+ * alive for the whole of this one compile call (the caller, eval_file.c's
+ * asnix_eval_file_scoped, keeps them on the C stack for exactly that
+ * long); `extra_count` may be 0 (an empty `scope` attrset), in which case
+ * this frame simply never matches anything and every name falls through
+ * to `builtins_frame` as usual. */
+IrProgram *asnix_compile_scoped(Ast *root, const char *base_dir,
+                                 const char **extra_names, size_t *extra_lens, size_t extra_count) {
+    g_compile_base_dir = base_dir;
+    IrBuilder *b = ib_new();
+    ScopeFrame builtins_frame;
+    init_builtins_frame(&builtins_frame);
+    ScopeFrame extra_frame = {
+        .up = &builtins_frame, .names = extra_names, .name_lens = extra_lens, .count = extra_count, .is_with = 0 };
+    compile_expr(b, root, &extra_frame);
     ib_halt(b);
     return ib_finish(b);
 }
