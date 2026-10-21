@@ -248,7 +248,18 @@ static Value prim_isNull(const Value *args, int64_t argc) {
 }
 static Value prim_isString(const Value *args, int64_t argc) {
     (void)argc;
-    return asnix_make_imm(asnix_tag_of(args[0]) == ASNIX_TAG_PTR ? ASNIX_IMM_TRUE : ASNIX_IMM_FALSE);
+    /* Paths and strings share ASNIX_TAG_PTR (see heap.h) -- isString must
+     * exclude paths (found via d.nix: `builtins.isString ./.` wrongly
+     * returned true here; real Nix returns false). */
+    return asnix_make_imm(asnix_tag_of(args[0]) == ASNIX_TAG_PTR && !asnix_value_is_path(args[0])
+                               ? ASNIX_IMM_TRUE
+                               : ASNIX_IMM_FALSE);
+}
+static Value prim_isPath(const Value *args, int64_t argc) {
+    (void)argc;
+    return asnix_make_imm(asnix_tag_of(args[0]) == ASNIX_TAG_PTR && asnix_value_is_path(args[0])
+                               ? ASNIX_IMM_TRUE
+                               : ASNIX_IMM_FALSE);
 }
 static Value prim_isList(const Value *args, int64_t argc) {
     (void)argc;
@@ -354,6 +365,7 @@ static Value build_isNull(void) { return make_primop_value((void *)prim_isNull, 
  * `builtins.isNull` itself uses. */
 Value asnix_make_isNull_primop(void) { return make_primop_value((void *)prim_isNull, 1); }
 static Value build_isString(void) { return make_primop_value((void *)prim_isString, 1); }
+static Value build_isPath(void) { return make_primop_value((void *)prim_isPath, 1); }
 static Value build_isList(void) { return make_primop_value((void *)prim_isList, 1); }
 static Value build_isAttrs(void) { return make_primop_value((void *)prim_isAttrs, 1); }
 static Value build_isFunction(void) { return make_primop_value((void *)prim_isFunction, 1); }
@@ -370,18 +382,33 @@ static Value build_isBool(void) { return make_primop_value((void *)prim_isBool, 
  * nixpkgs/lib version gate. */
 static Value build_nixVersion(void) { return asnix_make_string_value("2.35.2", 6); }
 
+/* `builtins.currentSystem` -- same "plain constant, no PrimOp needed"
+ * shape as nixVersion above. Real Nix registers this internally as
+ * `__currentSystem` (confirmed in ~/nix/src/libexpr/primops.cc), i.e.
+ * NOT a bare global (M27's bare-global rule: only non-`__`-prefixed
+ * names are exposed bare) -- `builtins.currentSystem` only, matching
+ * `nix-instantiate --eval -E 'currentSystem'` => "undefined variable".
+ * Hardcoded to this project's one supported platform (x86_64-linux,
+ * see flake.nix's `systems` list) rather than computed from `uname` --
+ * there's nothing else this process could ever be running on. Found
+ * needed evaluating real nixpkgs (`d.nix`'s default.nix chain selects
+ * `.currentSystem` while resolving the default platform). */
+static Value build_currentSystem(void) { return asnix_make_string_value("x86_64-linux", 12); }
+
 const AsnixBuiltinMiscDef ASNIX_BUILTINS_MISC[] = {
     { "substring", build_substring },
     { "stringLength", build_stringLength },
     { "concatStringsSep", build_concatStringsSep },
     { "isNull", build_isNull },
     { "isString", build_isString },
+    { "isPath", build_isPath },
     { "isList", build_isList },
     { "isAttrs", build_isAttrs },
     { "isFunction", build_isFunction },
     { "isInt", build_isInt },
     { "isBool", build_isBool },
     { "nixVersion", build_nixVersion },
+    { "currentSystem", build_currentSystem },
     { "baseNameOf", build_baseNameOf },
     { "dirOf", build_dirOf },
 };

@@ -47,7 +47,8 @@ what's actually implemented and the scope decisions made along the way.
 | M32 — dotted attrpath after `?` (`x ? a.b.c`) | done (see below) |
 | M33 — dynamic `?` segment (`x ? ${name}`, anywhere in the chain) | done (see below) |
 | M34 — unforced list elements reaching 6 builtins as raw scalars | done (see below) |
-| M35+ | not started |
+| M35 — `builtins.currentSystem`, `builtins.isPath` + `isString` path bug | done (see below) |
+| M36+ | not started |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
 
@@ -3377,3 +3378,33 @@ elements are correctly exempt.
 `make test`/`test-e2e` green (183 e2e, six new `m34_lazy_list_elem_*`
 fixtures, each a `map (x: x) [...]`-wrapped repro of one fixed builtin);
 `test-conformance` still 629 passed, no regressions.
+
+## M35 scope notes: `builtins.currentSystem`, `builtins.isPath` + an `isString` path bug
+
+Found continuing to chase `d.nix` right after M34: two more "attribute
+missing" aborts, root-caused the same way as M33's investigation (break
+on `OP_SELECT`'s miss branch in gdb, read the live symbol id out of
+`%rdx`, resolve it via `asnix_sym_name`) -- `currentSystem` then
+`isPath`, neither of which asnix implemented at all.
+
+`builtins.currentSystem`: a plain string constant (not a function),
+same "called once at `builtins`-construction time, no PrimOp needed"
+shape `nixVersion` already established. Confirmed via cppnix's own
+source (`~/nix/src/libexpr/primops.cc`: `.name = "__currentSystem"`) that
+real Nix registers this `__`-prefixed, i.e. `builtins`-only, not a bare
+global (matches `nix-instantiate --eval -E 'currentSystem'` =>
+"undefined variable"). Hardcoded to `"x86_64-linux"`, this project's one
+supported platform (see flake.nix), rather than computed from `uname`.
+
+`builtins.isPath`: same cppnix source confirms `__isPath` (builtins-only
+again). Added as a new primop. While adding it, found a genuine,
+previously-undiscovered bug in the *existing* `isString`: since paths
+and strings share `ASNIX_TAG_PTR` (distinguished by `asnix_value_is_path`,
+see heap.h), `prim_isString` checked only the tag, not the path-marker
+bit, so `builtins.isString ./.` wrongly returned `true` here (confirmed
+against real Nix: `false`). Fixed `isString` to exclude paths and
+implemented `isPath` as the mirror-image check (tag is `ASNIX_TAG_PTR`
+*and* the path marker is set).
+
+`make test`/`test-e2e` green (185 e2e, two new `m35_*` fixtures);
+`test-conformance` 632 passed (up from 629, no regressions).
