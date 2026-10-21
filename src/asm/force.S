@@ -42,6 +42,22 @@
     .globl asnix_force_for_print
     .type asnix_force_for_print, @function
 asnix_force_for_print:                  // Value asnix_force_for_print(Value v)
+.Lforce_top:                            // M23: re-entered (tail-loop, see .Lforce_done below)
+                                         // whenever a force's *result* turns out to itself be
+                                         // another unforced Thunk -- found via a lazy builtin
+                                         // (map/mapAttrs, M23) whose thunk body calls a
+                                         // lazy-pass-through primop (builtins.getAttr, which
+                                         // deliberately returns an attrset entry's raw value
+                                         // without forcing it -- correct and lazy on its own),
+                                         // so forcing ONE level could leave a Thunk cached as
+                                         // another Thunk's "result" where previously (every
+                                         // ordinary compiled thunk body always forces via
+                                         // OP_VAR_REF/OP_SELECT before its own OP_RET) that
+                                         // could never happen. Real Nix's own `forceValue` is
+                                         // itself a `while (v.isThunk())` loop for exactly this
+                                         // reason -- this was a real, latent gap in the
+                                         // single-force assumption, just never previously
+                                         // reachable.
     movq %rdi, %rax
     movq %rax, %rcx
     andq $ASNIX_TAG_MASK, %rcx
@@ -120,11 +136,21 @@ asnix_force_epilogue:
     popq %r14
     popq %r13
     popq %r12
-    ret
+    movq %rax, %rdi                     // tail-loop (see .Lforce_top's comment): this
+    jmp .Lforce_done                    // invocation's own frame is already fully unwound
+                                         // above, so re-entering the top from here is exactly
+                                         // as safe as an ordinary tail call
 
 .Lforce_cached:
     movq ASNIX_THUNK_OFF_ENV(%rax), %rax
 .Lforce_done:
+    movq %rax, %rcx
+    andq $ASNIX_TAG_MASK, %rcx
+    cmpq $ASNIX_TAG_THUNK, %rcx
+    jne .Lforce_ret
+    movq %rax, %rdi                     // %rdi may be stale here (e.g. the .Lforce_cached
+    jmp .Lforce_top                     // path never touches it) -- always resync from %rax
+.Lforce_ret:
     ret
 
 .Lforce_blackhole:

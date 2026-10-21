@@ -296,9 +296,18 @@ static Value prim_baseNameOf(const Value *args, int64_t argc) {
     (void)argc;
     int64_t len;
     const char *bytes = asnix_ptr_bytes(args[0], &len);
-    while (len > 0 && bytes[len - 1] == '/') len--; /* at most one trailing slash stripped,
-                                                       * matching real Nix's legacyBaseNameOf
-                                                       * (NOT GNU basename's "any number") */
+    if (len > 0 && bytes[len - 1] == '/') len--; /* AT MOST ONE trailing slash stripped (an
+                                                    * `if`, not a `while`) -- matching real
+                                                    * Nix's legacyBaseNameOf exactly (NOT GNU
+                                                    * basename's "any number"): verified
+                                                    * `baseNameOf "a//"` => "" (strip one
+                                                    * slash -> "a/", then the segment after
+                                                    * ITS last '/' is empty), not "a" -- a
+                                                    * prior version of this line used `while`,
+                                                    * silently stripping every trailing slash
+                                                    * instead of just one, found via
+                                                    * numtide/nix-conformance's
+                                                    * eval-okay-baseNameOf.nix. */
     int64_t start = len;
     while (start > 0 && bytes[start - 1] != '/') start--;
     return asnix_make_string_value(bytes + start, (size_t)(len - start));
