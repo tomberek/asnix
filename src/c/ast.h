@@ -161,12 +161,20 @@ struct Ast {
                                             * parse_binding_stmt). Applied at runtime, after
                                             * `bindings` above is fully built -- see compiler.c's
                                             * AST_ATTRSET case and OP_INSERT_DYNAMIC_ATTR (ir.h).
-                                            * Real Nix also doesn't give these lexical/recursive
-                                            * visibility even in `rec {}` (confirmed: `rec {
-                                            * ${k}=1; b=a; }` with `k="a"` still errors
-                                            * "undefined variable 'a'") -- consistent with never
-                                            * threading them through this project's own
-                                            * ScopeFrame mechanism at all. */
+                                            * M67: a dynamic binding never gets its OWN ScopeFrame
+                                            * slot, so a *static* sibling still can't reference a
+                                            * dynamically-NAMED attribute (confirmed: `rec {
+                                            * ${k}=1; b=a; }` with `k="a"` still errors "undefined
+                                            * variable 'a'") -- but a dynamic binding's own
+                                            * name/value expression DOES now read the enclosing
+                                            * `rec {}`'s frame (so it CAN see a *static* sibling:
+                                            * `let bString="b"; in (rec { "${bString}"=a; a=true;
+                                            * }).b` is `true`, confirmed against real Nix) -- see
+                                            * compiler.c's AST_ATTRSET case for the `&frame` vs
+                                            * `scope` split this depends on. A plain (non-`rec`)
+                                            * `{...}`'s dynamic bindings are unaffected -- never
+                                            * self-referential either way, same as a plain `{...}`'s
+                                            * static bindings. */
             size_t dyn_count;
         } attrset; /* AST_ATTRSET */
         struct {

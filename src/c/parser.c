@@ -113,7 +113,22 @@ typedef struct {
 } AttrSeg;
 
 typedef struct BTNode BTNode;
-typedef struct { BTNode *items; size_t len, cap; } BTVec;
+/* M67: `dyn` -- dynamic (`${expr} = value;`) bindings absorbed into THIS
+ * level of the tree by `reopen_attrset_into` (below), carried alongside
+ * the ordinary static `items`/`len`/`cap` since a BTNode has no static
+ * name to merge them under. Empty/zero for the overwhelming majority of
+ * BTVecs, which never go through a merge involving a dynamic-keyed
+ * literal at all. */
+typedef struct { BTNode *items; size_t len, cap; DynBindingVec dyn; } BTVec;
+
+/* M67: folds a BTVec's own absorbed-via-merge dynamic bindings (see
+ * reopen_attrset_into's comment) into this BLOCK's top-level explicit
+ * `${expr} = value;` DynBindingVec, so one `finalize_dyn_vec` call at
+ * each `{...}`/`rec {...}` call site below picks up both kinds. */
+static void merge_bt_dyn_into(BTVec *bt, DynBindingVec *dyn_out) {
+    for (size_t i = 0; i < bt->dyn.len; i++) dynbindingvec_push(dyn_out, bt->dyn.items[i]);
+}
+
 struct BTNode {
     const char *name;
     size_t name_len;
@@ -167,17 +182,27 @@ static void insert_attrpath(BTVec *vec, AttrSeg *segs, size_t seg_count, size_t 
  * into-a-literal merge (`a = rec {...}; a.c = ...;`, NixOS/nix#9020) via
  * the exact same code path real Nix's addAttr uses for both. */
 static void reopen_attrset_into(BTVec *dest, Ast *attrs) {
-    if (attrs->as.attrset.dyn_count > 0) {
-        /* `a = { ${k} = 1; }; a.c = 2;`-style regrettable merge (NixOS/
-         * nix#9020) of a literal that itself had a dynamic key -- this
-         * tree (BTVec/BTNode) only ever carries static bindings, so a
-         * dynamic one here would be silently dropped rather than fatal
-         * if unhandled. Not supported; fatal rather than silently losing
-         * data, same spirit as every other documented scope cut in this
-         * file. Not hit by anything this project has evaluated so far. */
-        fprintf(stderr, "asnix: parse error: cannot merge an attrpath into a literal "
-                         "attrset that has a dynamic key, aborting\n");
-        exit(1);
+    /* M67: `a."${k}" = 1; a."${k2}" = 2;` / `a.b = 1; a."${k}" = 2;`-style
+     * regrettable merges (NixOS/nix#9020) of a literal that itself had a
+     * dynamic key -- previously fatal unconditionally ("cannot merge an
+     * attrpath into a literal attrset that has a dynamic key"), found
+     * actually hit by numtide/nix-conformance's eval-okay-dynamic-attrs-2/
+     * eval-okay-merge-dynamic-attrs.nix, not just a hypothetical. Carried
+     * into `dest->dyn` (BTVec's own comment) instead of being dropped or
+     * fataling -- `finalize_bt_node`/the top-level block parser (below)
+     * re-attach it to whichever AST_ATTRSET this BTVec ultimately
+     * finalizes into, same as this project's own direct `${k} = v;`
+     * dynamic bindings already were. Verified against real
+     * `nix-instantiate --eval`: both files' listed cases evaluate as
+     * their own `.exp` says (plain merge of the static and dynamic
+     * attributes, duplicate-key rules applying across the two kinds
+     * exactly like real Nix's `addAttr` -- this project doesn't attempt
+     * to replicate the "two dynamic keys that happen to collide at
+     * runtime" dup-attr check, same OP_INSERT_DYNAMIC_ATTR behavior as
+     * every other dynamic binding already had before this fix). */
+    for (size_t i = 0; i < attrs->as.attrset.dyn_count; i++) {
+        AstDynBinding *db = &attrs->as.attrset.dyn_bindings[i];
+        dynbindingvec_push(&dest->dyn, (DynBinding){ .name_expr = db->name_expr, .value = db->value });
     }
     for (size_t i = 0; i < attrs->as.attrset.count; i++) {
         AstBinding *b = &attrs->as.attrset.bindings[i];
@@ -263,6 +288,12 @@ static AstBinding finalize_bt_node(BTNode *node) {
     attrs->as.attrset.bindings = out.items;
     attrs->as.attrset.count = out.len;
     attrs->as.attrset.is_rec = node->rec;
+    /* M67: re-attach whatever dynamic bindings this branch absorbed via
+     * reopen_attrset_into (see that function's own comment) -- a nested
+     * synthetic attrset needs its own dyn_bindings just like a top-level
+     * one does. */
+    attrs->as.attrset.dyn_bindings = finalize_dyn_vec(&node->children.dyn);
+    attrs->as.attrset.dyn_count = node->children.dyn.len;
     return (AstBinding){ .name = node->name, .name_len = node->name_len, .value = attrs, .is_inherit = 0 };
 }
 
@@ -478,10 +509,24 @@ static Token *expect(Parser *p, TokKind kind, const char *what) {
     return t;
 }
 
+/* M67: `or` is lexed as its own keyword token (TOK_OR, for the `.attr or
+ * default` select-with-default form -- see parse_select), but real Nix's
+ * grammar still accepts it as an ORDINARY IDENTIFIER in any position that
+ * can't be confused with that form -- a binding/formal name, or a bare
+ * variable reference (deprecated/"cursed" there with a warning, per
+ * NixOS/nix#11121, but still accepted, not rejected -- confirmed against
+ * real `nix-instantiate --eval`: `let or = 1; in or` evaluates to `1`
+ * with only a warning on stderr). `starts_atom`/`parse_atom` below treat
+ * a bare TOK_OR exactly like TOK_IDENT for this reason; found via
+ * numtide/nix-conformance's eval-okay-attrs5.nix (`let or = x: y: x ||
+ * y; in ...`, a plain binding name) and eval-okay-deprecate-cursed-or.nix
+ * (bare `or` as a function-application argument) -- both previously hit
+ * "parse error: expected a binding name"/failed to parse `or` as an
+ * atom at all. */
 static int starts_atom(TokKind k) {
     return k == TOK_INT || k == TOK_FLOAT || k == TOK_IDENT || k == TOK_TRUE || k == TOK_FALSE || k == TOK_NULL ||
            k == TOK_LPAREN || k == TOK_STR_START || k == TOK_ISTR_START || k == TOK_LBRACKET ||
-           k == TOK_LBRACE || k == TOK_REC || k == TOK_PATH || k == TOK_SEARCH_PATH;
+           k == TOK_LBRACE || k == TOK_REC || k == TOK_PATH || k == TOK_SEARCH_PATH || k == TOK_OR;
 }
 
 static Ast *parse_expr(Parser *p);
@@ -522,9 +567,43 @@ static AttrSeg parse_attr_segment(Parser *p, const char *what) {
         advance(p);
         Ast *name_expr = parse_expr(p);
         expect(p, TOK_RBRACE, "'}' closing a dynamic attribute name");
+        /* M67: a bare `${"literal"}` (no interpolation inside the string
+         * literal itself -- `${"a" + "b"}` or `${foo}` still count as
+         * genuinely dynamic) is a compile-time-constant name, same as
+         * the quoted-string branch below already folds. Real Nix does
+         * this too, generally (not just for `let`): `~/nix/src/libexpr/
+         * include/nix/expr/parser-state.hh`'s `ToBeStringyExpr::visit`,
+         * "consistently handle simple StringExpr ${"string"} as non-
+         * dynamic attributes" (NixOS/nix#14642) -- used for exactly this
+         * AttrPath-component position. Found via numtide/nix-
+         * conformance's eval-okay-dynamic-attrs-3.nix (`let ${"a"} = 1;
+         * in ...`, its own comment: "dynamic attrs are not generally
+         * allowed in `let`... but they are if they only contain a
+         * string") -- confirmed against real `nix-instantiate --eval`:
+         * `let ${"a"} = 1; in a` == `1`, but `let ${"a"+""} = 1; in a`
+         * still fails "dynamic attributes not allowed in let". */
+        if (name_expr->kind == AST_STRING) {
+            if (name_expr->as.string.count == 0) {
+                return (AttrSeg){ .is_dynamic = 0, .attr = "", .attr_len = 0 };
+            }
+            if (name_expr->as.string.count == 1 && !name_expr->as.string.parts[0].is_expr) {
+                return (AttrSeg){ .is_dynamic = 0, .attr = name_expr->as.string.parts[0].text,
+                                   .attr_len = name_expr->as.string.parts[0].text_len };
+            }
+        }
         return (AttrSeg){ .is_dynamic = 1, .name_expr = name_expr };
     }
     if (cur(p)->kind != TOK_STR_START) {
+        /* M67: `or` as a bare (unquoted) binding/attribute name -- see
+         * starts_atom's own comment above for the full rationale;
+         * `"or"` (quoted) was already accepted here (this function's own
+         * header comment), only the unquoted keyword-token form was
+         * missing. */
+        if (cur(p)->kind == TOK_OR) {
+            Token *t = cur(p);
+            advance(p);
+            return (AttrSeg){ .is_dynamic = 0, .attr = t->start, .attr_len = t->len };
+        }
         Token *t = expect(p, TOK_IDENT, what);
         return (AttrSeg){ .is_dynamic = 0, .attr = t->start, .attr_len = t->len };
     }
@@ -861,7 +940,8 @@ static Ast *parse_atom(Parser *p) {
             return parse_dquote_string(p);
         case TOK_ISTR_START:
             return parse_indented_string(p);
-        case TOK_IDENT: {
+        case TOK_IDENT:
+        case TOK_OR: { /* M67: bare `or` as an ordinary (deprecated/"cursed") variable -- see starts_atom's comment */
             advance(p);
             Ast *n = asnix_ast_new(AST_VAR);
             n->as.var.name = t->start;
@@ -929,6 +1009,7 @@ static Ast *parse_atom(Parser *p) {
             n->as.attrset.bindings = bindings.items;
             n->as.attrset.count = bindings.len;
             n->as.attrset.is_rec = 0;
+            merge_bt_dyn_into(&bt, &dyn); /* M67 */
             n->as.attrset.dyn_bindings = finalize_dyn_vec(&dyn);
             n->as.attrset.dyn_count = dyn.len;
             return n;
@@ -946,6 +1027,7 @@ static Ast *parse_atom(Parser *p) {
             n->as.attrset.bindings = bindings.items;
             n->as.attrset.count = bindings.len;
             n->as.attrset.is_rec = 1;
+            merge_bt_dyn_into(&bt, &dyn); /* M67 */
             n->as.attrset.dyn_bindings = finalize_dyn_vec(&dyn);
             n->as.attrset.dyn_count = dyn.len;
             return n;
@@ -1295,6 +1377,21 @@ static Ast *parse_let_bindings(Parser *p) {
     advance(p); /* 'in' */
     Ast *body = parse_expr(p);
 
+    /* M67: `let` has nowhere to put a dynamic binding absorbed via
+     * reopen_attrset_into (AST_LET has no dyn_bindings field at all,
+     * unlike AST_ATTRSET) -- fatal here with the same message a direct
+     * top-level `let ${k} = v;` already gets (parse_binding_stmt's own
+     * `dyn_out == NULL` check), rather than silently dropping it. Not
+     * believed reachable today (every path into this would need a `let`
+     * binding whose attrpath has a dynamic *non-first* segment that then
+     * collides with a sibling attrpath statement -- e.g. `let a.${k} =
+     * 1; a.b = 2; in ...` -- a shape nothing in this project's own
+     * fixtures or numtide/nix-conformance exercises), kept purely as a
+     * loud-not-silent guard. */
+    if (bt.dyn.len > 0) {
+        fprintf(stderr, "asnix: parse error: dynamic attributes not allowed in let\n");
+        exit(1);
+    }
     BindingVec bindings = { 0 };
     finalize_bt_vec(&bt, &bindings);
 
@@ -1397,6 +1494,7 @@ static Ast *parse_expr(Parser *p) {
             attrs->as.attrset.bindings = bindings.items;
             attrs->as.attrset.count = bindings.len;
             attrs->as.attrset.is_rec = 1;
+            merge_bt_dyn_into(&bt, &dyn); /* M67 */
             attrs->as.attrset.dyn_bindings = finalize_dyn_vec(&dyn);
             attrs->as.attrset.dyn_count = dyn.len;
             Ast *n = asnix_ast_new(AST_SELECT);

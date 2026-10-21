@@ -359,7 +359,7 @@ static Value asnix_make_builtins_attrs_ex(int skip_derivation_wrapper) {
      * it's visually obvious which pass added what. */
     const AsnixBuiltinM54Def *const m54_tables[] = { ASNIX_M54_BUILTINS };
     const size_t m54_counts[] = { ASNIX_M54_BUILTINS_COUNT };
-    /* M61: builtins.parseFlakeRef/flakeRefToString -- same {name,build()}
+    /* M66: builtins.parseFlakeRef/flakeRefToString -- same {name,build()}
      * shape, own table for the same "separate translation unit, separate
      * agent" reason M54's table is split out (builtins_flakeref.h). */
     const AsnixBuiltinFlakerefDef *const flakeref_tables[] = { ASNIX_FLAKEREF_BUILTINS };

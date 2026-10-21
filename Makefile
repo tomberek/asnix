@@ -129,7 +129,7 @@ test-conformance: asnix
 # (signal, e.g. a segfault) also counts as "pass" here, same coincidental-
 # pass caveat already documented for a few mined fixtures in
 # tests/conformance/, not a true clean-error pass.
-# M59: two env/comparison details, both matching numtide/nix-conformance's
+# M64: two env/comparison details, both matching numtide/nix-conformance's
 # own documented adapter protocol (README.md's "Writing an adapter"
 # section) exactly, rather than inventing a separate convention here:
 #   - HOME=/fake-home is one of the fixed env vars the protocol says every
@@ -148,6 +148,16 @@ test-conformance: asnix
 #     the same reason as above: a `.exp` file can never itself contain this
 #     clone's literal local path, so this substitution is a no-op on every
 #     comparison that wasn't already going to fail.
+#
+# M67: `TEST_VAR=foo` -- the real numtide/nix-conformance `run` script
+# exports this (plus `NIX_PATH`/`HOME`, not replicated here -- nothing in
+# this sweep needs them yet) before running any case (its own
+# `run:173`/README.md:84); eval-okay-getenv.nix reads it. Without this,
+# that one test's `.exp` ("foobar") can never match either implementation
+# -- confirmed directly: real `nix-instantiate --eval` on that same file,
+# run without TEST_VAR set, also gives a different result ("bar") -- an
+# environment-setup artifact of this lightweight sweep script, not an
+# asnix bug.
 NIX_CONFORMANCE_DIR ?= /tmp/nix-conformance
 test-nix-conformance: asnix
 	@dir="$(NIX_CONFORMANCE_DIR)/lang"; \
@@ -162,6 +172,7 @@ test-nix-conformance: asnix
 	root="$(NIX_CONFORMANCE_DIR)"; \
 	pass=0; fail=0; skip=0; failed=""; \
 	cd "$$dir" && \
+	export TEST_VAR=foo; \
 	for f in eval-okay-*.nix; do \
 		base="$${f%.nix}"; \
 		if [ -f "$$base.flags" ]; then skip=$$((skip+1)); continue; fi; \

@@ -1025,6 +1025,24 @@ static void compile_expr(IrBuilder *b, Ast *node, ScopeFrame *scope) {
                     ib_mk_thunk(b, ib_finish(thunk_b));
                 }
                 ib_mk_attrs(b, (int64_t)n, sorted_syms);
+                /* M67: `${expr} = value;` entries (M28) -- compiled
+                 * against the enclosing `scope`, same as every static
+                 * binding's value just above: a plain (non-`rec`)
+                 * attrset is never self-referential at all (confirmed
+                 * unchanged by this pass: `{ ${k} = a; a = 1; }` -- no
+                 * `rec` -- is "undefined variable 'a'" in real Nix too,
+                 * same as any other plain-`{}` sibling reference). See
+                 * the `rec` branch below for the case that DID need to
+                 * change (a dynamic binding's own value seeing a STATIC
+                 * `rec` sibling). */
+                for (size_t i = 0; i < node->as.attrset.dyn_count; i++) {
+                    compile_expr(b, node->as.attrset.dyn_bindings[i].name_expr, scope);
+                    IrBuilder *thunk_b = ib_new();
+                    compile_expr(thunk_b, node->as.attrset.dyn_bindings[i].value, scope);
+                    ib_ret(thunk_b);
+                    ib_mk_thunk(b, ib_finish(thunk_b));
+                    ib_insert_dynamic_attr(b);
+                }
             } else {
                 /* `rec { ... }`: same frame-first trick as AST_LET, keyed
                  * by original (unsorted) binding index so the ScopeFrame
@@ -1098,6 +1116,41 @@ static void compile_expr(IrBuilder *b, Ast *node, ScopeFrame *scope) {
                     for (size_t i = 0; i < n; i++) ib_frame_get(b, (int64_t)order[i]);
                     ib_mk_attrs(b, (int64_t)n, sorted_syms);
                 }
+                /* M67: `${expr} = value;` entries (M28), merged in HERE --
+                 * still inside the rec's own frame, before `ib_frame_exit`
+                 * -- using `&frame` (not `scope`) so a dynamic binding's
+                 * OWN name/value expression can see its STATIC siblings
+                 * via the ordinary OP_FRAME_GET path, same as any other
+                 * `rec {}` binding. Verified directly against real
+                 * `nix-instantiate --eval`: `let bString = "b"; in (rec {
+                 * "${bString}" = a; a = true; }).b` is `true` (the
+                 * *dynamic* binding's value `a` sees the static sibling
+                 * `a = true;`) -- previously compiled against the
+                 * *enclosing* `scope` instead, giving "undefined variable
+                 * 'a'" (found via numtide/nix-conformance's eval-okay-
+                 * dynamic-attrs.nix/-bare.nix). This is NOT the same
+                 * question ast.h's own AST_ATTRSET.dyn_bindings comment
+                 * answers (and that comment is still correct, unchanged by
+                 * this fix): a *static* sibling still cannot reference a
+                 * *dynamically-named* attribute (`rec { ${k}=1; b=a; }`
+                 * with `k="a"` is still "undefined variable 'a'", verified
+                 * -- static bindings are filed into fixed, compile-time-
+                 * known frame slots, and a dynamic binding never gets one,
+                 * so there's nothing for `b=a` to resolve to regardless of
+                 * this fix). Only the *dynamic* binding's own name/value
+                 * expressions gain the ability to read (never write) the
+                 * frame -- applied to the attrs value still sitting on the
+                 * VALSTACK from `ib_mk_attrs`/`ib_rec_overrides_merge`
+                 * just above, exactly as the non-`rec` path (below) does
+                 * with `scope` right after ITS OWN `ib_mk_attrs`. */
+                for (size_t i = 0; i < node->as.attrset.dyn_count; i++) {
+                    compile_expr(b, node->as.attrset.dyn_bindings[i].name_expr, &frame);
+                    IrBuilder *thunk_b = ib_new();
+                    compile_expr(thunk_b, node->as.attrset.dyn_bindings[i].value, &frame);
+                    ib_ret(thunk_b);
+                    ib_mk_thunk(b, ib_finish(thunk_b));
+                    ib_insert_dynamic_attr(b);
+                }
                 ib_frame_exit(b);
                 free(names);
                 free(name_lens);
@@ -1105,27 +1158,6 @@ static void compile_expr(IrBuilder *b, Ast *node, ScopeFrame *scope) {
             free(syms);
             free(order);
             free(sorted_syms);
-
-            /* `${expr} = value;` entries (M28), applied one at a time
-             * after the static part above -- the exact attrs Value is
-             * already on top of the VALSTACK regardless of which branch
-             * ran (ib_mk_attrs, then ib_frame_exit for `rec`). Each
-             * iteration: push the name, push a thunk wrapping the value
-             * (same laziness as every other attrset value), then
-             * OP_INSERT_DYNAMIC_ATTR pops all three and pushes the
-             * updated attrs -- fatal on a name collision, matching real
-             * Nix. See ast.h's AST_ATTRSET.dyn_bindings comment for why
-             * these never get a ScopeFrame slot (no lexical/recursive
-             * visibility, even in `rec {}` -- confirmed against real
-             * Nix). */
-            for (size_t i = 0; i < node->as.attrset.dyn_count; i++) {
-                compile_expr(b, node->as.attrset.dyn_bindings[i].name_expr, scope);
-                IrBuilder *thunk_b = ib_new();
-                compile_expr(thunk_b, node->as.attrset.dyn_bindings[i].value, scope);
-                ib_ret(thunk_b);
-                ib_mk_thunk(b, ib_finish(thunk_b));
-                ib_insert_dynamic_attr(b);
-            }
             return;
         }
         case AST_SELECT: {

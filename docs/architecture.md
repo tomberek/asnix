@@ -79,7 +79,8 @@ what's actually implemented and the scope decisions made along the way.
 | M64 — `~`-prefixed ("home") path literals, interpolated path literals (`./${foo}`, `~/${foo}`, ...); `builtins.path` | done, **scoped** (see below; `builtins.path` itself not implemented) |
 | M65 — `import`-value caching (a second `import` of the same resolved path re-evaluated from scratch instead of sharing the first's result) | done (see below) |
 | M66 — `builtins.parseFlakeRef`/`builtins.flakeRefToString`: flake-ref URL-like syntax (github/gitlab/indirect/path/git+/tarball+/file+) | done, **scoped** (see below) |
-| M67+ | not started |
+| M67 — external-conformance grab-bag: derivation `==` by `outPath`, dynamic-attrs scope fixes (rec-sibling visibility, attrpath-merge-into-a-dynamic-key, `${"literal"}` in `let`), `or` as an ordinary identifier, path-interpolation existence check, `fromJSON` deep-nesting stack fix, printer `<PRIMOP>`/`<LAMBDA>` | done, **scoped** (see below; function/slot-identity equality, `__curPos`, `tryEval` thunk re-eval, multi-segment `or default`, and `<PRIMOP-APP>` skipped) |
+| M68+ | not started |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
 
@@ -6677,3 +6678,407 @@ test-e2e` stay green, plus 6 new fixtures under `tests/e2e/`
 `flakeRefToString (parseFlakeRef s) == s` across all five scheme
 families on inputs already in canonical form), each verified against
 real `nix-instantiate --eval --strict` before being trusted.
+
+## M67 scope notes: external-conformance grab-bag
+
+A "pick off what you can" pass over a batch of unrelated small-to-medium
+numtide/nix-conformance gaps handed out as a single list (no shared
+root cause), sub-numbered M67a/b/... per item. Baseline before this
+pass: `make test-nix-conformance` `pass=557 fail=101 skip=148`; after:
+`pass=571 fail=87 skip=148` (net **+14**, confirmed stable across two
+repeat runs after an initial run showed 4 extra passes that didn't
+reproduce -- `eval-okay-overrides.nix`/`eval-okay-regex-014/113/114.nix`
+are flaky under load, unrelated to anything touched here, not counted).
+Every claim below was checked directly against real `nix-instantiate
+--eval --strict` (Determinate Nix 3.22.5 / 2.35.2) before writing code,
+per this project's standing convention.
+
+### M67a: derivation equality by `outPath`
+
+`eval-okay-eq-derivations.nix`/`eval-okay-eq-slot-derivations.nix`.
+`asnix_bshared_value_eq`'s `ASNIX_TAG_ATTRS` case only ever did a full
+structural walk (count + per-attr recursive `==`), which is wrong for
+two reasons real Nix's own `eqValues` (`~/nix/src/libexpr/eval.cc`)
+special-cases: (1) two derivations built from identical arguments are
+two different heap attrsets (different `drvA1`/`drvA2` objects) that
+should still be `==`, and (2) `derivation {...} // { dummy = 1; }`
+changes the attribute count/shape without changing what the derivation
+*means*, so a plain structural walk wrongly says unequal. Real Nix's
+rule (confirmed reading `eqValues`'s `nAttrs` case directly): if both
+sides' `isDerivation` (a `type` attr that forces to the string
+"derivation") is true, compare their `outPath` attribute's *value*
+(itself a recursive `eqValues`, i.e. an ordinary string compare once you
+get there) instead of walking every attribute -- NOT `drvPath` (a
+plausible-sounding guess the task handed down that turned out wrong
+once actually read from source).
+
+Added `value_is_derivation` (builtins_shared.c) and a new branch in
+`asnix_bshared_value_eq`'s `ASNIX_TAG_ATTRS` case, checked right after
+the existing `a.raw == b.raw` pointer fast path and before the
+structural walk: if both sides are derivations, compare `outPath`
+values and return, skipping the structural walk (and critically,
+skipping forcing any OTHER attribute -- `eval-okay-eq-slot-
+derivations.nix`'s `e = d // { f = x: x; t = throw "t"; }` relies on
+`e == d` never forcing `t`). Two conformance-mined-for-free bonus fixes
+fell out of this for free: `eval-fail-eq-derivation-type-throws.nix`/
+`eval-fail-elem-derivation-type-throws.nix` (confirming `isDerivation`'s
+own forcing of `type` lets a `throw`/`abort` inside it propagate
+uncaught, exactly like real Nix) now pass too, since `value_is_derivation`
+forces `type` unconditionally with no try/catch around it.
+
+Verified against real Nix: `derivation {name="a";...} == derivation
+{name="a";...}` (same args, different call) is `true`; the same with an
+extra `// {dummy=1;}` on one side is still `true`; same name but
+different `builder` is `false`. One new e2e fixture,
+`m67_derivation_eq.nix`.
+
+### M67b/c: dynamic (`${expr} = v;`) attrpath scope/merge gaps
+
+Three related but distinct gaps in `${expr}`-keyed attrset bindings,
+all found by actually reading `compiler.c`/`parser.c`'s own existing
+comments and then checking whether what they claimed was still true --
+two of the three claims turned out to be either wrong or narrower than
+how they were being used.
+
+**M67b -- a dynamic `rec {}` binding's value couldn't see its own static
+siblings** (`eval-okay-dynamic-attrs.nix`/`-bare.nix`:
+`rec { "${bString}" = a; a = true; }.b`, `bString = "b"`). `compiler.c`'s
+`AST_ATTRSET` case compiled every `${expr} = v;` entry's name/value
+against the *enclosing* `scope`, never the `rec`'s own frame, citing
+ast.h's own comment that "real Nix also doesn't give these lexical/
+recursive visibility even in `rec {}`" (confirmed by one real test:
+`rec { ${k}=1; b=a; }` with `k="a"` IS still "undefined variable 'a'").
+But that comment answers a different question than the one actually
+needed here -- confirmed directly: `let bString="b"; in (rec {
+"${bString}"=a; a=true; }).b` is `true` in real Nix. The two directions
+are genuinely different: a *static* sibling can never reference a
+*dynamically-named* attribute (no compile-time-known frame slot exists
+for it, unaffected by this fix), but a *dynamic* binding's own name/
+value expression CAN read (never write) the frame, same as any other
+`rec {}` binding. Fixed by compiling a `rec {}`'s dynamic bindings
+against `&frame` (the same `ScopeFrame` static bindings use) instead of
+`scope`, and moving their `OP_INSERT_DYNAMIC_ATTR` emission to run
+*before* `ib_frame_exit`, not after -- the attrs value sits on the
+VALSTACK throughout either way, only the *scope* dynamic bindings
+compile against changed. Non-`rec` `{}` is unaffected (never recursive,
+confirmed unchanged: `{ ${k}=a; a=1; }`, no `rec`, is still "undefined
+variable 'a'").
+
+**M67c -- merging an attrpath into (or a sibling attrpath statement
+alongside) a literal that itself had a dynamic key fataled unconditionally**
+(`eval-okay-dynamic-attrs-2.nix`: `{ a."${"b"}"=true; a."${"c"}"=false;
+}.a.b`; `eval-okay-merge-dynamic-attrs.nix`: `set1={a=1;};
+set1={"${"b"+""}"=2;};` and `set3.a=1; set3."${"b"+""}"=2;` shapes).
+`parser.c`'s static-attrpath-merge tree (`BTVec`/`BTNode`,
+`reopen_attrset_into`) only ever carried static bindings; its own
+comment called the dynamic-key case "not hit by anything this project
+has evaluated so far" and fataled rather than silently dropping data --
+turned out to actually be hit by this exact conformance batch, not just
+a hypothetical. Gave `BTVec` its own `dyn: DynBindingVec` field;
+`reopen_attrset_into` now folds a reopened literal's `dyn_bindings` into
+`dest->dyn` instead of fataling; `finalize_bt_node` re-attaches a
+branch's absorbed `dyn` bindings to its synthesized nested attrset; the
+three top-level `{...}`/`rec {...}` call sites fold `bt.dyn` into the
+block's own explicit `${...}=...;` `DynBindingVec` before finalizing.
+`let` (which has no `dyn_bindings` field on `AST_LET` at all) gets a
+loud guard instead -- fatal with the same "dynamic attributes not
+allowed in let" message, same spirit as the pre-existing convention,
+for a shape (`let a.${k}=1; a.b=2; in ...`) not believed reachable
+today and not exercised by anything in this project's own fixtures or
+numtide/nix-conformance.
+
+Verified against real Nix: both files' every listed case matches
+`.exp` exactly (`{ b=true; c=false; }`-shaped merges, `set3={a=1;b=2;}`-
+shaped attrpath-into-dynamic-sibling merges). Two new e2e fixtures,
+`m67_dynamic_attrs_rec_sibling.nix`/`m67_dynamic_attrs_merge.nix`.
+
+### M67d: `${"literal"}` is a compile-time-constant attr name, not a dynamic one
+
+`eval-okay-dynamic-attrs-3.nix`: `let ${"a"}=1; attrs=rec{b=c;
+${"c"}=d; d=a;}; in {inherit ${"a"}; inherit attrs; inherit (attrs)
+${"b"} ${"c"} d;}`, whose own comment says "dynamic attrs are not
+generally allowed in `let`... but they are if they only contain a
+string". `parse_attr_segment` already folded a *quoted-string* segment
+(`"a"`/`"foo${x}"`) into a static name when it had no actual
+interpolation inside, but the separate bare-`${expr}` branch never did
+the equivalent check on ITS `expr` -- so `${"a"}` (a dollar-brace
+wrapping a plain string-literal expression) stayed classified as
+genuinely dynamic, which is exactly what `let` unconditionally rejects.
+Real Nix does this same general fold, not just for `let`: confirmed in
+`~/nix/src/libexpr/include/nix/expr/parser-state.hh`'s
+`ToBeStringyExpr::visit`, "consistently handle simple StringExpr
+${"string"} as non-dynamic attributes" (NixOS/nix#14642), used for
+AttrPath components generally. Added the identical `AST_STRING`-with-
+no-real-interpolation check to the bare-`${expr}` branch of
+`parse_attr_segment`. Verified against real Nix: `let ${"a"}=1; in a`
+is `1`; `let ${"a"+""}=1; in a` still fails "dynamic attributes not
+allowed in let" (confirming the fold is specifically about a *literal*
+string, not merely a `${...}` that happens to be computable). One new
+e2e fixture, `m67_let_dollar_brace_string_literal.nix`.
+
+### M67e: `or` as an ordinary (if deprecated/"cursed") identifier
+
+`eval-okay-attrs5.nix` (`let or = x: y: x || y; in ...`) and
+`eval-okay-deprecate-cursed-or.nix` (`(x: x) (x: x+1) or;`-shaped bare-
+variable uses) both hit "parse error: expected a binding name"/failed
+to parse `or` as an atom at all -- `or` is lexed as its own keyword
+token (`TOK_OR`, for `.attr or default`), and nothing in `parser.c`
+ever accepted that token anywhere an ordinary identifier is legal. Real
+Nix's own grammar still accepts `or` as a plain identifier in any
+position that can't be confused with the select-default form --
+deprecated there with a warning (NixOS/nix#11121) but still accepted,
+not rejected (confirmed: `let or=1; in or` is `1`, warning on stderr
+only). Made `starts_atom`/`parse_atom` treat a bare `TOK_OR` exactly
+like `TOK_IDENT` (a plain `AST_VAR`), and `parse_attr_segment`'s
+unquoted-name fallback accept it too (binding/attribute/inherited
+names) -- the existing `had_select && TOK_OR` check (the real
+`.attr or default` grammar) runs first at its own call site regardless,
+so there's no new ambiguity: `or` only becomes a plain identifier where
+nothing already claims it as the select-default keyword.
+
+This exactly fixed `eval-okay-deprecate-cursed-or.nix` (stdout "0",
+which is all the lightweight `test-nix-conformance` sweep checks --
+the warning text on stderr is not compared). `eval-okay-attrs5.nix`
+parses further now but still fails on an unrelated, pre-existing,
+already-documented gap (see "Skipped" below) -- not reverted, since the
+`or`-as-identifier fix itself is correct and unblocks real syntax. One
+new e2e fixture, `m67_or_identifier.nix`.
+
+### M67f: string-interpolation of a nonexistent `Path` must fail
+
+`eval-fail-nonexist-path.nix` (`"${./fnord}/xyzzy"`) and
+`eval-fail-bad-string-interpolation-2.nix` (`"${./fnord}"`) both
+*succeeded* in asnix, printing the plain path text, where real Nix
+fails with `error: path '...' does not exist`. Root cause named by
+`value_util.c`'s own pre-existing comment on `coerce_to_string_for_
+interp`'s Path branch: real Nix's `"${path}"` triggers a "copy to
+store" coercion (which obviously requires the source to exist), not
+implemented here (no daemon `AddToStore`) -- but the *existence check*
+that gates it is cheap and independently addable without the rest.
+Confirmed the scope precisely against real Nix first: `builtins.toString
+./nonexistent` succeeds (no existence check at all -- plain text
+formatting); only *bare interpolation* of a Path requires existence.
+Added an `lstat` check (dangling symlinks still count as "existing",
+matching `pathExists`'s own convention) right there.
+
+**Regression found and fixed in the same pass**: this coercion function
+is shared by TWO call sites, not one -- `OP_STR_CONCAT` (genuine
+`"${...}"` interpolation) AND `asnix_add_values`'s path-`+`-string case
+(`/foo/bar + "/x"`), which reuses the exact same string-coercion rules
+for an entirely unrelated reason (confirmed against real Nix: `+` on a
+Path never requires existence, `toString (/foo/bar + "/x")` succeeds
+even when `/foo/bar` doesn't exist). The existence check was initially
+added unconditionally and broke `tests/e2e/m57g_path_canon_concat.nix`
+(`/foo/bar + "/../xyzzy/./foo.txt"`, a deliberately-nonexistent path
+used for canonicalization testing) -- caught by `make test-e2e`, not
+missed. Fixed by threading a `check_path_exists` bool through
+`coerce_to_string_for_interp`/a new shared `concat_strings_impl`, with
+the public `asnix_concat_strings` (used by `OP_STR_CONCAT`) passing 1
+and `asnix_add_values`'s own call passing 0. Also found and fixed a
+second, pre-existing instance of the exact same confusion in
+`tests/ir/test_strings_fixtures.c`'s own `fixture_concat_coerces_path`
+unit test, which used a deliberately-nonexistent fixed path string
+through the SAME (now existence-checking) interpolation path -- changed
+to `"/"` (portable, always exists) since that test is about the
+coercion logic, not existence.
+
+Verified against real Nix: `"${./fnord}"` on a nonexistent `./fnord`
+fails "path '...' does not exist"; `toString (path + string)` on a
+nonexistent path still succeeds. One new e2e fixture (the happy path),
+`m67_path_interp_exists.nix` -- note its own exact output isn't
+byte-identical to what real Nix would do for an interpolated path that
+*does* exist (real Nix still attempts an actual store-copy at that
+point, which is its own separate, already-documented, unimplemented
+gap -- this fix only adds the existence *gate* in front of the
+existing, unchanged "just the text" approximation).
+
+### M67g: `fromJSON` on a very deeply nested document segfaulted
+
+`eval-okay-fromjson-deep.nix` (`deep 20000` and `deep 100000`, nested
+`[[[...]]]]` built by string repetition) expects `[ 1 1 ]` on real Nix
+(whose nlohmann-backed parser documents no nesting limit); asnix's own
+hand-written recursive-descent parser (`builtins_json.c`) uses one
+native C stack frame per nesting level, which already fit `deep 20000`
+but segfaulted on `deep 100000` (confirmed: the default 8 MiB thread
+stack is the limiting factor, not an asnix-specific bug -- running the
+*same* binary under `ulimit -s 65536` made both cases pass with zero
+code change).
+
+**First attempt, reverted**: globally raising the process's own
+`RLIMIT_STACK` once at startup (`setrlimit`) fixed this file but broke a
+*different*, already-passing one: `eval-fail-toJSON-stack-overflow.nix`
+deliberately relies on hitting a stack limit to prove a *controlled*
+failure (real Nix has an explicit, interpreter-level `max-call-depth`
+counter completely independent of native stack size; asnix has no such
+counter anywhere, so its only "stack overflow" at all, here, is a
+native one) -- deepening the *whole process's* stack let `builtins.
+toJSON`'s own, unrelated recursive serializer (a different function
+entirely) run deep enough to actually finish instead of crashing,
+flipping that test from a (pre-existing, already-documented-as-
+coincidental, per this Makefile target's own `eval-fail-*` comment)
+"pass via native crash" to an outright fail. Found by `make
+test-nix-conformance`'s own before/after diff, not missed.
+
+**Fix that stuck**: scope the bigger stack to ONLY `fromJSON`'s own
+recursion, via a `ucontext.h` side stack (`getcontext`/`makecontext`/
+`swapcontext`) allocated fresh per call and freed after -- not a new OS
+thread (no actual concurrency: the caller is suspended for the
+`swapcontext` call's duration, same single-threaded execution this
+whole codebase, e.g. the global arena allocator, already assumes). This
+leaves `toJSON`'s own call path completely untouched, so it still
+crashes at the same native-stack-limited depth as before, while
+`fromJSON` gets a dedicated 64 MiB stack for its own parse.
+
+Verified against real Nix (already known from the task's own write-up,
+confirmed again here): `deep 20000`/`deep 100000` both `1`. `make
+test-nix-conformance` before/after confirms both files land correctly
+(`fromjson-deep` now passes, `toJSON-stack-overflow` still passes, no
+net change to the latter). One new e2e fixture (a smaller `deep 50000`,
+to keep the test suite fast), `m67_fromjson_deep.nix`.
+
+### M67h: value printer shows `<PRIMOP>`/`<LAMBDA>` instead of `<unprintable...>`
+
+`eval-okay-print.nix` (`trace [...] [null toString (deepSeq "x") (a:a)
+(let x=[x]; in x)]`) exposed that `main.c`'s `print_value_inner` had no
+case at all for `ASNIX_TAG_PRIMOP`/`ASNIX_TAG_CLOSURE` -- both fell to
+the generic `default:` branch and printed `<unprintable value, tag=N>`.
+Real Nix's printer shows `<PRIMOP>` for an unapplied builtin, `<LAMBDA>`
+for a bytecode closure, and `<PRIMOP-APP>` for a *partially*-applied
+multi-arg builtin. Added the first two unconditionally: `ASNIX_TAG_
+PRIMOP` is always correct as `<PRIMOP>` (every multi-arg builtin
+visible from Nix source is pre-curried into a chain of ordinary
+closures, `asnix_bshared_make_curried_native`, precisely BECAUSE Nix's
+call syntax is always unary -- a bare arity-N `ASNIX_TAG_PRIMOP` value
+only ever exists fully unapplied, so "0 args given" is the only
+reachable state). `ASNIX_TAG_CLOSURE` -> `<LAMBDA>` is NOT always
+correct for the same reason: a partially-applied native builtin (e.g.
+`deepSeq "x"`) is ALSO one of those synthetic curry-stage closures,
+bit-for-bit indistinguishable from a genuine user lambda at this tag (no
+spare field anywhere in the closure heap layout currently marks "I am a
+curry stage, not user code" -- its `formals`/`up` fields can legitimately
+take the same values either way) -- reliably telling them apart would
+need a dedicated marker threaded through the closure heap layout
+(`heap.h`) and every `.S` site that builds one, out of proportion for
+this pass. So `<LAMBDA>` is a known, documented approximation, same
+spirit as this project's other scoped gaps.
+
+This file ALSO exposed a second, independent gap in the *list* printer:
+real Nix's `[ (let x=[x]; in x) ]` case prints `[ [ «repeated» ] ]`
+(TWO levels before the cycle marker), not the one level asnix's
+existing cycle-detector gives (`[ «repeated» ]`) -- traced to the exact
+same underlying real-Nix quirk that also blocks the equality cluster
+(see "Skipped" below): real Nix's own cycle detection keys off the
+literal memory address of the *Value struct currently being printed*,
+and a *non-trivial* list-element expression (this one, a `let`) gets a
+FRESH such address via `maybeThunk`'s bit-copy-on-force semantics,
+bit-for-bit indistinguishable in CONTENT from the original but a
+different ADDRESS -- so the outer, "borrowed" copy inserts into `seen`
+once, then recurses into the SAME underlying list object's own
+(original) address, which inserts a SECOND time before finally hitting
+the already-seen entry. asnix's Value representation has no equivalent
+indirection (a Value already IS the heap pointer, there's no separate
+"box" to re-copy) -- not fixable without the same disproportionate
+architecture change the equality cluster needs, see "Skipped" below.
+
+Net: `eval-okay-print.nix` is closer (no longer `<unprintable...>`) but
+still not byte-exact, for the two reasons above -- stays in the failed
+list, documented rather than silently left as a worse-looking crash.
+One new e2e fixture testing what IS now correct outside a trace (direct
+top-level printing, not just inside `builtins.trace`), `m67_print_
+primop_lambda.nix`.
+
+### M67i: `TEST_VAR=foo` -- a `test-nix-conformance` harness gap, not an asnix bug
+
+`eval-okay-getenv.nix` (`getEnv "TEST_VAR" + (if getEnv "NO_SUCH_VAR" ==
+"" then "bar" else "bla")`, expecting `"foobar"`) "failed" only because
+this project's own lightweight `test-nix-conformance` Makefile target
+never set `TEST_VAR` before running -- confirmed this is a test-harness
+gap, not an asnix bug, by running real `nix-instantiate --eval` on the
+exact same file with `TEST_VAR` unset too: it ALSO doesn't give
+"foobar" then (gives "bar"). The real numtide/nix-conformance `run`
+script exports `TEST_VAR=foo` (plus `NIX_PATH`/`HOME`, not replicated
+here -- nothing else in the current failure list needs them) before
+running any case (`run:173`/`README.md:84`). Added `export TEST_VAR=foo`
+to the Makefile target. `builtins.getEnv` itself was already correct
+(confirmed: `TEST_VAR=foo asnix eval-okay-getenv.nix` already gave
+`"foobar"` before this fix -- only the sweep script's own environment
+was missing the variable).
+
+### Skipped (investigated, no fix)
+
+- **`eval-okay-eq-slot-elem.nix`/`eval-okay-eq-slot-identity.nix`/
+  `eval-okay-equal-function-direct-identical.nix`** -- all three need
+  real Nix's exact "Value-struct-address identity" hack
+  (`eqValues`'s `if (&v1 == &v2) return true` fast path, PLUS `nFunction`
+  unconditionally `return false` otherwise): a BARE VARIABLE reference
+  used as a list element/attrset value is pointer-SHARED with its
+  original binding's storage (`maybeThunk`'s trivial-expression case,
+  no copy), while almost every OTHER expression kind gets a FRESH
+  Value address via force-and-bit-copy even when the CONTENT is
+  identical -- so `f == f` (direct comparison) is `false` (two fresh,
+  non-address-equal copies of the same closure content, `nFunction`
+  dispatch always loses) but `[f] == [f]` (list-wrapped) can be `true`
+  (both list literals' elements point at the exact same original
+  storage, pointer check wins before `nFunction` dispatch ever runs).
+  Traced through by hand against each test's every sub-case (documented
+  in-session, not re-derived here) and confirmed this is genuinely,
+  precisely what's being tested. asnix's Value representation (a
+  tagged word that for any heap type already IS the pointer -- no
+  separate "box"/"slot" indirection a `let`/list-literal/thunk-force
+  could re-copy into a fresh address while leaving the content
+  unchanged) has no notion to hang this on at all; replicating it would
+  mean adding exactly that extra indirection layer for every value in
+  the system, pervasively touching the compiler's codegen for variable
+  references, list literals, attrset literals, and thunk-forcing alike
+  -- the same class of "infrastructure genuinely out of proportion"
+  this task's own instructions anticipate skipping. (Current behavior:
+  closures compare by CONTENT pointer identity unconditionally, which
+  is MORE permissive than real Nix in some of these cases and less in
+  others -- not a worse approximation than before this pass, just an
+  unchanged one.)
+- **`eval-okay-compare-operand-order.nix`** -- its last element,
+  `let __curPos = 42; in __curPos`, needs `__curPos` to be a true
+  parser-level magic identifier (rewritten to a position-literal AST
+  node at every occurrence, ignoring any user `let __curPos = ...;`
+  shadow) -- not implemented in asnix AT ALL (distinct from M59's
+  `unsafeGetAttrPos`, confirmed: `grep -rn curPos src/c` before this
+  pass found nothing). Per this task's own instructions, `__curPos`/
+  `unsafeGetAttrPos` is M59's area (another agent's); not deepened
+  here. Every OTHER element of this file already evaluates correctly
+  (verified by hand against the real-Nix-expected array with the
+  `__curPos` element dropped).
+- **`eval-okay-tryeval-failed-thunk-reeval.nix`** -- exactly, word for
+  word, the limitation M30's own scope notes ALREADY document under
+  "Known, accepted limitation, not engineered around": a thunk that
+  throws partway through `tryEval`'s `longjmp`-based catch is left
+  permanently marked `IN_PROGRESS` (blackholed), since the unwind skips
+  every normal "mark forced" step with no record of which thunk(s) were
+  mid-force at the time; re-forcing that SAME thunk a second time
+  (exactly what this file does, "Since Nix 2.34, errors are memoized")
+  incorrectly reports infinite recursion instead of re-raising. M30's
+  own text already calls a full fix "a much larger undertaking", citing
+  the need to track and roll back every thunk touched since the
+  matching `setjmp` -- confirmed this file is exercising precisely that
+  already-known, already-documented gap, not a new bug; not re-attempted
+  here, consistent with this task's "tryEval work disproportionate"
+  warning.
+- **`eval-okay-attrs5.nix`** (remaining failure after M67e's `or`-as-
+  identifier fix) -- `as.x.y.bla or bs.bar.foo or "xyzzy"` needs a
+  missing-attribute failure at ANY point along a MULTI-segment attrpath
+  (`bs.bar.foo`, where `bs.bar` itself is missing) to still be caught by
+  that chain's OWN trailing `or default`. `parser.c`'s `parse_select`
+  already documents this exact scope cut in its own comment ("only the
+  last segment's failure is caught, not an earlier one in a longer
+  chain") -- each `.`-segment becomes its own single-segment
+  `AST_SELECT` node, with `default_` attached only to the OUTERMOST
+  (last) one; a failure selecting an INNER segment happens while
+  evaluating that outer node's unprotected `target`, escaping the
+  default entirely. Fixing this properly means restructuring
+  `AST_SELECT` to hold a whole attrpath array with ONE default at the
+  end (matching real Nix's own `expr_simple '.' attrpath OR_KW
+  expr_select` grammar) instead of a chain of single-segment nodes --
+  a real AST/compiler restructuring, not a narrow fix, and an
+  orthogonal, pre-existing, already-documented gap this pass's `or`
+  fix merely got far enough to actually reach (confirmed: before M67e,
+  this file failed at the PARSE stage, before this semantic gap was
+  even reachable).

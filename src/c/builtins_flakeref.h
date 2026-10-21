@@ -6,12 +6,12 @@
 #include "asnix/value.h"
 
 /*
- * M61: `builtins.parseFlakeRef` / `builtins.flakeRefToString` -- pure
+ * M66: `builtins.parseFlakeRef` / `builtins.flakeRefToString` -- pure
  * string<->attrset parsing/formatting of the flake-ref URL-like syntax
  * (`github:owner/repo/ref?dir=...`, `git+https://...`, `path:/...`, bare
  * flake ids like `nixpkgs`, tarball/file URLs, ...). No filesystem/network
  * access, no actual flake resolution/fetching/registry lookup -- see
- * docs/architecture.md's M61 scope notes for the full spec derivation
+ * docs/architecture.md's M66 scope notes for the full spec derivation
  * (reverse-engineered from numtide/nix-conformance's
  * eval-okay-*flake-ref*.nix/.exp fixtures, cross-checked directly against
  * real `nix-instantiate --eval` for every ambiguous case) and the list of

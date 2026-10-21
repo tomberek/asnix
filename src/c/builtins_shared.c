@@ -332,6 +332,34 @@ void asnix_bshared_string_bytes(Value v, const char **bytes_out, int64_t *len_ou
     *bytes_out = asnix_ptr_bytes(v, len_out);
 }
 
+/* M67: real Nix's `eqValues` (eval.cc) special-cases attrsets that denote
+ * a derivation -- `isDerivation(v)` checks for a `type` attribute whose
+ * forced value is exactly the string "derivation" -- comparing them by
+ * their `outPath` attribute's value (itself a recursive `eqValues` call,
+ * not a raw byte-compare) rather than the generic attribute-by-attribute
+ * structural walk below. Verified directly against real `nix-instantiate
+ * --eval`: two separately-constructed `derivation {...}` calls with
+ * identical args are `==` (same outPath) even though they're two
+ * different heap attrsets; `derivation {...} // { dummy = 1; }` is still
+ * `==` to the original (outPath is unaffected by an unrelated `//`
+ * merge); two derivations differing only in `builder` are not `==`
+ * (different outPath). Needed because the generic structural walk below
+ * would otherwise (a) give the wrong answer whenever a `//` merge changes
+ * the attribute count/shape without changing outPath, and (b) risk
+ * forcing attributes real Nix never would (e.g. a `throw`-valued
+ * attribute merged on afterward) just to decide structural equality. */
+static int value_is_derivation(Value v) {
+    if (asnix_tag_of(v) != ASNIX_TAG_ATTRS) return 0;
+    uint32_t sym_type = asnix_intern("type", 4);
+    int64_t idx = asnix_bshared_attrs_find(v, sym_type);
+    if (idx < 0) return 0;
+    Value tv = asnix_force_for_print(asnix_bshared_attrs_value(v, idx));
+    if (asnix_tag_of(tv) != ASNIX_TAG_PTR || asnix_value_is_path(tv) || asnix_value_is_float(tv)) return 0;
+    int64_t len;
+    const char *bytes = asnix_ptr_bytes(tv, &len);
+    return len == 10 && memcmp(bytes, "derivation", 10) == 0;
+}
+
 int asnix_bshared_value_eq(Value a, Value b) {
     a = asnix_force_for_print(a);
     b = asnix_force_for_print(b);
@@ -377,6 +405,14 @@ int asnix_bshared_value_eq(Value a, Value b) {
         }
         case ASNIX_TAG_ATTRS: {
             if (a.raw == b.raw) return 1;
+            if (value_is_derivation(a) && value_is_derivation(b)) {
+                uint32_t sym_outpath = asnix_intern("outPath", 7);
+                int64_t ia = asnix_bshared_attrs_find(a, sym_outpath);
+                int64_t ib = asnix_bshared_attrs_find(b, sym_outpath);
+                if (ia >= 0 && ib >= 0) {
+                    return asnix_bshared_value_eq(asnix_bshared_attrs_value(a, ia), asnix_bshared_attrs_value(b, ib));
+                }
+            }
             int64_t na = asnix_bshared_attrs_count(a), nb = asnix_bshared_attrs_count(b);
             if (na != nb) return 0;
             for (int64_t i = 0; i < na; i++) {
