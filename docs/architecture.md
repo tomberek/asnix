@@ -71,7 +71,8 @@ what's actually implemented and the scope decisions made along the way.
 | M56 — integer-overflow detection (`+`/`-`/`*`/`/`, `builtins.add/sub/mul/div`) + `fromTOML` validation gaps (bare/incomplete time literals, calendar-range checks, duplicate table headers, leading-zero/double-underscore integers, invalid bare tokens, embedded NUL bytes, integer-literal overflow) | done (see below) |
 | M57 — conformance grab-bag (9 sub-items a-i): `lessThan`/`sort` on lists, `genericClosure` key-comparability, `__overrides` propagation, `toJSON` UTF-8 validation, `import`'s `__toString` coercion, `compareVersions`' int-overflow quirk, path-concat canonicalization, import symlink resolution, CLI `--arg`/`--argstr`/`-A` | done, **scoped** (see below; function/derivation-equality, `-I`, and context-attr-name skipped) |
 | M58 — `derivation` is a real Nix-level wrapper around `derivationStrict`, giving self-referential multi-output objects (`drv.out.outPath`, etc.) | done (see below) |
-| M59+ | not started |
+| M59 — `builtins.unsafeGetAttrPos`: a deliberately narrow, approximate implementation (no Attr-record growth, no lexer changes) | done, **scoped** (see below) |
+| M60+ | not started |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
 
@@ -2302,13 +2303,24 @@ trust this list as ground truth):**
   protocol at the dispatch-loop level), clearly disproportionate to
   the 2 files it would unblock in this pass. Affects
   `eval-okay-tryeval.nix`/`eval-okay-tryeval-failed-thunk-reeval.nix`.
-- **`__curPos`, `builtins.unsafeGetAttrPos`, position-tracking in
-  general** -- asnix's AST/IR carries no source-position information
-  anywhere (tokens do, but it's discarded at parse time); implementing
-  this would mean threading position info through the compiler and IR,
-  a cross-cutting change disproportionate to the handful of
-  `*-attr-pos*`/`eval-okay-curpos.nix`/`eval-okay-getattrpos*.nix`
-  files that need it.
+- **`__curPos`, real per-attribute position-tracking in general** --
+  asnix's AST/IR carries no source-position information anywhere
+  (tokens do, but it's discarded at parse time); implementing this
+  FULLY would mean threading position info through the compiler and IR
+  into the runtime Attr record, a cross-cutting change disproportionate
+  to the handful of `*-attr-pos*`/`eval-okay-curpos.nix`/
+  `eval-okay-getattrpos*.nix`/`eval-okay-compare-operand-order.nix`
+  files that need it. `builtins.unsafeGetAttrPos` ITSELF is no longer
+  in this skipped list as of M59 (see that section): it now exists,
+  with an exact null-vs-not-null distinction and an explicitly
+  approximate (placeholder `line`/`column`, uniform-not-per-binding
+  `file`) non-null case -- narrower than, but no longer identical to,
+  the gap this bullet still describes for `__curPos` and any future
+  need for real per-token position data flowing anywhere else.
+  `eval-okay-curpos.nix`/`eval-okay-getattrpos*.nix`/
+  `eval-okay-compare-operand-order.nix` still fail (they need exact,
+  not approximate, position values -- `__curPos`'s own magic value and
+  the files' exact expected line/column numbers).
 - **Dynamic/quoted-string attrset-literal keys** (`${expr} = val;`,
   `"${str}" = val;`) -- same M22-documented cut, not extended this
   pass; still blocks `eval-okay-attrs5.nix`/`eval-okay-attrs6.nix`/
@@ -5874,3 +5886,131 @@ numbers above, which run this project's own small mined
 `tests/conformance/` subset -- noted here as a distinct, one-off check,
 not a new standing baseline): 553 passed/105 failed/148 skipped before
 this fix, 556/102/148 after -- +3 net, zero regressions.
+
+## M59 scope notes: `builtins.unsafeGetAttrPos` -- a deliberately narrow, approximate implementation
+
+**Why this exists despite the standing scope cut.** This file's Known
+Gaps list (and the M54/M51 notes above) has long documented
+`builtins.unsafeGetAttrPos`/`__curPos`/position-tracking in general as
+skipped because "asnix's AST/IR carries no source-position information
+anywhere ... implementing this would mean threading position info
+through the compiler and IR, a cross-cutting change disproportionate to
+the handful of files that need it." That judgment was, and still is,
+correct for doing this *fully* -- real file/line/column for every
+individual attribute would mean growing the runtime Attr record
+(`ASNIX_ATTR_SIZE`/`ASNIX_ATTR_OFF_SYM`/`ASNIX_ATTR_OFF_VALUE`,
+`include/asnix/heap.h`), a change dozens of call sites across both C
+and asm (`op_select.S`'s binary search, `op_mk_attrs.S`,
+`derivation.c`, `attrs_update.c`, `builtins_attrs2.c`'s `listToAttrs`,
+...) would have to agree on. This pass implements something narrower
+and explicitly approximate instead, per a direct instruction to do so
+in place of that larger feature: get the function to exist, return the
+right *shape*, get the null-vs-not-null distinction exactly right, and
+document plainly what's approximated -- **without** growing the Attr
+record and **without** touching the lexer (`src/c/lexer.c`/`lexer.h`)
+at all.
+
+**Verified against real Nix first** (`nix-instantiate (Determinate Nix
+3.22.5) 2.35.2`, matching this repo's existing reference version):
+`unsafeGetAttrPos name attrset` returns `{ file; line; column; }` for an
+existing attribute (confirmed exact: a `let a = { x = 1; }; in
+builtins.unsafeGetAttrPos "x" a` fixture file has `x` at column 11 on
+line 1, and real Nix reports exactly `{ column = 11; file =
+"/tmp/t.nix"; line = 1; }`; a four-line fixture with `bar` on line 4
+reports `line = 4; column = 5` exactly matching the source), or `null`
+for a missing one -- and it's `builtins`-only, confirmed by
+`nix-instantiate --eval --strict -E 'builtins.isFunction
+unsafeGetAttrPos'` failing with "undefined variable 'unsafeGetAttrPos'"
+(unlike `scopedImport`, M54, which real Nix DOES expose as a bare
+global). Also notable: real Nix's own position tracking is disabled
+for `-E`/`--expr` string-sourced expressions (reports `null` even for
+an attribute that exists) but works for real files -- not reproduced
+here, irrelevant to asnix's own CLI shape (no `-E` flag exists).
+
+**What's exact:** the null-vs-not-null distinction. `unsafeGetAttrPos`
+(new, `src/c/builtins_m54.c`, added to the existing `ASNIX_M54_BUILTINS`
+`{name,build()}` table alongside `scopedImport`/`trace`/etc., curried
+via the same `asnix_bshared_make_curried_native` two-arg pattern every
+other arity-2 builtin in this codebase uses) does a real membership
+check (`asnix_bshared_attrs_find`, the same helper `hasAttr`/`getAttr`
+use) and returns real `ASNIX_NULL` when `name` isn't one of
+`attrset`'s attributes -- exactly matching real Nix, with no
+approximation at all on this half of the contract. It's wired into
+`asnix_make_builtins_attrs()` only (via the M54 table, which only ever
+feeds `builtins.X`), with no bare-global root-Env/`compiler.c`
+counterpart the way `scopedImport` has one -- matching the
+confirmed-above real-Nix behavior that this is `builtins`-only.
+
+**What's approximate, and why, for the non-null case:**
+
+- **`file`** is the resolved absolute path of the OUTERMOST file asnix
+  was originally invoked on (argv's `<file.nix>` in `main.c`), reported
+  *uniformly* for every attribute that exists, regardless of which
+  actual file/import actually wrote that specific binding. This needed
+  one small new piece of plumbing, deliberately kept to the minimum:
+  a new file-scoped global in `eval_file.c`, `g_top_level_file`
+  (exposed via a new getter, `asnix_eval_top_level_file()`,
+  `eval_file.h`), set once -- guarded, so a nested `import`/
+  `scopedImport` re-entering `asnix_eval_file`/`asnix_eval_file_scoped`
+  never overwrites it -- to a `strdup`'d copy of the resolved path (a
+  copy, not the `resolved` pointer `asnix_eval_file` itself frees before
+  returning, since a value `unsafeGetAttrPos` built can still be
+  forced later, e.g. during `main.c`'s post-return `print_value()`,
+  after that free already happened). This mirrors an existing,
+  narrower precedent already in the codebase: `compiler.c`'s own
+  `g_compile_base_dir` global, used for `AST_PATH` resolution, is the
+  same "one file-scoped global tracking which file is currently
+  relevant" idea, just scoped to directories-during-compile rather than
+  the one top-level file-during-the-whole-run. Real per-binding file
+  tracking (the file a *specific* attribute's value-literal was
+  actually written in, which could be any file reached via any chain of
+  `import`/`//`/`inherit` before the attrset reaches this call) would
+  require the attrset itself to carry that information -- which is
+  exactly the Attr-record growth this pass is scoped to avoid. `""` if
+  no file has been evaluated yet (shouldn't happen via `main.c`'s normal
+  entry point; only reachable in principle via `asnix_eval_expr_source`,
+  the `--arg`/`--argstr` CLI path, which has no file of its own).
+- **`line`/`column`** are **fixed placeholders, always `1`/`1`** --
+  not read from anywhere, and not even an attempt at "the position of
+  the file's top-level expression" (computing even that much would
+  still require correlating an AST node back to a Token's `pos`, then
+  computing a line/column by scanning the source buffer, none of which
+  exists anywhere in the current pipeline). The one piece of real
+  per-token position data that does already exist in this codebase
+  without any lexer change -- `lexer.h`'s `Token.pos`, a `const char *`
+  into the source buffer, present on every token -- is read by
+  `parser.c` only long enough to build `AstBinding`/`AstDynBinding`
+  (`src/c/ast.h`), which keep NO position field at all, and is
+  discarded once the `Ast` tree is built; by the time any value reaches
+  a runtime `Attrs` object, there is no path left from "the attribute
+  that exists" back to "the token that named it" without adding a field
+  somewhere compile-time AND runtime both reach -- i.e. growing either
+  `AstBinding` (compile-time only, insufficient by itself) *and* the
+  Attr record (what this pass is explicitly scoped to avoid). A fixed
+  `1`/`1` was chosen over any fancier guess specifically to avoid
+  implying false precision -- it reads as an obvious placeholder rather
+  than a plausible-but-wrong real position.
+
+**Fixtures:** `tests/e2e/m59_unsafegetattrpos_exists.nix` (checks
+`builtins.isAttrs`/`isString pos.file`/`isInt pos.line`/`isInt
+pos.column` and the exact `{column;file;line;}` attribute-name shape
+via `attrNames`, deliberately NOT asserting the approximate `file`
+string's exact value or the placeholder `line`/`column` numbers, per
+the above), `tests/e2e/m59_unsafegetattrpos_missing.nix` (asserts
+`unsafeGetAttrPos "y" a == null` exactly, no approximation on this
+side). Both generated against, and matching, real `nix-instantiate
+--eval --strict` first.
+
+**Regression:** `make test` (unit, all green) and `make test-e2e` (238
+fixtures, up from 236, the two new `m59_*` files; all green, no
+regressions) both clean. `test-conformance`: this worktree's own small
+curated `tests/conformance/` subset (19 files) unchanged byte-for-byte
+before/after. The full external numtide/nix-conformance `lang/` corpus
+(`cd /tmp/nix-conformance && ./run adapters/asnix-m59 lang`, a scratch
+adapter pointed at this worktree's own build, same convention as every
+prior pass's own scratch adapter) reports **687 passed, 115 failed, 0
+known, 62 skipped both before and after** this change, byte-identical
+pass/fail lists -- expected and unsurprising: no `lang/` corpus file
+exercises `unsafeGetAttrPos` (it needs `__curPos`-adjacent exact
+position tracking to be a meaningful differential test, which is
+exactly the feature this pass does not attempt).

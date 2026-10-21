@@ -746,6 +746,77 @@ static Value build_scopedImport(void) { return asnix_bshared_make_curried_native
 
 Value asnix_make_scopedImport_primop(void) { return build_scopedImport(); }
 
+/* ---------------------------------------------------------------------
+ * unsafeGetAttrPos name attrset (M59) -- `builtins`-only in real Nix
+ * (confirmed: `nix-instantiate --eval --strict -E 'builtins.isFunction
+ * unsafeGetAttrPos'` errors "undefined variable 'unsafeGetAttrPos'",
+ * unlike `scopedImport` above -- so this is wired into
+ * ASNIX_M54_BUILTINS only, with no asnix_make_*_primop/root-Env-slot
+ * counterpart the way scopedImport has one).
+ *
+ * Real Nix returns `{ file; line; column; }` describing where
+ * `attrset`'s binding named `name` was written in source, or `null` if
+ * `attrset` has no such attribute (verified directly: `let a = { x = 1;
+ * }; in builtins.unsafeGetAttrPos "x" a` => `{ column = 11; file =
+ * "<...>"; line = 1; }`; `... unsafeGetAttrPos "y" a` => `null`).
+ *
+ * asnix has no source-position information available at this call site
+ * at all, by construction: `attrset` here is a bare runtime Attrs heap
+ * value (ASNIX_TAG_ATTRS) with no back-pointer to whatever AST node (or
+ * which of possibly several files, if the attrset was merged/imported)
+ * originally built it, and growing the Attr record (ASNIX_ATTR_SIZE/
+ * ASNIX_ATTR_OFF_SYM/ASNIX_ATTR_OFF_VALUE, heap.h) to add one is
+ * EXPLICITLY out of scope for this milestone (see docs/architecture.md's
+ * M59 scope notes -- this is a deliberately narrow, approximate
+ * implementation requested in place of the full position-tracking
+ * feature this project's docs have long flagged as a disproportionate,
+ * cross-cutting change). What this function actually does:
+ *
+ *   - The null-vs-not-null distinction IS exact: returns real `ASNIX_NULL`
+ *     if `name` isn't one of `attrset`'s attributes (asnix_bshared_
+ *     attrs_find), a `{file;line;column;}` attrset otherwise -- same
+ *     membership test `hasAttr`/`getAttr` already use.
+ *   - `file` is APPROXIMATE: the resolved absolute path of the
+ *     OUTERMOST file asnix was originally invoked on (asnix_eval_
+ *     top_level_file, eval_file.c/.h), reported uniformly for every
+ *     attribute that exists -- regardless of which actual file/import
+ *     wrote the specific binding being asked about. "" if no file is
+ *     tracked yet (shouldn't happen via main.c's normal entry point).
+ *   - `line`/`column` are FIXED PLACEHOLDERS (1/1), not read from
+ *     anywhere: the only genuinely available per-token position data in
+ *     this codebase (lexer.h's Token.pos) is discarded by parser.c
+ *     before it ever reaches an AstBinding, and threading it all the way
+ *     from there through compiler.c's IR into a runtime Attrs entry
+ *     would mean exactly the Attr-record growth this pass is scoped to
+ *     avoid. A uniform 1/1 is honest about being a placeholder rather
+ *     than implying false precision. */
+static Value unsafeGetAttrPos2_impl(const Value *args, int64_t argc) {
+    (void)argc;
+    ASNIX_REQUIRE_STRING(args[0], "unsafeGetAttrPos");
+    ASNIX_REQUIRE_ATTRS(args[1], "unsafeGetAttrPos");
+
+    const char *name_bytes;
+    int64_t name_len;
+    asnix_bshared_string_bytes(args[0], &name_bytes, &name_len, "unsafeGetAttrPos");
+    uint32_t name_sym = asnix_intern(name_bytes, (size_t)name_len);
+
+    if (asnix_bshared_attrs_find(args[1], name_sym) < 0) return ASNIX_NULL;
+
+    const char *file = asnix_eval_top_level_file();
+    if (!file) file = "";
+
+    uint32_t syms[3];
+    Value vals[3];
+    syms[0] = asnix_intern("file", 4);
+    vals[0] = asnix_make_string_value(file, strlen(file));
+    syms[1] = asnix_intern("line", 4);
+    vals[1] = asnix_make_int(1);
+    syms[2] = asnix_intern("column", 6);
+    vals[2] = asnix_make_int(1);
+    return asnix_bshared_make_attrs(syms, vals, 3);
+}
+static Value build_unsafeGetAttrPos(void) { return asnix_bshared_make_curried_native((void *)unsafeGetAttrPos2_impl, 2); }
+
 const AsnixBuiltinM54Def ASNIX_M54_BUILTINS[] = {
     { "bitAnd", build_bitAnd },
     { "bitOr", build_bitOr },
@@ -757,6 +828,7 @@ const AsnixBuiltinM54Def ASNIX_M54_BUILTINS[] = {
     { "getContext", build_getContext },
     { "appendContext", build_appendContext },
     { "scopedImport", build_scopedImport },
+    { "unsafeGetAttrPos", build_unsafeGetAttrPos },
 };
 
 const size_t ASNIX_M54_BUILTINS_COUNT = sizeof(ASNIX_M54_BUILTINS) / sizeof(ASNIX_M54_BUILTINS[0]);
