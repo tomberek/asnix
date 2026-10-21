@@ -45,9 +45,10 @@ static void buf_put_escaped(Buf *b, const char *s) {
     buf_putc(b, '"');
 }
 
-char *asnix_build_derivation_aterm(const AtermOutput *outputs, size_t noutputs, const char *system,
-                                    const char *builder, const char **args, size_t nargs, const AtermEnvVar *env,
-                                    size_t nenv) {
+char *asnix_build_derivation_aterm(const AtermOutput *outputs, size_t noutputs,
+                                    const AtermInputDrv *input_drvs, size_t ninput_drvs, const char **input_srcs,
+                                    size_t ninput_srcs, const char *system, const char *builder, const char **args,
+                                    size_t nargs, const AtermEnvVar *env, size_t nenv) {
     Buf b = { 0 };
 
     buf_puts(&b, "Derive([");
@@ -57,9 +58,30 @@ char *asnix_build_derivation_aterm(const AtermOutput *outputs, size_t noutputs, 
         buf_put_escaped(&b, outputs[i].name);
         buf_putc(&b, ',');
         buf_put_escaped(&b, outputs[i].path);
-        buf_puts(&b, ",\"\",\"\")");
+        buf_putc(&b, ',');
+        buf_put_escaped(&b, outputs[i].hash_algo ? outputs[i].hash_algo : "");
+        buf_putc(&b, ',');
+        buf_put_escaped(&b, outputs[i].hash ? outputs[i].hash : "");
+        buf_putc(&b, ')');
     }
-    buf_puts(&b, "],[],[],");
+    buf_puts(&b, "],[");
+    for (size_t i = 0; i < ninput_drvs; i++) {
+        if (i > 0) buf_putc(&b, ',');
+        buf_putc(&b, '(');
+        buf_put_escaped(&b, input_drvs[i].drv_path);
+        buf_puts(&b, ",[");
+        for (size_t j = 0; j < input_drvs[i].noutput_names; j++) {
+            if (j > 0) buf_putc(&b, ',');
+            buf_put_escaped(&b, input_drvs[i].output_names[j]);
+        }
+        buf_puts(&b, "])");
+    }
+    buf_puts(&b, "],[");
+    for (size_t i = 0; i < ninput_srcs; i++) {
+        if (i > 0) buf_putc(&b, ',');
+        buf_put_escaped(&b, input_srcs[i]);
+    }
+    buf_puts(&b, "],");
     buf_put_escaped(&b, system);
     buf_putc(&b, ',');
     buf_put_escaped(&b, builder);

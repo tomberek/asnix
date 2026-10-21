@@ -85,7 +85,8 @@ what's actually implemented and the scope decisions made along the way.
 | M70 — multi-segment `a.b.c or default`: every segment of a dotted chain now shares ONE `or` guard, matching real Nix's `ExprSelect::eval` (M67's documented residual gap, blocking `./asnix d.nix` on real nixpkgs) | done (see below) |
 | M71 — `builtins.storeDir` (plain constant, `"/nix/store"`) | done (see below) |
 | M72 — bumped `derivation`'s fixed attribute-count cap from 64 to 256; **`./asnix d.nix` now evaluates to completion with no crash** (the standing bug-chase's own goal) | done (see below) |
-| M73+ | not started |
+| M73 — fixed-output derivations now compute their real output/`.drv` paths via real Nix's actual `makeFixedOutputPath` formula (prerequisite for M74's `hashDerivationModulo` work) | done (see below) |
+| M74+ | not started |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
 
@@ -7641,3 +7642,70 @@ always "evaluates without crashing," which is now met.
 fixture). `make test-nix-conformance`: `pass=624 fail=34 skip=148`,
 unchanged (this fix isn't exercised by that corpus -- no test case
 constructs a 65+ attribute derivation).
+
+## M73 scope notes: fixed-output derivations' real `makeFixedOutputPath` formula
+
+Found while scoping M74's `hashDerivationModulo` work (the user asked
+for `d.nix`'s computed `hello.outPath` to actually MATCH real Nix's,
+not just stop crashing) -- M74's own verification plan calls for a
+"fixed-output input" test case (since `<nix/fetchurl.nix>`, M46, is
+fixed-output, and `hello`'s own `src` comes from it), which immediately
+exposed a pre-existing, **separate** bug: a fixed-output
+`derivation {...}` call's `outPath` never matched real Nix at all.
+`validate_output_hash_fields`'s own pre-existing comment admitted this
+outright ("it does NOT change how the derivation's store path is
+actually computed") -- the function only ever validated `outputHash`'s
+SHAPE, then let the output path fall through to the ordinary masked-
+ATerm-digest scheme every other (non-fixed-output) derivation uses,
+which is simply the wrong formula for this case. Confirmed directly:
+`derivation { ...; outputHashAlgo="sha256"; outputHashMode="flat";
+outputHash="00...00"; }.outPath` gave a different path on asnix than
+on real `nix-instantiate --eval --strict`.
+
+**Fix**: ported real Nix's actual `makeFixedOutputPath`
+(`~/nix/src/libstore/store-dir-config.cc`) verbatim. Two cases:
+- `sha256` + `outputHashMode = "recursive"`: the output path comes
+  straight from the content hash itself (`makeStorePath("source", hash,
+  name)`) -- no extra hashing step.
+- every other combination (the common case: `"flat"` mode, which is
+  `<nix/fetchurl.nix>`'s own default, M46): hash a
+  `"fixed:out:<r:-or-empty><algo>:<hex-hash>:"` payload string with
+  SHA-256, then feed *that* into the ordinary `makeStorePath("output:out",
+  ..., name)` formula (`compute_store_path`, unchanged, M8/M62). Renamed
+  `validate_output_hash_fields` to `decode_output_hash` (same
+  validation, now also returns the decoded raw digest bytes + resolved
+  algorithm so the above can actually use them -- a new
+  `compute_fixed_output_path` function implements the two-case formula,
+  reusing `compute_store_path` in both branches rather than
+  reimplementing its preimage/outer-hash/base32 pipeline a third time).
+
+A second, related gap found verifying the "recursive" case specifically:
+real Nix's `.drv` ATerm for a fixed-output derivation's `Outputs` entry
+carries real `hashAlgo`/`hash` fields (confirmed directly against a
+real `.drv`: `("out",path,"sha256","0d5f6015...")`, not `("out",path,
+"","")`, which is what every *other* derivation's entry correctly
+still has) -- needed because this derivation's own `drvPath` is hashed
+from this REAL (unmasked) ATerm text, so a wrong Outputs entry means a
+wrong `drvPath` even when `outPath` itself is already correct (exactly
+what the "recursive" verification case caught: `outPath` matched,
+`drvPath` didn't, until this was fixed). `"recursive"` mode additionally
+prepends `"r:"` to that ATerm field specifically (confirmed: `("out",
+path,"r:sha256",hash)`) -- a real Nix detail (`makeFileIngestionPrefix`)
+distinct from (and in addition to) the path-formula's own `"r:"`
+handling above. `AtermOutput` (`aterm.h`/`aterm.c`) gained `hash_algo`/
+`hash` fields, NULL for the ordinary (non-fixed-output) case every
+other derivation still uses unchanged.
+
+Verified against real `nix-instantiate --eval --strict`, both `outPath`
+AND `drvPath`, across: flat+sha256 (hex), SRI-format (`sha256-base64`,
+`outputHashAlgo=""`, `<nix/fetchurl.nix>`'s own shape, M48), recursive+
+sha256, and flat+md5 -- all four now match exactly.
+
+`make test`/`test-e2e` green (`tests/c/test_aterm.c` and its 4 call
+sites updated for `asnix_build_derivation_aterm`'s new `inputDrvs`/
+`inputSrcs` parameters, added ahead of M74's own need for them, passed
+as empty for now; `test_multi_output`'s unaffected by the new
+`AtermOutput` fields since C zero-initializes trailing struct-literal
+members). `make test-conformance` (mined subset) unchanged.
+`make test-nix-conformance`: `pass=624 fail=34 skip=148` before this
+fix, `pass=626 fail=32 skip=148` after -- +2 net, zero regressions.

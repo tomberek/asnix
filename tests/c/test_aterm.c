@@ -33,7 +33,8 @@ static void test_advanced_attributes_defaults(void) {
     };
 
     AtermOutput outs_masked[] = { { "out", "" } };
-    char *masked = asnix_build_derivation_aterm(outs_masked, 1, "my-system", "/bin/bash", args, 2, env_masked, 4);
+    char *masked = asnix_build_derivation_aterm(outs_masked, 1, NULL, 0, NULL, 0, "my-system", "/bin/bash", args, 2,
+                                                 env_masked, 4);
     check_eq(masked,
              "Derive([(\"out\",\"\",\"\",\"\")],[],[],\"my-system\",\"/bin/bash\",[\"-c\",\"echo hello > "
              "$out\"],[(\"builder\",\"/bin/bash\"),(\"name\",\"advanced-attributes-defaults\"),(\"out\",\"\"),("
@@ -49,7 +50,8 @@ static void test_advanced_attributes_defaults(void) {
         { "system", "my-system" },
     };
     AtermOutput outs_real[] = { { "out", real_out_path } };
-    char *real = asnix_build_derivation_aterm(outs_real, 1, "my-system", "/bin/bash", args, 2, env_real, 4);
+    char *real = asnix_build_derivation_aterm(outs_real, 1, NULL, 0, NULL, 0, "my-system", "/bin/bash", args, 2,
+                                               env_real, 4);
     char expected[512];
     snprintf(expected, sizeof(expected),
              "Derive([(\"out\",\"%s\",\"\",\"\")],[],[],\"my-system\",\"/bin/bash\",[\"-c\",\"echo hello > "
@@ -69,7 +71,7 @@ static void test_asnix_test_derivation(void) {
         { "system", "x86_64-linux" },
     };
     AtermOutput outs[] = { { "out", "/nix/store/jahl3hfswiax761wm6y2dxbhjgpjdnl1-asnix-test" } };
-    char *got = asnix_build_derivation_aterm(outs, 1, "x86_64-linux", "/bin/sh", args, 2, env, 4);
+    char *got = asnix_build_derivation_aterm(outs, 1, NULL, 0, NULL, 0, "x86_64-linux", "/bin/sh", args, 2, env, 4);
     check_eq(got,
              "Derive([(\"out\",\"/nix/store/jahl3hfswiax761wm6y2dxbhjgpjdnl1-asnix-test\",\"\",\"\")],[],[],"
              "\"x86_64-linux\",\"/bin/sh\",[\"-c\",\"echo hi\"],[(\"builder\",\"/bin/sh\"),(\"name\",\"asnix-test\"),"
@@ -82,7 +84,7 @@ static void test_escaping(void) {
     const char *args[] = { "line1\nline2", "a\"quote", "back\\slash", "tab\there" };
     AtermEnvVar env[] = { { "k", "v" } };
     AtermOutput outs[] = { { "out", "" } };
-    char *got = asnix_build_derivation_aterm(outs, 1, "s", "b", args, 4, env, 1);
+    char *got = asnix_build_derivation_aterm(outs, 1, NULL, 0, NULL, 0, "s", "b", args, 4, env, 1);
     check_eq(got, "Derive([(\"out\",\"\",\"\",\"\")],[],[],\"s\",\"b\",[\"line1\\nline2\",\"a\\\"quote\",\"back\\"
                   "\\slash\",\"tab\\there\"],[(\"k\",\"v\")])",
              "only \\n \\r \\t \\\" \\\\ are escaped, matching Nix's exact rule");
@@ -109,7 +111,7 @@ static void test_multi_output(void) {
         { "bin", "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-x-bin" },
         { "out", "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x" },
     };
-    char *got = asnix_build_derivation_aterm(outs, 2, "x86_64-linux", "/bin/sh", args, 2, env, 6);
+    char *got = asnix_build_derivation_aterm(outs, 2, NULL, 0, NULL, 0, "x86_64-linux", "/bin/sh", args, 2, env, 6);
     check_eq(got,
              "Derive([(\"bin\",\"/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-x-bin\",\"\",\"\"),(\"out\","
              "\"/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x\",\"\",\"\")],[],[],\"x86_64-linux\",\"/bin/sh\","

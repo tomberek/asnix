@@ -10,6 +10,7 @@
 #include "asnix/ir.h" /* asnix_force_for_print */
 #include "aterm.h"
 #include "base32.h"
+#include "base64.h"
 #include "builtins_compare.h" /* asnix_toJSON_cstr -- M69's __structuredAttrs support */
 #include "builtins_shared.h" /* asnix_bshared_make_primop, asnix_bshared_make_attrs */
 #include "eval_file.h"       /* asnix_eval_file -- M58's derivation.nix wrapper */
@@ -88,6 +89,13 @@ static int valid_hash_algo_str(const char *s, size_t len) {
            (len == 6 && memcmp(s, "sha256", 6) == 0) || (len == 6 && memcmp(s, "sha512", 6) == 0);
 }
 
+static int hex_digit_value(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
 static size_t hash_algo_digest_bytes(const char *s, size_t len) {
     if (len == 3) return 16;       /* md5 */
     if (len == 4) return 20;       /* sha1 */
@@ -95,8 +103,23 @@ static size_t hash_algo_digest_bytes(const char *s, size_t len) {
     return 64;                     /* sha512 */
 }
 
-static void validate_output_hash_fields(const char *output_hash, const char *output_hash_algo,
-                                         const char *output_hash_mode) {
+/* M73: on top of validate_output_hash_fields's existing well-formedness
+ * checks (unchanged below), this ALSO decodes a valid `outputHash` into
+ * raw digest bytes and reports the resolved algorithm -- needed by
+ * compute_fixed_output_path (below) to actually implement real Nix's
+ * `makeFixedOutputPath` formula, which this project validated the
+ * SHAPE of since M48 but never actually used for path computation
+ * (confirmed via a direct `nix-instantiate` comparison: a fixed-output
+ * `derivation {...}` call's `outPath` did NOT match real Nix at all --
+ * `validate_output_hash_fields`'s own pre-M73 comment admitted this
+ * outright, "it does NOT change how the derivation's store path is
+ * actually computed"). `*out_has_hash` is 0 if `output_hash` is NULL
+ * (not a fixed-output derivation at all) -- callers must check this
+ * before using `out_raw`/`out_raw_len`/`out_algo`. */
+static void decode_output_hash(const char *output_hash, const char *output_hash_algo,
+                                const char *output_hash_mode, int *out_has_hash, uint8_t out_raw[64],
+                                size_t *out_raw_len, const char **out_algo, size_t *out_algo_len) {
+    *out_has_hash = 0;
     if (output_hash_mode && strcmp(output_hash_mode, "flat") != 0 && strcmp(output_hash_mode, "recursive") != 0) {
         fprintf(stderr, "asnix: unknown hash mode '%s', expected 'flat' or 'recursive'\n", output_hash_mode);
         exit(1);
@@ -151,6 +174,32 @@ static void validate_output_hash_fields(const char *output_hash, const char *out
                 output_hash, (int)algo_len, algo);
         exit(1);
     }
+
+    if (hash_len == hex_len) {
+        for (size_t i = 0; i < n; i++) {
+            int hi = hex_digit_value(hash_body[2 * i]);
+            int lo = hex_digit_value(hash_body[2 * i + 1]);
+            if (hi < 0 || lo < 0) {
+                fprintf(stderr, "asnix: hash '%s' is not valid hex\n", output_hash);
+                exit(1);
+            }
+            out_raw[i] = (uint8_t)((hi << 4) | lo);
+        }
+    } else if (hash_len == b32_len) {
+        if (asnix_base32_decode(hash_body, hash_len, out_raw, n) != 0) {
+            fprintf(stderr, "asnix: hash '%s' is not valid base32\n", output_hash);
+            exit(1);
+        }
+    } else {
+        if (asnix_base64_decode(hash_body, hash_len, out_raw, 64) != (int64_t)n) {
+            fprintf(stderr, "asnix: hash '%s' is not valid base64\n", output_hash);
+            exit(1);
+        }
+    }
+    *out_has_hash = 1;
+    *out_raw_len = n;
+    *out_algo = algo;
+    *out_algo_len = algo_len;
 }
 
 /* The full `makeStorePath(type, hash, name)` (see store_path.h's header
@@ -185,6 +234,58 @@ static void compute_store_path(const char *type, const uint8_t inner_digest[32],
         fprintf(stderr, "asnix: derivation: computed store path too long\n");
         exit(1);
     }
+}
+
+/* M73: real Nix's `makeFixedOutputPath` (~/nix/src/libstore/
+ * store-dir-config.cc) -- computes a fixed-output derivation's "out"
+ * output path DIRECTLY from its content hash, NOT via the ordinary
+ * masked-ATerm-digest scheme (compute_store_path's own caller below,
+ * used by every OTHER derivation) -- a completely separate formula,
+ * only reached when `outputHash` is given. Verified directly against
+ * real Nix (a minimal fixed-output `derivation {...}` repro,
+ * see this milestone's scope notes) -- before this fix,
+ * `validate_output_hash_fields` (now `decode_output_hash`) only ever
+ * checked outputHash's SHAPE, never used it for path computation at
+ * all, so every fixed-output derivation's outPath was simply wrong.
+ * Two cases, ported verbatim from the real formula:
+ *  - sha256 + "recursive" (NAR) ingestion: the output path is `
+ *    makeStorePath("source", <the content hash itself>, name)` --
+ *    the raw hash feeds straight into `compute_store_path`'s own
+ *    preimage-then-outer-hash pipeline as its "inner digest", no
+ *    extra wrapping. (Real Nix's `type` additionally gets ":<ref>"
+ *    segments appended per referenced store path -- out of scope here,
+ *    matching this project's existing fixed-output `unsafeDiscardReferences`
+ *    scope cut: fixed-output derivations aren't allowed to reference
+ *    other store paths without it, and this project doesn't model that
+ *    attribute at all, so there are never any references to append.)
+ *  - every other combination (the common case in practice: "flat"
+ *    mode, which is `<nix/fetchurl.nix>`'s own default, M46): hash a
+ *    small "fixed:out:<modePrefix><algo>:<hex-hash>:" payload string
+ *    with SHA-256, then feed THAT hash into
+ *    `makeStorePath("output:out", ..., name)` the same way. */
+static void compute_fixed_output_path(const char *output_hash_mode, const uint8_t raw[64], size_t raw_len,
+                                       const char *algo, size_t algo_len, const char *name, char *out,
+                                       size_t out_cap) {
+    int is_recursive = output_hash_mode && strcmp(output_hash_mode, "recursive") == 0;
+    if (is_recursive && algo_len == 6 && memcmp(algo, "sha256", 6) == 0) {
+        uint8_t digest32[32];
+        memcpy(digest32, raw, 32);
+        compute_store_path("source", digest32, name, out, out_cap);
+        return;
+    }
+    static const char hexdigits[] = "0123456789abcdef";
+    char hexhash[128 + 1];
+    for (size_t i = 0; i < raw_len; i++) {
+        hexhash[2 * i] = hexdigits[raw[i] >> 4];
+        hexhash[2 * i + 1] = hexdigits[raw[i] & 0xf];
+    }
+    hexhash[2 * raw_len] = '\0';
+    char payload[256];
+    int n = snprintf(payload, sizeof(payload), "fixed:out:%s%.*s:%s:", is_recursive ? "r:" : "", (int)algo_len,
+                      algo, hexhash);
+    uint8_t digest[32];
+    sha256_or_die(payload, (size_t)n, digest);
+    compute_store_path("output:out", digest, name, out, out_cap);
 }
 
 Value asnix_prim_derivation(const Value *args, int64_t argc) {
@@ -449,7 +550,13 @@ Value asnix_prim_derivation(const Value *args, int64_t argc) {
         exit(1);
     }
     asnix_check_store_path_name(name);
-    validate_output_hash_fields(output_hash, output_hash_algo, output_hash_mode);
+    int has_fixed_hash;
+    uint8_t fixed_hash_raw[64];
+    size_t fixed_hash_raw_len = 0;
+    const char *fixed_hash_algo = NULL;
+    size_t fixed_hash_algo_len = 0;
+    decode_output_hash(output_hash, output_hash_algo, output_hash_mode, &has_fixed_hash, fixed_hash_raw,
+                        &fixed_hash_raw_len, &fixed_hash_algo, &fixed_hash_algo_len);
 
     /* `outputs` defaults to `["out"]` -- same default
      * ASNIX_DERIVATION_NIX_SOURCE's own `outputs ? [ "out" ]` already
@@ -507,10 +614,13 @@ Value asnix_prim_derivation(const Value *args, int64_t argc) {
     for (size_t o = 0; o < noutputs; o++) {
         masked_outs[o].name = output_names[o];
         masked_outs[o].path = "";
+        masked_outs[o].hash_algo = NULL;
+        masked_outs[o].hash = NULL;
     }
     qsort(masked_outs, noutputs, sizeof(masked_outs[0]), atermoutput_cmp);
 
-    char *masked_aterm = asnix_build_derivation_aterm(masked_outs, noutputs, system, builder, arg_strs, nargs, env, nenv);
+    char *masked_aterm = asnix_build_derivation_aterm(masked_outs, noutputs, NULL, 0, NULL, 0, system, builder,
+                                                       arg_strs, nargs, env, nenv);
     uint8_t masked_digest[32];
     sha256_or_die(masked_aterm, strlen(masked_aterm), masked_digest);
     free(masked_aterm);
@@ -532,14 +642,78 @@ Value asnix_prim_derivation(const Value *args, int64_t argc) {
             if (strcmp(env[i].key, output_names[o]) == 0) env[i].value = out_paths[o];
     }
 
+    /* M73: a fixed-output derivation's "out" path is NOT derived from
+     * `masked_digest` at all -- override it with the real formula
+     * (compute_fixed_output_path, above). Safe to index [0]/output_names[0]
+     * directly: `output_hash` (hence `has_fixed_hash`) is only ever
+     * accepted together with exactly one output named "out" (the
+     * `multiple outputs are not supported in fixed-output derivations`
+     * check above). The corresponding `env["out"]` entry (already set
+     * to the wrong, masked-digest-derived path by the loop just above)
+     * is corrected too, so the real ATerm pass below -- and `__json`,
+     * already serialized earlier for structured-attrs mode -- both see
+     * the right value where they read `env`/`out_paths` afterward. */
+    char fixed_hash_algo_cstr[16]; /* longest: "r:" + "sha256"/"sha512" + NUL */
+    char fixed_hash_algo_hex[128 + 1];
+    if (has_fixed_hash) {
+        compute_fixed_output_path(output_hash_mode, fixed_hash_raw, fixed_hash_raw_len, fixed_hash_algo,
+                                   fixed_hash_algo_len, name, out_paths[0], sizeof(out_paths[0]));
+        for (size_t i = 0; i < nenv; i++)
+            if (strcmp(env[i].key, "out") == 0) env[i].value = out_paths[0];
+
+        /* `fixed_hash_algo` may point into the MIDDLE of `output_hash`'s
+         * own buffer (e.g. the SRI-prefix-stripping case in
+         * decode_output_hash, "sha256-base64body" -- `algo` points at
+         * the whole string, bounded by `algo_len`, NOT NUL-terminated
+         * at that boundary) -- copy it into its own small, properly
+         * NUL-terminated buffer before handing it to AtermOutput, which
+         * (like every other field asnix_build_derivation_aterm reads)
+         * expects a plain C string, not a (pointer,length) pair.
+         * "recursive" mode additionally prepends "r:" to the ATerm's
+         * hashAlgo field (confirmed directly against a real .drv:
+         * `("out",path,"r:sha256",hash)`, not `("out",path,"sha256",
+         * hash)`) -- `makeFileIngestionPrefix`'s own "r:"/""  split,
+         * used here ONLY for this ATerm-serialization field, NOT for
+         * compute_fixed_output_path's path-computation formula above
+         * (whose two branches already each handle this distinction
+         * their own way: the recursive+sha256 branch bypasses the
+         * "fixed:out:..." payload scheme entirely, every other
+         * combination bakes its own "r:"/"" prefix into that payload
+         * string directly). */
+        int is_recursive = output_hash_mode && strcmp(output_hash_mode, "recursive") == 0;
+        snprintf(fixed_hash_algo_cstr, sizeof(fixed_hash_algo_cstr), "%s%.*s", is_recursive ? "r:" : "",
+                 (int)fixed_hash_algo_len, fixed_hash_algo);
+
+        static const char hexdigits[] = "0123456789abcdef";
+        for (size_t i = 0; i < fixed_hash_raw_len; i++) {
+            fixed_hash_algo_hex[2 * i] = hexdigits[fixed_hash_raw[i] >> 4];
+            fixed_hash_algo_hex[2 * i + 1] = hexdigits[fixed_hash_raw[i] & 0xf];
+        }
+        fixed_hash_algo_hex[2 * fixed_hash_raw_len] = '\0';
+    }
+
     AtermOutput real_outs[ASNIX_DRV_MAX_OUTPUTS];
     for (size_t o = 0; o < noutputs; o++) {
         real_outs[o].name = output_names[o];
         real_outs[o].path = out_paths[o];
+        /* M73: real Nix's ATerm `Outputs` section carries the real
+         * hashAlgo/hash fields for a fixed-output derivation (confirmed
+         * directly against a real .drv: `("out",path,"sha256","0d5f60...")`,
+         * NOT `("out",path,"","")`) -- needed so this derivation's OWN
+         * `drvPath` (hashed from this REAL, unmasked ATerm) matches real
+         * Nix. Every other derivation keeps "","" exactly as before. */
+        if (has_fixed_hash && strcmp(output_names[o], "out") == 0) {
+            real_outs[o].hash_algo = fixed_hash_algo_cstr;
+            real_outs[o].hash = fixed_hash_algo_hex;
+        } else {
+            real_outs[o].hash_algo = NULL;
+            real_outs[o].hash = NULL;
+        }
     }
     qsort(real_outs, noutputs, sizeof(real_outs[0]), atermoutput_cmp);
 
-    char *real_aterm = asnix_build_derivation_aterm(real_outs, noutputs, system, builder, arg_strs, nargs, env, nenv);
+    char *real_aterm = asnix_build_derivation_aterm(real_outs, noutputs, NULL, 0, NULL, 0, system, builder, arg_strs,
+                                                     nargs, env, nenv);
     uint8_t real_digest[32];
     sha256_or_die(real_aterm, strlen(real_aterm), real_digest);
     free(real_aterm);
