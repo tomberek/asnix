@@ -39,6 +39,7 @@ extern void asnix_op_le(void);
 extern void asnix_op_ge(void);
 extern void asnix_op_not(void);
 extern void asnix_op_update(void);
+extern void asnix_op_concat_lists(void);
 extern void asnix_op_assert_fail(void);
 extern void asnix_op_str_concat(void);
 extern void asnix_op_with(void);
@@ -81,6 +82,7 @@ void *asnix_handler_table[OP_COUNT] = {
     [OP_GE] = (void *)asnix_op_ge,
     [OP_NOT] = (void *)asnix_op_not,
     [OP_UPDATE] = (void *)asnix_op_update,
+    [OP_CONCAT_LISTS] = (void *)asnix_op_concat_lists,
     [OP_ASSERT_FAIL] = (void *)asnix_op_assert_fail,
     [OP_STR_CONCAT] = (void *)asnix_op_str_concat,
     [OP_WITH] = (void *)asnix_op_with,

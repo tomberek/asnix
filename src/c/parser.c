@@ -544,11 +544,37 @@ static Ast *parse_has_attr(Parser *p) {
     return e;
 }
 
-static Ast *parse_mul(Parser *p) {
+/* `++` (M23) -- binds tighter than `*`/`/`/`+`/`-` but looser than `?`/
+ * application, right-associative (`[1] ++ [2] ++ [3]` == `[1] ++ ([2] ++
+ * [3])`), matching real Nix's grammar exactly (`~/nix/src/libexpr/
+ * parser.y`: `%right CONCAT` declared after `%left '*' '/'` and before
+ * `%nonassoc '?'`/`%nonassoc NEGATE` -- i.e. CONCAT sits between MUL and
+ * HAS_ATTR in precedence). Added alongside builtins.fromTOML: asnix had
+ * no `++` token/grammar/op at all before this -- found needed because
+ * numtide/nix-conformance's own differential corpus for fromTOML
+ * (lang/corpora/toml.nix) builds its test-case list with `docs ++ times`,
+ * so every single fromTOML conformance case failed to even *parse*
+ * despite the parser itself being correct (see docs/architecture.md's
+ * Known Bugs list). */
+static Ast *parse_concat(Parser *p) {
     Ast *lhs = parse_has_attr(p);
+    if (cur(p)->kind == TOK_CONCAT) {
+        advance(p);
+        Ast *rhs = parse_concat(p); /* right-recurse: right-associative */
+        Ast *n = asnix_ast_new(AST_BINOP);
+        n->as.binop.op = 'c';
+        n->as.binop.lhs = lhs;
+        n->as.binop.rhs = rhs;
+        return n;
+    }
+    return lhs;
+}
+
+static Ast *parse_mul(Parser *p) {
+    Ast *lhs = parse_concat(p);
     while (cur(p)->kind == TOK_STAR) {
         advance(p);
-        Ast *rhs = parse_has_attr(p);
+        Ast *rhs = parse_concat(p);
         Ast *n = asnix_ast_new(AST_BINOP);
         n->as.binop.op = '*';
         n->as.binop.lhs = lhs;
@@ -592,7 +618,12 @@ static Ast *parse_add(Parser *p) {
  *   parse_update //             right-assoc, chainable
  *   parse_not   ! (prefix)      binds the rest of this chain down to parse_add
  *   parse_add   + -             (already existed, M4)
+ *   parse_mul   * /             (already existed, M4)
+ *   parse_concat ++             right-assoc, chainable -- binds TIGHTER than
+ *                                * / + -, looser than ? and application (M23,
+ *                                see parse_concat's own comment above parse_mul)
  *
+
  * `->`'s precedence/associativity (lowest, right-assoc) cross-checked
  * against cppnix's real grammar (~/nix/src/libexpr/parser.y: `%right
  * IMPL`, declared before `%left OR`, i.e. binding looser).

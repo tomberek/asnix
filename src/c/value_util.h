@@ -75,6 +75,12 @@ Value asnix_concat_strings(const Value *parts, int64_t count);
  * whenever both operands aren't already known to be ints. */
 Value asnix_add_values(Value lhs, Value rhs);
 
+/* `++` (M23): both operands must already be verified TAG_LIST by the
+ * caller (op_concat_lists.S does the type check, same split OP_UPDATE
+ * uses for asnix_attrs_update) -- pushes a fresh List holding `lhs`'s
+ * elements followed by `rhs`'s, in order. */
+Value asnix_concat_lists(Value lhs, Value rhs);
+
 /* Arena-allocates a NUL-terminated copy of an asnix String's bytes.
  * asnix strings are never NUL-terminated themselves (see heap.h), but
  * code boundaries that expect plain C strings (aterm.c's API) need one;

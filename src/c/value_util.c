@@ -171,6 +171,25 @@ Value asnix_add_values(Value lhs, Value rhs) {
     return result;
 }
 
+/* `++` (M23) -- callers (op_concat_lists.S) have already verified both
+ * operands are TAG_LIST; this is just the plain-C "copy both element
+ * arrays into one fresh List", the same split OP_UPDATE already uses for
+ * '//' (asnix_attrs_update, attrs_update.c). */
+Value asnix_concat_lists(Value lhs, Value rhs) {
+    const char *lbase = (const char *)(lhs.raw & ~(uint64_t)ASNIX_TAG_MASK);
+    const char *rbase = (const char *)(rhs.raw & ~(uint64_t)ASNIX_TAG_MASK);
+    int64_t lcount = *(const int64_t *)(lbase + ASNIX_LIST_OFF_COUNT);
+    int64_t rcount = *(const int64_t *)(rbase + ASNIX_LIST_OFF_COUNT);
+    int64_t total = lcount + rcount;
+
+    void *mem = asnix_arena_alloc(8 + (uint64_t)total * sizeof(Value));
+    *(int64_t *)((char *)mem + ASNIX_LIST_OFF_COUNT) = total;
+    char *out = (char *)mem + ASNIX_LIST_OFF_ELEMS;
+    if (lcount > 0) memcpy(out, lbase + ASNIX_LIST_OFF_ELEMS, (size_t)lcount * sizeof(Value));
+    if (rcount > 0) memcpy(out + (size_t)lcount * sizeof(Value), rbase + ASNIX_LIST_OFF_ELEMS, (size_t)rcount * sizeof(Value));
+    return (Value){ .raw = (uint64_t)(uintptr_t)mem | ASNIX_TAG_LIST };
+}
+
 char *asnix_string_value_to_cstr(Value string_val) {
     const char *s = (const char *)(string_val.raw & ~0x7ULL);
     int64_t len = *(const int64_t *)(s + ASNIX_STRING_OFF_LEN);

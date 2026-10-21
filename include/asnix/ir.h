@@ -131,6 +131,13 @@ enum {
     OP_NOT,         /* in-place: top of stack must be TAG_IMM true/false, else fatal */
     OP_UPDATE,      /* pops rhs,lhs (both must be TAG_ATTRS, else fatal); pushes the
                       * right-biased sorted-array merge (asnix_attrs_update, src/c/attrs_update.c) */
+    OP_CONCAT_LISTS, /* `++` (M23, added alongside builtins.fromTOML -- found needed because
+                       * numtide/nix-conformance's lang/corpora/toml.nix itself uses `docs ++
+                       * times`, and asnix had no `++` token/grammar/op at all before this; see
+                       * docs/architecture.md's Known Bugs list). Pops rhs,lhs (both must be
+                       * TAG_LIST, else fatal); pushes a fresh List holding lhs's elements
+                       * followed by rhs's (asnix_concat_lists, src/c/value_util.c) -- same
+                       * "glue is asm, the real logic is a plain C copy" split as OP_UPDATE. */
     OP_ASSERT_FAIL, /* b = pool index of {msg ptr, msg len}; unconditionally asnix_fatal()s --
                       * compiler.c's AST_ASSERT only reaches this on the cond-false branch */
     OP_STR_CONCAT, /* strings: a = count; pops `count` values (reverse push order like
