@@ -14,6 +14,7 @@
 #include "builtins_list.h"
 #include "builtins_list2.h"
 #include "builtins_misc.h"
+#include "builtins_regex.h"
 #include "derivation.h"
 #include "eval_file.h"
 #include "hash_shim.h"
@@ -264,12 +265,13 @@ Value asnix_make_toString_primop(void) {
 }
 
 /* Merges this file's own BUILTINS[] with the builtins-expansion modules
- * added across two passes (M17: list/attrs/misc; this pass: closure/
- * list2/attrs2/compare), each kept in its own translation unit so agents
- * working in parallel (M17) or on independent feature batches (this pass)
- * don't textually collide on one shared array -- see builtins_list.h/
- * builtins_attrs.h/builtins_misc.h/builtins_closure.h/builtins_list2.h/
- * builtins_attrs2.h/builtins_compare.h's own "integration step" comments,
+ * added across three passes (M17: list/attrs/misc; M19: closure/list2/
+ * attrs2/compare; this pass: regex), each kept in its own translation
+ * unit so agents working in parallel (M17) or on independent feature
+ * batches (M19, this pass) don't textually collide on one shared array
+ * -- see builtins_list.h/builtins_attrs.h/builtins_misc.h/
+ * builtins_closure.h/builtins_list2.h/builtins_attrs2.h/
+ * builtins_compare.h/builtins_regex.h's own "integration step" comments,
  * which this function fulfills.
  *
  * Two source shapes, merged via two small adapter loops: the plain
@@ -288,11 +290,12 @@ Value asnix_make_builtins_attrs(void) {
     const AsnixBuiltinDef *const list_shaped_tables[] = { asnix_builtins_list, ASNIX_ATTRS_BUILTINS };
     const size_t list_shaped_counts[] = { asnix_builtins_list_count, ASNIX_ATTRS_BUILTINS_COUNT };
     const AsnixBuiltinMiscDef *const build_tables[] = {
-        ASNIX_BUILTINS_MISC, ASNIX_CLOSURE_BUILTINS, ASNIX_LIST2_BUILTINS, ASNIX_ATTRS2_BUILTINS, ASNIX_COMPARE_BUILTINS,
+        ASNIX_BUILTINS_MISC, ASNIX_CLOSURE_BUILTINS, ASNIX_LIST2_BUILTINS,
+        ASNIX_ATTRS2_BUILTINS, ASNIX_COMPARE_BUILTINS, ASNIX_REGEX_BUILTINS,
     };
     const size_t build_counts[] = {
         ASNIX_BUILTINS_MISC_COUNT, ASNIX_CLOSURE_BUILTINS_COUNT, ASNIX_LIST2_BUILTINS_COUNT,
-        ASNIX_ATTRS2_BUILTINS_COUNT, ASNIX_COMPARE_BUILTINS_COUNT,
+        ASNIX_ATTRS2_BUILTINS_COUNT, ASNIX_COMPARE_BUILTINS_COUNT, ASNIX_REGEX_BUILTINS_COUNT,
     };
 
     size_t n = 0;
