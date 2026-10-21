@@ -75,7 +75,8 @@ what's actually implemented and the scope decisions made along the way.
 | M60 — `builtins.unsafeDiscardStringContext` (no-op, matching M54's getContext/appendContext scope cut) | done (see below) |
 | M61 — real string-context tracking (`getContext`/`appendContext`/derivation-input propagation) | investigated, **no fix** (see below) |
 | M62 — `derivationStrict` generalized to real multi-output derivations (`outputs = [ "out" "bin" ... ]`), one distinct store path per declared output | done, **scoped** (see below) |
-| M63+ | not started |
+| M63 — `asnix_apply`'s PrimOp path didn't populate `args[-1]` ("self"), crashing any of this codebase's own self-capturing curried builtins (`elemAt`, `map`, `filter`, `foldl'`) when invoked through it rather than an ordinary `OP_CALL` | done (see below) |
+| M64+ | not started |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
 
@@ -6226,7 +6227,7 @@ Verified directly against real Nix (`nix-instantiate --eval --strict`
 on the exact repro above): `d.bin.outPath` and `d.outPath` are
 different store paths, `d.out.outPath == d.outPath` still holds (M58's
 self-reference property, specifically for the `"out"` output), both
-captured byte-for-byte in two new `tests/e2e/m61_derivation_multi_
+captured byte-for-byte in two new `tests/e2e/m62_derivation_multi_
 output*.nix` fixtures (one boolean-property check, one exact-store-
 path check against the real paths `nix-instantiate` computed for `x`/
 `x-bin`).
@@ -6253,3 +6254,70 @@ actual input derivations, not just blanked outputs of the SAME
 derivation) and `eval-okay-derivation-legacy.nix`/`eval-okay-drv-
 structured-attrs.nix` (`__structuredAttrs`, a wholly separate JSON-
 based attribute-passing mode this project has no support for at all).
+
+## M63 scope notes: `asnix_apply`'s PrimOp path didn't populate `args[-1]` ("self")
+
+Found continuing to chase `d.nix` right after M62: `./asnix d.nix`
+dumped core. gdb's backtrace (unreliable past 1-2 frames in this
+threaded-dispatch evaluator, as usual, but the top frame was solid)
+showed a segfault inside `prim_elemAt_stage2`
+(`builtins_list.c:290`, `Value list = self_captures(args)[0];`),
+called from `asnix_apply` (`apply.S`), called from somewhere inside
+`foldl'`'s own C loop. `self_captures()` (`builtins_list.c`) recovers
+a curried stage PrimOp's own trailing captured Value(s) by reading
+`args[-1]` -- a real invariant `op_call.S` guarantees for ordinary
+in-language calls (the callee's own tagged Value sits in the VALSTACK
+slot immediately before its arguments), which this module's own
+header comment already documents, including an explicit (but, it
+turned out, incomplete) argument for why `asnix_apply` never needs to
+satisfy it: "this module itself only ever uses asnix_apply to call the
+*user-supplied* function ... never its own curried stages".
+
+That argument missed one case: the user-supplied function CAN, after
+being partially applied, evaluate to one of THIS module's own self-
+capturing PrimOps. Minimal repro (verified identical result on real
+Nix, `30`, vs. a clean segfault on asnix before this fix):
+```
+builtins.foldl' (acc: builtins.elemAt [10 20 30]) 0 [0 1 2]
+```
+`op`'s first application (`asnix_apply(op, &acc, 1)` inside
+`builtins_list.c`'s `apply2`) is an ordinary Closure call -- fine, no
+issue -- and returns `elemAt [10 20 30]`, itself a curried, self-
+capturing `prim_elemAt_stage2` PrimOp instance. `apply2`'s SECOND call
+(`asnix_apply(step1, &elem, 1)`) invokes that PrimOp directly through
+`asnix_apply`'s own PrimOp branch, which built its own scratch args
+buffer with nothing meaningful before it -- `self_captures`'s
+`args[-1]` read garbage off `asnix_apply`'s stack frame, segfaulting.
+Same risk applies to `map`'s `f`/`filter`'s `pred` (both also
+self-capturing via this exact mechanism), not just `foldl'`'s `op`;
+only `foldl'` happened to be what `d.nix` hit first.
+
+**Fix** (`src/asm/apply.S`): the PrimOp branch's scratch buffer gained
+a fifth header slot ("self", holding the original tagged PrimOp Value
+straight from `%rdi`, which is never clobbered before this point) at
+offset 32, with the forced-argument copy shifted from offset 32 to 40
+to make room -- `ASNIX_APPLY_PRIMOP_SCRATCH_BYTES` stays 104 bytes
+unchanged (40-byte header + 8 Value slots, still satisfying the
+existing `%rsp ≡ 0 (mod 16)` requirement with no new padding needed).
+`args[-1]` (i.e. offset 32, one slot before the offset-40 forced-args
+copy handed to `fn`) now holds exactly what `op_call.S` would have put
+there, so `self_captures` works identically regardless of which path
+invoked the PrimOp. Only fixes the FORCING path; the narrower
+`NOFORCE` path (`foldl'`'s stage2 specifically, M53) still hands `fn`
+the caller's own raw buffer with no slot before it (that buffer isn't
+owned by this function, so there's nothing to retroactively add a slot
+to) -- not reproduced, not fixed here, a consistent, narrower instance
+of the exact same pre-existing limitation, not a new gap.
+
+Verified: the minimal repro above now returns `30` on asnix, matching
+real Nix exactly; `builtins.foldl' (acc: i: acc ++ [(builtins.elemAt
+[10 20 30] i)]) [] [0 1 2]` and `builtins.map (builtins.elemAt [10 20
+30]) [0 1 2]` (two shapes that happened NOT to trigger the bug, since
+their intermediate values go through an ordinary lambda/lazy-thunk
+path instead) still both give `[ 10 20 30 ]`, confirming no regression
+in the already-working cases. `./asnix d.nix` progresses past this
+exact segfault to whatever comes next in the standing chase.
+
+`make test`/`test-e2e` both green (one new `m63_*` fixture, verified
+against real `nix-instantiate --eval --strict` first), zero
+regressions. `make test-conformance` (mined subset) unchanged.

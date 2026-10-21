@@ -45,13 +45,48 @@
     // arity in this codebase (max 3, e.g. replaceStrings/foldl/foldr),
     // and the fatal fallback below handles anything larger cleanly
     // rather than silently overflowing. Header (fn ptr/argc/original
-    // args ptr/loop index, 4 x 8 bytes) + 8 Value slots = 96, plus 8
-    // bytes of padding so the total is ≡ 8 (mod 16) -- required because
-    // %rsp is already 8 mod 16 at this function's own entry (the
-    // ordinary call-site convention: the return address consumes 8 of
-    // the 16), and subtracting an amount ≡ 8 (mod 16) is exactly what
-    // brings %rsp to 0 mod 16 for every `call` made while this scratch
-    // region is live.
+    // args ptr/loop index/self, 5 x 8 bytes = 40) + 8 Value slots (64)
+    // = 104, already ≡ 8 (mod 16) with no extra padding needed --
+    // required because %rsp is already 8 mod 16 at this function's own
+    // entry (the ordinary call-site convention: the return address
+    // consumes 8 of the 16), and subtracting an amount ≡ 8 (mod 16) is
+    // exactly what brings %rsp to 0 mod 16 for every `call` made while
+    // this scratch region is live.
+    //
+    // M62-adjacent (found via d.nix): "self" (header offset 32, forced-
+    // args copy starting right after at 40) exists so that `args[-1]`
+    // -- which builtins_list.c's self_captures() reads to recover a
+    // curried stage PrimOp's own trailing captured Value(s), see that
+    // function's header comment -- is populated the same way op_call.S
+    // already populates it for an ordinary in-language call. Before
+    // this fix, nothing here ever wrote a slot before the forced-args
+    // copy, so calling one of THIS codebase's own self-capturing
+    // PrimOps (e.g. `builtins.elemAt someList`, a curried arity-1
+    // PrimOp instance) through asnix_apply -- which happens whenever a
+    // builtin like foldl'/map hands a *user-supplied* function to
+    // apply2/asnix_apply, and that function's body itself evaluates to
+    // one of these PrimOps (confirmed minimal repro:
+    // `builtins.foldl' (acc: builtins.elemAt [1 2 3]) 0 [0]`, where
+    // `op`'s first application returns `elemAt someList` -- itself a
+    // self-capturing PrimOp -- which is then applied a SECOND time via
+    // apply2's own asnix_apply call, not an ordinary OP_CALL) read
+    // whatever garbage happened to sit one slot before this function's
+    // own scratch buffer, segfaulting. Only fixes the forcing path
+    // (`.Lapply_primop_force_done`'s `args[-1]`) -- the NOFORCE path
+    // just below (`.Lapply_primop_skip_force`) still hands `fn` the
+    // caller's own raw buffer with no slot before it, since that
+    // buffer belongs to code outside this function (apply2 and
+    // friends' own small on-stack arrays) and can't retroactively gain
+    // one; narrower, pre-existing, consistent with the same "only the
+    // OP_CALL convention populates args[-1]" limitation self_captures'
+    // own header comment already names, not a new gap this fix
+    // introduces. NOFORCE is used only by foldl''s stage2 (M53), which
+    // itself calls self_captures -- so the identical crash is still
+    // reachable if a `foldl' op` (after exactly one application) is
+    // itself handed to another apply2/asnix_apply call site rather
+    // than an ordinary Nix-level application; not reproduced, not fixed
+    // here, same documented-scope-cut spirit as every other narrower
+    // limitation in this codebase.
     .equ ASNIX_APPLY_MAX_PRIMOP_ARGC, 8
     .equ ASNIX_APPLY_PRIMOP_SCRATCH_BYTES, 104
 
@@ -158,6 +193,8 @@ asnix_apply:                            // Value asnix_apply(Value fn, const Val
     movq %rdx, 8(%rsp)                  // argc
     movq %rsi, 16(%rsp)                 // original args ptr
     movq $0, 24(%rsp)                   // loop index i
+    movq %rdi, 32(%rsp)                 // self (tagged PrimOp Value, still intact in %rdi here --
+                                         // see this scratch layout's header comment above)
 
     cmpq $0, %r8
     jne .Lapply_primop_skip_force
@@ -170,12 +207,14 @@ asnix_apply:                            // Value asnix_apply(Value fn, const Val
     movq (%rsi, %rcx, 8), %rdi          // args[i]
     call asnix_force_for_print
     movq 24(%rsp), %rcx                 // reload i (clobbered by the call)
-    movq %rax, 32(%rsp, %rcx, 8)        // forced_args[i] = result
+    movq %rax, 40(%rsp, %rcx, 8)        // forced_args[i] = result (offset 40: right after the
+                                         // "self" slot at 32, see this scratch layout's header
+                                         // comment -- NOT 32 itself, which would overwrite self)
     incq %rcx
     movq %rcx, 24(%rsp)
     jmp .Lapply_primop_force_loop
 .Lapply_primop_force_done:
-    leaq 32(%rsp), %rsi                 // args ptr = our forced local copy
+    leaq 40(%rsp), %rsi                 // args ptr = our forced local copy (args[-1] == self, at 32)
     jmp .Lapply_primop_call
 .Lapply_primop_skip_force:
     movq 16(%rsp), %rsi                 // args ptr = original, unforced (e.g. tryEval via apply)
