@@ -65,6 +65,19 @@ static void validate_output_hash_fields(const char *output_hash, const char *out
         fprintf(stderr, "asnix: unknown hash mode '%s', expected 'flat' or 'recursive'\n", output_hash_mode);
         exit(1);
     }
+    /* M48: an EMPTY `outputHashAlgo` means "unspecified, infer the
+     * algorithm from outputHash's own SRI/legacy prefix instead"
+     * (confirmed: `outputHashAlgo = ""; outputHash = "sha256-...";`
+     * evaluates fine on real Nix -- `<nix/fetchurl.nix>`'s own default
+     * for `outputHashAlgo` is literally `if hash != "" then "" else
+     * ...`, i.e. this exact empty-string case, found evaluating real
+     * nixpkgs). Treated the same as `output_hash_algo == NULL` below
+     * (both mean "nothing known from this source yet, derive it from
+     * output_hash's own prefix instead") -- this check must happen
+     * BEFORE the unknown-algorithm rejection, which previously fired
+     * on `""` itself before ever reaching the SRI-prefix-stripping
+     * logic further down that would have resolved it correctly. */
+    if (output_hash_algo && output_hash_algo[0] == '\0') output_hash_algo = NULL;
     if (output_hash_algo && !valid_hash_algo_str(output_hash_algo, strlen(output_hash_algo))) {
         fprintf(stderr, "asnix: unknown hash algorithm '%s'\n", output_hash_algo);
         exit(1);

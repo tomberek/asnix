@@ -60,7 +60,8 @@ what's actually implemented and the scope decisions made along the way.
 | M45 — `builtins.toFile` | done, **scoped** (see below) |
 | M46 — `<nix/fetchurl.nix>` virtual-corepkgs special case | done, **scoped** (see below) |
 | M47 — list-to-string coercion (`toString`/derivation env vars) | done, **scoped** (see below) |
-| M48-M49 | not started |
+| M48 — `outputHashAlgo = ""` wrongly rejected as an unknown hash algorithm | done (see below) |
+| M49 | not started |
 | M50 — name the specific value/field in 6 more generic fatal-path error messages | done (see below) |
 | M51 — float literals: lexer, heap-boxed Value kind, `+`/`-`/`*`/`/`/comparison promotion, printer, `floor`/`ceil`/`isFloat`, `toJSON`/`fromJSON`/`fromTOML` float support | done, **scoped** (see below) |
 | M52 — fix `with`-frame leaking into a sibling expression (core evaluator fix) | done, **scoped** (see below) |
@@ -4944,6 +4945,39 @@ just the aggregate count) that exactly these 3 tests are the only
 change -- 663 passed before this fix, 660 after, net -3, entirely
 accounted for by the documented `outputs`-validation gap above, not a
 regression in list-to-string coercion's own correctness.
+
+## M48 scope notes: `outputHashAlgo = ""` wrongly rejected as an unknown hash algorithm
+
+Found continuing to chase `d.nix` right after M47: once `fetchurl.nix`'s
+own derivation call evaluates far enough to reach
+`validate_output_hash_fields` (`derivation.c`), it fataled with "unknown
+hash algorithm ''" -- `<nix/fetchurl.nix>`'s own default for
+`outputHashAlgo` is literally `if hash != "" then "" else ...`, i.e. an
+empty string, not absent/NULL, whenever `outputHash` is set and
+`outputHashAlgo` is not (the common real-world case for a plain SRI
+hash). Verified directly against real Nix: `derivation { ...;
+outputHashAlgo = ""; outputHash = "sha256-...";
+}` evaluates fine there -- the empty string means "unspecified, infer
+the algorithm from `outputHash`'s own SRI/legacy prefix instead," which
+`validate_output_hash_fields` already had logic for (the
+`strchr(output_hash, '-')`/`:'` prefix-stripping block later in the same
+function) -- it just never got a chance to run, since the
+unknown-algorithm check fired on the empty string first.
+
+Fix: normalize `output_hash_algo[0] == '\0'` to `NULL` right before the
+unknown-algorithm check (`derivation.c`'s
+`validate_output_hash_fields`), so an empty string is treated exactly
+like "not given at all" and falls through to the existing
+SRI-prefix-resolution logic. Verified both directions against real
+Nix: `outputHashAlgo = ""` with a valid SRI `outputHash` now succeeds
+(matches `nix-instantiate --eval --strict` exactly); `outputHashAlgo =
+"bogus"` still correctly fatals with "unknown hash algorithm 'bogus'"
+on both asnix and real Nix (a genuinely-unknown non-empty algorithm
+name is unaffected).
+
+`make test`/`test-e2e` green (one new `m48_*` fixture); `test-conformance`:
+688 passed, 114 failed, 0 known, 62 skipped -- identical to the
+pre-fix count (no regressions; not directly exercised by that corpus).
 
 ## M57 scope notes: conformance grab-bag
 
