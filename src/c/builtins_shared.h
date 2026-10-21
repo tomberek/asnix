@@ -58,6 +58,32 @@ void asnix_bshared_fatal(const char *who, const char *msg);
 /* OP_SELECT's (op_select.S) static-attribute-missing path -- see the
  * full comment in builtins_shared.c. */
 _Noreturn void asnix_bshared_select_missing_fatal(uint32_t sym);
+
+/* M50: shared "what kind of value is this" helper for fatal-path error
+ * messages -- see the long comment above its definition in
+ * builtins_shared.c. Returns a static, non-owned "a/an <kind>" string
+ * (int/bool/null/string/path/list/attrset/function/...), the same
+ * tag -> name mapping builtins.c's `prim_typeOf` already established.
+ * Non-static (unlike most one-off helpers in this file) because
+ * attrs_update.c's asnix_attrs_insert_dynamic needs it too. */
+const char *asnix_bshared_type_name(Value v);
+
+/* OP_SELECT's (op_select.S) "selection target is not an attrset" fatal
+ * path -- names the actual type via asnix_bshared_type_name above. `v`
+ * is the still-tagged Value popped off VALSTACK. */
+_Noreturn void asnix_bshared_select_type_fatal(Value v);
+
+/* OP_CALL's (op_call.S) "call target is not a function" fatal path --
+ * same idea. `v` is the still-tagged callee Value. */
+_Noreturn void asnix_bshared_call_type_fatal(Value v);
+
+/* OP_CHECK_FORMALS's (op_check_formals.S) two lambda-pattern-mismatch
+ * fatal paths -- names the specific required/unexpected field, mirroring
+ * asnix_bshared_select_missing_fatal's M36 precedent. `sym` is an
+ * already-interned symbol id. */
+_Noreturn void asnix_bshared_cf_missing_fatal(uint32_t sym);
+_Noreturn void asnix_bshared_cf_extra_fatal(uint32_t sym);
+
 void asnix_bshared_require_tag(Value v, int tag, const char *who, const char *what);
 #define ASNIX_REQUIRE_ATTRS(v, who) asnix_bshared_require_tag((v), ASNIX_TAG_ATTRS, (who), "an attrset")
 #define ASNIX_REQUIRE_STRING(v, who) asnix_bshared_require_tag((v), ASNIX_TAG_PTR, (who), "a string")

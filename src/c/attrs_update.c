@@ -7,6 +7,7 @@
 
 #include "asnix/arena.h"
 #include "asnix/heap.h"
+#include "builtins_shared.h" /* asnix_bshared_type_name, see M50 */
 #include "symtab.h"
 #include "value_util.h"
 
@@ -72,7 +73,8 @@ Value asnix_attrs_insert_dynamic(Value attrs, Value name_val, Value value) {
         return attrs;
     }
     if (asnix_tag_of(name_val) != ASNIX_TAG_PTR || asnix_value_is_path(name_val)) {
-        fprintf(stderr, "asnix: a dynamic '${...}' attribute name must be a string\n");
+        fprintf(stderr, "asnix: a dynamic '${...}' attribute name must be a string (got %s)\n",
+                asnix_bshared_type_name(name_val));
         exit(1);
     }
     int64_t name_len;

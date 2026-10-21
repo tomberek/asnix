@@ -5,9 +5,6 @@
 #include "asnix/value.h"
 
     .section .rodata
-.Lmsg_call_type:
-    .ascii "asnix: call target is not a function, aborting\n"
-    .equ ASNIX_MSG_CALL_TYPE_LEN, . - .Lmsg_call_type
 .Lmsg_call_arity:
     .ascii "asnix: call argument count does not match arity, aborting\n"
     .equ ASNIX_MSG_CALL_ARITY_LEN, . - .Lmsg_call_arity
@@ -171,9 +168,15 @@ asnix_op_call:                          // a = argc
     jmp *%rax
 
 .Lop_call_type_error:
-    leaq .Lmsg_call_type(%rip), %rdi
-    movq $ASNIX_MSG_CALL_TYPE_LEN, %rsi
-    jmp asnix_fatal
+    // M50: names the actual type of the uncallable target (real `call`
+    // into C, same reasoning as op_select.S's .Lselect_type_error/M36:
+    // %rsp is already 16-byte aligned entering asnix_op_call -- nothing
+    // has been pushed yet on this path -- and asnix_bshared_call_type_
+    // fatal is _Noreturn, so the pushed return address is never used).
+    // %rdx still holds the original tagged callee Value here (loaded
+    // above, before any masking).
+    movq %rdx, %rdi
+    call asnix_bshared_call_type_fatal
 .Lop_call_arity_error:
     leaq .Lmsg_call_arity(%rip), %rdi
     movq $ASNIX_MSG_CALL_ARITY_LEN, %rsi

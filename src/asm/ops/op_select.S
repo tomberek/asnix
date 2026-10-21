@@ -4,9 +4,6 @@
 #include "asnix/value.h"
 
     .section .rodata
-.Lmsg_select_type:
-    .ascii "asnix: '.' selection target is not an attrset, aborting\n"
-    .equ ASNIX_MSG_SELECT_TYPE_LEN, . - .Lmsg_select_type
 .Lmsg_blackhole:
     .ascii "asnix: infinite recursion forcing a thunk (blackhole), aborting\n"
     .equ ASNIX_MSG_BLACKHOLE_LEN, . - .Lmsg_blackhole
@@ -90,9 +87,16 @@ asnix_op_select:                        // a = symbol id; pops an attrset, pushe
     jmp *%rax
 
 .Lselect_type_error:
-    leaq .Lmsg_select_type(%rip), %rdi
-    movq $ASNIX_MSG_SELECT_TYPE_LEN, %rsi
-    jmp asnix_fatal
+    // M50: names the actual type of the non-attrset target (real `call`
+    // into C, not a tail `jmp` -- same reasoning as .Lselect_missing
+    // below/M36: %rsp is already 16-byte aligned entering this handler,
+    // asnix_bshared_select_type_fatal is _Noreturn so the pushed return
+    // address is never used, and this only ever runs immediately before
+    // exit(1), so it costs nothing on the hot (successful select) path
+    // above. %rax still holds the original tagged Value here (loaded at
+    // handler entry, not yet `andq $-8`'d).
+    movq %rax, %rdi
+    call asnix_bshared_select_type_fatal
 .Lselect_missing:
     // Names the attribute (real Nix's own "attribute 'x' missing"
     // wording) -- a real `call` into C (not a tail `jmp` like the other
