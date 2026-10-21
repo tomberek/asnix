@@ -46,6 +46,38 @@ asnix_op_call:                          // a = argc
 
     pushq %rsi                           // save IP
     pushq %rdi                           // save ENV (2 pushes, stays 16-byte aligned)
+
+    // M25: force each argument before handing it to the native C
+    // function. Native primops read args[i]'s raw tag directly -- they
+    // have no way to force a thunk themselves (that needs the full
+    // dispatch machinery, see asnix_force_for_print, src/asm/force.S).
+    // Previously a no-op in practice: every argument reaching here was
+    // already forced by construction, since call arguments used to be
+    // compiled eagerly (call-by-value). Now that compiler.c's AST_APP
+    // wraps every argument in a genuine thunk (M25, for real Nix's
+    // call-by-need semantics -- e.g. lazy fixed points like `let f = x:
+    // {a=1;}; self = f self; in self.a`), a primop could otherwise
+    // receive an unforced Thunk and misread its raw bits as if it were
+    // already the right tag -- silent corruption, not a clean error.
+    // %r9 is a loop counter spilled to a fixed one-time-allocated stack
+    // slot (not push/pop'd per iteration) specifically to keep %rsp
+    // 16-byte aligned across every `call` here, matching this file's
+    // existing push-in-pairs discipline.
+    subq $16, %rsp
+    xorq %r9, %r9
+.Lop_call_force_args:
+    cmpq %rbx, %r9
+    jge .Lop_call_force_args_done
+    movq 8(%r15, %r9, 8), %rdi
+    movq %r9, (%rsp)
+    call asnix_force_for_print
+    movq (%rsp), %r9
+    movq %rax, 8(%r15, %r9, 8)
+    incq %r9
+    jmp .Lop_call_force_args
+.Lop_call_force_args_done:
+    addq $16, %rsp
+
     leaq 8(%r15), %rdi                   // arg1 = args ptr (straight into VALSTACK, no Env copy)
     movq %rbx, %rsi                      // arg2 = argc
     call *%rbp

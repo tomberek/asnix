@@ -37,7 +37,8 @@ what's actually implemented and the scope decisions made along the way.
 | M22 — real-nixpkgs-evaluation sweep: block comments, `->`, more bare globals, dynamic attrs, directory-import fix | done, **in progress** (see below -- real nixpkgs still doesn't fully evaluate) |
 | M23 — numtide/nix-conformance sweep (3 parallel passes): `++`/`/` operators, attrpath binding sugar, hyphenated identifiers, map/mapAttrs laziness fix, builtins-expansion pass, `builtins.match`/`builtins.split` (POSIX regex), `builtins.fromTOML` (hand-written TOML parser) | done, **scoped** (see below) |
 | M24 — quoted-string attrpath segments (`"a b"` as a binding/select/has-attr key) | done, **scoped** (see below) |
-| M25+ | not started |
+| M25 — real call-by-need for function arguments (core evaluator fix) | done (see below) |
+| M26+ | not started |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
 
@@ -2771,3 +2772,78 @@ targets, attrset-literal keys, or `?`. Lambda-pattern formals
 (`{a, "b c" ? default}: ...`) deliberately do NOT get this treatment --
 confirmed real Nix itself rejects a quoted formal name too (`({ "a b"
 }: ...)` is a syntax error there), so there was nothing to fix.
+
+## M25 scope notes: real call-by-need for function arguments
+
+Found continuing to chase `d.nix`: nixpkgs's `lib/default.nix` evaluates
+`lib = makeExtensible' (self: ...)`, where `makeExtensible'`'s own body
+is `let self = rattrs self // {...}; in self` -- a lazy fixed-point
+combinator (the same idiom behind `lib.makeExtensible`, overlays,
+`callPackage`, and `finalAttrs`-style patterns throughout real nixpkgs).
+asnix aborted on this with "infinite recursion forcing a thunk
+(blackhole)" even though the self-reference is never actually read by
+anything that matters.
+
+**Root cause, confirmed with two independent minimal reproductions
+against real `nix-instantiate --eval` before touching any code**:
+- `(x: 1) (abort "never runs")` -- real Nix returns `1` (the unused
+  argument is never evaluated); asnix aborted immediately.
+- `let f = x: { a = 1; }; self = f self; in self.a` -- real Nix returns
+  `1`; asnix blackholed.
+
+Both point at the same bug: `compiler.c`'s `AST_APP` case compiled a
+function call's argument expression directly inline (eager, call-by-
+value) before `OP_CALL`, instead of real Nix's call-by-need (an argument
+is a thunk, forced only if and when the callee's body actually reads the
+parameter). Every *other* binding form in this codebase (`let`,
+`rec {}`, plain attrset values) was already correctly lazy via
+`OP_MK_THUNK` since M6 -- function-call arguments were the one place
+real Nix's laziness was never implemented at all. This is why the
+self-referential fixed point blackholed: `f self` evaluated `self`
+*at the call site*, forcing the very thunk already in the middle of
+being forced.
+
+**Fix**: `AST_APP` now wraps the argument expression in its own
+`OP_MK_THUNK` (a fresh `IrBuilder`, compiled and `ib_ret`-terminated
+exactly like a `let`-binding's value, capturing the caller's current env)
+instead of compiling it straight into the caller's code. `OP_VAR_REF`'s
+existing force-on-read logic (unchanged) then forces the parameter
+lazily, if and only if the callee's body actually references it --
+exactly the same mechanism that already made `let`-bindings lazy, now
+extended to call arguments too.
+
+**A second, necessary fix surfaced immediately by the first**: every
+native-code `builtins.*` primop reads its arguments' raw tag bits
+directly (`args[0]`, `args[1]`, ...) with no way to force a thunk itself
+-- forcing requires re-entering the full dispatch loop (`asnix_force_for_
+print`), which a plain C function can't do on its own. Previously this
+was a harmless invariant gap (every argument reaching a primop call was
+*already* forced, since arguments used to be compiled eagerly) --
+real/dangerous now that arguments are genuine thunks: a primop could
+silently misinterpret an unforced thunk's raw bits as if they were
+already the expected tag (corruption, not a clean error). Fixed in
+`op_call.S`'s primop-call path: a new loop forces every argument
+(`asnix_force_for_print`, already used for primops' *return* values
+since M23) before the native function ever sees them. The loop counter
+is spilled to a one-time-allocated 16-byte stack slot rather than
+push/pop'd per iteration, to keep `%rsp` 16-byte aligned across each
+`call` -- matching this file's existing push-in-pairs discipline. Closure
+calls are untouched (correctly): a closure's parameter is bound to an Env
+slot via the ordinary argument-copy loop, and `OP_VAR_REF`'s own forcing
+handles it lazily exactly like any other binding, no primop-style eager
+forcing needed or wanted there.
+
+**Verified**: both minimal repros above now match real Nix exactly;
+`make test`/`test-e2e`/`test-conformance` all green (157 e2e, 19
+conformance, full unit suite); numtide/nix-conformance's `lang/` pass
+count went from 387 to 389 (small additional gain, no regression) on the
+real external runner.
+
+**Not yet addressed, a real known follow-up**: every call argument is
+now unconditionally thunk-wrapped, even a trivial one (`f 1`, `f x` where
+`x` is already a plain variable) -- a real, measurable performance cost
+(one arena allocation plus an extra indirection per call argument) that
+real Nix implementations typically avoid via a "this argument is already
+in WHNF, don't bother thunking it" fast path. Correctness came first;
+this is a legitimate target for a future profiling-driven pass, not
+attempted here.

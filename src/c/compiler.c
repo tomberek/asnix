@@ -486,11 +486,38 @@ static void compile_expr(IrBuilder *b, Ast *node, ScopeFrame *scope) {
             ib_has_attr(b, sym);
             return;
         }
-        case AST_APP:
+        case AST_APP: {
+            /* Real Nix call arguments are call-by-need, not call-by-
+             * value: `(x: 1) (abort "never runs")` returns `1` without
+             * ever evaluating the unused argument, and a lazy fixed
+             * point like `let f = x: {a=1;}; self = f self; in self.a`
+             * (idiomatic throughout nixpkgs -- lib.makeExtensible,
+             * overlays, callPackage, `finalAttrs` patterns) depends on
+             * `self` being passed to `f` as an unforced reference, never
+             * evaluated at the call site at all (forcing an in-progress
+             * thunk from the *inside* of its own computation is a real
+             * cycle; merely passing it through unused is not -- real Nix
+             * returns `1` here too, confirmed against `nix-instantiate`).
+             * Previously this compiled the argument directly into the
+             * caller's own code (eager, call-by-value), which aborted on
+             * the first example and blackholed on the second -- a real,
+             * previously-undiscovered core-evaluator bug, not a syntax
+             * gap, found evaluating real nixpkgs (M25). Fixed the same
+             * way every other lazy binding already works (AST_LET/
+             * AST_ATTRSET above): wrap the argument expression in its
+             * own OP_MK_THUNK, capturing the *caller's* env, instead of
+             * compiling it inline -- OP_VAR_REF's existing force-on-read
+             * logic (already correct, untouched) then forces it, if and
+             * only if the callee's body ever actually reads the
+             * parameter. */
             compile_expr(b, node->as.app.fn, scope);
-            compile_expr(b, node->as.app.arg, scope);
+            IrBuilder *arg_b = ib_new();
+            compile_expr(arg_b, node->as.app.arg, scope);
+            ib_ret(arg_b);
+            ib_mk_thunk(b, ib_finish(arg_b));
             ib_call(b, 1);
             return;
+        }
         case AST_BINOP:
             compile_expr(b, node->as.binop.lhs, scope);
             compile_expr(b, node->as.binop.rhs, scope);
