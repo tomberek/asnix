@@ -3859,3 +3859,35 @@ already correct, unchanged by this fix) both now pass. Two new e2e
 fixtures: `m57a_lessthan_lists.nix`/`m57a_sort_lists.nix`. `make
 test`/`test-e2e` green (200 e2e); `test-conformance` 635 passed (+2),
 167 failed (-2), 0 known, 62 skipped -- no other test's result moved.
+
+### M57b: `genericClosure` key-comparability validation
+
+`builtins_closure.c`'s own top comment already documented the scope
+cut: dedup by `asnix_bshared_value_eq` instead of a real ordered
+`std::map<Value*, CompareValues>` like real Nix's, deliberately not
+replicating the "incomparable key types" error. Closed that gap
+without needing a real ordering: added a `value_key_comparable(Value,
+Value)` helper (same int/string/list type scope M57a's `value_lt`
+supports) and call it against every already-seen key right before the
+existing equality check in the dedup loop, `asnix_bshared_fatal`-ing
+out on a mismatch. Confirmed against real Nix that the comparator is
+consulted on every insertion attempt *regardless of actual equality*
+-- even `{key=true;}` twice throws "cannot compare a Boolean with a
+Boolean; values of that type are incomparable" -- so the new check
+intentionally runs unconditionally before the equality check, not only
+when values turn out unequal.
+
+Verified against real `nix-instantiate --eval`: int-vs-string keys
+throws "cannot compare a string with an integer"; two `{key={};}`
+(attrset keys, same type but never comparable) throws "...
+incomparable"; two `{key=true;}` throws the same way; ordinary
+string-keyed closures are unaffected. Both `eval-fail-genericClosure-
+keys-incompatible-types.nix` and `eval-fail-genericClosure-keys-
+uncomparable.nix` now exit non-zero as required. One new e2e fixture,
+`m57b_genericclosure_ok_strings.nix` (a same-type-string-keys closure,
+confirming the ordinary path is untouched -- no e2e fixture for the
+fail cases themselves since `test-e2e`'s harness only diffs stdout
+against an expected success value, not exit codes; the conformance
+suite already covers that). `make test`/`test-e2e` green (201 e2e);
+`test-conformance` 637 passed (+2), 165 failed (-2), 0 known, 62
+skipped -- no other test's result moved.

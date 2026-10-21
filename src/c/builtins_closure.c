@@ -28,16 +28,19 @@
  *   - Real Nix's dedup set uses `builtins.lessThan`-style ordering
  *     (`CompareValues`, via a `std::map`) and genuinely errors if two
  *     encountered keys aren't comparable (e.g. mixing int and string
- *     keys: "cannot compare a string with an integer"). This
- *     implementation dedups by *equality* instead (asnix_bshared_value_eq)
- *     -- observably identical for every case that doesn't mix
- *     incomparable key types (the overwhelmingly common real-world case:
- *     string keys, e.g. derivation/module names), and deliberately not
- *     replicating the mixed-type-keys error path -- doing so would need a
- *     general ordering over int/string/bool/null/list/attrs keys this
- *     project's own `<` operator doesn't have either (op_cmp.S is
- *     INT-only; see docs/architecture.md's Operators section) a real,
- *     documented scope cut, not an oversight.
+ *     keys: "cannot compare a string with an integer") -- confirmed this
+ *     throws even when the two keys are *otherwise equal*, e.g. two
+ *     `{key = true;}` items throw "cannot compare a Boolean with a
+ *     Boolean; values of that type are incomparable", because the
+ *     dedup set's ordering comparator is consulted on every insertion
+ *     attempt regardless of value equality. This implementation still
+ *     dedups by *equality* (asnix_bshared_value_eq), but now gates every
+ *     such comparison on `value_key_comparable` below first (same
+ *     int/string/list scope `asnix_bshared_value_lt`, M57a, supports --
+ *     bool/null/attrs/function keys, or a mismatched pair like int-vs-
+ *     string, are rejected) so a key-comparability violation is still
+ *     caught and still fatal, just via an equality-based dedup loop
+ *     instead of a real ordered map.
  */
 #include "builtins_closure.h"
 
@@ -48,6 +51,7 @@
 #include "asnix/ir.h"
 #include "builtins_shared.h"
 #include "symtab.h"
+#include "value_util.h"
 
 typedef struct {
     Value *data;
@@ -60,6 +64,23 @@ static void vv_push(ValueVec *v, Value x) {
         v->data = realloc(v->data, v->cap * sizeof(Value));
     }
     v->data[v->len++] = x;
+}
+
+/* Same type scope as asnix_bshared_value_lt (M57a): int-vs-int,
+ * string-vs-string, list-vs-list (checked shallowly here -- a `key`
+ * made of lists-of-incomparable-elements will still get caught, just
+ * one level later, by this same check on the next insertion attempt
+ * that actually walks into the mismatched elements via value_lt itself
+ * were it ever invoked; for the dedup-by-equality loop below, a shallow
+ * tag check is enough to reject the two kinds of input the two
+ * conformance cases exercise: an incompatible type mix, and a type
+ * that's never comparable at all, e.g. an attrset). */
+static int value_key_comparable(Value a, Value b) {
+    int ta = asnix_tag_of(a), tb = asnix_tag_of(b);
+    if (ta == ASNIX_TAG_INT && tb == ASNIX_TAG_INT) return 1;
+    if (ta == ASNIX_TAG_PTR && tb == ASNIX_TAG_PTR && !asnix_value_is_path(a) && !asnix_value_is_path(b)) return 1;
+    if (ta == ASNIX_TAG_LIST && tb == ASNIX_TAG_LIST) return 1;
+    return 0;
 }
 
 static Value prim_genericClosure(const Value *args, int64_t argc) {
@@ -101,6 +122,10 @@ static Value prim_genericClosure(const Value *args, int64_t argc) {
 
         int already_seen = 0;
         for (size_t i = 0; i < seen_keys.len; i++) {
+            if (!value_key_comparable(seen_keys.data[i], key)) {
+                asnix_bshared_fatal("genericClosure",
+                    "cannot compare two 'key' values (incompatible or uncomparable types)");
+            }
             if (asnix_bshared_value_eq(seen_keys.data[i], key)) { already_seen = 1; break; }
         }
         if (already_seen) continue;
