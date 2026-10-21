@@ -83,7 +83,8 @@ what's actually implemented and the scope decisions made along the way.
 | M68 — a hand-written POSIX-ERE backtracking engine (`src/c/regex_engine.c`) to fix the 33 real behavioral gaps M55 triaged-but-didn't-fix between glibc's `<regex.h>` and real Nix's libstdc++ `std::regex` | done, **scoped** (see below; the 6 already-known-unfixable Class C patterns from M55 are still unfixed, deliberately) |
 | M69 — `derivation`/`derivationStrict`'s `__structuredAttrs = true;` mode (JSON-serialized input attrs instead of per-attribute stringified env vars) | done, **scoped** (see below) |
 | M70 — multi-segment `a.b.c or default`: every segment of a dotted chain now shares ONE `or` guard, matching real Nix's `ExprSelect::eval` (M67's documented residual gap, blocking `./asnix d.nix` on real nixpkgs) | done (see below) |
-| M71+ | not started |
+| M71 — `builtins.storeDir` (plain constant, `"/nix/store"`) | done (see below) |
+| M72+ | not started |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
 
@@ -7563,3 +7564,25 @@ before/after diff of the failed-file list, not just the aggregate
 counts, that the one flip is exactly `eval-okay-attrs5.nix` -- the file
 M67e's own notes predicted this fix would resolve -- and nothing else
 regressed or newly failed).
+
+## M71 scope notes: `builtins.storeDir`
+
+Found continuing to chase `d.nix` right after M70: the next blocker was
+"attribute 'storeDir' missing, aborting" -- the same gdb technique as
+every prior milestone (break on `asnix_bshared_select_missing_fatal`,
+read the symbol id) named the missing attribute directly, no deeper
+investigation needed this time. `builtins.storeDir` is a real Nix
+builtin -- a plain constant (`"/nix/store"` on this dev machine,
+confirmed via `nix-instantiate --eval -E 'builtins.storeDir'`), not a
+function -- that wasn't implemented at all. Grepping nixpkgs confirmed
+several `pkgs/by-name` packages reference it directly. `builtins`-only,
+same M27 bare-global rule `nixVersion`/`currentSystem` already follow
+(confirmed: bare `storeDir` is also "undefined variable" on real Nix).
+
+Implemented identically to the existing `nixVersion`/`currentSystem`
+precedent in `builtins_misc.c` (a `build()` slot returning a plain
+string Value, no `PrimOp` needed since it's not callable). `make
+test`/`test-e2e` green (one new `m71_*` fixture, verified against real
+`nix-instantiate --eval --strict` first), `test-conformance` (mined
+subset) unchanged. `d.nix` progresses past this exact blocker to the
+next one.

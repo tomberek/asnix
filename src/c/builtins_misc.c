@@ -622,6 +622,17 @@ static Value build_nixVersion(void) { return asnix_make_string_value("2.35.2", 6
  * `.currentSystem` while resolving the default platform). */
 static Value build_currentSystem(void) { return asnix_make_string_value("x86_64-linux", 12); }
 
+/* `builtins.storeDir` (M71) -- same "plain constant, no PrimOp needed"
+ * shape as nixVersion/currentSystem above. Real Nix's is the configured
+ * Nix store's root directory (`/nix/store` on every real installation,
+ * including this dev machine's -- confirmed via `nix-instantiate --eval
+ * -E 'builtins.storeDir'`), `builtins`-only (confirmed: bare `storeDir`
+ * is "undefined variable" there too, matching the same M27 bare-global
+ * rule nixVersion/currentSystem already follow). Found via `d.nix`:
+ * several nixpkgs packages (under `pkgs/by-name`) reference
+ * `builtins.storeDir` directly, expecting a path-prefix-shaped string. */
+static Value build_storeDir(void) { return asnix_make_string_value("/nix/store", 10); }
+
 const AsnixBuiltinMiscDef ASNIX_BUILTINS_MISC[] = {
     { "substring", build_substring },
     { "stringLength", build_stringLength },
@@ -641,6 +652,7 @@ const AsnixBuiltinMiscDef ASNIX_BUILTINS_MISC[] = {
     { "ceil", build_ceil },
     { "nixVersion", build_nixVersion },
     { "currentSystem", build_currentSystem },
+    { "storeDir", build_storeDir },
     { "baseNameOf", build_baseNameOf },
     { "dirOf", build_dirOf },
     { "placeholder", build_placeholder },
