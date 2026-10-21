@@ -102,6 +102,39 @@ Value asnix_coerce_to_string(Value v) {
             }
             break;
         }
+        case ASNIX_TAG_LIST: {
+            /* A list coerces to a string by recursively coercing each
+             * element and joining with a single space (M47) -- real
+             * Nix's own `coerceToString`'s `coerceMore` branch does the
+             * same (`~/nix/src/libexpr/eval.cc`), found needed by
+             * `<nix/fetchurl.nix>`'s own `urls = [ url ];` derivation
+             * attribute (every derivation attribute value is coerced to
+             * a string for the environment, see `derivation.c`).
+             * Verified against real `nix-instantiate --eval`:
+             * `builtins.toString [1 2 3]` == `"1 2 3"`, `builtins.toString
+             * [ "a" "b" ]` == `"a b"`, `builtins.toString []` == `""`.
+             * Does not replicate cppnix's own "skip the separator before
+             * an empty nested list" quirk (that function's own comment
+             * calls it "not quite correct") -- not hit by anything this
+             * project has evaluated so far. */
+            int64_t count = asnix_bshared_list_count(v);
+            const Value *elems = asnix_bshared_list_elems(v);
+            char *result = NULL;
+            size_t result_len = 0;
+            for (int64_t i = 0; i < count; i++) {
+                Value piece = asnix_coerce_to_string(asnix_force_for_print(elems[i]));
+                int64_t piece_len;
+                const char *piece_bytes = asnix_ptr_bytes(piece, &piece_len);
+                int has_sep = (i + 1 < count);
+                result = realloc(result, result_len + (size_t)piece_len + (has_sep ? 1 : 0));
+                memcpy(result + result_len, piece_bytes, (size_t)piece_len);
+                result_len += (size_t)piece_len;
+                if (has_sep) result[result_len++] = ' ';
+            }
+            Value out = asnix_make_string_value(result ? result : "", result_len);
+            free(result);
+            return out;
+        }
         default: break;
     }
     fprintf(stderr, "asnix: cannot coerce this value to a string\n");

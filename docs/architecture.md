@@ -59,7 +59,8 @@ what's actually implemented and the scope decisions made along the way.
 | M44 — `builtins.placeholder`/bare `placeholder` | done (see below) |
 | M45 — `builtins.toFile` | done, **scoped** (see below) |
 | M46 — `<nix/fetchurl.nix>` virtual-corepkgs special case | done, **scoped** (see below) |
-| M47-M49 | not started |
+| M47 — list-to-string coercion (`toString`/derivation env vars) | done, **scoped** (see below) |
+| M48-M49 | not started |
 | M50 — name the specific value/field in 6 more generic fatal-path error messages | done (see below) |
 | M51 | in progress (parallel agent: float literals) |
 | M52 — fix `with`-frame leaking into a sibling expression (core evaluator fix) | done, **scoped** (see below) |
@@ -4895,3 +4896,50 @@ file *also* exercises `"aa" < "ab"` (string ordering via `<`), a
 separate, pre-existing, already-documented scope cut (this codebase's
 `<`/`>` operators are INT-only, see `asnix_bshared_value_lt`'s own
 comment) that this batch does not attempt to lift.
+
+## M47 scope notes: list-to-string coercion (`toString`/derivation env vars)
+
+Found continuing to chase `d.nix` right after M46: `<nix/fetchurl.nix>`
+imports fine now, but calling the resulting function aborts with
+"cannot coerce this value to a string" -- root-caused via gdb (broke
+at the fatal, read the value's raw tag: `ASNIX_TAG_LIST`) to
+`derivation.c`'s generic per-attribute env-var coercion hitting
+`urls = [ url ];` (fetchurl.nix's own derivation call sets this).
+`asnix_coerce_to_string` had no `ASNIX_TAG_LIST` case at all --
+confirmed via cppnix source (`~/nix/src/libexpr/eval.cc`'s
+`coerceToString`, `coerceMore` branch) that real Nix recursively
+coerces each element and joins with a single space. Verified against
+real `nix-instantiate --eval`: `builtins.toString [1 2 3]` ==
+`"1 2 3"`, `builtins.toString [ "a" "b" ]` == `"a b"`, `builtins.toString
+[]` == `""`. Does not replicate cppnix's own "skip the separator
+before an empty nested list" quirk (that function's own comment calls
+it "not quite correct") -- not hit by anything this project has
+evaluated so far. Confirmed this is a distinct function from string
+*interpolation*'s own narrower coercion (`coerce_to_string_for_interp`,
+same file, already documented as deliberately NOT accepting a list --
+verified `"${[1 2]}"` is still a real Nix error and unaffected by this
+change, since that function has its own separate tag-dispatch, never
+delegating to `asnix_coerce_to_string`'s new list case).
+
+Known, accepted regression (same pattern M45's `toFile` fix already
+established): three numtide/nix-conformance tests --
+`eval-fail-drv-outputs-duplicate.nix`, `eval-fail-drv-outputs-empty.nix`,
+`eval-fail-drv-fixed-two-outputs.nix` -- flip from a coincidental PASS
+to a genuine FAIL. All three set a derivation's `outputs` attribute to
+an invalid list (duplicate names / empty / multiple outputs combined
+with a fixed-output hash); `derivation.c` has no `outputs`-specific
+validation logic at all (confirmed: no `"outputs"` handling anywhere in
+that file), so these were only "passing" because `outputs`, like any
+other list-valued attribute, used to hit the exact same generic
+"cannot coerce" crash `urls` did -- an accidental error for the wrong
+reason, not real `outputs` validation. Implementing multi-output
+derivation support (the actual missing feature) is a separately
+tracked, larger scope cut -- not needed by `d.nix`'s own single-output
+`fetchurl` usage, which is what motivated this fix in the first place.
+
+`make test`/`test-e2e` green (205 e2e, one new `m47_*` fixture);
+`test-conformance`: confirmed via a before/after fail-list diff (not
+just the aggregate count) that exactly these 3 tests are the only
+change -- 663 passed before this fix, 660 after, net -3, entirely
+accounted for by the documented `outputs`-validation gap above, not a
+regression in list-to-string coercion's own correctness.
