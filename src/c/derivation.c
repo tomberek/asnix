@@ -1179,6 +1179,14 @@ Value asnix_prim_derivation(const Value *args, int64_t argc) {
     char *real_aterm = asnix_build_derivation_aterm(real_outs, noutputs, real_input_drvs, ngroups,
                                                      (const char **)refs.srcs, refs.nsrcs, system, builder, arg_strs,
                                                      nargs, env, nenv);
+    /* Debugging aid for the standing d.nix/nixpkgs-hash-parity bug-chase
+     * (M74-M77+): set ASNIX_DEBUG_DRV=<name> to dump this derivation's
+     * own real ATerm text to stderr when its `name` matches, instead of
+     * repeatedly adding/removing a one-off fprintf here each session. */
+    {
+        const char *dbg = getenv("ASNIX_DEBUG_DRV");
+        if (dbg && strcmp(dbg, name) == 0) fprintf(stderr, "ASNIX_DEBUG_DRV[%s] = %s\n", name, real_aterm);
+    }
     uint8_t real_digest[32];
     sha256_or_die(real_aterm, strlen(real_aterm), real_digest);
     free(real_aterm);
