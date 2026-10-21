@@ -99,13 +99,13 @@ Value asnix_eval_file(const char *path) {
 
     /* Fresh root env/builtins every call -- an imported file does not
      * inherit the importing file's local scope (see eval_file.h). Slots
-     * 1-8 (`import`, `map`, `abort`, `toString`, `removeAttrs`, `isNull`,
-     * `throw`, `derivation`) are eight of the small set of names real Nix
-     * exposes as bare globals in addition to `builtins.X` -- see
-     * builtins.h's asnix_make_import_primop comment for the full list
-     * checked; compiler.c's root ScopeFrame must list the same names in
-     * the same order. */
-    Env *root_env = asnix_env_alloc(NULL, 9);
+     * 1-10 (`import`, `map`, `abort`, `toString`, `removeAttrs`, `isNull`,
+     * `throw`, `derivation`, `baseNameOf`, `dirOf`) are ten of the small
+     * set of names real Nix exposes as bare globals in addition to
+     * `builtins.X` -- see builtins.h's asnix_make_import_primop comment
+     * for the full list checked; compiler.c's root ScopeFrame must list
+     * the same names in the same order. */
+    Env *root_env = asnix_env_alloc(NULL, 11);
     root_env->values[0] = asnix_make_builtins_attrs();
     root_env->values[1] = asnix_make_import_primop();
     root_env->values[2] = asnix_make_map_primop();
@@ -115,6 +115,8 @@ Value asnix_eval_file(const char *path) {
     root_env->values[6] = asnix_make_isNull_primop();
     root_env->values[7] = asnix_make_throw_primop();
     root_env->values[8] = asnix_make_derivation_primop();
+    root_env->values[9] = asnix_make_baseNameOf_primop();
+    root_env->values[10] = asnix_make_dirOf_primop();
 
     Value result = asnix_eval(prog, root_env);
 

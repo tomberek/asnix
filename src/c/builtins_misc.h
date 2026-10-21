@@ -36,4 +36,10 @@ extern const size_t ASNIX_BUILTINS_MISC_COUNT;
  * bare globals (M18's import/map/abort/toString, extended here). */
 Value asnix_make_isNull_primop(void);
 
+/* Same idea, for `baseNameOf`/`dirOf` (M23) -- also real Nix bare
+ * globals (see builtins.h's asnix_make_import_primop comment for the
+ * full curated list). */
+Value asnix_make_baseNameOf_primop(void);
+Value asnix_make_dirOf_primop(void);
+
 #endif /* ASNIX_BUILTINS_MISC_H */
