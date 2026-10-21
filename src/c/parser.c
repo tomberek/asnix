@@ -423,6 +423,42 @@ static Ast *parse_select(Parser *p);
  * `{ ... }` -- all three use the same binding-list grammar (see ast.h's
  * note on AstBinding.is_inherit for why the desugared value differs by
  * form but `is_inherit` is attached regardless). */
+/* Parses one attrpath segment: a plain identifier, or a static quoted-
+ * string key (matching real Nix's grammar, `~/nix/src/libexpr/parser.y`'s
+ * `attr: IDENTIFIER | string_attr`) -- shared by both `inherit`'s
+ * attribute-name list and attrpath binding sugar (`a."b c".d = val;`).
+ * Needed for names that collide with a reserved keyword and so can't be
+ * written bare (e.g. nixpkgs's own `lib/trivial.nix`: `"or" = x: y: x ||
+ * y;`, and `lib/default.nix`: `inherit (self.trivial) ... "or" ...;`) --
+ * found evaluating real nixpkgs. A dynamic `${expr}` segment is a
+ * documented, separate scope cut (see M22's scope notes on dynamic
+ * attrset-literal keys): rejected here with a clear, dedicated message
+ * rather than silently mishandled -- real Nix rejects it unconditionally
+ * for `inherit` too ("dynamic attributes not allowed in inherit",
+ * confirmed in cppnix's own grammar), though it IS allowed for an
+ * ordinary attrpath binding in real Nix; asnix doesn't support it in
+ * either position yet. The returned Token is malloc'd for the string
+ * case (never freed -- same "compile-time-only auxiliary, process exits
+ * soon after" convention as TokenVec/BTVec themselves), or the lexer's
+ * own stable token-array pointer for the plain-identifier case. */
+static Token *parse_attr_segment(Parser *p, const char *what) {
+    if (cur(p)->kind != TOK_STR_START) return expect(p, TOK_IDENT, what);
+    advance(p); /* TOK_STR_START */
+    Token *tok = malloc(sizeof(Token));
+    *tok = (Token){ .kind = TOK_IDENT, .start = "", .len = 0 };
+    if (cur(p)->kind == TOK_STR_PART) {
+        tok->start = cur(p)->start;
+        tok->len = cur(p)->len;
+        advance(p);
+    }
+    if (cur(p)->kind != TOK_STR_END) {
+        fprintf(stderr, "asnix: parse error: dynamic attributes not allowed here\n");
+        exit(1);
+    }
+    advance(p); /* TOK_STR_END */
+    return tok;
+}
+
 static void parse_binding_stmt(Parser *p, BTVec *out) {
     if (cur(p)->kind == TOK_INHERIT) {
         advance(p);
@@ -432,9 +468,8 @@ static void parse_binding_stmt(Parser *p, BTVec *out) {
             src_expr = parse_expr(p);
             expect(p, TOK_RPAREN, "')'");
         }
-        while (cur(p)->kind == TOK_IDENT) {
-            Token *name = cur(p);
-            advance(p);
+        while (cur(p)->kind == TOK_IDENT || cur(p)->kind == TOK_STR_START) {
+            Token *name = parse_attr_segment(p, "an inherited name");
             Ast *value;
             if (src_expr) {
                 Ast *sel = asnix_ast_new(AST_SELECT);
@@ -472,16 +507,15 @@ static void parse_binding_stmt(Parser *p, BTVec *out) {
     }
     /* Attrpath binding sugar (`a.b.c = val;`, real Nix's `attrpath '='
      * expr ';'`) -- see the BTNode/insert_attrpath comment above for the
-     * full merge semantics. Scope cut: only plain-identifier segments are
-     * supported (the overwhelmingly common case); a quoted-string or
-     * `${...}` segment anywhere, including the first, still hits the
-     * pre-existing "a binding name"/"an attribute name" fatal parse
-     * error below, same as before this feature existed. */
+     * full merge semantics. Each segment may be a plain identifier or a
+     * static quoted-string key (see parse_attr_segment). Scope cut: a
+     * dynamic `${...}` segment anywhere, including the first, still hits
+     * parse_attr_segment's fatal error -- not supported here yet. */
     TokenVec segs = { 0 };
-    tokenvec_push(&segs, expect(p, TOK_IDENT, "a binding name"));
+    tokenvec_push(&segs, parse_attr_segment(p, "a binding name"));
     while (cur(p)->kind == TOK_DOT) {
         advance(p);
-        tokenvec_push(&segs, expect(p, TOK_IDENT, "an attribute name"));
+        tokenvec_push(&segs, parse_attr_segment(p, "an attribute name"));
     }
     expect(p, TOK_EQUALS, "'='");
     Ast *value = parse_expr(p);
@@ -679,7 +713,11 @@ static Ast *parse_select(Parser *p) {
             n->as.select.attr_len = 0;
             had_dynamic = 1;
         } else {
-            Token *attr = expect(p, TOK_IDENT, "an attribute name");
+            /* Plain identifier or a static quoted-string segment (`x."a
+             * b"`) -- see parse_attr_segment's comment. Verified against
+             * `nix-instantiate --eval`: `let x = { "a b" = 5; }; in x."a
+             * b"` => `5`. */
+            Token *attr = parse_attr_segment(p, "an attribute name");
             n->as.select.attr_expr = NULL;
             n->as.select.attr = attr->start;
             n->as.select.attr_len = attr->len;
@@ -736,7 +774,10 @@ static Ast *parse_has_attr(Parser *p) {
     Ast *e = parse_app(p);
     while (cur(p)->kind == TOK_QUESTION) {
         advance(p);
-        Token *attr = expect(p, TOK_IDENT, "an attribute name");
+        /* Plain identifier or a static quoted-string segment, same as
+         * parse_select -- verified against `nix-instantiate --eval`:
+         * `x ? "a b"` is valid real-Nix syntax. */
+        Token *attr = parse_attr_segment(p, "an attribute name");
         Ast *n = asnix_ast_new(AST_HAS_ATTR);
         n->as.has_attr.target = e;
         n->as.has_attr.attr = attr->start;

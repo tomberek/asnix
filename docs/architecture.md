@@ -36,7 +36,8 @@ what's actually implemented and the scope decisions made along the way.
 | M21 — real structural `==`/`!=` + real `+` operator dispatch | done, **scoped** (see below) |
 | M22 — real-nixpkgs-evaluation sweep: block comments, `->`, more bare globals, dynamic attrs, directory-import fix | done, **in progress** (see below -- real nixpkgs still doesn't fully evaluate) |
 | M23 — numtide/nix-conformance sweep (3 parallel passes): `++`/`/` operators, attrpath binding sugar, hyphenated identifiers, map/mapAttrs laziness fix, builtins-expansion pass, `builtins.match`/`builtins.split` (POSIX regex), `builtins.fromTOML` (hand-written TOML parser) | done, **scoped** (see below) |
-| M24+ | not started |
+| M24 — quoted-string attrpath segments (`"a b"` as a binding/select/has-attr key) | done, **scoped** (see below) |
+| M25+ | not started |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
 
@@ -2736,3 +2737,37 @@ implementation is the one described earlier in this document (`OP_CONCAT`/
    missing the reserved-keyword case) -- the more complete fix
    (`attr_name_needs_quoting`/`print_attr_name`, `main.c`) is the one that
    survived integration.
+
+## M24 scope notes: quoted-string attrpath segments
+
+Found continuing to chase `d.nix` (importing real nixpkgs) past M23:
+`lib/default.nix` hit "parse error: expected ';'" on `inherit
+(self.trivial) ... "or" ...;` -- `or` is a reserved keyword in asnix (and
+in real Nix), so real nixpkgs's own `lib/trivial.nix` defines it as
+`"or" = x: y: x || y;` (a quoted key) rather than bare `or = ...;`, and
+`lib/default.nix` correspondingly re-exports it via `inherit (self.trivial)
+"or" ...;`. asnix's `inherit`/attrpath-binding/`.select`/`?has-attr`
+parsing only ever accepted `TOK_IDENT` for an attribute name -- a quoted
+string segment anywhere (`"or"`, `x."a b"`, `x ? "a b"`, `x."a b" = 1;`)
+was a hard parse error.
+
+Cross-checked against cppnix's real grammar
+(`~/nix/src/libexpr/parser.y`): `attr: IDENTIFIER | string_attr` (a
+static quoted string) for ordinary attrpath segments, but `inherit`'s own
+`attrs` rule explicitly rejects a *dynamic* (`${expr}`) segment
+("dynamic attributes not allowed in inherit") while still accepting a
+static string one. Fixed with one shared helper, `parse_attr_segment`
+(`parser.c`), used at all four call sites that previously hard-coded
+`expect(p, TOK_IDENT, ...)`: `inherit`'s name list, attrpath binding
+sugar (`a.b.c = val;`, including attrset-literal keys -- same function),
+`.select` (`parse_select`), and `? has-attr` (`parse_has_attr`). Verified
+each against real `nix-instantiate --eval` individually (`x."a b"`,
+`x ? "a b"`, `let x."a b".c = 5; in x."a b".c`) before trusting it.
+
+**Scope cuts, deliberate, both already-documented from M22, unchanged
+here**: a *dynamic* `${expr}` attrpath segment is still only supported
+for `.select` (`OP_SELECT_DYNAMIC`, M22), not for `inherit`, binding
+targets, attrset-literal keys, or `?`. Lambda-pattern formals
+(`{a, "b c" ? default}: ...`) deliberately do NOT get this treatment --
+confirmed real Nix itself rejects a quoted formal name too (`({ "a b"
+}: ...)` is a syntax error there), so there was nothing to fix.
