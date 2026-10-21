@@ -112,6 +112,16 @@ enum {
                       * OP_FRAME_EXIT once all consumers of the frame are done. */
     OP_FRAME_SET,   /* a = slot index; pops one value off VALSTACK and stores it into
                       * slot `a` of the CURRENT Env (set up by OP_FRAME_ALLOC). */
+    OP_FRAME_GET,   /* a = slot index (M29); pushes slot `a` of the CURRENT Env verbatim --
+                      * raw data movement, deliberately NOT forcing (unlike OP_VAR_REF).
+                      * Used only to read back a binding's freshly-OP_FRAME_SET thunk for
+                      * `rec {}` attrset construction (compiler.c's AST_ATTRSET case),
+                      * where OP_VAR_REF's force-on-read would be wrong: it would eagerly
+                      * force every `rec {}` field the instant the literal is constructed,
+                      * not lazily on first actual select -- a real bug found evaluating
+                      * real nixpkgs, same root-cause class as M25's call-by-value
+                      * argument bug (confirmed: `(rec { a = abort "x"; b = 2; }).b`
+                      * aborted here instead of returning `2`). */
     OP_FRAME_EXIT,  /* no operands; ENV = ENV->up -- undoes exactly one OP_FRAME_ALLOC,
                       * restoring the enclosing scope so a `let`/`rec {}` used as a
                       * non-tail subexpression doesn't leak its frame into whatever

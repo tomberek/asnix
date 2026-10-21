@@ -12,6 +12,7 @@
 // AST_LET/AST_ATTRSET cases for the full picture.
 #include "asnix/env.h"
 #include "asnix/ir.h"
+#include "asnix/stackcheck.h"
 
     .text
 
@@ -47,6 +48,24 @@ asnix_op_frame_set:                     // a = slot index; pops VALSTACK into EN
     movq (%rsi), %rax
     jmp *%rax
     .size asnix_op_frame_set, . - asnix_op_frame_set
+
+    // M29: raw frame read, deliberately NOT forcing -- see this op's own
+    // comment in ir.h for why OP_VAR_REF (which always forces) is wrong
+    // for the one thing this is used for (reading back a `rec {}`
+    // binding's freshly-OP_FRAME_SET thunk to hand to OP_MK_ATTRS).
+    .globl asnix_op_frame_get
+    .type asnix_op_frame_get, @function
+asnix_op_frame_get:                     // a = slot index; pushes ENV.values[slot] verbatim
+    movq ASNIX_IROP_OFF_A(%rsi), %rdx   // rdx = slot
+    movq ASNIX_ENV_OFF_VALUES(%rdi, %rdx, 8), %rax
+
+    ASNIX_CHECK_VALSTACK %rcx
+    movq %rax, (%r12)
+    addq $8, %r12
+    addq $ASNIX_IROP_SIZE, %rsi
+    movq (%rsi), %rax
+    jmp *%rax
+    .size asnix_op_frame_get, . - asnix_op_frame_get
 
     .globl asnix_op_frame_exit
     .type asnix_op_frame_exit, @function

@@ -41,7 +41,8 @@ what's actually implemented and the scope decisions made along the way.
 | M26 — unary `-` (negate) | done (see below) |
 | M27 — `fromTOML` bare global + corrected understanding of real Nix's bare-global rule | done (see below) |
 | M28 — dynamic attrset-literal keys (`{${k} = v;}`) + `expr.${k} or default` | done, **scoped** (see below) |
-| M29+ | not started |
+| M29 — `rec {}` eagerly forced every field on construction (core evaluator fix) | done (see below) |
+| M30+ | not started |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
 
@@ -3003,3 +3004,49 @@ by a static one (`a.${k} = v;`); the "regrettable merge" path
 quirk) fatals cleanly if the literal being reopened has any dynamic
 entries rather than silently dropping them. None of these were needed by
 anything hit so far.
+
+## M29 scope notes: `rec {}` eagerly forced every field on construction
+
+Found continuing to chase `d.nix`: `lib/strings.nix` (a large `{lib}:
+let...in rec {...}`) hit "attribute missing" merely from being *called*
+with an argument -- before anything ever selected a specific field.
+Minimal repro, confirmed against real `nix-instantiate --eval` before
+touching any code: `(rec { a = abort "x"; b = 2; }).b` aborted in asnix
+instead of returning `2` (real Nix never touches `a` at all, since
+nothing selects it).
+
+**Root cause, same class of bug as M25's call-by-value argument fix**:
+`compiler.c`'s `AST_ATTRSET` case, for the `rec {}` branch, builds each
+binding as a thunk, files it into a fresh frame slot (`OP_FRAME_SET`),
+then needs to read all of them back in *sorted* order to hand to
+`OP_MK_ATTRS` (which needs every value present, matching its parallel
+sorted-symbols array). That read-back used `OP_VAR_REF` -- the only
+frame-reading op that existed before this -- which forces on every read
+by design (correct for a genuine variable reference, where the value is
+about to be used). Here it was being repurposed as a "move this value
+out of the frame" step, not a real variable reference, so M25's same
+fix couldn't directly apply: `OP_VAR_REF` forcing immediately turned a
+`rec {}` literal's construction into "force every field right now,"
+regardless of whether anything would ever select them.
+
+**Fix**: a new op, `OP_FRAME_GET` (`op_frame.S`), that reads a frame
+slot's raw value verbatim -- no thunk-force check at all, pure data
+movement. `compiler.c`'s `rec {}` branch now uses `ib_frame_get` instead
+of `ib_var_ref` for the read-back; each binding is already a fresh,
+never-shared `Thunk` at that point (just built via `OP_MK_THUNK`), so a
+raw read-back is exactly correct -- the thunk still gets forced later,
+lazily, the first time something actually selects that field (via the
+*normal*, unchanged `OP_SELECT`, which already forces on read, same as
+before). `AST_LET` was checked and confirmed to NOT have this bug: its
+body is compiled with an ordinary `compile_expr`, which only emits
+`OP_VAR_REF` for variables actually referenced, each forcing correctly
+on genuine use -- no bulk "read everything back" step exists there, so
+nothing needed fixing on that path.
+
+**Verified**: the minimal repro above now matches real Nix exactly.
+`make test`/`test-e2e`/`test-conformance` all green (167 e2e, 19
+conformance, full unit suite); numtide/nix-conformance's `lang/` pass
+count unchanged (388, within noise of 389) -- this bug happened not to
+be exercised by that suite's own cases, but is a real, significant
+correctness fix for actual nixpkgs evaluation, where `rec {}` is used
+constantly.

@@ -127,6 +127,10 @@ size_t ib_frame_set(IrBuilder *b, int64_t slot) {
     return ib_emit(b, OP_FRAME_SET, slot, 0);
 }
 
+size_t ib_frame_get(IrBuilder *b, int64_t slot) {
+    return ib_emit(b, OP_FRAME_GET, slot, 0);
+}
+
 size_t ib_frame_exit(IrBuilder *b) {
     return ib_emit(b, OP_FRAME_EXIT, 0, 0);
 }

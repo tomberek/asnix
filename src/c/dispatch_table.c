@@ -30,6 +30,7 @@ extern void asnix_op_select(void);
 extern void asnix_op_mk_thunk(void);
 extern void asnix_op_frame_alloc(void);
 extern void asnix_op_frame_set(void);
+extern void asnix_op_frame_get(void);
 extern void asnix_op_frame_exit(void);
 extern void asnix_op_eq(void);
 extern void asnix_op_neq(void);
@@ -76,6 +77,7 @@ void *asnix_handler_table[OP_COUNT] = {
     [OP_MK_THUNK] = (void *)asnix_op_mk_thunk,
     [OP_FRAME_ALLOC] = (void *)asnix_op_frame_alloc,
     [OP_FRAME_SET] = (void *)asnix_op_frame_set,
+    [OP_FRAME_GET] = (void *)asnix_op_frame_get,
     [OP_FRAME_EXIT] = (void *)asnix_op_frame_exit,
     [OP_EQ] = (void *)asnix_op_eq,
     [OP_NEQ] = (void *)asnix_op_neq,

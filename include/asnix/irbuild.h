@@ -68,6 +68,7 @@ size_t ib_mk_thunk(IrBuilder *b, IrProgram *body_prog);
  * ir.h for the full rationale. */
 size_t ib_frame_alloc(IrBuilder *b, int64_t nslots);
 size_t ib_frame_set(IrBuilder *b, int64_t slot);
+size_t ib_frame_get(IrBuilder *b, int64_t slot);
 size_t ib_frame_exit(IrBuilder *b);
 
 /* "operators" milestone: comparisons (INT-only for ordering, see

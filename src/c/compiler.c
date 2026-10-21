@@ -688,9 +688,20 @@ static void compile_expr(IrBuilder *b, Ast *node, ScopeFrame *scope) {
                  * by original (unsorted) binding index so the ScopeFrame
                  * slot a binding's thunk-body references lines up with
                  * the OP_FRAME_SET that filed it. Once every binding is
-                 * filed, OP_VAR_REF(0, slot) reads each value straight
-                 * back off the frame in sorted order -- reusing the exact
-                 * same OP_MK_ATTRS the non-rec path uses. */
+                 * filed, OP_FRAME_GET(slot) reads each one straight back
+                 * off the frame in sorted order -- reusing the exact same
+                 * OP_MK_ATTRS the non-rec path uses. Deliberately
+                 * OP_FRAME_GET, NOT OP_VAR_REF (M29 fix): OP_VAR_REF
+                 * forces on read, which would eagerly force *every*
+                 * `rec {}` field the instant the literal is constructed
+                 * -- a real bug found evaluating real nixpkgs (confirmed:
+                 * `(rec { a = abort "x"; b = 2; }).b` aborted instead of
+                 * returning `2`, same root-cause class as M25's call-by-
+                 * value argument bug). Each binding is already a fresh,
+                 * never-shared Thunk (OP_MK_THUNK) at this point, so a
+                 * raw, non-forcing read-back is exactly right -- the
+                 * Thunk itself still gets forced later, lazily, the
+                 * first time something actually selects that field. */
                 AstBinding *bindings = node->as.attrset.bindings;
                 const char **names = malloc(n * sizeof(char *));
                 size_t *name_lens = malloc(n * sizeof(size_t));
@@ -715,7 +726,7 @@ static void compile_expr(IrBuilder *b, Ast *node, ScopeFrame *scope) {
                     ib_mk_thunk(b, ib_finish(thunk_b));
                     ib_frame_set(b, (int64_t)i);
                 }
-                for (size_t i = 0; i < n; i++) ib_var_ref(b, 0, (int64_t)order[i]);
+                for (size_t i = 0; i < n; i++) ib_frame_get(b, (int64_t)order[i]);
                 ib_mk_attrs(b, (int64_t)n, sorted_syms);
                 ib_frame_exit(b);
                 free(names);
