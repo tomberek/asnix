@@ -51,7 +51,8 @@ what's actually implemented and the scope decisions made along the way.
 | M36 — name the attribute in `.` selection's "attribute missing" error | done (see below) |
 | M37 — `builtins.functionArgs` | done (see below) |
 | M38 — `asnix_apply`'s PrimOp path never forced args/return (core evaluator fix) | done (see below) |
-| M39+ | not started |
+| M39 — `builtins.addErrorContext` | done (see below) |
+| M40+ | not started |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
 
@@ -3569,3 +3570,31 @@ function value directly from C" call sites.
 `make test`/`test-e2e` green (191 e2e, two new `m38_*` fixtures, each a
 `map somePrimop (map (x: x) [...])`-shaped repro); `test-conformance`
 still 632 passed, no regressions.
+
+## M39 scope notes: `builtins.addErrorContext`
+
+Found continuing to chase `d.nix` right after M38: `builtins.
+addErrorContext` was entirely missing. Confirmed via cppnix source
+(`~/nix/src/libexpr/primops.cc`: `.name = "__addErrorContext"`)
+builtins-only, not a bare global. Real Nix's only observable effect is
+annotating `value`'s error trace with `msg` if-and-only-if forcing
+`value` throws -- verified `msg` gets no special extra laziness beyond
+ordinary call-by-need: `let y = addErrorContext "ctx" (abort "x"); in
+1` == `1` (same as any unused lazy binding -- M25's own thunk-the-
+argument machinery already accounts for this, nothing addErrorContext-
+specific), while forcing the result directly (top-level eval, or
+wrapping in `isAttrs (...)`) does abort, with "… ctx" shown in the real
+Nix trace.
+
+Since asnix has no error-trace/position system at all, there's nothing
+to attach `msg` to -- implemented as a pure pass-through, `msg: value:
+value` (`addErrorContext2_impl`, builtins_misc.c), which already
+reproduces every observable case above via this project's ordinary M25
+call-by-need semantics: no `NOFORCE` needed, since forcing only
+happens when the *caller* forces the call's own result (the final
+curry stage's `OP_CALL` forces both args only once something actually
+forces that call to run at all) -- exactly matching real Nix's timing.
+
+`make test`/`test-e2e` green (192 e2e, one new `m39_*` fixture covering
+both the success and the lazy-unused cases); `test-conformance` still
+632 passed, no regressions.

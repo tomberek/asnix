@@ -233,6 +233,31 @@ static Value build_concatStringsSep(void) {
 }
 
 /* ---------------------------------------------------------------------
+ * builtins.addErrorContext msg value (M39, `__addErrorContext` in real
+ * Nix -- builtins-only, confirmed in ~/nix/src/libexpr/primops.cc). Real
+ * Nix's only observable effect is annotating `value`'s error trace with
+ * `msg` *if and only if* forcing `value` throws -- confirmed `msg` isn't
+ * forced any more eagerly than `value` itself by ordinary call-by-need
+ * (`let y = addErrorContext "ctx" (abort "x"); in 1` == 1, same as any
+ * other unused lazy binding; `addErrorContext "ctx" (abort "x")`
+ * forced directly DOES abort, exactly as if written bare -- no special
+ * extra laziness beyond normal application). Since asnix has no error-
+ * trace/position system at all (no position tracking anywhere in this
+ * codebase), there is nothing to attach `msg` to -- implemented as a
+ * pure pass-through, `msg: value: value`, which already reproduces
+ * every observable success/failure case above via this project's
+ * ordinary M25 call-by-need semantics (no NOFORCE needed: forcing only
+ * happens when the *caller* forces the call's own result, same as real
+ * Nix). */
+static Value addErrorContext2_impl(const Value *args, int64_t argc) {
+    (void)argc;
+    return args[1];
+}
+static Value build_addErrorContext(void) {
+    return make_curried_native((void *)addErrorContext2_impl, 2);
+}
+
+/* ---------------------------------------------------------------------
  * Type predicates. All verified true/false the obvious way against real
  * nix-instantiate (isNull null/isNull 1, isString "a"/isString 1,
  * isList [1 2 3], isAttrs {a=1;}, isFunction (a:a)/isFunction
@@ -426,6 +451,7 @@ const AsnixBuiltinMiscDef ASNIX_BUILTINS_MISC[] = {
     { "isString", build_isString },
     { "isPath", build_isPath },
     { "functionArgs", build_functionArgs },
+    { "addErrorContext", build_addErrorContext },
     { "isList", build_isList },
     { "isAttrs", build_isAttrs },
     { "isFunction", build_isFunction },
