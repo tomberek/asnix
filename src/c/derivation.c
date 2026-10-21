@@ -17,6 +17,7 @@
 #include "hash_shim.h"
 #include "nar.h" /* asnix_copy_path_to_store -- M75 */
 #include "store_path.h"
+#include "string_context.h" /* M76 */
 #include "symtab.h"
 #include "value_util.h"
 
@@ -462,13 +463,23 @@ static void asnix_collect_input_refs(Value v, InputRefSet *out) {
         }
         /* Every derivation Value reachable from user code has these
          * three fields (M58's wrapper, ASNIX_DERIVATION_NIX_SOURCE) --
-         * an attrset without all three just isn't a derivation output,
-         * and is a no-op here (not recursed into further: real Nix's
-         * own context mechanism attaches to the STRING a coercion
-         * produces, not to arbitrary nested structure, so there's
-         * nothing else in a non-derivation attrset that could carry a
-         * reference this scope cares about). */
-        if (idx_type < 0 || idx_drvpath < 0 || idx_outname < 0) return;
+         * an attrset without all three just isn't a derivation output
+         * ITSELF, but (M76) may still have one buried inside its own
+         * attribute values (e.g. a `__structuredAttrs`-mode attribute,
+         * which bypasses the normal string-coercion path below entirely
+         * and only ever reaches this function as a raw, uncoerced
+         * Value -- confirmed needed: real `hello.drv` itself uses
+         * `__structuredAttrs`) -- recurse into every nested value in
+         * that case, matching real Nix's own JSON serializer
+         * (`printValueAsJSON`), which does the same walk to collect
+         * context from a structured-attrs blob. */
+        if (idx_type < 0 || idx_drvpath < 0 || idx_outname < 0) {
+            for (int64_t i = 0; i < count; i++) {
+                const char *entry = base + ASNIX_ATTRS_OFF_ENTRIES + i * ASNIX_ATTR_SIZE;
+                asnix_collect_input_refs(*(const Value *)(entry + ASNIX_ATTR_OFF_VALUE), out);
+            }
+            return;
+        }
         Value type_val = asnix_force_for_print(
             *(const Value *)(base + ASNIX_ATTRS_OFF_ENTRIES + idx_type * ASNIX_ATTR_SIZE + ASNIX_ATTR_OFF_VALUE));
         if (asnix_tag_of(type_val) != ASNIX_TAG_PTR) return;
@@ -494,6 +505,22 @@ static void asnix_collect_input_refs(Value v, InputRefSet *out) {
         int64_t count = *(const int64_t *)(base + ASNIX_LIST_OFF_COUNT);
         const Value *elems = (const Value *)(base + ASNIX_LIST_OFF_ELEMS);
         for (int64_t i = 0; i < count; i++) asnix_collect_input_refs(elems[i], out);
+        return;
+    }
+    /* M76: a plain string (ASNIX_TAG_PTR, neither Path nor Float) may
+     * already carry attached string context -- e.g. the result of an
+     * earlier `"${pkg}/bin/x"` interpolation, evaluated long before
+     * THIS `derivation {...}` call ever runs, with no structure left
+     * to walk by the time it gets here. This is the actual fix for the
+     * gap M74's own scope notes flagged: `builder = stdenvShell;`
+     * (nixpkgs) traces back to a string interpolation of a derivation
+     * reference, which the structural checks above alone can never
+     * see. See string_context.h's own header comment. */
+    if (tag == ASNIX_TAG_PTR && !asnix_value_is_path(v) && !asnix_value_is_float(v)) {
+        const AsnixStringContext *ctx = asnix_string_context_of(v);
+        if (!ctx) return;
+        for (size_t i = 0; i < ctx->ndrvs; i++) input_ref_add_built(out, ctx->drvs[i].drv_path, ctx->drvs[i].output_name);
+        for (size_t i = 0; i < ctx->nsrcs; i++) input_ref_add_src(out, ctx->srcs[i]);
         return;
     }
     if (tag == ASNIX_TAG_PTR && asnix_value_is_path(v)) {
@@ -573,6 +600,38 @@ Value asnix_prim_derivation(const Value *args, int64_t argc) {
             break;
         }
     }
+    /* M76: `__ignoreNulls = true;` -- found chasing d.nix past this
+     * milestone's own core string-context mechanism: nixpkgs's own
+     * `make-derivation.nix` sets this unconditionally, and real Nix's
+     * `derivationStrictInternal` (~/nix/src/libexpr/primops.cc) skips
+     * the `__ignoreNulls` attribute itself UNCONDITIONALLY (regardless
+     * of its own value or `__structuredAttrs` mode -- a plain `if
+     * (i->name == state.s.ignoreNulls) continue;` before the main
+     * per-attribute switch, NOT gated like `__structuredAttrs`'s own
+     * conditional skip below), and additionally skips EVERY OTHER
+     * attribute whose forced value is `null` when `ignoreNulls` is
+     * true -- confirmed directly: real `hello.drv`'s own `__json` blob
+     * has neither `__ignoreNulls` nor `userHook` (a null-valued
+     * attribute nixpkgs sets) at all, where asnix previously emitted
+     * both verbatim. */
+    int ignore_nulls = 0;
+    {
+        uint32_t in_sym = asnix_intern("__ignoreNulls", 13);
+        for (int64_t i = 0; i < count; i++) {
+            const char *entry = base + ASNIX_ATTRS_OFF_ENTRIES + i * ASNIX_ATTR_SIZE;
+            uint32_t sym = *(const uint32_t *)(entry + ASNIX_ATTR_OFF_SYM);
+            if (sym != in_sym) continue;
+            Value raw_val = *(const Value *)(entry + ASNIX_ATTR_OFF_VALUE);
+            Value val = asnix_force_for_print(raw_val);
+            if (asnix_tag_of(val) == ASNIX_TAG_IMM && asnix_imm_subtag(val) == ASNIX_IMM_TRUE) {
+                ignore_nulls = 1;
+            } else if (!(asnix_tag_of(val) == ASNIX_TAG_IMM && asnix_imm_subtag(val) == ASNIX_IMM_FALSE)) {
+                fprintf(stderr, "asnix: derivation: '__ignoreNulls' must be a boolean\n");
+                exit(1);
+            }
+            break;
+        }
+    }
     /* In structured-attrs mode, every attribute except `args` (handled
      * identically either way, see below) and `__structuredAttrs` itself
      * gets JSON-serialized into one `__json` env var instead of each
@@ -605,10 +664,24 @@ Value asnix_prim_derivation(const Value *args, int64_t argc) {
          * context and properly saves/restores every register it touches
          * (see src/asm/force.S), so it nests like any well-behaved call. */
         Value val = asnix_force_for_print(raw_val);
-        asnix_collect_input_refs(val, &refs);
 
         size_t keylen;
         const char *key = asnix_sym_name(sym, &keylen);
+
+        /* M76: `__ignoreNulls` itself is always excluded (see this
+         * function's own pre-scan comment above); every OTHER
+         * null-valued attribute is excluded too, but only when the
+         * flag is actually set -- both unconditional-on-the-key /
+         * conditional-on-every-other-key splits matching real Nix
+         * exactly. Must come before `asnix_collect_input_refs` too: a
+         * skipped attribute contributes nothing to `inputDrvs`/
+         * `inputSrcs` either, matching real Nix's own early `continue`
+         * (which skips its context-collecting `coerceToString` calls
+         * entirely for a dropped attribute). */
+        if (keylen == 13 && memcmp(key, "__ignoreNulls", 13) == 0) continue;
+        if (ignore_nulls && asnix_tag_of(val) == ASNIX_TAG_IMM && asnix_imm_subtag(val) == ASNIX_IMM_NULL) continue;
+
+        asnix_collect_input_refs(val, &refs);
 
         /* When the mode is actually active, `__structuredAttrs` itself is
          * never pushed into `env` OR the JSON blob -- matches real Nix's
@@ -1230,6 +1303,23 @@ Value asnix_prim_derivation(const Value *args, int64_t argc) {
     for (size_t o = 0; o < noutputs; o++) {
         syms[1 + o] = asnix_intern(output_names[o], strlen(output_names[o]));
         vals[1 + o] = asnix_make_string_value(out_paths[o], strlen(out_paths[o]));
+        /* M76: this is THE origin point for real string context --
+         * `pkg.out`/`pkg.${name}` (hence `"${pkg}/bin/x"`-style
+         * interpolation, and `asnix_coerce_to_string[_for_derivation]`'s
+         * own `outPath` lookup) ultimately resolve to exactly this
+         * string Value. Attaching `Built(drv_path, output_names[o])`
+         * here is what lets a LATER derivation's attribute coercion
+         * (string interpolation, not just a bare attrset/Path) recover
+         * this dependency -- see string_context.h's header comment for
+         * why this matters (hello.drv's own `builder` attribute reaches
+         * `bash` only this way). `vals[0]` (`drvPath` itself) stays
+         * context-free -- that's real Nix's separate `DrvDeep` context
+         * (referencing the WHOLE closure), explicitly out of scope,
+         * same as M74's own structural collector never handled it. */
+        AsnixStringContext out_ctx;
+        asnix_ctx_init(&out_ctx);
+        asnix_ctx_add_built(&out_ctx, drv_path, output_names[o]);
+        asnix_string_attach_context(vals[1 + o], &out_ctx);
     }
     for (size_t i = 1; i < nkeys; i++) {
         size_t j = i;

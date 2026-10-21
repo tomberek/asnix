@@ -88,7 +88,8 @@ what's actually implemented and the scope decisions made along the way.
 | M73 — fixed-output derivations now compute their real output/`.drv` paths via real Nix's actual `makeFixedOutputPath` formula (prerequisite for M74's `hashDerivationModulo` work) | done (see below) |
 | M74 — real `hashDerivationModulo`: input derivations' own hashes are now substituted into a dependent derivation's `InputDrvs` before hashing, instead of every output/drvPath being computed from each derivation's own attributes in isolation | done, **scoped** (see below; `./asnix d.nix`'s `hello.outPath` still doesn't match real Nix bit-for-bit — a separately tracked, still-open gap, see below) |
 | M75 — real store-copying (NAR-hash + content-addressed path) for local (non-`/nix/store`) Path literals coerced via genuine string interpolation or inside a `derivation {...}` attribute | done, **scoped** (see below; `./asnix d.nix`'s `hello.outPath` STILL doesn't match real Nix — the remaining gap is real Nix's *string context*, a materially larger feature, see below) |
-| M76+ | not started |
+| M76 — real string context: an invisible dependency-provenance set attached to string Values, surviving concatenation/coercion, so a derivation reference reaching an attribute only through prior string interpolation (not a bare attrset/Path) is now tracked in `inputDrvs`/`inputSrcs` too; also fixed `__ignoreNulls` (found while verifying) | done, **scoped** (see below; `./asnix d.nix`'s `hello.outPath` now has the exact right `inputDrvs`/`inputSrcs`/`__json` *shape*, but still doesn't match bit-for-bit — the remaining gap is the FULL nixpkgs bootstrap chain's own hash parity, a much larger, open-ended undertaking, see below) |
+| M77+ | not started |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
 
@@ -7995,3 +7996,146 @@ file, directory, and derivation-attribute cases -- plus the
 `m67_path_interp_exists` fixture/expected correction above).
 `make test-nix-conformance`: `pass=628 fail=30 skip=148` -- +1 net
 over M74, zero regressions.
+
+## M76 scope notes: real string context
+
+Chasing `d.nix` past M75: `hello.outPath` still didn't match real Nix.
+Diffing asnix's own computed ATerm for `hello-2.12.3` against real Nix's
+actual `.drv` found the gap was qualitatively different and larger than
+M74/M75: real Nix's `hello.drv` has FOUR `inputDrvs` (`bash`,
+`stdenv-linux`, `version-check-hook`, the `fetchurl` source), but asnix's
+only had THREE -- missing `bash` entirely, even though `bash`'s own store
+path *was* correctly present as the literal `builder` string. Root cause:
+nixpkgs sets `builder = stdenvShell;`, which traces back to `shell =
+"${stage0.bash}/bin/bash";` (`pkgs/stdenv/linux/default.nix`) -- a STRING
+INTERPOLATION of a derivation reference, concatenated with a literal
+suffix, evaluated to a plain opaque string long before `derivation
+{...}`'s primop ever sees it. M74's structural collector
+(`asnix_collect_input_refs`: looks for a bare derivation attrset, a list
+of derivations, or an already-resolved store Path) is blind to this by
+construction -- once a reference becomes a STRING via interpolation,
+there's no structure left to walk. This is the same feature M61 (and
+implicitly M45/M54/M60) already declined once, for being disproportionate
+to its own user-facing payoff (`getContext`/`hasContext`/
+`addDrvOutputDependencies`) -- the user explicitly chose to implement it
+anyway, since it turned out to also be load-bearing for hash parity.
+
+**Key design simplification vs. the originally-declined scope**: that
+earlier estimate (~101 call sites, a new tagged Value kind touching the
+asm layer) assumed context would be baked into the STRING HEAP LAYOUT
+itself (like Path/Float's marker-byte trick, `include/asnix/heap.h`).
+Instead, a new `src/c/string_context.c`/`.h` attaches context via a SIDE
+TABLE keyed by the string Value's own arena pointer (a linear-scan array,
+same convention as `eval_file.c`'s import cache / `derivation.c`'s
+masked-hash cache) -- ordinary string reads (every asm op: equality,
+printing, hashing, `OP_STR_CONCAT`'s own byte-copying) stay COMPLETELY
+untouched, since they never need to know a context exists. Only the
+specific C-level functions that *construct* a new string from existing
+string/attrs/list inputs need to query-and-propagate -- a literal survey
+of every such function (an Explore agent cross-referencing both this
+codebase and real Nix's own `coerceToString`/`primops.cc`) found ~20 call
+sites, not ~101, and zero asm changes.
+
+`AsnixStringContext` (`drvs: {drv_path, output_name}[]`, `srcs: path[]`)
+reuses exactly M74's own `BuiltRef`/`InputRefSet` vocabulary.
+`asnix_string_attach_context(v, ctx)`/`asnix_string_context_of(v)` are the
+only two public entry points -- a no-op/`NULL` for the overwhelmingly
+common case (every plain-literal/arithmetic/non-derivation string never
+gets a table entry at all).
+
+**Origin points** (where context is *synthesized*): `asnix_prim_derivation`
+(`derivation.c`) now attaches `Built(drv_path, output_names[o])` to each
+output-path string it builds for the self-referential `strict` attrset --
+this is exactly what `pkg.out`/`pkg.${name}` resolve to, which is what
+`"${pkg}/bin/x"`-style interpolation reads via the `outPath`-lookup
+coercion path (`drvPath` itself stays context-free -- that's real Nix's
+separate `DrvDeep` context, referencing a derivation's whole closure,
+explicitly out of scope, same as M74's own collector never handled it).
+Coercing an already-`/nix/store/...` Path to a string, and M75's NAR-copy
+result, both now attach `Opaque(path)` -- this subsumes M74's bare-Path
+structural detection entirely.
+
+**Propagation points** (forward/union existing context, no new entries):
+`asnix_coerce_to_string`'s ATTRS (`__toString`/`outPath`) and LIST
+branches; the same two branches in `asnix_coerce_to_string_for_derivation`
+(M75); `coerce_to_string_for_interp`'s Path branch; `concat_strings_impl`
+(backs both `"${...}"` interpolation and `+`'s string/path-concat case --
+the single highest-traffic site). Each follows the same mechanical
+pattern: accumulate each piece's own context via `asnix_string_context_of`,
+union into a local `AsnixStringContext`, attach to the result if
+non-empty. Scoped OUT of this milestone (matching M74's own precedent of
+naming what's deferred, not silently skipping it): propagation through
+`substring`/`concatStringsSep`/`baseNameOf`/`dirOf`/`replaceStrings`/
+`stringToCharacters`/`toJSON`/`toXML`; `getContext`/`appendContext`'s real
+Nix-level attrset shape (currently still hardcoded no-ops);
+`unsafeDiscardStringContext` actually stripping an entry (currently still
+a harmless identity pass-through, same as before this milestone, since
+nothing had context to discard either way); `toFile`'s context-validation-
+and-fold-into-NAR-references nuance. None of these are hit by `hello`'s
+own attribute shapes -- real but not load-bearing for this milestone's
+goal, tracked as a follow-up.
+
+**`derivation.c` rewiring**: `asnix_collect_input_refs` (M74) is extended,
+not replaced -- it still recognizes a bare derivation attrset/list
+structurally (needed for e.g. `src = a;` where `a` is a derivation
+attrset not yet coerced to a string), but now ALSO: (a) reads attached
+context off any plain-string leaf it visits (the actual fix -- an
+interpolated `builder` string, by the time it reaches here, carries its
+`Built(bash's drvPath, "out")` ref from M76's propagation above, with no
+structure left to inspect), and (b) recurses into a GENERIC (non-
+derivation-shaped) attrset's own nested attribute values too, instead of
+treating it as a dead end. (b) was found necessary, not just thorough-for-
+its-own-sake: confirmed directly that real `hello.drv` itself uses
+`__structuredAttrs = true;`, whose non-special attributes bypass the
+normal string-coercion call entirely and reach this collector only as a
+raw, uncoerced Value -- matching real Nix's own JSON serializer
+(`printValueAsJSON`), which performs the identical recursive walk to
+collect context from a structured-attrs blob.
+
+**Found and fixed in the same verification pass, not string-context
+itself but directly blocking the same goal**: `__ignoreNulls = true;`
+(nixpkgs' `make-derivation.nix` sets this unconditionally) was not
+implemented at all -- real Nix's `derivationStrictInternal`
+(`~/nix/src/libexpr/primops.cc`) unconditionally skips the
+`__ignoreNulls` attribute itself (regardless of its own value or
+`__structuredAttrs` mode) and additionally skips every OTHER attribute
+whose forced value is `null` when the flag is set. Confirmed directly:
+real `hello.drv`'s own `__json` blob has neither `__ignoreNulls` nor
+`userHook` (a null-valued attribute nixpkgs sets) at all; asnix previously
+emitted both verbatim, a second, independent source of `__json` byte
+mismatch on top of the missing `bash` inputDrv.
+
+Verified against real `nix-instantiate --eval --strict`: the exact
+`hello`-shaped pattern (`builder = "${a}/bin/sh";`, a derivation reference
+reaching `derivation {...}` ONLY through a prior string interpolation,
+never as a bare attrset) and a `+`-concatenated variant both match
+exactly (`tests/e2e/m76_interp_dep.nix`/`m76_plus_dep.nix`); all 5 of
+M74's own verification fixtures re-verified unchanged (the context-based
+collection produces IDENTICAL results to the old structural-only walk for
+every case it already handled).
+
+**Re-ran `d.nix`**: `hello.outPath` still does NOT match real Nix
+bit-for-bit, but the gap changed character entirely. Before this
+milestone: 3 of 4 expected `inputDrvs` (missing `bash`), and the `__json`
+blob had 2 extra keys real Nix's doesn't. After: all 4 `inputDrvs` present
+(sorted correctly), identical `inputSrcs`, and the `__json` blob now has
+the EXACT SAME KEY SET as real Nix's (confirmed by direct comparison,
+key-by-key) -- every remaining difference is a VALUE mismatch for keys
+whose values are themselves derived from upstream packages (`bash`,
+`stdenv-linux`, `version-check-hook`, the fetched source tarball) not yet
+matching real Nix's own hashes. Dumping real `bash-5.3p15.drv` directly
+found it has its OWN 21 `inputDrvs` (`bootstrap-stage4-gcc-wrapper`,
+`bootstrap-stage4-stdenv-linux`, `bison`, 15 individual patch derivations,
+...) -- this is the full nixpkgs bootstrap chain, not a leaf. Reaching bit-
+exact `hello.outPath` parity means reaching bit-exact parity for every
+package in that chain, an open-ended, much larger undertaking than any
+single milestone so far -- explicitly flagged to the user as such rather
+than silently continuing into it; tracked as a separate, indefinite
+follow-up to the standing `d.nix` bug-chase, not a blocker on this
+milestone's own (verified, scoped) completion.
+
+`make test`/`test-e2e` green (2 new `m76_*` fixtures, each verified
+byte-for-byte against real `nix-instantiate --eval --strict` before being
+written). `make test-nix-conformance`: `pass=628 fail=30 skip=148` --
+unchanged from M75 (this corpus doesn't exercise multi-derivation
+hashing), zero regressions.

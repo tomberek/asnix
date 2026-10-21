@@ -14,6 +14,7 @@
 #include "asnix/ir.h" /* asnix_force_for_print, asnix_apply */
 #include "builtins_shared.h"
 #include "nar.h"
+#include "string_context.h" /* M76 */
 #include "symtab.h"
 
 Value asnix_make_string_value(const char *s, size_t len) {
@@ -148,11 +149,16 @@ Value asnix_coerce_to_string(Value v) {
              * its one argument, matching real Nix; its result (and a
              * plain `outPath`'s value) is coerced recursively, since
              * either could itself be a path or another such object.
-             * Scope cut: this is purely a *value*-coercion upgrade, not
-             * the separate, larger "string context" feature (dependency
-             * tracking through string ops) this project deliberately
-             * doesn't implement -- a derivation's `outPath` still works
-             * here as a plain string, just without any attached context. */
+             * M76: `outPath`/`__toString`'s own result may already carry
+             * attached string context (e.g. a derivation's own output
+             * path, see derivation.c's asnix_prim_derivation) -- forward
+             * it unchanged, same pointer-identity preservation every
+             * other "just return the inner coercion" case here already
+             * gets for free (no NEW context is ever synthesized in this
+             * function, only forwarded -- that matches real Nix, whose
+             * plain `toString` never triggers copyToStore and so never
+             * synthesizes an Opaque ref, but still forwards whatever
+             * context an input Value already carries). */
             uint32_t sym_tostring = asnix_intern("__toString", 10);
             int64_t idx = asnix_bshared_attrs_find(v, sym_tostring);
             if (idx >= 0) {
@@ -181,13 +187,20 @@ Value asnix_coerce_to_string(Value v) {
              * Does not replicate cppnix's own "skip the separator before
              * an empty nested list" quirk (that function's own comment
              * calls it "not quite correct") -- not hit by anything this
-             * project has evaluated so far. */
+             * project has evaluated so far.
+             *
+             * M76: each element's own context (if any) unions into the
+             * joined result's context -- same pattern as
+             * `concat_strings_impl`'s propagation. */
             int64_t count = asnix_bshared_list_count(v);
             const Value *elems = asnix_bshared_list_elems(v);
             char *result = NULL;
             size_t result_len = 0;
+            AsnixStringContext ctx;
+            asnix_ctx_init(&ctx);
             for (int64_t i = 0; i < count; i++) {
                 Value piece = asnix_coerce_to_string(asnix_force_for_print(elems[i]));
+                asnix_ctx_union_into(&ctx, asnix_string_context_of(piece));
                 int64_t piece_len;
                 const char *piece_bytes = asnix_ptr_bytes(piece, &piece_len);
                 int has_sep = (i + 1 < count);
@@ -198,6 +211,7 @@ Value asnix_coerce_to_string(Value v) {
             }
             Value out = asnix_make_string_value(result ? result : "", result_len);
             free(result);
+            asnix_string_attach_context(out, &ctx);
             return out;
         }
         default: break;
@@ -229,8 +243,21 @@ Value asnix_coerce_to_string_for_derivation(Value v) {
         char *nul_terminated = malloc((size_t)len + 1);
         memcpy(nul_terminated, bytes, (size_t)len);
         nul_terminated[len] = '\0';
+        /* M76: a bare Path, once coerced into a derivation attribute's
+         * text, is exactly real Nix's `copyToStore=true` origin point
+         * for an Opaque context entry -- whether it was ALREADY under
+         * `/nix/store/` (a prior derivation's own output, reached as a
+         * bare Path rather than through that derivation's attrset) or
+         * just got NAR-copied there by M75 below. This replaces M74's
+         * `asnix_collect_input_refs`'s structural bare-Path detection
+         * entirely: that walk is blind to a Path reached only AFTER a
+         * prior string interpolation, this is not. */
         if (len > 11 && memcmp(nul_terminated, "/nix/store/", 11) == 0) {
             Value out = asnix_make_string_value(nul_terminated, (size_t)len);
+            AsnixStringContext ctx;
+            asnix_ctx_init(&ctx);
+            asnix_ctx_add_opaque(&ctx, nul_terminated);
+            asnix_string_attach_context(out, &ctx);
             free(nul_terminated);
             return out;
         }
@@ -243,7 +270,12 @@ Value asnix_coerce_to_string_for_derivation(Value v) {
         char store_path[300];
         asnix_copy_path_to_store(nul_terminated, store_path, sizeof(store_path));
         free(nul_terminated);
-        return asnix_make_string_value(store_path, strlen(store_path));
+        Value out = asnix_make_string_value(store_path, strlen(store_path));
+        AsnixStringContext ctx;
+        asnix_ctx_init(&ctx);
+        asnix_ctx_add_opaque(&ctx, store_path);
+        asnix_string_attach_context(out, &ctx);
+        return out;
     }
     if (asnix_tag_of(v) == ASNIX_TAG_ATTRS) {
         uint32_t sym_tostring = asnix_intern("__toString", 10);
@@ -264,8 +296,11 @@ Value asnix_coerce_to_string_for_derivation(Value v) {
         const Value *elems = asnix_bshared_list_elems(v);
         char *result = NULL;
         size_t result_len = 0;
+        AsnixStringContext ctx;
+        asnix_ctx_init(&ctx);
         for (int64_t i = 0; i < count; i++) {
             Value piece = asnix_coerce_to_string_for_derivation(asnix_force_for_print(elems[i]));
+            asnix_ctx_union_into(&ctx, asnix_string_context_of(piece));
             int64_t piece_len;
             const char *piece_bytes = asnix_ptr_bytes(piece, &piece_len);
             int has_sep = (i + 1 < count);
@@ -276,6 +311,7 @@ Value asnix_coerce_to_string_for_derivation(Value v) {
         }
         Value out = asnix_make_string_value(result ? result : "", result_len);
         free(result);
+        asnix_string_attach_context(out, &ctx);
         return out;
     }
     return asnix_coerce_to_string(v);
@@ -358,11 +394,27 @@ static Value coerce_to_string_for_interp(Value v, int check_path_exists) {
              * for the same reason the existence check above is: this is
              * real Nix's `copyToStore=true` coercion, which `+`'s reuse
              * of this function must not trigger. */
-            if (check_path_exists && !(len > 11 && memcmp(nul_terminated, "/nix/store/", 11) == 0)) {
+            /* M76: same Opaque-context origin point as
+             * asnix_coerce_to_string_for_derivation's identical Path
+             * branch -- see its own comment. Only reached when
+             * `check_path_exists` (genuine interpolation, not `+`'s
+             * reuse of this function), matching exactly when the
+             * store-copy itself is gated. */
+            if (check_path_exists) {
+                int in_store = len > 11 && memcmp(nul_terminated, "/nix/store/", 11) == 0;
                 char store_path[300];
-                asnix_copy_path_to_store(nul_terminated, store_path, sizeof(store_path));
+                const char *final_path = nul_terminated;
+                if (!in_store) {
+                    asnix_copy_path_to_store(nul_terminated, store_path, sizeof(store_path));
+                    final_path = store_path;
+                }
+                Value out = asnix_make_string_value(final_path, strlen(final_path));
+                AsnixStringContext ctx;
+                asnix_ctx_init(&ctx);
+                asnix_ctx_add_opaque(&ctx, final_path);
+                asnix_string_attach_context(out, &ctx);
                 free(nul_terminated);
-                return asnix_make_string_value(store_path, strlen(store_path));
+                return out;
             }
             free(nul_terminated);
             return asnix_coerce_to_string(v);
@@ -440,8 +492,11 @@ static Value concat_strings_impl(const Value *parts, int64_t count, int check_pa
 
     Value *coerced = malloc((size_t)count * sizeof(Value));
     int64_t total_len = 0;
+    AsnixStringContext ctx;
+    asnix_ctx_init(&ctx);
     for (int64_t i = 0; i < count; i++) {
         coerced[i] = coerce_to_string_for_interp(parts[i], check_path_exists);
+        asnix_ctx_union_into(&ctx, asnix_string_context_of(coerced[i]));
         const char *s = (const char *)(coerced[i].raw & ~0x7ULL);
         total_len += *(const int64_t *)(s + ASNIX_STRING_OFF_LEN);
     }
@@ -456,7 +511,15 @@ static Value concat_strings_impl(const Value *parts, int64_t count, int check_pa
         out += len;
     }
     free(coerced);
-    return (Value){ .raw = (uint64_t)(uintptr_t)mem | ASNIX_TAG_PTR };
+    Value result = (Value){ .raw = (uint64_t)(uintptr_t)mem | ASNIX_TAG_PTR };
+    /* M76: `asnix_concat_path` (M64, path-literal interpolation/`~`)
+     * also calls this but then rewraps the result as a PATH, not a
+     * string -- Paths never carry context in real Nix (only strings
+     * do), so attaching here and letting canon_wrap_as_path's own
+     * fresh Path value simply not have an entry is correct; no special
+     * casing needed for that caller. */
+    asnix_string_attach_context(result, &ctx);
+    return result;
 }
 
 /* Shared by asnix_add_values (`path + string`) and asnix_concat_path
