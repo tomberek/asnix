@@ -4015,6 +4015,37 @@ case" pattern M11's own `m11_import_fixtures/` already established).
 (+1 over M57d's 642), 159 failed (-1), 0 known, 62 skipped -- no other
 test's result moved across either of these two sub-items.
 
+### M57f: `compareVersions`' int-overflow-to-string quirk
+
+Real Nix's `nextComponent`/`componentsLT` (`~/nix/src/libstore/names.cc`)
+parses a numeric version component with `string2Int<int>` -- `int`, not
+`int64_t` -- so a component whose numeric VALUE exceeds `INT32_MAX`
+(2147483647) fails that parse and falls back to being compared as a
+plain string for that round, not as a (correctly-valued) big integer.
+asnix's `component_is_int` (builtins_compare.c, used only by
+`compareVersions`'s `components_lt`, not by plain `splitVersion`) just
+accumulated into an `int64_t` with no bound at all. Added the same
+32-bit check upstream has, inline in the existing digit-accumulation
+loop (bail to "not a number" the instant the running value exceeds
+2147483647) -- checking the accumulated VALUE rather than e.g. the
+component's string length matters: confirmed `"0000000000000000000002"`
+(23 digits, value 2) is still numeric, only `"2147483648"` (2^31, over
+the boundary despite being a *shorter* string) isn't.
+
+Verified against real `nix-instantiate --eval`, all five
+`compareVersions` cases in `eval-okay-versions-int-range.nix`:
+`"2147483648"` vs `"9"` => -1 (over the boundary, loses to numeric `9`
+by the existing non-numeric-sorts-before-numeric rule); `"2147483647"`
+vs `"9"` => 1 (`INT32_MAX` itself still parses, compares numerically,
+correctly wins); `"0.0.0-20191109021931"` vs `"0.0.0-100"` => -1;
+leading-zeros case => 1; `"1.0-4294967296"` vs `"1.0-5"` => -1 -- all
+now match. `splitVersion`/`parseDrvName` (same fixture's other two
+sub-cases) were already correct, confirming the bug was scoped exactly
+to `components_lt`'s numeric check as expected. One new e2e fixture
+(`m57f_compareversions_int_overflow.nix`). `make test`/`test-e2e`
+green (207 e2e); `test-conformance` 644 passed (+1), 158 failed (-1),
+0 known, 62 skipped.
+
 ### M57: items investigated and explicitly skipped
 
 - **Function/derivation equality quirks** (item 3 in the original
@@ -4040,12 +4071,13 @@ test's result moved across either of these two sub-items.
   equality's `isDerivation`-style eager `type`-forcing during `==` was
   not investigated in depth given the above; left for a future pass.
 
-- **`compareVersions`'s int-overflow-to-string quirk** (item 3's other
-  half) and **path normalization for `path + string`** (item 6) and
-  **symlink resolution** (item 7) and **CLI flag plumbing** (item 8):
-  not reached in this pass -- time went to the higher-priority items
-  above instead, per the task's own suggested ordering. None of these
-  were investigated beyond reading the task description, so there's no
+- **Path normalization for `path + string`** (item 6) and **symlink
+  resolution** (item 7) and **CLI flag plumbing** (item 8): not reached
+  in this pass -- time went to the higher-priority items above instead,
+  per the task's own suggested ordering (`compareVersions`'s
+  int-overflow-to-string quirk, item 3's other half, WAS reached --
+  see M57f above). None of these three were investigated beyond
+  reading the task description, so there's no
   "turned out to be harder than expected" verdict for them; they're
   simply undone, left for a follow-up M58+.
 

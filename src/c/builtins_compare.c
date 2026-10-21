@@ -92,12 +92,28 @@ static void next_component(const char *s, int64_t len, int64_t *pos, const char 
     *pos = p;
 }
 
+/* M57f: real Nix's `nextComponent`/`componentsLT` (names.cc) parses a
+ * numeric component with `string2Int<int>` -- `int`, NOT `int64_t` --
+ * so a component whose numeric value exceeds INT32_MAX (2147483647)
+ * fails that parse and falls back to being treated as a plain STRING
+ * component for the rest of `componentsLT`'s comparison, not as a
+ * (correctly-valued) big integer. Verified against real `nix-instantiate
+ * --eval`: `compareVersions "2147483648" "9"` == -1 (2^31, one over the
+ * boundary, loses to "9" by the non-numeric-sorts-before-numeric rule)
+ * but `compareVersions "2147483647" "9"` == 1 (INT32_MAX itself still
+ * parses fine, compares numerically, and correctly wins); a long run of
+ * leading zeros does NOT trip this (`"0000000000000000000002"` is still
+ * numeric value 2, no overflow) -- confirmed the threshold tracks the
+ * numeric VALUE accumulated so far, not the component's string length,
+ * which is exactly what checking after each digit (rather than e.g.
+ * rejecting on length > 10) gets right for both cases at once. */
 static int component_is_int(const char *s, int64_t len, int64_t *out) {
     if (len == 0) return 0;
     int64_t v = 0;
     for (int64_t i = 0; i < len; i++) {
         if (s[i] < '0' || s[i] > '9') return 0;
         v = v * 10 + (s[i] - '0');
+        if (v > 2147483647LL) return 0;
     }
     *out = v;
     return 1;
