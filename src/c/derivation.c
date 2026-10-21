@@ -470,7 +470,34 @@ static void input_ref_add_src(InputRefSet *s, const char *path) {
     s->srcs[s->nsrcs++] = dup_cstr(path, strlen(path));
 }
 
-static void asnix_collect_input_refs(Value v, InputRefSet *out) {
+/* M83 (chasing ffmpeg's own nixpkgs-hash mismatch): `json_mode` --
+ * TRUE only when `v` is a value that real Nix would actually
+ * `printValueAsJSON` in full (a `__structuredAttrs`-eligible attribute's
+ * raw value) -- FALSE for every ordinary (non-structured-attrs)
+ * attribute, which real Nix instead feeds through `coerceToString`
+ * (`asnix_coerce_to_string_for_derivation`'s own ATTRS case: `__toString`
+ * then `outPath`, nothing else). Blindly recursing into every field of a
+ * non-derivation ATTRS value regardless of this distinction (this
+ * function's pre-M83 behavior) over-collects: `lib.cleanSourceWith`'s
+ * result (nixpkgs's `lib/sources.nix`) is a plain attrset carrying an
+ * `origSrc` field (the ORIGINAL, unfiltered Path) alongside its real
+ * `outPath` (the filtered copy actually used) -- walking `origSrc` too
+ * NAR-copies the unfiltered directory a second time and wrongly adds it
+ * as its own extra `inputSrcs` entry, one real Nix never produces (only
+ * `outPath`, reached via `src.outPath` during ordinary string coercion,
+ * is ever actually copied/referenced). Confirmed directly against real
+ * `nix-instantiate`: a minimal `derivation { ...; srcAttr = lib.
+ * cleanSourceWith { src = ./sub; filter = ...; }; }` repro's real
+ * `inputSrcs` has exactly the one filtered-copy entry; this project
+ * (pre-fix) additionally listed the raw, unfiltered `./sub` under its
+ * own basename. First surfaced bisecting `d.nix` (ffmpeg) ->
+ * `pipewire` -> `ffado` -> `scons` -> `python3.14-distutils` ->
+ * `python3.14-jaraco-envs` -> `python3.14-tox` ->
+ * `python3.14-pyproject-api` -> `python3.14-furo` ->
+ * `furo-web-npm-deps`/`npm-config-hook` -> `prefetch-npm-deps`, whose
+ * `rustPlatform.buildRustPackage` source (`lib.cleanSourceWith { src =
+ * ./.; ...}`) hits exactly this shape. */
+static void asnix_collect_input_refs(Value v, InputRefSet *out, int json_mode) {
     v = asnix_force_for_print(v);
     int tag = asnix_tag_of(v);
     if (tag == ASNIX_TAG_ATTRS) {
@@ -496,14 +523,39 @@ static void asnix_collect_input_refs(Value v, InputRefSet *out) {
          * and only ever reaches this function as a raw, uncoerced
          * Value -- confirmed needed: real `hello.drv` itself uses
          * `__structuredAttrs`) -- recurse into every nested value in
-         * that case, matching real Nix's own JSON serializer
-         * (`printValueAsJSON`), which does the same walk to collect
-         * context from a structured-attrs blob. */
+         * that case (`json_mode`), matching real Nix's own JSON
+         * serializer (`printValueAsJSON`), which does the same walk to
+         * collect context from a structured-attrs blob. Outside that
+         * (M83, `!json_mode`): mirror `asnix_coerce_to_string_for_
+         * derivation`'s own ATTRS handling exactly instead -- `__toString`
+         * then `outPath`, nothing else; see this function's own header
+         * comment above for why. */
         if (idx_type < 0 || idx_drvpath < 0 || idx_outname < 0) {
-            for (int64_t i = 0; i < count; i++) {
-                const char *entry = base + ASNIX_ATTRS_OFF_ENTRIES + i * ASNIX_ATTR_SIZE;
-                asnix_collect_input_refs(*(const Value *)(entry + ASNIX_ATTR_OFF_VALUE), out);
+            if (json_mode) {
+                for (int64_t i = 0; i < count; i++) {
+                    const char *entry = base + ASNIX_ATTRS_OFF_ENTRIES + i * ASNIX_ATTR_SIZE;
+                    asnix_collect_input_refs(*(const Value *)(entry + ASNIX_ATTR_OFF_VALUE), out, 1);
+                }
+                return;
             }
+            uint32_t sym_tostring = asnix_intern("__toString", 10);
+            int64_t idx_ts = asnix_bshared_attrs_find(v, sym_tostring);
+            if (idx_ts >= 0) {
+                Value fn = asnix_force_for_print(asnix_bshared_attrs_value(v, idx_ts));
+                Value result = asnix_apply(fn, &v, 1);
+                asnix_collect_input_refs(asnix_force_for_print(result), out, 0);
+                return;
+            }
+            uint32_t sym_outpath = asnix_intern("outPath", 7);
+            int64_t idx_op = asnix_bshared_attrs_find(v, sym_outpath);
+            if (idx_op >= 0) {
+                asnix_collect_input_refs(asnix_bshared_attrs_value(v, idx_op), out, 0);
+                return;
+            }
+            /* Neither -- `asnix_coerce_to_string_for_derivation` would
+             * fall through to `asnix_coerce_to_string`, which rejects a
+             * plain ATTRS value outright (fatal error): nothing real
+             * coercion could ever reach, so nothing to collect either. */
             return;
         }
         Value type_val = asnix_force_for_print(
@@ -530,7 +582,7 @@ static void asnix_collect_input_refs(Value v, InputRefSet *out) {
         const char *base = (const char *)(v.raw & ~0x7ULL);
         int64_t count = *(const int64_t *)(base + ASNIX_LIST_OFF_COUNT);
         const Value *elems = (const Value *)(base + ASNIX_LIST_OFF_ELEMS);
-        for (int64_t i = 0; i < count; i++) asnix_collect_input_refs(elems[i], out);
+        for (int64_t i = 0; i < count; i++) asnix_collect_input_refs(elems[i], out, json_mode);
         return;
     }
     /* M76: a plain string (ASNIX_TAG_PTR, neither Path nor Float) may
@@ -740,7 +792,29 @@ Value asnix_prim_derivation(const Value *args, int64_t argc) {
         if (keylen == 13 && memcmp(key, "__ignoreNulls", 13) == 0) continue;
         if (ignore_nulls && asnix_tag_of(val) == ASNIX_TAG_IMM && asnix_imm_subtag(val) == ASNIX_IMM_NULL) continue;
 
-        asnix_collect_input_refs(val, &refs);
+        /* M83: whether THIS attribute's value is JSON-serialized in full
+         * (`json_mode`, for `asnix_collect_input_refs` below) -- computed
+         * early because the call below has to precede the per-key
+         * branching that normally determines this (`is_special`'s own
+         * definition, further down, is identical -- duplicated here
+         * rather than hoisted because every other reader of `is_special`
+         * still wants it computed right next to the code it actually
+         * gates). Mirrors exactly which attributes end up in `json_vals`
+         * (raw, unwalked by `asnix_coerce_to_string_for_derivation`)
+         * versus the generic `else` (plain coercion) below: `args` is
+         * always coerced per-element regardless of `__structuredAttrs`
+         * (the `continue` right below never reaches the `structured_attrs`
+         * check at all), so it's excluded here too even though it isn't
+         * one of the `is_special` names. */
+        int is_special_early = (keylen == 4 && memcmp(key, "name", 4) == 0) ||
+                               (keylen == 6 && memcmp(key, "system", 6) == 0) ||
+                               (keylen == 7 && memcmp(key, "builder", 7) == 0) ||
+                               (keylen == 10 && memcmp(key, "outputHash", 10) == 0) ||
+                               (keylen == 14 && memcmp(key, "outputHashAlgo", 14) == 0) ||
+                               (keylen == 14 && memcmp(key, "outputHashMode", 14) == 0);
+        int is_args_key = (keylen == 4 && memcmp(key, "args", 4) == 0);
+        int json_mode_for_attr = structured_attrs && !is_special_early && !is_args_key;
+        asnix_collect_input_refs(val, &refs, json_mode_for_attr);
 
         /* When the mode is actually active, `__structuredAttrs` itself is
          * never pushed into `env` OR the JSON blob -- matches real Nix's

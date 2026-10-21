@@ -96,7 +96,9 @@ what's actually implemented and the scope decisions made along the way.
 | M81 — `nix-conformance` sweep: 7 parallel agents each independently triaged a disjoint slice of the remaining failures (real `getContext`/`appendContext`/`addDrvOutputDependencies`, `builtins.path`/`filterSource`/bare URL literals, `__curPos`, an `inherit (expr) a b;` double-evaluation bug, function-equality semantics, printer `<PRIMOP>`/`<PRIMOP-APP>` distinction, `__json` renormalization, regex collating-symbol rejection), merged with hand-resolved overlaps (one real design conflict: two independent `builtins.path` implementations, the more complete one kept and extended) | done (see below; `make test-nix-conformance`: `pass=628 fail=30 skip=148` → **`pass=646 fail=12 skip=148`**) |
 | M82 — real `builtins.fetchGit` (shells out to `git`, reuses M75/M80's NAR-hash store-copy machinery for `outPath`), fixing an `undefined variable 'fetchGit'` crash that was actually a compile-time scope-resolution problem (both `if`/`else` arms get compiled up front), not a runtime one | done (see below; `./asnix d.nix` — `ffmpeg.outPath` — now runs to completion with no crash; computed hash still differs from real Nix, a separate, pre-existing, unrelated gap documented as the next thread) |
 | M83 — 5 more nix-conformance fixes: `import`'s real `resolveExprPath` symlink-chain-following (+ per-file `__curPos.file`), `builtins.tryEval` failed-thunk memoization (a real asm-core fix: an intrusive IN_PROGRESS-thunk stack spanning 5 op_*.S/force.S sites + `op_call.S`'s `asnix_op_ret`), `fromTOML` now rejects TOML dates/times (matching the Nix version actually installed here, correcting a stale M81 claim), a regex group-repetition memory-limit approximation | done, **scoped** (see below; `make test-nix-conformance`: `pass=646 fail=12` → **pass=651 fail=7**; zero regressions in `make test`/`make test-e2e`/`make test-nixpkgs-hash`) |
-| M84+ | not started |
+| M84 — root-caused and fixed the M82 `ffmpeg` mismatch: `asnix_collect_input_refs` blindly recursed into every field of any non-derivation attrset (correct only for genuine `__structuredAttrs` JSON blobs), so `lib.cleanSourceWith`'s `origSrc` field (the pre-filter Path, alongside the real filtered `outPath`) got NAR-copied a second time and added as a bogus extra `inputSrcs` entry real Nix never produces | done (see below; `./asnix d.nix` — `ffmpeg.outPath` — now matches real Nix byte-for-byte) |
+| M85 — `tests/nixpkgs-hash/attrs.txt` expanded from 4 packages to 74 (148 `outPath`/`drvPath` checks), spanning CLI tools, compilers/interpreters, multi-output libraries, build tooling, a GUI/graphics stack slice, fixed-output fetchers, and `nix` itself | done (see below; `make test-nixpkgs-hash`: **`pass=148 fail=0`** — no new divergence found beyond the one M84 already fixed) |
+| M86+ | not started |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
 
@@ -8966,3 +8968,197 @@ element) that same struct-identity, which is a core representation
 change, not a printer-local fix -- the same scope boundary M81 already
 drew for `maybeThunk` slot-identity sharing, just reached from the
 printer instead of from `==`.
+
+## M84: root-caused and fixed the M82 `ffmpeg` mismatch -- `asnix_collect_input_refs` over-collecting through non-derivation attrsets
+
+Picked up the exact thread M82 left off: `./asnix d.nix`
+(`ffmpeg.outPath`) ran to completion but didn't match real Nix's hash.
+Bisected the ~60-wide dependency closure the same binary-search way
+every prior hash-parity bug this session was found: dump each
+candidate's own ATerm with `ASNIX_DEBUG_DRV=<name>`, diff it
+(hash-normalized) against the real `.drv` `nix-instantiate` writes to
+the store for the same attribute, and recurse into whichever
+`InputDrvs` entry's hash actually differs (several entries differ
+textually but are false leads -- see below). The chain, each one
+confirmed by directly comparing that package's own `.outPath`/
+`.drvPath` against real `nix-instantiate --eval --strict`:
+
+```
+ffmpeg -> sdl2-compat -> sdl3 -> { pipewire, zenity }
+zenity -> gtk4 -> gst-plugins-bad -> { openal-soft, spandsp }
+pipewire -> { ffado, roc-toolkit, spandsp }
+ffado -> scons -> python3.14-distutils -> python3.14-jaraco-envs
+  -> python3.14-tox -> python3.14-pyproject-api -> python3.14-furo
+  -> furo-web (passthru.web, a buildNpmPackage) -> { furo-web-npm-deps
+     (FOD), npm-config-hook } -> prefetch-npm-deps
+     (rustPlatform.buildRustPackage)
+```
+
+**False leads worth naming** (so a future bisection doesn't waste time
+re-discovering this): `spandsp` showed up as a hash mismatch inside
+*two* unrelated parents' `InputDrvs` (`gst-plugins-bad` and
+`pipewire`), and `furo-web-npm-deps` (the `fetchNpmDeps` FOD) showed up
+inside `furo-web`'s -- in both cases the mismatched entry's own
+`.drvPath` (the literal `.drv` *file's* store path) differed, but its
+own `.outPath` (what the entry's `hashDerivationModulo` actually
+produces) was byte-identical to real Nix. This is expected, not a bug:
+`hashDerivationModulo`'s whole purpose (M74) is to substitute each
+input's *recursive modulo-hash* into a derivation's own hash
+computation, not that input's literal file path -- so a `.drv`-file-
+only divergence somewhere *else* in that input's own ancestry (one
+that doesn't change ITS OWN `hashDerivationModulo`) can cosmetically
+perturb a dependency's `InputDrvs`-listed path without ever touching
+the hash that actually matters. Confirmed directly: `nix-instantiate
+--eval --strict -E '(import nixpkgs {}).spandsp.outPath'` and the
+asnix equivalent agree exactly, even though `.drvPath` doesn't -- the
+real divergence had to be chased elsewhere (`openal-soft`, whose
+`.outPath` genuinely disagreed, led to the real `pipewire` ->
+`ffado` branch).
+
+**Root cause, isolated with a 7-line minimal repro** (not ffmpeg --
+`derivation { ...; srcAttr = lib.cleanSourceWith { src = ./sub;
+filter = name: type: baseNameOf name != "drop.txt"; }; }`, `./sub`
+containing one kept and one dropped file): real Nix's `.drv` lists
+exactly one `inputSrcs` entry (the filtered copy, store-name
+`source`); asnix's listed *two* -- the correct filtered `source`
+entry, PLUS a second, spurious entry named `sub` (the UNFILTERED
+original directory's own basename), never built by real Nix at all.
+
+`lib/sources.nix`'s `cleanSourceWith`/`fromSourceAttributes` (the
+mechanism behind `lib.cleanSourceWith`, and therefore anything using
+it -- `rustPlatform.buildRustPackage`'s default `src` filter among
+many others) returns a plain attrset shaped `{ _isLibCleanSourceWith
+= true; origSrc; name; filter; outPath = builtins.path { ... }; }` --
+*not* a `type = "derivation"` attrset. `origSrc` is the ORIGINAL,
+UNFILTERED `Path` (here, the whole `prefetch-npm-deps/` source
+directory); `outPath` is the actual filtered copy real Nix's
+`coerceToString` ever looks at when this attrset flows into a
+derivation attribute.
+
+`derivation.c`'s `asnix_collect_input_refs` -- a call-scoped walk
+(M74/M76) that reconstructs which of a `derivation {...}` call's
+attribute values reference another derivation's output or a plain
+store path, mirroring the union of context real Nix's own
+`coerceToString` calls would collect -- had exactly one recursion
+rule for an ATTRS value that isn't itself a derivation: recurse into
+*every* nested attribute value, unconditionally. That rule exists for
+a real, narrower need (M76): a `__structuredAttrs`-mode attribute's
+raw value gets walked by real Nix's `printValueAsJSON` in full, so a
+derivation reference buried inside a *JSON-serialized* nested attrset
+genuinely needs the same full walk. But the SAME blind-recursion rule
+was also firing for `cleanSourceWith`'s result when it's an ordinary
+(non-structured-attrs) attribute value -- where real Nix's actual
+coercion (`asnix_coerce_to_string_for_derivation`'s own ATTRS case)
+only ever follows `__toString` then `outPath`, nothing else. Walking
+`origSrc` too NAR-copied the unfiltered directory a second time
+(M75's `asnix_copy_path_to_store`) and registered that copy as its
+own bogus extra `inputSrcs` entry.
+
+Fix: `asnix_collect_input_refs` now takes an explicit `json_mode`
+flag. Reaching a non-derivation ATTRS value with `json_mode` true
+(a genuine `__structuredAttrs`-blob attribute) keeps the old blind
+walk, recursing with `json_mode` still true. Reaching one with
+`json_mode` false now mirrors `asnix_coerce_to_string_for_derivation`
+exactly instead: follow `__toString` (calling it) if present, else
+`outPath` if present, else contribute nothing (matching that function
+falling through to a fatal "can't coerce" real Nix would also hit --
+nothing a real coercion could ever reach either). The call site
+(looping over a `derivation {...}` call's own attributes) now computes
+`json_mode` per-attribute as `structured_attrs && !is_special &&
+!is_args_key` -- the exact set of attributes that flow into the
+`__json` blob raw rather than through ordinary string coercion
+(`args` is carved out even in structured-attrs mode: real Nix always
+coerces it per-element regardless, confirmed by this file's own
+pre-existing comment on that `continue`). `LIST` recursion threads
+`json_mode` through unchanged (a list's own elements get the same
+treatment as their container, in both real Nix and this project
+already, independent of this fix).
+
+Verified the fix closes every hop of the bisected chain above (each
+one's `.outPath`/`.drvPath` now matches real `nix-instantiate --eval
+--strict` exactly, not just the leaf `prefetch-npm-deps` the minimal
+repro targeted) and, at the top:
+
+```
+"/nix/store/29iacg6h530yx7rxz4k1fhvi0kxxhsam-ffmpeg-9.0.1-bin"
+```
+
+-- `./asnix d.nix` now matches real Nix's
+`(import nixpkgs {}).ffmpeg.outPath` byte-for-byte, closing the gap
+M82 left open.
+
+`make test`/`make test-e2e`/`make test-conformance`: unchanged, all
+green. `make test-nix-conformance`: `pass=646 fail=12 skip=148`,
+identical to the pre-fix baseline -- zero regressions (expected: no
+numtide/nix-conformance fixture happens to exercise a non-derivation
+attrset with an `outPath`/`__toString` inside a `derivation {...}`
+attribute value). `make test-nixpkgs-hash`: `pass=8 fail=0`,
+unchanged (the pre-existing 4-package corpus never reached this code
+path either -- see the next milestone for why a much wider corpus was
+overdue).
+
+## M85: `tests/nixpkgs-hash/attrs.txt` expanded from 4 packages to 74
+
+The M77 corpus (`hello`/`hello.src`/`bash`/`curl`) was a smoke test, not
+a real sweep -- four packages sharing mostly the same shallow shape.
+Expanded `tests/nixpkgs-hash/attrs.txt` to 74 real nixpkgs top-level
+attribute paths (148 `outPath`+`drvPath` checks total), deliberately
+spread across the categories the task asked for rather than just
+picking 70 more packages that look like `hello`:
+
+- common CLI tools (`ripgrep`, `fd`, `bat`, `jq`, `tree`, `fzf`, `tmux`,
+  `htop`, `neovim`, `rsync`, `openssh`, `which`, `less`, `nano`, `vim`,
+  `fish`, `zsh`, `yarn`, `git`/`git.src`)
+- GNU-coreutils-family / classic Unix tools (`coreutils`, `findutils`,
+  `diffutils`, `patch`, `gnugrep`, `gnused`, `gawk`, `gnutar`, `gzip`,
+  `bzip2`, `xz`, `zstd`)
+- compilers/toolchains (`gcc`, `clang`, `llvm`, `rustc`, `go`, `jdk`)
+- scripting-language interpreters (`python3`/`python3.src`, `python311`,
+  `perl`, `ruby`, `nodejs`)
+- common C libraries, several genuinely multi-output (`zlib`,
+  `openssl`, `libxml2`, `sqlite`, `pcre2`, `ncurses`, `readline`,
+  `glibc`, `util-linux`)
+- build-system tooling (`cmake`, `pkg-config`, `autoconf`, `automake`,
+  `libtool`, `ninja`, `meson`)
+- a GUI/graphics stack slice (`boost`, `cairo`, `pixman`, `freetype`,
+  `fontconfig`, `harfbuzz`, `glib`, `gtk3`)
+- fetcher-based/fixed-output derivations beyond the pre-existing
+  `hello.src` (`curl.src`, `git.src`, `python3.src`)
+- `nix` itself, a large real-world multi-output C++ derivation
+
+Confirmed (not assumed) the `__structuredAttrs` category is real
+coverage, not just hoped-for: queried every candidate's own
+`drvAttrs.__structuredAttrs` and found ~40 of the 74 (`ripgrep`, `bat`,
+`jq`, `fzf`, `tmux`, `neovim`, `coreutils`, `findutils`, `diffutils`,
+`patch`, every `gnu*` tool, `gzip`/`bzip2`/`xz`/`zstd`, `zlib`,
+`openssl`, `libxml2`, `sqlite`, `pcre2`, `ncurses`, `readline`,
+`glibc`, `util-linux`, `cmake`, `pkg-config`, `autoconf`, `automake`,
+`libtool`, `ninja`, `boost`, `glib`, `gcc`, `clang`, `llvm`, `go`, ...)
+genuinely set it, so this corpus's `__structuredAttrs` ATerm-encoding
+path (M69/M80) gets real exercise, not a single lucky hit.
+
+Deliberately left `ffmpeg`/`sdl2-compat`/`prefetch-npm-deps` out of
+this list: `ffmpeg.outPath` alone takes several seconds to evaluate
+(a much larger closure than anything else here) and is already
+tracked separately by the repo root's `d.nix` plus M82/M84's own
+notes, not by this smoke-sweep corpus.
+
+Run post-M84 (the `asnix_collect_input_refs` fix): **pass=148
+fail=0** -- every single check in the expanded corpus passes. No NEW
+divergence was found beyond the one M84 already root-caused and
+fixed (expected: none of these 74 attribute paths route through
+`rustPlatform.buildRustPackage`'s `cargoLock.lockFile` ->
+`lib.cleanSourceWith`-shaped `src` the way `ffmpeg`'s `sdl2-compat` ->
+... -> `prefetch-npm-deps` chain did -- the bug class M84 fixed is
+real and triggers for any `derivation {...}` attribute whose value is
+a non-derivation attrset exposing both an unfiltered `Path` field and
+an `outPath`, not unique to `prefetch-npm-deps`, but this particular
+corpus's 74 picks happen not to hit that specific shape). Confirms
+M84's fix, not this corpus's own breadth, is what closed the `ffmpeg`
+gap -- and that the fix didn't regress anything else reachable from a
+much wider, more diverse slice of real nixpkgs than this project had
+ever swept before.
+
+`make test`/`make test-e2e`/`make test-conformance`: unchanged, all
+green. `make test-nix-conformance`: `pass=646 fail=12 skip=148`,
+identical to the pre-existing baseline -- zero regressions.
