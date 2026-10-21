@@ -17,8 +17,17 @@
  * literal resolves relative to the directory of the file it's *written
  * in*, not the process's cwd or the importing file's directory (see
  * src/c/eval_file.c, which computes this once per file and is the only
- * other caller of asnix_compile besides this file's own tests). */
-IrProgram *asnix_compile(Ast *root, const char *base_dir);
+ * other caller of asnix_compile besides this file's own tests).
+ *
+ * `file_path` (M82): the resolved absolute path of the .nix file being
+ * compiled (not just its directory) -- used ONLY for `__curPos`'s `file`
+ * field (AST_CURPOS in compile_expr), so a `__curPos` token inside an
+ * IMPORTED file reports that file's own path, not the outermost file
+ * asnix was invoked on (the old M80 approximation). May be NULL (falls
+ * back to `asnix_eval_top_level_file()`, matching the old behavior
+ * exactly) -- every real caller passes it, NULL only covers this file's
+ * own unit tests, which don't exercise `__curPos`. */
+IrProgram *asnix_compile(Ast *root, const char *base_dir, const char *file_path);
 
 /* M54: `builtins.scopedImport`'s compile-time half -- same as
  * asnix_compile above, but with one extra named (lexical, not `with`-
@@ -29,7 +38,7 @@ IrProgram *asnix_compile(Ast *root, const char *base_dir);
  * like any other variable reference. See compiler.c's own comment on
  * this function and eval_file.c's asnix_eval_file_scoped (the only
  * caller) for the matching runtime half. */
-IrProgram *asnix_compile_scoped(Ast *root, const char *base_dir,
+IrProgram *asnix_compile_scoped(Ast *root, const char *base_dir, const char *file_path,
                                  const char **extra_names, size_t *extra_lens, size_t extra_count);
 
 #endif /* ASNIX_COMPILER_H */

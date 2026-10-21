@@ -1,11 +1,36 @@
 #include "tryeval.h"
 
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
 
+#include "asnix/ir.h" /* ASNIX_THUNK_OFF_ENV/STATE, ASNIX_THUNK_STATE_FAILED */
+
 static jmp_buf *g_tryeval_stack[ASNIX_TRYEVAL_MAX_DEPTH];
 static int g_tryeval_depth = 0;
+
+/* M82: stacklimits.S's intrusive IN_PROGRESS-thunk stack -- see
+ * tryeval.h's own comment and ir.h's ASNIX_THUNK_OFF_ENV comment. Each
+ * node's "prev" link is stashed in the thunk's own (otherwise unused
+ * while IN_PROGRESS) `env` field, so this is a plain linked-list walk
+ * over raw thunk-cell addresses, not a separate allocation. */
+extern int64_t asnix_inprogress_head;
+
+int64_t asnix_tryeval_save_inprogress_head(void) {
+    return asnix_inprogress_head;
+}
+
+void asnix_tryeval_unwind_inprogress(int64_t saved_head) {
+    int64_t cur = asnix_inprogress_head;
+    while (cur != saved_head) {
+        char *cell = (char *)(intptr_t)cur;
+        int64_t next = *(int64_t *)(cell + ASNIX_THUNK_OFF_ENV);
+        *(int64_t *)(cell + ASNIX_THUNK_OFF_STATE) = ASNIX_THUNK_STATE_FAILED;
+        cur = next;
+    }
+    asnix_inprogress_head = saved_head;
+}
 
 void asnix_tryeval_push(jmp_buf *buf) {
     if (g_tryeval_depth >= ASNIX_TRYEVAL_MAX_DEPTH) {

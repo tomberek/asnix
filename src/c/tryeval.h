@@ -3,6 +3,7 @@
 
 #include <setjmp.h>
 #include <stddef.h>
+#include <stdint.h>
 
 /*
  * M30: a narrow, targeted catchable-throw mechanism for `builtins.tryEval`
@@ -33,17 +34,29 @@
  * `prim_tryEval` returns normally (whichever way it got there), the
  * caller's own push/pop restores them regardless of what happened inside.
  *
- * Known, accepted limitation, not engineered around: if the thrown
- * expression's evaluation forced some OTHER thunk partway through (not
- * the thunk `tryEval` was directly asked to evaluate), that thunk is left
- * marked IN_PROGRESS forever (the normal "finish forcing, mark FORCED"
- * step never runs for it) -- referencing that *same* thunk object again
- * later would incorrectly blackhole. A full fix would mean tracking and
- * rolling back every thunk touched since the matching `setjmp`, which is
- * a much larger undertaking; not attempted here, since a `tryEval`'d
- * expression that throws is, in every real pattern seen so far
- * (nixpkgs's own `impure-overlays.nix`), a disposable one-off whose
- * intermediate thunks are never touched again from elsewhere.
+ * M82 (see docs/architecture.md): previously-documented limitation, now
+ * fixed -- if the thrown expression's evaluation forced some OTHER thunk
+ * partway through (not just the thunk `tryEval` was directly asked to
+ * evaluate), that thunk used to stay marked IN_PROGRESS forever (the
+ * normal "finish forcing, mark FORCED" step never runs for it, since the
+ * `longjmp` back to here skips every intervening op_*.S/force.S
+ * epilogue) -- referencing that *same* thunk object again later would
+ * incorrectly blackhole (found via numtide/nix-conformance's
+ * eval-okay-tryeval-failed-thunk-reeval.nix: "Since Nix 2.34, errors are
+ * memoized" -- real Nix re-raises the SAME cached failure on a second
+ * force, rather than either re-running the thunk's body or treating it
+ * as a genuine cycle). Fixed via `asnix_inprogress_head`
+ * (stacklimits.S): every op_*.S/force.S site that marks a thunk
+ * IN_PROGRESS also pushes it onto this intrusive stack (linked through
+ * the thunk's own, now-unused `env` field -- see ir.h's ASNIX_THUNK_OFF_
+ * ENV comment), and `asnix_tryeval_save_inprogress_head`/
+ * `asnix_tryeval_unwind_inprogress` below let `prim_tryEval`
+ * (builtins_tryeval.c) walk exactly the range of thunks that became
+ * IN_PROGRESS during ITS OWN dynamic extent (not any OUTER, still-
+ * legitimately-in-progress force further up the call chain) and mark
+ * them FAILED instead -- re-forcing a FAILED thunk re-raises
+ * (catchable again) rather than re-running the body or blackholing; see
+ * each op_*.S/force.S's own `.L*_reraise` label.
  */
 
 #define ASNIX_TRYEVAL_MAX_DEPTH 256
@@ -68,5 +81,24 @@ void asnix_tryeval_pop(void);
  * never returns. Otherwise falls back to exactly asnix_fatal's own
  * behavior (write `msg` to stderr, exit 1) -- never returns either way. */
 _Noreturn void asnix_tryeval_raise_or_fatal(const char *msg, size_t len);
+
+/* M82: snapshot of `asnix_inprogress_head` (stacklimits.S) -- call BEFORE
+ * forcing the expression `tryEval` was asked to evaluate (alongside the
+ * existing VALSTACK/RETSP-limit saves, builtins_tryeval.c), so a later
+ * `asnix_tryeval_unwind_inprogress` call knows exactly which thunks
+ * became IN_PROGRESS strictly within this `tryEval`'s own dynamic
+ * extent. */
+int64_t asnix_tryeval_save_inprogress_head(void);
+
+/* M82: walks `asnix_inprogress_head`'s intrusive stack from its CURRENT
+ * value down to `saved_head` (as returned by
+ * asnix_tryeval_save_inprogress_head before the force that just got
+ * caught), marking every thunk in that range ASNIX_THUNK_STATE_FAILED
+ * (instead of leaving it stuck IN_PROGRESS) and restoring
+ * `asnix_inprogress_head` to `saved_head`. Call ONLY from the caught
+ * (longjmp'd-to) branch -- on the normal-return path every thunk already
+ * popped itself via its own successful OP_RET, so the head is already
+ * back to `saved_head` with nothing to unwind. */
+void asnix_tryeval_unwind_inprogress(int64_t saved_head);
 
 #endif /* ASNIX_TRYEVAL_H */

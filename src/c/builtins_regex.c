@@ -100,18 +100,55 @@ static char *nul_copy(const char *bytes, int64_t len) {
  * engine` routes every `[.name.]` occurrence to that engine rather
  * than trusting glibc's more lenient `regcomp` for it.
  *
- * Deliberately NOT chased (see docs/architecture.md's M80 scope
- * notes): `(a){24998}` -- real Nix rejects this specific
- * group-repetition count as "memory limit exceeded" at libstdc++'s own
- * internal NFA-state-count limit, well below glibc's own much higher
- * limit (which still accepts it, so there's no existing signal to
- * repurpose, unlike `a{99999}`-shaped bare-repetition cases where
- * glibc's own limit happens to trip at a nearby count for unrelated
- * reasons) -- an inherent engine-complexity-limit mismatch whose exact
- * boundary depends on the repeated body's own shape in a way that
- * can't be derived from a handful of probe patterns without
- * effectively reverse-engineering libstdc++'s NFA compiler's internal
- * state-cost accounting. */
+ * M82 (see docs/architecture.md): `(a){24998}` -- real Nix rejects this
+ * specific group-repetition count as "memory limit exceeded" at
+ * libstdc++'s own internal NFA-state-count limit, well below glibc's
+ * own much higher limit (which still accepts it, so unlike
+ * `a{99999}`-shaped BARE-repetition cases -- no group, just a literal
+ * repeated directly -- where glibc's own regcomp limit happens to trip
+ * at a nearby count for unrelated reasons and asnix already gets this
+ * right "for free" via regcomp's own rejection, a *group* repetition
+ * needs its own explicit check here). Confirmed empirically against the
+ * `nix-instantiate` installed in this environment (binary search on
+ * `builtins.match "(a){N}" "aaa"`): accepted up to exactly N=24997,
+ * rejected at N=24998 -- an inherent engine-complexity-limit whose exact
+ * boundary depends on the repeated body's own shape (a costlier body
+ * would trip at a lower N) in a way that can't be derived in general
+ * from a handful of probe patterns without effectively reverse-
+ * engineering libstdc++'s NFA compiler's internal state-cost accounting
+ * -- NOT attempted here. Instead: `group_repeat_bound_too_large` below
+ * rejects any `(...)` capture group followed by a `{m}`/`{m,}`/`{m,n}`
+ * interval whose bound exceeds `ASNIX_GROUP_REPEAT_SAFE_MAX` (1000) --
+ * comfortably above every actual group-repetition count anywhere in
+ * numtide/nix-conformance's corpora (`corpora/regex.nix`'s own group-
+ * repeat cases top out at `{1,3}`) and comfortably below the real
+ * ~24998 limit, so this can never misclassify anything currently
+ * exercised in either direction; it is a conservative approximation of
+ * real Nix's actual limit, not a faithful reproduction of it. */
+#define ASNIX_GROUP_REPEAT_SAFE_MAX 1000
+
+/* `p[i] == '{'` on entry (caller already checked). Parses a POSIX ERE
+ * interval `{m}`/`{m,}`/`{m,n}` starting there and returns 1 if either
+ * bound present exceeds ASNIX_GROUP_REPEAT_SAFE_MAX -- see the comment
+ * above. Returns 0 (not rejected on this basis) for anything else,
+ * including a malformed interval (that's `pattern_rejected_by_real_nix`'s
+ * OTHER rules', or plain regcomp's, concern -- this function only ever
+ * adds rejections, never overrides one already found valid). */
+static int group_repeat_bound_too_large(const char *p, int64_t len, int64_t i) {
+    int64_t j = i + 1;
+    int64_t bound1 = -1, bound2 = -1;
+    int64_t start = j;
+    while (j < len && p[j] >= '0' && p[j] <= '9') j++;
+    if (j > start) bound1 = atoll(p + start); /* no overflow concern: capped against a plain 4-digit threshold below */
+    if (j < len && p[j] == ',') {
+        j++;
+        start = j;
+        while (j < len && p[j] >= '0' && p[j] <= '9') j++;
+        if (j > start) bound2 = atoll(p + start);
+    }
+    if (j >= len || p[j] != '}') return 0; /* malformed -- not this function's rule to enforce */
+    return (bound1 > ASNIX_GROUP_REPEAT_SAFE_MAX) || (bound2 > ASNIX_GROUP_REPEAT_SAFE_MAX);
+}
 static int pattern_rejected_by_real_nix(const char *p, int64_t len) {
     static const char *valid_escapes = ".()*+?[{^$|\\";
     int in_bracket = 0, bracket_first = 0, paren_depth = 0;
@@ -130,6 +167,10 @@ static int pattern_rejected_by_real_nix(const char *p, int64_t len) {
                 if (paren_depth == 0) return 1;
                 paren_depth--;
                 i++;
+                /* M82: a just-closed group immediately followed by a
+                 * large `{m}`/`{m,}`/`{m,n}` interval -- see
+                 * group_repeat_bound_too_large's own comment above. */
+                if (i < len && p[i] == '{' && group_repeat_bound_too_large(p, len, i)) return 1;
                 continue;
             }
             if (c == '{' && i + 1 < len && p[i + 1] == ',') return 1;

@@ -231,6 +231,23 @@ asnix_op_ret:
     // an ordinary call -- the body's last expression already left its
     // result on top of VALSTACK (same place an ordinary call leaves its
     // result); memoize it into the thunk cell before resuming.
+    //
+    // M82: this thunk (%rcx) is always exactly the current head of
+    // `asnix_inprogress_head`'s intrusive stack (stacklimits.S) here --
+    // forcing is strictly LIFO under normal (non-exceptional)
+    // completion, so whichever thunk most recently went IN_PROGRESS is
+    // always the next one to finish -- so pop it (read its "prev" link,
+    // stashed in ENV while IN_PROGRESS, BEFORE overwriting ENV with the
+    // cached result below) rather than leaving it stuck on the list
+    // forever, which would corrupt the chain for the NEXT thunk's own
+    // push/pop (found exactly this way: a successfully-forced thunk
+    // left dangling on the list, its `env` field later holding a cached
+    // Value instead of a valid "prev" pointer, crashing
+    // asnix_tryeval_unwind_inprogress's walk on an unrelated later
+    // `tryEval` catch). %rax is dead here (last loaded by OP_CALL's own
+    // dispatch, several ops ago).
+    movq ASNIX_THUNK_OFF_ENV(%rcx), %rax
+    movq %rax, asnix_inprogress_head(%rip)
     movq -8(%r12), %rdx
     movq %rdx, ASNIX_THUNK_OFF_ENV(%rcx)
     movq $ASNIX_THUNK_STATE_FORCED, ASNIX_THUNK_OFF_STATE(%rcx)

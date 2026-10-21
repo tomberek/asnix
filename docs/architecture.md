@@ -95,7 +95,8 @@ what's actually implemented and the scope decisions made along the way.
 | M80 — right-sized M78's scratch-buffer constants against a real measured high-water-mark instead of leaving them as round-number guesses; `asnix_eval`'s shrunk (8 MiB/2 MiB → 1 MiB/1 MiB), `asnix_apply`/`asnix_force_for_print`'s deliberately left unchanged after real-world cross-checks (a 15,000-element list literal test, real Nix's own 10,000-call `max-call-depth` default) proved the raw per-package measurement wasn't representative enough to shrink safely | done (see below; `asnix_arena.total_allocated` for `d.nix`: 151 MB → 126 MB, ~17%; zero regressions) |
 | M81 — `nix-conformance` sweep: 7 parallel agents each independently triaged a disjoint slice of the remaining failures (real `getContext`/`appendContext`/`addDrvOutputDependencies`, `builtins.path`/`filterSource`/bare URL literals, `__curPos`, an `inherit (expr) a b;` double-evaluation bug, function-equality semantics, printer `<PRIMOP>`/`<PRIMOP-APP>` distinction, `__json` renormalization, regex collating-symbol rejection), merged with hand-resolved overlaps (one real design conflict: two independent `builtins.path` implementations, the more complete one kept and extended) | done (see below; `make test-nix-conformance`: `pass=628 fail=30 skip=148` → **`pass=646 fail=12 skip=148`**) |
 | M82 — real `builtins.fetchGit` (shells out to `git`, reuses M75/M80's NAR-hash store-copy machinery for `outPath`), fixing an `undefined variable 'fetchGit'` crash that was actually a compile-time scope-resolution problem (both `if`/`else` arms get compiled up front), not a runtime one | done (see below; `./asnix d.nix` — `ffmpeg.outPath` — now runs to completion with no crash; computed hash still differs from real Nix, a separate, pre-existing, unrelated gap documented as the next thread) |
-| M83+ | not started |
+| M83 — 5 more nix-conformance fixes: `import`'s real `resolveExprPath` symlink-chain-following (+ per-file `__curPos.file`), `builtins.tryEval` failed-thunk memoization (a real asm-core fix: an intrusive IN_PROGRESS-thunk stack spanning 5 op_*.S/force.S sites + `op_call.S`'s `asnix_op_ret`), `fromTOML` now rejects TOML dates/times (matching the Nix version actually installed here, correcting a stale M81 claim), a regex group-repetition memory-limit approximation | done, **scoped** (see below; `make test-nix-conformance`: `pass=646 fail=12` → **pass=651 fail=7**; zero regressions in `make test`/`make test-e2e`/`make test-nixpkgs-hash`) |
+| M84+ | not started |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
 
@@ -8804,3 +8805,164 @@ intermediate derivations in both asnix and real
 `nix-instantiate --eval --strict --json` for the same attribute paths)
 that's its own multi-step investigation, not a quick follow-up. This
 is the next thread to pull on `d.nix`.
+## M83: five more nix-conformance fixes -- import-follows-symlink,
+tryEval failed-thunk memoization, fromTOML date rejection, and a regex
+group-repetition memory limit
+
+Picked up the 5 tractable-looking failures M81's sweep didn't attempt
+(`make test-nix-conformance`: `pass=646 fail=12 skip=148` going in).
+Result: **`pass=651 fail=7 skip=148`** -- all 5 fixed, zero
+regressions (`make test`/`make test-e2e` both stayed green throughout;
+`make test-nixpkgs-hash` stayed `pass=8 fail=0`). The remaining 7
+failures are exactly M81's already-confirmed-large 7 (`eval-okay-
+context-inputs`/`eq-slot-elem`/`eq-slot-identity`/`getattrpos`/
+`getattrpos-functionargs`/`inherit-attr-pos`/`print`) -- see M81's own
+notes, plus this milestone's own `eval-okay-print.nix` re-confirmation
+below.
+
+1. **`eval-okay-import-follows-symlink.nix`** -- real Nix's
+   `resolveExprPath` (`eval.cc`) follows a symlink chain on the exact
+   literal path handed to `import` itself (not any symlinked
+   *directory* component reached along the way -- that's a genuinely
+   different rule, M57h's own `eval-okay-symlink-resolution.nix` fix,
+   and the two don't conflict: `lstat`/`readlink` only ever inspect the
+   FINAL path component, so a regular file reached through a symlinked
+   parent directory is untouched by this). Added `follow_symlink_chain`
+   (`eval_file.c`) -- an `lstat`+`readlink` loop bounded at 1024 hops,
+   mirroring cppnix's own loop exactly -- called from `resolve_file_
+   path` after the existing (symlink-blind) lexical canonicalization.
+   This also fixed `__curPos.file` for files reached via `import`: it
+   used to always report the OUTERMOST file asnix was invoked on (an
+   M80-documented approximation) -- now `asnix_compile`/`asnix_compile_
+   scoped` take an explicit `file_path` parameter (the resolved path,
+   threaded from `eval_file.c`'s own `resolved` variable at each of
+   their 3 call sites) instead of calling `asnix_eval_top_level_file()`
+   unconditionally, so a `__curPos` token inside an IMPORTED file now
+   reports THAT file's own path. (`line`/`column` were already exact,
+   M80.) The pre-existing import-value cache (M65, keyed by resolved
+   path) needed no changes -- it already gives two imports that resolve
+   to the same real file the identical cached `Value`, which is exactly
+   what makes the test's second import print `«repeated»` (M80's own
+   whole-print-call ATTRS dedup, M81, already keys off this same
+   pointer identity) while a `scopedImport` of the same path (which
+   intentionally bypasses the cache) prints in full again.
+
+2. **`eval-okay-tryeval-failed-thunk-reeval.nix`** -- "Since Nix 2.34,
+   errors are memoized": forcing a thunk whose body already threw once
+   must re-raise the SAME failure (catchable again) on a second force,
+   not re-run the body (no duplicate side effects) and not blackhole
+   (it's not a genuine cycle). `tryeval.h`'s own pre-existing comment
+   candidly documented this as a known, unfixed limitation: a `longjmp`
+   back to `builtins.tryEval`'s `setjmp` skips every op_*.S/force.S
+   epilogue between the throw and the catch, so any thunk that went
+   `IN_PROGRESS` in that range stays stuck that way forever -- re-
+   forcing it later hit the SAME blackhole guard as a genuine `let x =
+   x; in x` cycle, aborting the whole process even inside a `tryEval`.
+   Fixed with a new `ASNIX_THUNK_STATE_FAILED` (`ir.h`) plus
+   `asnix_inprogress_head` (`stacklimits.S`): an intrusive Thunk*-stack,
+   linked through each IN_PROGRESS thunk's own `env` field (dead at that
+   point -- already consumed to jump into the body, and not read again
+   until FORCED repurposes it for the cached value) -- every site that
+   sets IN_PROGRESS (`op_var_ref.S`, `op_with.S`'s `OP_WITH_TRY`,
+   `op_select.S`, `op_select_or.S`, `force.S`) pushes itself on; the one
+   site that transitions IN_PROGRESS -> FORCED (`op_call.S`'s
+   `asnix_op_ret`, which already memoizes every force uniformly
+   regardless of which op started it) pops itself back off, since
+   forcing nests strictly LIFO under normal completion. `builtins.
+   tryEval` (`builtins_tryeval.c`) saves the head before forcing its
+   argument and, ONLY on the caught-exception path, walks from the
+   live head down to that saved marker (`asnix_tryeval_unwind_
+   inprogress`, `tryeval.c`) marking everything in that range FAILED
+   instead of leaving it IN_PROGRESS -- this correctly leaves an OUTER,
+   still-legitimately-in-progress force (e.g. a `tryEval` called from
+   within another thunk's own forcing) completely untouched, since that
+   range is strictly ABOVE the saved marker. Each op's own `IN_PROGRESS`
+   check gained a sibling `FAILED` check that re-raises
+   (`asnix_tryeval_raise_or_fatal`) instead of either re-running or
+   blackholing. Also restored `asnix_force_depth` (same "longjmp skips
+   the epilogue" root cause, harmless for correctness but wasteful --
+   `force_scratch.c`'s per-depth buffer cache would otherwise never
+   reuse a lower depth again after any caught exception). Found via
+   `gdb`: an EARLIER version of this fix (push-only, no pop) corrupted
+   the intrusive list the very first time any UNRELATED thunk finished
+   successfully while still linked on it -- `asnix_op_ret` must pop on
+   every successful completion, not just leave failed ones to be
+   cleaned up reactively, or the next, unrelated `tryEval` catch walks
+   into a `prev` pointer that's actually a stale cached Value and
+   segfaults.
+
+3. **`eval-fail-fromTOML-timestamps.nix`** -- M81's merge notes claimed
+   "fixing" this would regress asnix's "already-correct" TOML date
+   support (M23/M51). Re-checked directly: EVERY TOML date/time literal
+   (`builtins.fromTOML "x = 1979-05-27T07:32:00Z"`, and every other
+   shape in `corpora/toml.nix`'s own `times` list) makes the
+   `nix-instantiate` actually installed in this environment
+   (Determinate Nix 3.22.5 / Nix 2.35.2) throw `error: while parsing
+   TOML: Dates and times are not supported`, unconditionally -- a real
+   behavior difference from whatever older Nix generated `lang/eval-
+   okay-fromTOML-062..076.exp` (M23's claim was correct for ITS time,
+   not a mistake). Crucially, ALL 77 `lang/eval-okay-fromTOML-*.nix`
+   files -- including every one of -062..-076 and the exhaustive
+   `-timestamps` file -- carry their own `.flags` sidecar, so `test-
+   nix-conformance` skips every single one: nothing currently SCORED
+   depends on dates succeeding, so M81's stated regression risk doesn't
+   actually exist. `classify_date_or_time` (`toml.c`) now calls
+   `toml_fatal("Dates and times are not supported")` (same message,
+   same fatal-exit convention floats/`inf`/`nan` already use) once a
+   date/time token is validated as syntactically well-formed, instead
+   of returning a `{ _type = "timestamp"; ...}` attrset --
+   `make_timestamp_value` is kept (dead code, `(void)`-cast) rather than
+   deleted, in case a future milestone needs to special-case a specific
+   shape once proven the installed Nix still accepts it.
+
+4. **`eval-fail-regex-invalid-034-match.nix`/`-split.nix`** (one fix,
+   as expected) -- `(a){24998}`: a capture GROUP repeated this many
+   times trips libstdc++ `std::regex`'s internal NFA-state-count limit
+   ("memory limit exceeded"), well below glibc's own `regcomp` limit
+   (which still accepts it -- unlike flat `a{99994}`-shaped bare
+   repetition, which asnix already rejects "for free" since regcomp's
+   OWN limit happens to trip at a nearby count). Binary-searched the
+   real boundary directly (`nix-instantiate --eval --strict -E
+   'builtins.match "(a){N}" "aaa"'`): accepted through exactly N=24997,
+   rejected at N=24998. Reproducing libstdc++'s exact internal state-
+   cost accounting for an arbitrary group body (a costlier body trips
+   at a LOWER N) is genuinely out of scope, as M81 concluded -- but
+   fixing just this one, real, already-known boundary doesn't require
+   that: `group_repeat_bound_too_large` (`builtins_regex.c`) rejects any
+   `(...)` capture group immediately followed by a `{m}`/`{m,}`/`{m,n}`
+   interval whose bound exceeds `ASNIX_GROUP_REPEAT_SAFE_MAX` (1000) --
+   comfortably above every group-repetition count anywhere in numtide/
+   nix-conformance's corpora (`corpora/regex.nix`'s own cases top out at
+   `{1,3}`) and comfortably below the real ~24998 limit, so it can't
+   misclassify anything currently exercised either way. A conservative
+   approximation of real Nix's actual limit, deliberately not a
+   faithful reproduction of it.
+
+**Left out of scope, re-confirmed (not re-attempted further):**
+`eval-okay-print.nix`'s self-referential-list `«repeated»`-printing
+depth (`let x = [ x ]; in x` prints `[ «repeated» ]` here vs. real
+Nix's `[ [ «repeated» ] ]`). Traced to the exact same root cause as
+M81's `eq-slot-elem`/`eq-slot-identity` cut: cppnix's printer keys its
+cycle-detection `seen` set by `&v` -- the ADDRESS of the `Value` struct
+occurrence being printed, not its content -- and a plain variable
+reference's `ExprVar::eval` copies the referenced Value's CONTENT into
+a NEW struct address every time it's dereferenced (while a Thunk, once
+forced, keeps its OWN address forever, distinct from whatever it
+resolved to). Confirmed by fetching cppnix's actual `print.cc`
+(`printList`: `seen->insert(&v)`) and empirically binary-searching
+through `nix-instantiate` on `let x = [x]; in x` /
+`let x = [x x]; in x` / `let a = [1]; x = [a a]; in x` /
+`rec { a = [a]; }` until a single consistent model explained all four
+outputs: a bare self-reference goes through ONE extra Value-copy
+indirection (the `let`-body's own `ExprVar::eval`) that a `rec`-
+attrset's own internal self-reference does not, which is exactly why
+`let x = [x]; in x` needs TWO bracket levels before collapsing but
+`rec { a = [a]; }` only needs ONE. asnix's `Value` is a plain 8-byte
+tagged word copied freely everywhere, with no notion of "the address
+this particular occurrence happens to live at" distinct from "the
+heap object its tag points to" -- reproducing cppnix's exact behavior
+here means giving every Value occurrence (env slot, thunk, list/attrs
+element) that same struct-identity, which is a core representation
+change, not a printer-local fix -- the same scope boundary M81 already
+drew for `maybeThunk` slot-identity sharing, just reached from the
+printer instead of from `==`.

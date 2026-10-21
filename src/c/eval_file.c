@@ -56,12 +56,6 @@ static char *read_file(const char *path) {
     return buf;
 }
 
-/* True iff `path` names a directory (not a regular file). */
-static int is_directory(const char *path) {
-    struct stat st;
-    return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
-}
-
 /* Directory part of an absolute path (as produced by resolve_import_path,
  * so always starts with '/' and has no trailing slash itself). "/foo.nix"
  * -> "/" (the one case where the result legitimately keeps its slash). */
@@ -117,6 +111,78 @@ static char *resolve_import_path(const char *path) {
     return canon;
 }
 
+/* M82: real Nix's `resolveExprPath` (eval.cc) -- NOT to be confused with
+ * M57h's `resolve_import_path` just above, which deliberately does NOT
+ * resolve symlinks (needed so a relative import reached *through* a
+ * symlinked DIRECTORY component resolves its own `../foo` against the
+ * path as written, not the symlink's physical target -- see that
+ * function's own comment). This is a narrower, different rule: real Nix
+ * additionally follows a symlink chain on the exact literal path given to
+ * `import` itself (the "last component", i.e. the whole path string
+ * resolveExprPath was handed, as opposed to any symlinked directory
+ * earlier in that path) -- `eval-okay-import-follows-symlink.nix`'s own
+ * comment names the cppnix function directly. Confirmed against cppnix's
+ * `resolveExprPath`: `while (lstat(path) is a symlink) path =
+ * absPath(readlink(path), dirOf(path))`, i.e. the loop re-examines
+ * whatever the symlink's target resolves to (itself possibly another
+ * symlink, possibly reached via a *different* directory than the
+ * original), which is exactly what a `link-imp.nix -> dir/imp.nix`
+ * single-hop, or `link2.nix -> link-imp.nix -> dir/imp.nix` double-hop,
+ * needs. Crucially, lstat()/readlink() only ever inspect the FINAL path
+ * component (the OS itself transparently resolves any symlinked
+ * directories earlier in the path when lstat() walks it) -- so a regular
+ * file reached through a symlinked parent directory (M57h's own
+ * `eval-okay-symlink-resolution.nix` fixture: `foo/overlays -> ../overlays`
+ * is the symlink, but `overlay.nix` itself is a plain file) is NOT a
+ * symlink itself, this loop's first lstat() sees S_ISLNK false
+ * immediately, and `path` comes back completely unchanged -- so this is
+ * additive, not a conflict with M57h's fix. `*is_dir_out` reports whether
+ * the FINAL (post-symlink-chain) path is a directory, since the caller
+ * (resolve_file_path) needs that anyway and re-stat'ing would be
+ * redundant. */
+static char *follow_symlink_chain(char *canon, int *is_dir_out) {
+    struct stat st;
+    for (int hops = 0; hops < 1024; hops++) {
+        if (lstat(canon, &st) != 0) {
+            /* Doesn't exist (or unreadable) -- let the ordinary
+             * read_file()/is_directory() error paths downstream report
+             * this the same way they always have; nothing more to
+             * resolve. */
+            *is_dir_out = 0;
+            return canon;
+        }
+        if (!S_ISLNK(st.st_mode)) {
+            *is_dir_out = S_ISDIR(st.st_mode);
+            return canon;
+        }
+        char target[4096];
+        ssize_t n = readlink(canon, target, sizeof(target) - 1);
+        if (n < 0) {
+            *is_dir_out = 0;
+            return canon;
+        }
+        target[n] = '\0';
+        char *dir = dir_of(canon);
+        char *joined;
+        if (target[0] == '/') {
+            joined = malloc((size_t)n + 1);
+            memcpy(joined, target, (size_t)n + 1);
+        } else {
+            size_t dir_len = strlen(dir);
+            joined = malloc(dir_len + 1 + (size_t)n + 1);
+            memcpy(joined, dir, dir_len);
+            joined[dir_len] = '/';
+            memcpy(joined + dir_len + 1, target, (size_t)n + 1);
+        }
+        free(dir);
+        free(canon);
+        canon = asnix_canon_path(joined);
+        free(joined);
+    }
+    fprintf(stderr, "asnix: too many levels of symbolic links in path '%s'\n", canon);
+    exit(1);
+}
+
 /* Resolves `path` to its final absolute form -- following the `import
  * somedir` => `somedir/default.nix` rule (verified against
  * `nix-instantiate --eval` -- found evaluating real nixpkgs,
@@ -130,7 +196,9 @@ static char *resolve_import_path(const char *path) {
  * BEFORE paying for a read+lex+parse+compile+eval it might not need. */
 static char *resolve_file_path(const char *path) {
     char *resolved = resolve_import_path(path);
-    if (is_directory(resolved)) {
+    int is_dir;
+    resolved = follow_symlink_chain(resolved, &is_dir);
+    if (is_dir) {
         size_t len = strlen(resolved);
         char *with_default = malloc(len + strlen("/default.nix") + 1);
         memcpy(with_default, resolved, len);
@@ -305,7 +373,7 @@ Value asnix_eval_file(const char *path) {
 
     char *base_dir;
     Ast *ast = parse_resolved_file(resolved, &base_dir);
-    IrProgram *prog = asnix_compile(ast, base_dir);
+    IrProgram *prog = asnix_compile(ast, base_dir, resolved);
     Env *root_env = make_root_env(NULL);
     Value result = asnix_eval(prog, root_env);
     import_cache_insert(resolved, result);
@@ -319,7 +387,7 @@ Value asnix_eval_file(const char *path) {
 Value asnix_eval_file_for_derivation_bootstrap(const char *path) {
     char *resolved, *base_dir;
     Ast *ast = parse_file(path, &resolved, &base_dir);
-    IrProgram *prog = asnix_compile(ast, base_dir);
+    IrProgram *prog = asnix_compile(ast, base_dir, resolved);
     Env *root_env = make_root_env_ex(NULL, 1);
     Value result = asnix_eval(prog, root_env);
     free(resolved);
@@ -346,7 +414,7 @@ Value asnix_eval_file_scoped(const char *path, Value scope) {
         names[i] = asnix_sym_name(sym, &lens[i]);
     }
 
-    IrProgram *prog = asnix_compile_scoped(ast, base_dir, names, lens, (size_t)n);
+    IrProgram *prog = asnix_compile_scoped(ast, base_dir, resolved, names, lens, (size_t)n);
 
     Env *root_env = make_root_env(NULL);
     Env *scope_env = asnix_env_alloc(root_env, n);
@@ -377,7 +445,7 @@ Value asnix_eval_expr_source(const char *src) {
     size_t ntoks;
     Token *toks = asnix_lex(src, &ntoks);
     Ast *ast = asnix_parse(toks, ntoks, src);
-    IrProgram *prog = asnix_compile(ast, cwd);
+    IrProgram *prog = asnix_compile(ast, cwd, NULL);
     Env *root_env = make_root_env(NULL);
     return asnix_eval(prog, root_env);
 }

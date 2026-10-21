@@ -65,15 +65,37 @@
  * mechanism behind Nix's laziness. `state` distinguishes:
  *   UNFORCED:     env/body/pool are valid (the deferred computation)
  *   IN_PROGRESS:  currently being forced -- re-entering (e.g. `let x = x;
- *                 in x`) is a cycle, caught and aborted (blackholing)
+ *                 in x`) is a cycle, caught and aborted (blackholing).
+ *                 While IN_PROGRESS, `env` is repurposed (see M82 below)
+ *                 to link this cell onto `asnix_inprogress_head`'s
+ *                 intrusive stack -- safe because nothing needs to read
+ *                 the ORIGINAL `env` again once its one-time use (the
+ *                 jump into the thunk's body) has already happened; see
+ *                 each of the five op_*.S/force.S sites that set
+ *                 IN_PROGRESS for the exact insertion point.
  *   FORCED:       `env`'s slot has been overwritten with the cached
  *                 Value.raw instead; body/pool are no longer meaningful
+ *   FAILED (M82): this thunk's body previously ran to a `throw`/failed
+ *                 `assert` that unwound (via `builtins.tryEval`'s
+ *                 setjmp/longjmp, see tryeval.c) past this cell's own
+ *                 OP_RET -- which, since Nix 2.34, real Nix memoizes
+ *                 (conformance fixture:
+ *                 eval-okay-tryeval-failed-thunk-reeval.nix): re-forcing
+ *                 a FAILED thunk must NOT re-run its body (no second
+ *                 `trace` side effect) and must NOT be treated as a
+ *                 genuine blackhole (it isn't a cycle, just a stale
+ *                 IN_PROGRESS left by the longjmp skipping the normal
+ *                 "mark FORCED" epilogue) -- instead it re-raises
+ *                 (`asnix_tryeval_raise_or_fatal`, tryeval.c/.h),
+ *                 catchable by an enclosing `tryEval` same as the
+ *                 original failure was. `env`/`body`/`pool` are no
+ *                 longer meaningful once FAILED (same as FORCED).
  * Forcing overwrites the cell in place (single-threaded, so no CAS claim
  * protocol is needed the way a parallel evaluator like ~/gnix/iets
  * requires) -- every tagged pointer to this same cell sees the memoized
  * value after the first force, exactly once computed. */
 #define ASNIX_THUNK_OFF_STATE 0
-#define ASNIX_THUNK_OFF_ENV   8  /* UNFORCED: Env*; FORCED: cached Value.raw */
+#define ASNIX_THUNK_OFF_ENV   8  /* UNFORCED: Env*; IN_PROGRESS: intrusive "prev" link (M82); FORCED: cached Value.raw */
 #define ASNIX_THUNK_OFF_BODY  16
 #define ASNIX_THUNK_OFF_POOL  24
 #define ASNIX_THUNK_SIZE      32
@@ -81,6 +103,7 @@
 #define ASNIX_THUNK_STATE_UNFORCED    0
 #define ASNIX_THUNK_STATE_IN_PROGRESS 1
 #define ASNIX_THUNK_STATE_FORCED      2
+#define ASNIX_THUNK_STATE_FAILED      3 /* M82: see the comment block above */
 
 #ifndef __ASSEMBLER__
 

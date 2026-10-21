@@ -42,6 +42,9 @@ asnix_force_depth:
 .Lmsg_blackhole:
     .ascii "asnix: infinite recursion forcing a thunk (blackhole), aborting\n"
     .equ ASNIX_MSG_BLACKHOLE_LEN, . - .Lmsg_blackhole
+.Lmsg_reeval_failed:
+    .ascii "asnix: re-evaluation of a thunk whose first evaluation failed, aborting\n"
+    .equ ASNIX_MSG_REEVAL_FAILED_LEN, . - .Lmsg_reeval_failed
 
     .data
     .align 8
@@ -83,6 +86,8 @@ asnix_force_for_print:                  // Value asnix_force_for_print(Value v)
     je .Lforce_cached
     cmpq $ASNIX_THUNK_STATE_IN_PROGRESS, %rcx
     je .Lforce_blackhole
+    cmpq $ASNIX_THUNK_STATE_FAILED, %rcx
+    je .Lforce_reraise
 
     // Bring our own VALSTACK/RETSP and save every candidate-scratch
     // register, exactly like asnix_eval's prologue (see docs/abi.md) --
@@ -139,7 +144,13 @@ asnix_force_for_print:                  // Value asnix_force_for_print(Value v)
 
     movq ASNIX_THUNK_OFF_BODY(%rbx), %rsi
     movq ASNIX_THUNK_OFF_POOL(%rbx), %r13
-    movq ASNIX_THUNK_OFF_ENV(%rbx), %rdi
+    movq ASNIX_THUNK_OFF_ENV(%rbx), %rdi // last read of ENV's original meaning -- safe to repurpose below
+    // M82: push onto the intrusive IN_PROGRESS stack -- see
+    // stacklimits.S's asnix_inprogress_head comment. %rcx is dead here
+    // (last written by the ASNIX_CHECK_RETSP macro above).
+    movq asnix_inprogress_head(%rip), %rcx
+    movq %rcx, ASNIX_THUNK_OFF_ENV(%rbx)
+    movq %rbx, asnix_inprogress_head(%rip)
     movq (%rsi), %rax
     jmp *%rax
 
@@ -181,4 +192,13 @@ asnix_force_epilogue:
     leaq .Lmsg_blackhole(%rip), %rdi
     movq $ASNIX_MSG_BLACKHOLE_LEN, %rsi
     jmp asnix_fatal
+
+.Lforce_reraise:
+    // M82: see op_var_ref.S's matching .Lvar_ref_reraise comment --
+    // fires before this routine's own prologue pushes anything, so the
+    // stack is exactly as it was on entry, same as .Lforce_blackhole
+    // just above.
+    leaq .Lmsg_reeval_failed(%rip), %rdi
+    movq $ASNIX_MSG_REEVAL_FAILED_LEN, %rsi
+    jmp asnix_tryeval_raise_or_fatal
     .size asnix_force_for_print, . - asnix_force_for_print

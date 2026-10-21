@@ -7,6 +7,9 @@
 .Lmsg_blackhole:
     .ascii "asnix: infinite recursion forcing a thunk (blackhole), aborting\n"
     .equ ASNIX_MSG_BLACKHOLE_LEN, . - .Lmsg_blackhole
+.Lmsg_reeval_failed:
+    .ascii "asnix: re-evaluation of a thunk whose first evaluation failed, aborting\n"
+    .equ ASNIX_MSG_REEVAL_FAILED_LEN, . - .Lmsg_reeval_failed
 
     .text
 
@@ -38,6 +41,8 @@ asnix_op_var_ref:                       // a = depth, b = slot
     je .Lvar_ref_forced
     cmpq $ASNIX_THUNK_STATE_IN_PROGRESS, %rcx
     je .Lvar_ref_blackhole
+    cmpq $ASNIX_THUNK_STATE_FAILED, %rcx
+    je .Lvar_ref_reraise
 
     // UNFORCED: enter the thunk's body like a zero-arg call, with a
     // retframe that tells OP_RET to memoize the result back into this
@@ -55,7 +60,14 @@ asnix_op_var_ref:                       // a = depth, b = slot
 
     movq ASNIX_THUNK_OFF_BODY(%rax), %rsi       // IP = thunk body (read before ENV overwrites rdi, in case body==env aliasing ever mattered -- it doesn't here, but keep the read order defensive)
     movq ASNIX_THUNK_OFF_POOL(%rax), %r13
-    movq ASNIX_THUNK_OFF_ENV(%rax), %rdi         // ENV = thunk's captured scope
+    movq ASNIX_THUNK_OFF_ENV(%rax), %rdi         // ENV = thunk's captured scope -- last read of this
+                                                  // field's ORIGINAL meaning; safe to repurpose below.
+    // M82: push this thunk onto the intrusive IN_PROGRESS stack (see
+    // stacklimits.S's asnix_inprogress_head comment) -- %rcx is dead
+    // here (last written by the STATE check above).
+    movq asnix_inprogress_head(%rip), %rcx
+    movq %rcx, ASNIX_THUNK_OFF_ENV(%rax)
+    movq %rax, asnix_inprogress_head(%rip)
     movq (%rsi), %rax
     jmp *%rax
 
@@ -73,4 +85,14 @@ asnix_op_var_ref:                       // a = depth, b = slot
     leaq .Lmsg_blackhole(%rip), %rdi
     movq $ASNIX_MSG_BLACKHOLE_LEN, %rsi
     jmp asnix_fatal
+
+.Lvar_ref_reraise:
+    // M82: re-forcing a thunk whose previous force failed (`throw`/a
+    // failed `assert`, caught by an enclosing `tryEval` since Nix 2.34
+    // memoizes failures too) -- not a genuine cycle, and must not re-run
+    // the body (no duplicate side effects): re-raise, catchable again by
+    // whatever `tryEval` is active now (or fatal if none is).
+    leaq .Lmsg_reeval_failed(%rip), %rdi
+    movq $ASNIX_MSG_REEVAL_FAILED_LEN, %rsi
+    jmp asnix_tryeval_raise_or_fatal
     .size asnix_op_var_ref, . - asnix_op_var_ref

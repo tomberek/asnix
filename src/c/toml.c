@@ -631,12 +631,32 @@ static size_t normalize_time(const char *s, size_t n, char *out) {
     return o;
 }
 
-/* Real Nix's fromTOML represents every TOML date/time kind (local date,
- * local time, local date-time, offset date-time) identically: an
- * attrset `{ _type = "timestamp"; value = "<normalized text>"; }`
- * (confirmed directly against lang/eval-okay-fromTOML-062..076.exp) --
- * just a string wrapped in an attrset, fully representable here despite
- * asnix having no native date/time type, unlike floats. */
+/* M82 (see docs/architecture.md): this project's own M23 milestone
+ * built full date/time SUPPORT here (an attrset `{ _type = "timestamp";
+ * value = "<normalized text>"; }`), on the claim that real Nix's
+ * `fromTOML` represents every TOML date/time kind this way -- "confirmed
+ * directly against lang/eval-okay-fromTOML-062..076.exp" at the time.
+ * Re-checked directly against the `nix-instantiate` actually installed
+ * in this environment (Determinate Nix 3.22.5 / Nix 2.35.2) while
+ * chasing `eval-fail-fromTOML-timestamps.nix`: EVERY TOML date/time
+ * value (local date, local time, local date-time, offset date-time --
+ * every case in `corpora/toml.nix`'s own `times` list, not just that
+ * fixture) now makes it throw `error: while parsing TOML: Dates and
+ * times are not supported`, unconditionally -- a real, verified
+ * behavior change in the Nix version installed here vs. whatever
+ * generated those `-062`..`-076.exp` files (M23's own claim was correct
+ * for its time, not a mistake, just stale). All 77
+ * `lang/eval-okay-fromTOML-*.nix` files (including every one of
+ * -062..-076 and `-timestamps`) carry their own `.flags` sidecar, i.e.
+ * `test-nix-conformance` SKIPS all of them -- so nothing currently
+ * scored depends on dates succeeding, and matching the installed real
+ * Nix's actual current behavior (reject unconditionally, same
+ * `toml_fatal` convention `looks_like_date_or_time`'s sibling TOML-float
+ * rejection already uses just below) is the honest fix, not a special
+ * case for one test file. `make_timestamp_value`'s attrset-building
+ * code is kept dead-but-documented below rather than deleted, in case a
+ * future milestone needs to special-case a SPECIFIC date shape once
+ * proven that real Nix still accepts it. */
 static Value make_timestamp_value(const char *text, size_t len) {
     uint32_t sym_type = asnix_intern("_type", 5);
     uint32_t sym_value = asnix_intern("value", 5);
@@ -648,6 +668,7 @@ static Value make_timestamp_value(const char *text, size_t len) {
 static Value classify_date_or_time(const char *tok, size_t n) {
     char buf[96];
     size_t o;
+    (void)make_timestamp_value; /* kept for a future milestone -- see comment above */
     if (n >= 10 && tok[4] == '-' && tok[7] == '-') {
         if (!valid_date_value(tok)) toml_fatal("invalid calendar date in TOML document");
         memcpy(buf, tok, 10);
@@ -664,7 +685,9 @@ static Value classify_date_or_time(const char *tok, size_t n) {
         if (!valid_time_value(tok, n)) toml_fatal("invalid or incomplete TOML local-time value (requires HH:MM:SS)");
         o = normalize_time(tok, n, buf);
     }
-    return make_timestamp_value(buf, o);
+    (void)o;
+    toml_fatal("Dates and times are not supported");
+    return asnix_make_imm(ASNIX_IMM_NULL); /* unreachable -- toml_fatal always exit()s */
 }
 
 /* M56: `_` digit separators must be single and strictly between two

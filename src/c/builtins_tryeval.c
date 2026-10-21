@@ -45,10 +45,23 @@
 extern int64_t asnix_valstack_limit;
 extern int64_t asnix_retsp_limit;
 
+/* M82: `asnix_force_for_print` also increments `asnix_force_depth`
+ * (force.S) on entry and only decrements it in its own ordinary
+ * epilogue -- same "longjmp skips the epilogue" problem as the two
+ * limits above, except here the consequence isn't a crash (nothing
+ * checks this one against a bound), just permanently inflating which
+ * per-depth force_scratch.c buffer every SUBSEQUENT force reaching this
+ * depth reuses. Harmless for correctness but wasteful across many
+ * caught `tryEval`s in one process; restored for the same reason the
+ * two limits above are. */
+extern int64_t asnix_force_depth;
+
 static Value prim_tryEval(const Value *args, int64_t argc) {
     (void)argc;
     int64_t saved_valstack_limit = asnix_valstack_limit;
     int64_t saved_retsp_limit = asnix_retsp_limit;
+    int64_t saved_force_depth = asnix_force_depth;
+    int64_t saved_inprogress_head = asnix_tryeval_save_inprogress_head();
 
     jmp_buf buf;
     asnix_tryeval_push(&buf);
@@ -59,12 +72,22 @@ static Value prim_tryEval(const Value *args, int64_t argc) {
         value = asnix_force_for_print(args[0]);
         success = 1;
     } else {
+        /* M82: the longjmp here skipped every op_*.S/force.S epilogue
+         * between the throw/failed-assert and this catch -- any thunk
+         * that became IN_PROGRESS in that range (tracked via
+         * asnix_inprogress_head, pushed to on entry, popped on normal
+         * completion) is stuck there forever unless we clean it up:
+         * mark each one FAILED (re-forcing it later re-raises instead
+         * of re-running its body or wrongly blackholing -- see
+         * tryeval.h's own comment on this). */
+        asnix_tryeval_unwind_inprogress(saved_inprogress_head);
         value = asnix_make_imm(ASNIX_IMM_FALSE);
         success = 0;
     }
     asnix_tryeval_pop();
     asnix_valstack_limit = saved_valstack_limit;
     asnix_retsp_limit = saved_retsp_limit;
+    asnix_force_depth = saved_force_depth;
 
     uint32_t syms[2];
     Value vals[2];

@@ -7,6 +7,9 @@
 .Lmsg_blackhole:
     .ascii "asnix: infinite recursion forcing a thunk (blackhole), aborting\n"
     .equ ASNIX_MSG_BLACKHOLE_LEN, . - .Lmsg_blackhole
+.Lmsg_reeval_failed:
+    .ascii "asnix: re-evaluation of a thunk whose first evaluation failed, aborting\n"
+    .equ ASNIX_MSG_REEVAL_FAILED_LEN, . - .Lmsg_reeval_failed
 
     .text
 
@@ -58,6 +61,8 @@ asnix_op_select:                        // a = symbol id; pops an attrset, pushe
     je .Lselect_forced
     cmpq $ASNIX_THUNK_STATE_IN_PROGRESS, %rcx
     je .Lselect_blackhole
+    cmpq $ASNIX_THUNK_STATE_FAILED, %rcx
+    je .Lselect_reraise
 
     movq $ASNIX_THUNK_STATE_IN_PROGRESS, ASNIX_THUNK_OFF_STATE(%rax)
 
@@ -72,7 +77,13 @@ asnix_op_select:                        // a = symbol id; pops an attrset, pushe
 
     movq ASNIX_THUNK_OFF_BODY(%rax), %rsi
     movq ASNIX_THUNK_OFF_POOL(%rax), %r13
-    movq ASNIX_THUNK_OFF_ENV(%rax), %rdi
+    movq ASNIX_THUNK_OFF_ENV(%rax), %rdi // last read of ENV's original meaning -- safe to repurpose below
+    // M82: push onto the intrusive IN_PROGRESS stack -- see
+    // stacklimits.S's asnix_inprogress_head comment. %rcx is dead here
+    // (last written by the STATE check above).
+    movq asnix_inprogress_head(%rip), %rcx
+    movq %rcx, ASNIX_THUNK_OFF_ENV(%rax)
+    movq %rax, asnix_inprogress_head(%rip)
     movq (%rsi), %rax
     jmp *%rax
 
@@ -85,6 +96,14 @@ asnix_op_select:                        // a = symbol id; pops an attrset, pushe
     addq $ASNIX_IROP_SIZE, %rsi
     movq (%rsi), %rax
     jmp *%rax
+
+.Lselect_reraise:
+    // M82: see op_var_ref.S's matching .Lvar_ref_reraise comment --
+    // re-forcing a previously-FAILED thunk re-raises instead of re-
+    // running the body or blackholing.
+    leaq .Lmsg_reeval_failed(%rip), %rdi
+    movq $ASNIX_MSG_REEVAL_FAILED_LEN, %rsi
+    jmp asnix_tryeval_raise_or_fatal
 
 .Lselect_type_error:
     // M50: names the actual type of the non-attrset target (real `call`

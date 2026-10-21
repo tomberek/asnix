@@ -30,6 +30,12 @@
  * returned) -- see src/c/eval_file.c. */
 static const char *g_compile_base_dir = NULL;
 
+/* M82: see compiler.h's own comment on asnix_compile's `file_path`
+ * parameter -- same lifetime/scoping rules as `g_compile_base_dir` just
+ * above (valid for exactly one asnix_compile()/asnix_compile_scoped()
+ * call, read only by AST_CURPOS in compile_expr). */
+static const char *g_compile_file_path = NULL;
+
 /* Lexically canonicalizes an absolute path: collapses `.` and `..`
  * components and doubled slashes, same as real Nix's `canonPath`
  * (verified against `nix-instantiate --eval 'builtins.toString
@@ -1481,20 +1487,25 @@ static void compile_expr(IrBuilder *b, Ast *node, ScopeFrame *scope) {
              * the identical `{file;line;column;}`), built once here the
              * same way AST_PATH's own literal case just above does.
              *
-             * `file`: APPROXIMATE, same documented scope limit as
-             * `builtins.unsafeGetAttrPos` (builtins_m54.c's
-             * `unsafeGetAttrPos2_impl`) -- `asnix_eval_top_level_file()`
-             * is the outermost file asnix was invoked on, not
-             * necessarily the file THIS `__curPos` token actually lives
-             * in if it's reached through an `import` chain. `line`/
-             * `column` are NOT approximate -- M80's whole point (see
-             * parser.c's curpos_line_col) is that those two, unlike
-             * `unsafeGetAttrPos`'s per-ATTRIBUTE position, only ever
-             * need ONE token's position (the `__curPos` occurrence
-             * itself), which is cheap to get exactly right without the
-             * runtime Attr-record growth `unsafeGetAttrPos` would need
-             * for full accuracy. */
-            const char *file = asnix_eval_top_level_file();
+             * `file`: M82 made this exact, not approximate --
+             * `g_compile_file_path` is THIS compile call's own resolved
+             * file path (every real caller, eval_file.c, passes its own
+             * `resolved` path through asnix_compile/asnix_compile_scoped
+             * now), so a `__curPos` token inside an IMPORTED file
+             * correctly reports that file, not the outermost file asnix
+             * was invoked on. Only falls back to
+             * `asnix_eval_top_level_file()` when `g_compile_file_path`
+             * is NULL, which happens for exactly one caller
+             * (`asnix_eval_expr_source`, CLI `--arg`/`--argstr`
+             * expression evaluation, which has no file of its own) plus
+             * this file's own unit tests. `line`/`column` are exact
+             * regardless -- M80's whole point (see parser.c's
+             * curpos_line_col) is that those two, unlike
+             * `unsafeGetAttrPos`'s per-ATTRIBUTE position (still
+             * approximate, out of scope -- see docs/architecture.md's
+             * M82 notes), only ever need ONE token's position (the
+             * `__curPos` occurrence itself). */
+            const char *file = g_compile_file_path ? g_compile_file_path : asnix_eval_top_level_file();
             if (!file) file = "";
             uint32_t syms[3];
             Value vals[3];
@@ -1545,8 +1556,9 @@ static void init_builtins_frame(ScopeFrame *f) {
     f->is_with = 0;
 }
 
-IrProgram *asnix_compile(Ast *root, const char *base_dir) {
+IrProgram *asnix_compile(Ast *root, const char *base_dir, const char *file_path) {
     g_compile_base_dir = base_dir;
+    g_compile_file_path = file_path;
     IrBuilder *b = ib_new();
     ScopeFrame builtins_frame;
     init_builtins_frame(&builtins_frame);
@@ -1580,9 +1592,10 @@ IrProgram *asnix_compile(Ast *root, const char *base_dir) {
  * long); `extra_count` may be 0 (an empty `scope` attrset), in which case
  * this frame simply never matches anything and every name falls through
  * to `builtins_frame` as usual. */
-IrProgram *asnix_compile_scoped(Ast *root, const char *base_dir,
+IrProgram *asnix_compile_scoped(Ast *root, const char *base_dir, const char *file_path,
                                  const char **extra_names, size_t *extra_lens, size_t extra_count) {
     g_compile_base_dir = base_dir;
+    g_compile_file_path = file_path;
     IrBuilder *b = ib_new();
     ScopeFrame builtins_frame;
     init_builtins_frame(&builtins_frame);

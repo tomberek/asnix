@@ -68,15 +68,27 @@ static void check_bool(Value v, int want, const char *msg) {
     CHECK(ok, msg);
 }
 
-/* Timestamps (TOML date/time literals) are real Nix's `{ _type =
- * "timestamp"; value = "<text>"; }` shape, see toml.c's
- * make_timestamp_value -- confirmed against lang/eval-okay-fromTOML-062
- * through -076.exp. */
-static void check_timestamp(Value v, const char *want_value, const char *msg) {
-    CHECK(asnix_tag_of(v) == ASNIX_TAG_ATTRS, msg);
-    if (asnix_tag_of(v) != ASNIX_TAG_ATTRS) return;
-    check_string(get(v, "_type"), "timestamp", msg);
-    check_string(get(v, "value"), want_value, msg);
+/* M82 (see docs/architecture.md): forks a child that parses `doc` (a
+ * single TOML date/time literal) and expects it to call `toml_fatal`
+ * (an unconditional `exit(1)`, same fork()+exit-code pattern established
+ * by tests/c/test_abort.c and tests/asm/test_stacklimits.c/test_apply.c
+ * for every other fatal path in this codebase) -- see toml.c's
+ * `classify_date_or_time`'s own comment for why dates/times are now
+ * rejected instead of represented as a `{ _type = "timestamp"; ...}`
+ * attrset (the OLD behavior this helper used to check, before M82
+ * found the `nix-instantiate` actually installed in this environment
+ * rejects every TOML date/time shape unconditionally). */
+static void check_date_time_rejected(const char *doc, const char *msg) {
+    pid_t pid = fork();
+    if (pid == 0) {
+        close(2); /* silence toml_fatal's own stderr line -- not under test here */
+        asnix_arena_init(0);
+        toml(doc);
+        _exit(42); /* reaching here means it wrongly succeeded */
+    }
+    int status = 0;
+    waitpid(pid, &status, 0);
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 1, msg);
 }
 
 /* Ground truth: lang/eval-okay-fromTOML-001..005.exp. */
@@ -186,15 +198,15 @@ static void test_quoted_and_unusual_keys(void) {
     check_string(get(v, "a"), "caf\xc3\xa9", "non-ASCII string value");
 }
 
-/* Ground truth: lang/eval-okay-fromTOML-062..076.exp. */
+/* Ground truth: lang/eval-fail-fromTOML-timestamps.err.exp (M82) -- see
+ * check_date_time_rejected's own comment for why this no longer checks
+ * a `{ _type = "timestamp"; ...}` shape. */
 static void test_timestamps(void) {
-    Value v = toml("a = 1979-05-27\nb = 07:32:00.5\nc = 1979-05-27T07:32:00Z\nd = 1979-05-27 07:32:00Z\n"
-                    "e = 1979-05-27t07:32:00z");
-    check_timestamp(get(v, "a"), "1979-05-27", "local date");
-    check_timestamp(get(v, "b"), "07:32:00.500", "local time: fractional seconds padded to 3 digits");
-    check_timestamp(get(v, "c"), "1979-05-27T07:32:00Z", "offset date-time");
-    check_timestamp(get(v, "d"), "1979-05-27T07:32:00Z", "space-separated date-time normalized to 'T'");
-    check_timestamp(get(v, "e"), "1979-05-27T07:32:00Z", "lowercase t/z normalized to uppercase T/Z");
+    check_date_time_rejected("a = 1979-05-27", "local date rejected");
+    check_date_time_rejected("a = 07:32:00.5", "local time rejected");
+    check_date_time_rejected("a = 1979-05-27T07:32:00Z", "offset date-time rejected");
+    check_date_time_rejected("a = 1979-05-27 07:32:00Z", "space-separated date-time rejected");
+    check_date_time_rejected("a = 1979-05-27t07:32:00z", "lowercase t/z date-time rejected");
 }
 
 /* Comments/blank-lines/CRLF: lang/eval-okay-fromTOML-053..057.exp. */
