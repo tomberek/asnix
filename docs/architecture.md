@@ -42,7 +42,8 @@ what's actually implemented and the scope decisions made along the way.
 | M27 — `fromTOML` bare global + corrected understanding of real Nix's bare-global rule | done (see below) |
 | M28 — dynamic attrset-literal keys (`{${k} = v;}`) + `expr.${k} or default` | done, **scoped** (see below) |
 | M29 — `rec {}` eagerly forced every field on construction (core evaluator fix) | done (see below) |
-| M30+ | not started |
+| M30 — `builtins.tryEval` (catchable `throw`/failed `assert`) | done, **scoped** (see below) |
+| M31+ | not started |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
 
@@ -3050,3 +3051,102 @@ count unchanged (388, within noise of 389) -- this bug happened not to
 be exercised by that suite's own cases, but is a real, significant
 correctness fix for actual nixpkgs evaluation, where `rec {}` is used
 constantly.
+
+## M30 scope notes: `builtins.tryEval`
+
+Found continuing to chase `d.nix`: `pkgs/top-level/impure-overlays.nix`
+unconditionally calls `try (toString <nixpkgs-overlays>) ""` where `try
+x def = let r = builtins.tryEval x; in if r.success then r.value else
+def;` -- every real nixpkgs evaluation runs this. Also the thing
+Known Bug #29 (M23) identified as blocking the *entire* ~270-case regex
+differential corpus (every `eval-okay-regex-NNN.nix`/`eval-fail-regex-
+invalid-NNN-*.nix` case wraps its call in this same `try` helper).
+
+**Scope, narrower than "catch anything" -- confirmed by reading cppnix's
+actual source, not assumed**: real Nix's `tryEval` only catches
+`AssertionError` (`~/nix/src/libexpr/primops.cc`'s `prim_tryEval`:
+`catch (AssertionError & e)`), and `ThrownError` (`throw`'s own exception
+type) is its *only* subclass (`~/nix/src/libexpr/include/nix/expr/
+eval-error.hh`: `MakeError(ThrownError, AssertionError)`). A failed
+`assert` throws `AssertionError` directly (hence the class's name).
+Everything else -- type errors, infinite recursion, missing attributes,
+and (confirmed directly, surprisingly) `abort` itself -- derives from
+plain `EvalError`, a *sibling* of `AssertionError`, not a subclass, so
+none of those are caught. Verified every one of these distinctions
+directly against real `nix-instantiate --eval` before writing any code
+(`tryEval (abort "x")` still aborts the whole process unconditionally;
+`tryEval (1 + "a")` is not caught either; `tryEval (throw "x")` and
+`tryEval (assert false; 1)` both are, uniformly `{success=false;
+value=false;}`). This made the actual implementation much more tractable
+than "thread exception handling through every fatal path in the
+codebase" (M23's original, correctly pessimistic framing of the
+*general* problem) -- only two call sites needed to change at all.
+
+**Mechanism**: plain `setjmp`/`longjmp` (`tryeval.c`/`.h`), not a sweeping
+redesign. `prim_throw` (`builtins.c`) and `OP_ASSERT_FAIL`'s handler
+(`op_assert.S`) now both route through `asnix_tryeval_raise_or_fatal`
+instead of a direct fatal exit -- it `longjmp`s to the innermost active
+`tryEval`'s buffer if one exists, otherwise falls back to exactly the
+previous write-to-stderr-and-`exit(1)` behavior (so top-level `throw`/
+`assert` failures, the overwhelmingly common case, are byte-for-byte
+unchanged). This works because this project's own dispatch loop already
+keeps its live evaluator state (VALSTACK/POOL/RETSP) in registers
+(`%r12`/`%r13`/`%r14`) deliberately chosen to be SysV callee-saved
+specifically so they survive an ordinary C call for free (see
+docs/abi.md) -- which also means a plain `longjmp` correctly rewinds
+them back to their `setjmp`-time values with no extra bookkeeping.
+
+**A real bug found and fixed while verifying this, not assumed away**:
+`asnix_valstack_limit`/`asnix_retsp_limit` (the bounds-check ceilings
+`force.S`'s nested-forcing context saves/restores around its own use,
+`stacklimits.S`) are plain C global variables, not registers -- `longjmp`
+has no way to restore them, since they're not part of the CPU context it
+saves. A `longjmp` triggered from *inside* a nested `asnix_force_for_
+print` call (exactly what forcing `tryEval`'s own argument does) skips
+that function's ordinary epilogue, the only place those globals would
+otherwise get restored -- confirmed directly: `tryEval (throw "x")`
+failed with a bogus "value stack overflow" before this fix, because the
+very next push after the catch compared the (correctly longjmp-restored)
+`%r12` against a now-completely-unrelated stale limit left over from the
+abandoned nested force. Fixed by having `prim_tryEval` itself
+(`builtins_tryeval.c`) save and explicitly restore both globals around
+its own try/catch, on *either* path (redundant but harmless on the
+normal-return path, since `asnix_force_for_print`'s own epilogue would
+have already restored them correctly there too; load-bearing on the
+caught path, which skips that epilogue entirely).
+
+**A second, necessary mechanism**: `tryEval` needs its argument *raw and
+unforced*, so it can force it itself inside its own catch scope --
+forcing it any earlier (e.g. M25's "primops get pre-forced arguments"
+convention, `op_call.S`) would mean the exception could already have
+escaped before `tryEval`'s own `setjmp` is even installed. Added a new
+`ASNIX_PRIMOP_OFF_NOFORCE` field to the `PrimOp` heap layout (`heap.h`,
+defaulting to 0 -- every *existing* arena allocation already zero-fills
+this for free, so no other primop constructor needed to change at all)
+and a new constructor, `asnix_bshared_make_primop_noforce`, used only by
+`tryEval`'s own registration; `op_call.S`'s M25 arg-forcing loop now
+checks this flag and skips entirely when set.
+
+Registered under `builtins.tryEval` only (real Nix's own registered name
+is `__tryEval`, confirmed in cppnix's source -- unlike `fromTOML`/
+`removeAttrs`/etc. this is NOT one of the bare-global names).
+
+**Verified**: every distinction above checked directly against real
+`nix-instantiate --eval` before being trusted; the exact `impure-
+overlays.nix` `try` pattern now works end-to-end. `make test`/
+`test-e2e`/`test-conformance` all green (172 e2e, 19 conformance, full
+unit suite). numtide/nix-conformance's `lang/` pass count: **388 -> 627**
+(+239) on the real external runner -- confirming M23's own prediction
+that this single missing builtin was gating the entire regex
+differential corpus.
+
+**Known, accepted limitation, not engineered around** (see tryeval.h's
+own comment for the full reasoning): if the thrown expression's
+evaluation forced some *other* thunk partway through (not the one
+`tryEval` was directly asked to evaluate), that thunk is left marked
+IN_PROGRESS forever -- referencing that exact same thunk object again
+later would incorrectly blackhole. A full fix would mean tracking and
+rolling back every thunk touched since the matching `setjmp`, a much
+larger undertaking; not attempted, since every real pattern seen so far
+treats a throwing `tryEval`'d expression as a disposable one-off whose
+intermediate thunks are never touched again.

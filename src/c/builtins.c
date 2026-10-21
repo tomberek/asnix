@@ -17,10 +17,12 @@
 #include "builtins_misc.h"
 #include "builtins_regex.h"
 #include "builtins_toml.h"
+#include "builtins_tryeval.h"
 #include "derivation.h"
 #include "eval_file.h"
 #include "hash_shim.h"
 #include "symtab.h"
+#include "tryeval.h"
 #include "value_util.h"
 
 static Value make_string(const char *s, size_t len) {
@@ -62,8 +64,18 @@ static Value prim_throw(const Value *args, int64_t argc) {
     Value msg = asnix_coerce_to_string(args[0]);
     int64_t len;
     const char *bytes = asnix_ptr_bytes(msg, &len);
-    fprintf(stderr, "asnix: %.*s\n", (int)len, bytes);
-    exit(1);
+    /* M30: routed through the catchable-throw mechanism instead of a
+     * direct fprintf+exit -- `builtins.tryEval` must be able to catch
+     * this (confirmed against real Nix: `throw` IS one of the two
+     * things `tryEval` catches, see tryeval.h). Falls back to exactly
+     * the same "asnix: <msg>\n" + exit(1) behavior when no `tryEval` is
+     * active, so top-level `throw` (the overwhelmingly common case)
+     * looks identical to before. */
+    char *formatted = asnix_arena_alloc((size_t)len + 8);
+    memcpy(formatted, "asnix: ", 7);
+    memcpy(formatted + 7, bytes, (size_t)len);
+    formatted[7 + len] = '\n';
+    asnix_tryeval_raise_or_fatal(formatted, (size_t)(7 + len + 1));
 }
 
 static Value prim_typeOf(const Value *args, int64_t argc) {
@@ -304,12 +316,12 @@ Value asnix_make_builtins_attrs(void) {
     const size_t list_shaped_counts[] = { asnix_builtins_list_count, ASNIX_ATTRS_BUILTINS_COUNT };
     const AsnixBuiltinMiscDef *const build_tables[] = {
         ASNIX_BUILTINS_MISC, ASNIX_CLOSURE_BUILTINS, ASNIX_LIST2_BUILTINS, ASNIX_ATTRS2_BUILTINS, ASNIX_COMPARE_BUILTINS,
-        ASNIX_M23_BUILTINS, ASNIX_REGEX_BUILTINS, ASNIX_TOML_BUILTINS,
+        ASNIX_M23_BUILTINS, ASNIX_REGEX_BUILTINS, ASNIX_TOML_BUILTINS, ASNIX_TRYEVAL_BUILTINS,
     };
     const size_t build_counts[] = {
         ASNIX_BUILTINS_MISC_COUNT, ASNIX_CLOSURE_BUILTINS_COUNT, ASNIX_LIST2_BUILTINS_COUNT,
         ASNIX_ATTRS2_BUILTINS_COUNT, ASNIX_COMPARE_BUILTINS_COUNT, ASNIX_M23_BUILTINS_COUNT, ASNIX_REGEX_BUILTINS_COUNT,
-        ASNIX_TOML_BUILTINS_COUNT,
+        ASNIX_TOML_BUILTINS_COUNT, ASNIX_TRYEVAL_BUILTINS_COUNT,
     };
 
     size_t n = 0;

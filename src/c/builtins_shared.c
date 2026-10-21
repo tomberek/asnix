@@ -17,6 +17,17 @@ Value asnix_bshared_make_primop(void *fn, int64_t arity) {
     void *mem = asnix_arena_alloc(ASNIX_PRIMOP_SIZE);
     *(void **)((char *)mem + ASNIX_PRIMOP_OFF_FN) = fn;
     *(int64_t *)((char *)mem + ASNIX_PRIMOP_OFF_ARITY) = arity;
+    /* ASNIX_PRIMOP_OFF_NOFORCE left at its fresh-arena zero (force args,
+     * the default for every primop except tryEval -- see that field's
+     * own comment, heap.h). */
+    return (Value){ .raw = (uint64_t)(uintptr_t)mem | ASNIX_TAG_PRIMOP };
+}
+
+Value asnix_bshared_make_primop_noforce(void *fn, int64_t arity) {
+    void *mem = asnix_arena_alloc(ASNIX_PRIMOP_SIZE);
+    *(void **)((char *)mem + ASNIX_PRIMOP_OFF_FN) = fn;
+    *(int64_t *)((char *)mem + ASNIX_PRIMOP_OFF_ARITY) = arity;
+    *(int64_t *)((char *)mem + ASNIX_PRIMOP_OFF_NOFORCE) = 1;
     return (Value){ .raw = (uint64_t)(uintptr_t)mem | ASNIX_TAG_PRIMOP };
 }
 

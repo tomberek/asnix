@@ -55,8 +55,18 @@
  * contiguous arg layout the Closure call path already reads from) rather
  * than copying into a new Env frame -- primops have no lexical body to
  * capture a scope for. */
-#define ASNIX_PRIMOP_OFF_FN    0
-#define ASNIX_PRIMOP_OFF_ARITY 8
-#define ASNIX_PRIMOP_SIZE      16
+#define ASNIX_PRIMOP_OFF_FN      0
+#define ASNIX_PRIMOP_OFF_ARITY   8
+#define ASNIX_PRIMOP_OFF_NOFORCE 16 /* M30: nonzero means op_call.S's primop-call path must
+                                      * NOT force this primop's arguments before calling it
+                                      * (every existing primop leaves this 0, preserving M23's
+                                      * "args are pre-forced" convention unchanged) -- the one
+                                      * exception is `tryEval`, which needs its raw, unforced
+                                      * argument so it can force it itself inside its own
+                                      * setjmp/longjmp catch scope (see builtins_tryeval.c);
+                                      * forcing it in op_call.S first, before tryEval's own
+                                      * catch is even installed, would make tryEval unable to
+                                      * catch anything at all. */
+#define ASNIX_PRIMOP_SIZE        24
 
 #endif /* ASNIX_HEAP_H */

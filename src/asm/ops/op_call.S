@@ -63,11 +63,19 @@ asnix_op_call:                          // a = argc
     // slot (not push/pop'd per iteration) specifically to keep %rsp
     // 16-byte aligned across every `call` here, matching this file's
     // existing push-in-pairs discipline.
+    //
+    // M30: skipped entirely when ASNIX_PRIMOP_OFF_NOFORCE is set --
+    // `tryEval` is the one primop that needs its argument raw/unforced,
+    // so it can force it itself inside its own setjmp/longjmp catch
+    // scope (builtins_tryeval.c). Every other primop leaves this flag 0
+    // and is unaffected.
+    cmpq $0, ASNIX_PRIMOP_OFF_NOFORCE(%rdx)
+    jne .Lop_call_force_args_done
     subq $16, %rsp
     xorq %r9, %r9
 .Lop_call_force_args:
     cmpq %rbx, %r9
-    jge .Lop_call_force_args_done
+    jge .Lop_call_force_args_done_pop
     movq 8(%r15, %r9, 8), %rdi
     movq %r9, (%rsp)
     call asnix_force_for_print
@@ -75,8 +83,9 @@ asnix_op_call:                          // a = argc
     movq %rax, 8(%r15, %r9, 8)
     incq %r9
     jmp .Lop_call_force_args
-.Lop_call_force_args_done:
+.Lop_call_force_args_done_pop:
     addq $16, %rsp
+.Lop_call_force_args_done:
 
     leaq 8(%r15), %rdi                   // arg1 = args ptr (straight into VALSTACK, no Env copy)
     movq %rbx, %rsi                      // arg2 = argc

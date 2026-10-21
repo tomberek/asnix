@@ -32,6 +32,13 @@
 
 Value asnix_bshared_make_primop(void *fn, int64_t arity);
 
+/* Same as asnix_bshared_make_primop, except the resulting PrimOp's
+ * arguments are NOT pre-forced by op_call.S before the native function
+ * is called (ASNIX_PRIMOP_OFF_NOFORCE, heap.h) -- used only by
+ * `tryEval` (M30), which needs its raw, unforced argument so it can
+ * force it itself inside its own setjmp/longjmp catch scope. */
+Value asnix_bshared_make_primop_noforce(void *fn, int64_t arity);
+
 /* Builds a curried Closure chain of length `arity` wrapping the real,
  * ordinary arity-`arity` native PrimOp `native_fn` -- see
  * builtins_misc.c's make_curried_native for the full rationale (ordinary
