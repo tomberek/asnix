@@ -204,8 +204,14 @@ struct Ast {
         } with1; /* AST_WITH */
         struct {
             Ast *target;
-            const char *attr;
+            const char *attr;      /* valid when attr_expr == NULL (static segment) */
             size_t attr_len;
+            Ast *attr_expr;        /* non-NULL for a dynamic `? ${expr}` segment -- same
+                                       split as AST_SELECT.attr_expr (see above); resolved
+                                       at runtime via OP_HAS_ATTR_DYNAMIC, not interned at
+                                       compile time. Found needed: nixpkgs's own
+                                       lib/systems/default.nix has `rustc-target-env ?
+                                       ${final.rust.rustcTargetSpec}`. */
         } has_attr; /* AST_HAS_ATTR: `target ? attr` */
         struct {
             const char *text; /* raw lexeme: e.g. "./foo.nix", or the bare name for a search path */

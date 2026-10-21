@@ -118,6 +118,10 @@ size_t ib_with_miss(IrBuilder *b);
 /* Lambda-patterns: pops a value, pushes TRUE/FALSE -- see op_has_attr.S. */
 size_t ib_has_attr(IrBuilder *b, uint32_t sym);
 
+/* `expr ? ${nameExpr}` (M33): pops the name Value then the target -- see
+ * OP_HAS_ATTR_DYNAMIC (ir.h) and op_has_attr_dynamic.S. */
+size_t ib_has_attr_dynamic(IrBuilder *b);
+
 /* Lambda-patterns: eager pre-destructuring validation of the call argument
  * (see op_check_formals.S for the exact semantics and pool layout).
  * `required_syms_sorted` must have `required_count` entries, sorted

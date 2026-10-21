@@ -201,6 +201,10 @@ size_t ib_has_attr(IrBuilder *b, uint32_t sym) {
     return ib_emit(b, OP_HAS_ATTR, (int64_t)sym, 0);
 }
 
+size_t ib_has_attr_dynamic(IrBuilder *b) {
+    return ib_emit(b, OP_HAS_ATTR_DYNAMIC, 0, 0);
+}
+
 size_t ib_check_formals(IrBuilder *b, int64_t required_count, const uint32_t *required_syms_sorted,
                          int64_t total_count, const uint32_t *all_syms_sorted) {
     /* Pool layout -- see op_check_formals.S's long comment. */

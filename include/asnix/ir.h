@@ -225,6 +225,17 @@ enum {
                      * asnix_resolve_search_path_value, compiler.c). Deliberately resolved
                      * at *evaluation* time, not compile time like an ordinary path
                      * literal, specifically so this can be caught. */
+    OP_HAS_ATTR_DYNAMIC, /* `expr ? ${nameExpr}` (M33): pops the name Value then the target
+                     * (reverse push order, same convention as OP_SELECT_DYNAMIC), pushes
+                     * TRUE/FALSE -- never fatal, not even on a non-attrset target (matches
+                     * plain OP_HAS_ATTR's graceful fallthrough, NOT OP_SELECT_DYNAMIC's
+                     * fatal-on-miss). The name must still be a string (fatal otherwise, a
+                     * genuine misuse rather than a "not found"). Membership-only, like
+                     * OP_HAS_ATTR -- never forces the matched entry's value. See
+                     * asnix_bshared_has_attr_dynamic (builtins_shared.c) and
+                     * op_has_attr_dynamic.S. Found needed evaluating real nixpkgs:
+                     * lib/systems/default.nix has `rustc-target-env ?
+                     * ${final.rust.rustcTargetSpec}`. */
     OP_COUNT
 };
 

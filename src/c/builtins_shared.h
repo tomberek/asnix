@@ -136,6 +136,13 @@ Value asnix_bshared_select_dynamic(Value target, Value name_val);
  * plain form above) on a miss -- a non-string name is still fatal. */
 int asnix_bshared_select_dynamic_or(Value target, Value name_val, Value *out);
 
+/* `expr ? ${nameExpr}` (M33, OP_HAS_ATTR_DYNAMIC -- see ir.h). Membership-
+ * only, never fatal on a non-attrset target (returns 0, matching plain
+ * OP_HAS_ATTR's graceful "no") -- a non-string name is still fatal, same
+ * rule as every other dynamic-attr-name primitive. Never forces the
+ * matched entry's value. */
+int asnix_bshared_has_attr_dynamic(Value target, Value name_val);
+
 /* M23: builds a genuinely LAZY Thunk that, when first forced, computes
  * `f arg` (asnix_bshared_make_lazy_call1) or the curried `(f arg1) arg2`
  * (asnix_bshared_make_lazy_call2) -- NOT an eager asnix_apply call made

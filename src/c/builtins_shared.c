@@ -232,6 +232,18 @@ int asnix_bshared_select_dynamic_or(Value target, Value name_val, Value *out) {
     return 1;
 }
 
+int asnix_bshared_has_attr_dynamic(Value target, Value name_val) {
+    if (asnix_tag_of(target) != ASNIX_TAG_ATTRS) return 0;
+    if (asnix_tag_of(name_val) != ASNIX_TAG_PTR || asnix_value_is_path(name_val)) {
+        fprintf(stderr, "asnix: a dynamic '${...}' attribute name must be a string\n");
+        exit(1);
+    }
+    int64_t len;
+    const char *bytes = asnix_ptr_bytes(name_val, &len);
+    uint32_t sym = asnix_intern(bytes, (size_t)len);
+    return asnix_bshared_attrs_find(target, sym) >= 0;
+}
+
 int asnix_bshared_value_lt(Value a, Value b, const char *who) {
     int ta = asnix_tag_of(a), tb = asnix_tag_of(b);
     if (ta == ASNIX_TAG_INT && tb == ASNIX_TAG_INT) {

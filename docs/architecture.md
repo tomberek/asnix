@@ -45,7 +45,8 @@ what's actually implemented and the scope decisions made along the way.
 | M30 — `builtins.tryEval` (catchable `throw`/failed `assert`) | done, **scoped** (see below) |
 | M31 — lazy `<name>` search-path resolution (catchable by `tryEval`) | done (see below) |
 | M32 — dotted attrpath after `?` (`x ? a.b.c`) | done (see below) |
-| M33+ | not started |
+| M33 — dynamic `?` segment (`x ? ${name}`, anywhere in the chain) | done (see below) |
+| M34+ | not started |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
 
@@ -3240,3 +3241,63 @@ appended via that same outer loop as before.
 
 `make test`/`test-e2e`/`test-conformance` all green (173 e2e, 19
 conformance, full unit suite).
+
+## M33 scope notes: dynamic `?` segment (`x ? ${name}`, anywhere in the chain)
+
+Found continuing to chase `d.nix` right after M32 landed: the *next*
+parse error in `lib/systems/default.nix` turned out to be a different
+segment of the same `?`-attrpath feature -- `rustc-target-env ?
+${final.rust.rustcTargetSpec}`, a *dynamic* segment right after `?`
+(not preceded by a `.`). `parse_attr_segment` only recognized
+`TOK_IDENT`/a static quoted string, so this hit the "expected an
+attribute name" fatal. Root-caused by reading cppnix's full grammar
+(`~/nix/src/libexpr/parser.y`): `attrpath: attrpath '.' attr | attrpath
+'.' string_attr | attr | string_attr`, and `string_attr: '"'
+string_parts '"' | DOLLAR_CURLY expr '}'` -- `string_attr` (which
+includes the dynamic `${expr}` form) is a valid `attrpath` segment on
+its own, not just after a `.`, which is why `? ${expr}` parses as a
+dynamic has-attr check with no leading dot needed. Confirmed against
+real `nix-instantiate --eval`: `x ? ${name}`, `x ? ${name}.b`, and `x ?
+a.${name}` (dynamic in every position: first segment, before a `.`,
+after a `.`) all work, all graceful (`false`, not a type error) when
+the target or an intermediate value is missing/wrong-type.
+
+Needed one new IR op, `OP_HAS_ATTR_DYNAMIC` (`src/asm/ops/
+op_has_attr_dynamic.S`), mirroring `OP_SELECT_DYNAMIC`'s C-deferred
+pattern (`asnix_bshared_has_attr_dynamic`, `builtins_shared.c`: interns
+the name at runtime, binary-searches) rather than `OP_HAS_ATTR`'s own
+hand-rolled asm binary search, since the symbol isn't known until
+runtime -- same rationale M28 used for `OP_SELECT_DYNAMIC`. Unlike
+`OP_SELECT_DYNAMIC` (fatal on a non-attrset target), this one follows
+`OP_HAS_ATTR`'s graceful rule: a non-attrset target is simply `false`,
+never fatal (only a non-string *name* is a hard fatal, a genuine
+misuse). `AST_HAS_ATTR` grew an `attr_expr` field, the same split
+`AST_SELECT` already has.
+
+`parser.c`'s M32 dotted-chain desugaring (`x ? a.b.c` ->
+`x ? a && (x.a or {}) ? b && ...`) needed each segment to carry either a
+static name or a dynamic expression, not just a `Token*` -- added a
+small `AttrSeg` tagged struct and a shared `parse_attrpath_segment`
+helper (handles `TOK_DOLLAR_LBRACE` by parsing a full `expr` and
+expecting a closing `}`, else falls back to the existing
+`parse_attr_segment`), plus `set_has_attr_segment`/`set_select_segment`
+helpers so the same `AttrSeg` populates either node kind's static-or-
+dynamic fields. A dynamic segment's expression node is deliberately
+reused as-is in both the `AST_HAS_ATTR` check and the following
+`AST_SELECT ... or {}` node when the chain continues past it (the same
+way the static case already reused a `Token*`'s `start`/`len`) --
+`compile_expr` is a pure read-only tree walk (confirmed: no AST-node
+mutation/caching anywhere in `compiler.c`), so compiling the same
+sub-AST twice just re-evaluates the (pure, side-effect-free) name
+expression twice; harmless and consistent with real Nix's own purity
+guarantees, just not the single-evaluation `attrpath`-vector approach
+cppnix's C++ takes internally.
+
+Verified against real `nix-instantiate --eval` for the three segment
+positions (bare, before a `.`, after a `.`) and the missing-key case;
+the parse error in `lib/systems/default.nix` is gone and evaluation now
+proceeds further into the file (the next blocker, if any, is a separate,
+not-yet-diagnosed issue).
+
+`make test`/`test-e2e` green (177 e2e); `test-conformance` 629 passed
+(up from 628, no regressions).

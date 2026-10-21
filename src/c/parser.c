@@ -874,6 +874,60 @@ static Ast *parse_negate(Parser *p) {
     return parse_app(p);
 }
 
+/* One segment of a `?`-chain's attrpath: either a plain identifier/
+ * static quoted-string (same as parse_attr_segment, `attr`/`attr_len`
+ * valid) or a dynamic `${expr}` segment (`name_expr` valid instead) --
+ * real Nix's grammar allows a dynamic `string_attr` segment anywhere in
+ * an `attrpath` (`~/nix/src/libexpr/parser.y`: `attrpath: ... | attrpath
+ * '.' string_attr | string_attr`, and `string_attr: ... | DOLLAR_CURLY
+ * expr '}'`), including as the very first segment right after `?`.
+ * Confirmed against `nix-instantiate --eval`: `let x = { a = 5; }; name =
+ * "a"; in x ? ${name}` => true, and `x ? ${name}.b` / `x ? a.${name}`
+ * both also work the same way a fully-static chain does. Found needed
+ * evaluating real nixpkgs: `lib/systems/default.nix` has
+ * `rustc-target-env ? ${final.rust.rustcTargetSpec}`. */
+typedef struct {
+    int is_dynamic;
+    Ast *name_expr;      /* valid when is_dynamic */
+    const char *attr;    /* valid when !is_dynamic */
+    size_t attr_len;
+} AttrSeg;
+
+static AttrSeg parse_attrpath_segment(Parser *p) {
+    if (cur(p)->kind == TOK_DOLLAR_LBRACE) {
+        advance(p);
+        Ast *name_expr = parse_expr(p);
+        expect(p, TOK_RBRACE, "'}' closing a dynamic attribute name");
+        return (AttrSeg){ .is_dynamic = 1, .name_expr = name_expr };
+    }
+    Token *attr = parse_attr_segment(p, "an attribute name");
+    return (AttrSeg){ .is_dynamic = 0, .attr = attr->start, .attr_len = attr->len };
+}
+
+static void set_has_attr_segment(Ast *n, AttrSeg seg) {
+    if (seg.is_dynamic) {
+        n->as.has_attr.attr_expr = seg.name_expr;
+        n->as.has_attr.attr = NULL;
+        n->as.has_attr.attr_len = 0;
+    } else {
+        n->as.has_attr.attr_expr = NULL;
+        n->as.has_attr.attr = seg.attr;
+        n->as.has_attr.attr_len = seg.attr_len;
+    }
+}
+
+static void set_select_segment(Ast *n, AttrSeg seg) {
+    if (seg.is_dynamic) {
+        n->as.select.attr_expr = seg.name_expr;
+        n->as.select.attr = NULL;
+        n->as.select.attr_len = 0;
+    } else {
+        n->as.select.attr_expr = NULL;
+        n->as.select.attr = seg.attr;
+        n->as.select.attr_len = seg.attr_len;
+    }
+}
+
 /* `expr ? attr` (has-attr): binds tighter than arithmetic but looser than
  * application, matching real Nix's precedence table. Confirmed against
  * `nix-instantiate --eval '1 ? a'` => false (not an error) -- a non-
@@ -888,30 +942,29 @@ static Ast *parse_has_attr(Parser *p) {
          * nested existence, confirmed against `nix-instantiate --eval`
          * (found needed evaluating real nixpkgs: `lib/systems/
          * default.nix` has `platform ? gcc.arch`). Each segment may be a
-         * plain identifier or a static quoted-string, same as
-         * parse_select (parse_attr_segment). Desugars directly to `x ? a
-         * && (x.a or {}) ? b && ((x.a or {}).b or {}) ? c ...` -- reusing
-         * the already-correct AST_HAS_ATTR/AST_SELECT-with-`or`/AST_AND
-         * nodes, no new AST node or IR op needed. Verified this
-         * desugaring matches real Nix exactly for the three cases that
-         * actually distinguish it from a naive "just select, no
+         * plain identifier, a static quoted-string, or a dynamic
+         * `${expr}` (see parse_attrpath_segment/AttrSeg above). Desugars
+         * directly to `x ? a && (x.a or {}) ? b && ((x.a or {}).b or {})
+         * ? c ...` -- reusing the already-correct AST_HAS_ATTR/
+         * AST_SELECT-with-`or`/AST_AND nodes, no new AST node needed
+         * (dynamic segments needed one new IR op, OP_HAS_ATTR_DYNAMIC,
+         * since AST_SELECT already had its own dynamic op). Verified
+         * this desugaring matches real Nix exactly for the three cases
+         * that actually distinguish it from a naive "just select, no
          * fallback" version: a missing intermediate attr, an
          * intermediate value that exists but isn't an attrset, and a
          * fully-present chain -- all graceful (`false`), none fatal. */
-        Token *attr = parse_attr_segment(p, "an attribute name");
+        AttrSeg seg = parse_attrpath_segment(p);
         Ast *n = asnix_ast_new(AST_HAS_ATTR);
         n->as.has_attr.target = e;
-        n->as.has_attr.attr = attr->start;
-        n->as.has_attr.attr_len = attr->len;
+        set_has_attr_segment(n, seg);
         Ast *result = n;
         Ast *running_target = e;
         while (cur(p)->kind == TOK_DOT) {
             advance(p);
             Ast *sel = asnix_ast_new(AST_SELECT);
             sel->as.select.target = running_target;
-            sel->as.select.attr = attr->start;   /* the segment just checked above */
-            sel->as.select.attr_len = attr->len;
-            sel->as.select.attr_expr = NULL;
+            set_select_segment(sel, seg);   /* the segment just checked above */
             Ast *empty_attrs = asnix_ast_new(AST_ATTRSET);
             empty_attrs->as.attrset.bindings = NULL;
             empty_attrs->as.attrset.count = 0;
@@ -921,11 +974,10 @@ static Ast *parse_has_attr(Parser *p) {
             sel->as.select.default_ = empty_attrs;
             running_target = sel; /* == the previous target's `.attr or {}` */
 
-            attr = parse_attr_segment(p, "an attribute name");
+            seg = parse_attrpath_segment(p);
             Ast *next_check = asnix_ast_new(AST_HAS_ATTR);
             next_check->as.has_attr.target = running_target;
-            next_check->as.has_attr.attr = attr->start;
-            next_check->as.has_attr.attr_len = attr->len;
+            set_has_attr_segment(next_check, seg);
 
             Ast *and_node = asnix_ast_new(AST_AND);
             and_node->as.logic.lhs = result;

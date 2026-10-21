@@ -518,6 +518,15 @@ static void compile_expr(IrBuilder *b, Ast *node, ScopeFrame *scope) {
         }
         case AST_HAS_ATTR: {
             compile_expr(b, node->as.has_attr.target, scope);
+            if (node->as.has_attr.attr_expr) {
+                /* Dynamic `? ${expr}` -- same split as AST_SELECT's
+                 * attr_expr case: push the name's value, let
+                 * OP_HAS_ATTR_DYNAMIC intern/look it up at runtime (see
+                 * asnix_bshared_has_attr_dynamic, builtins_shared.c). */
+                compile_expr(b, node->as.has_attr.attr_expr, scope);
+                ib_has_attr_dynamic(b);
+                return;
+            }
             uint32_t sym = asnix_intern(node->as.has_attr.attr, node->as.has_attr.attr_len);
             ib_has_attr(b, sym);
             return;
