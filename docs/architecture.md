@@ -61,7 +61,8 @@ what's actually implemented and the scope decisions made along the way.
 | M50 — name the specific value/field in 6 more generic fatal-path error messages | done (see below) |
 | M51 | in progress (parallel agent: float literals) |
 | M52 — fix `with`-frame leaking into a sibling expression (core evaluator fix) | done, **scoped** (see below) |
-| M53-M54 | in progress (parallel agents: foldl'/replaceStrings laziness, missing builtins) |
+| M53 — `foldl'`/`replaceStrings` forced values real Nix never would (plus a core list-literal laziness fix) | done (see below) |
+| M54 | in progress (parallel agent: missing builtins) |
 | M55 — regex engine gaps triage (`builtins.match`/`builtins.split`, 39 conformance failures) | investigated, **no fix** (see below) |
 | M56-M57 | in progress (parallel agents: fromTOML/overflow, misc backlog) |
 
@@ -4216,3 +4217,128 @@ otherwise exercised by the numtide/nix-conformance `lang` corpus as a
 pass/fail flip, so the aggregate numbers don't move even though the
 underlying bug is real and independently verified against
 `nix-instantiate`.
+
+## M53 scope notes: `foldl'`/`replaceStrings` forcing values they shouldn't -- plus the list-literal laziness gap actually blocking one of them
+
+Found via numtide/nix-conformance triage: three failures all shaped like
+the M23/M29/M34 laziness-bug family, but forcing *too much, too early*
+(the opposite direction from M34's "forced too little" builtins) --
+`eval-okay-foldlStrict-lazy-elements.nix`,
+`eval-okay-foldlStrict-lazy-initial-accumulator.nix`, and the last
+expression of `eval-okay-replacestrings.nix`, each a canary `throw`
+that must never fire.
+
+**Bug 1 -- `builtins.foldl'`'s initial accumulator (`builtins_list.c`)**.
+Minimal repro, verified against real `nix-instantiate --eval` before
+touching anything: `builtins.foldl' (_: x: x) (throw "never forced")
+["a" 42]` => `42`, no throw -- `op`'s first parameter is never read, so
+real Nix's own `prim_foldlStrict` (primops.cc) never forces the initial
+accumulator merely because it was passed in (it only forces it in the
+*empty-list* case, where the accumulator directly becomes the result).
+Root cause: `foldl'` is implemented as three chained curried native
+PrimOp stages (`prim_foldl_prime` -> stage2 -> stage3, builtins_list.c's
+own long header comment explains the staging mechanism), and
+`op_call.S`'s M25 fix ("force every argument before handing it to a
+native primop function") is a *blanket* rule applied to every primop
+call, including the internal call `(foldl' op) acc` that merely hands
+`acc` to stage2 for capture -- stage2 never inspects `acc`'s tag, only
+stores it, so forcing it there was always wrong, not merely redundant.
+Fix: a new `make_primop1_noforce` (mirrors `make_primop1`, just also
+sets `ASNIX_PRIMOP_OFF_NOFORCE`, the M30 flag `tryEval` already uses for
+the same reason) used *only* for the stage2 object `prim_foldl_prime`
+returns. Stage3 (the call supplying `list`) deliberately keeps ordinary
+forcing -- it genuinely needs the list's own `ASNIX_TAG_LIST` tag/count/
+elems (`check_list`), matching real Nix's own
+`state.forceList(*args[2], ...)`. Disambiguated against "fixing this
+doesn't silently make genuinely-needed strictness disappear": `builtins.
+foldl' (acc: x: acc + x) (throw "used") [1 2 3]` still throws (`op`
+actually reads `acc`), confirmed identical to real Nix.
+
+**Bug 1b (the one that actually blocked `-lazy-elements.nix`) -- list
+literals were never lazy per-element at all**. The accumulator fix
+alone did not make `eval-okay-foldlStrict-lazy-elements.nix` pass;
+minimal repros bypassing `foldl'` entirely proved the real root cause
+is far more basic: `builtins.head [ 42 (throw "boom") ]`,
+`builtins.length [ 42 (throw "boom") ]`, and even `builtins.foldl' (x:
+y: x) 999 [ 42 (throw "boom") ]` (an `op` that reads *neither*
+argument) all aborted on this build with "boom" -- proving the throw
+fired merely from *constructing* the list literal, before any consumer
+touched a specific element. `compiler.c`'s `AST_LIST` case compiled
+every element inline via plain `compile_expr` (no thunk wrapping), so
+the moment anything forced the list value itself to WHNF (needed just
+to read its own `ASNIX_TAG_LIST` tag/count/elems pointer -- an
+unavoidable, correct thing for `foldl'`/`head`/`length` to do), the
+list's own construction bytecode ran to completion, which unconditionally
+executed *every* element's code, including calling `throw`. This was a
+known, already-documented gap (see M34's own scope notes: `builtins.
+elemAt [(abort "boom") 1] 1` was already confirmed to abort, "a
+documented, different, narrower scope gap... not the thing fixed
+here") -- but it is exactly the thing blocking this milestone's test.
+
+Fix: `AST_LIST` now wraps each element in its own thunk (`ib_mk_thunk`)
+before `ib_mk_list`, the *exact* pattern the non-`rec` `AST_ATTRSET`
+branch already uses for binding values (compiler.c, a few hundred lines
+above) and `AST_APP` already uses for call arguments (M25) -- reused
+machinery, no new op. `OP_MK_LIST` (`op_mk_list.S`) itself needed no
+change: it already just moves `count` already-evaluated `Value`s off
+`VALSTACK` into a list object, oblivious to whether each one is a
+forced `Value` or (now, also) a `Thunk`.
+
+This *broadens* which lists can hold unforced `Thunk` elements (previously
+only `map`/`mapAttrs` results, M23; now every list literal in source,
+`[...]`), so re-audited every direct list-element-reading site project-wide
+(same audit M34 already did for the narrower map/mapAttrs-only case) by
+running the full regression suite and checking every diff: one more
+genuine gap turned up, `removeAttrs`'s name-list argument
+(`builtins_attrs.c`'s `prim_removeAttrs_apply2`, e.g. `removeAttrs { a=1;
+b=2; } [ "b" ]` -- a bare list literal, now exercising the new thunk-
+wrapped-element path for the first time) read `list_elem(namelist, i)`
+raw without forcing; fixed the same way M34 fixed its six builtins,
+`asnix_force_for_print` immediately before the tag check. Every other
+direct list-element-reading site audited (`elem`/`any`/`all`/`concatMap`/
+`sort`/`partition`/`foldl`/`foldr`/`catAttrs` in builtins_list2.c,
+`elemAt`/`concatLists`/`tail`/`head`/`++` in builtins_list.c,
+`genericClosure`, `listToAttrs`/`attrByPath`, `toJSON`,
+`asnix_bshared_value_eq`) was already either a correct lazy pass-through
+(function-argument position, or copied verbatim into a new list/attrs
+without inspecting the raw tag) or already force-before-read from M34 --
+confirmed by the full regression suite (below) showing zero new
+failures anywhere else.
+
+**Bug 2 -- `builtins.replaceStrings` (`builtins_compare.c`'s
+`replaceStrings3_impl`)**. `eval-okay-replacestrings.nix`'s last case:
+`replaceStrings [ "oo" "XX" ] [ "u" (throw "unreachable") ] "foobar"` =>
+`"fubar"`, no throw -- `"XX"` never occurs in `"foobar"`, so its paired
+`to` entry must never be read. The previous implementation force-read
+*every* `to[i]`'s bytes upfront, in the same loop that reads every
+`from[i]` (a loop M34 already fixed to force -- a *different* bug in
+the same function, replaceStrings's `to`/`from` list elements
+themselves being unforced Thunks from a `map` call). `from[i]` genuinely
+needs reading upfront (every entry is tested at every scan position),
+but `to[i]` is only ever needed at the one position (if any) where
+`from[i]` actually matches. Fix: stopped precomputing `to_bytes`/
+`to_lens` arrays entirely; `to_elems[found]` is now forced and its bytes
+read lazily, right at the `memcpy` call site inside the `found >= 0`
+branch, only for the specific index that actually matched. Disambiguated
+both directions against real Nix: `replaceStrings [ "oo" "XX" ] [ "u"
+(throw "reachable") ] "fooXXbar"` still throws (`"XX"` *does* occur), and
+`replaceStrings [ "oo" "XX" ] [ (throw "unreachable-first") "u" ]
+"fooXXbar"` still throws too (`"oo"` occurs, so `to[0]` -- the throwing
+one -- *is* read).
+
+**Verification**: every repro and disambiguating case checked directly
+against `nix-instantiate --eval --strict` before and after. Four new
+e2e fixtures (`m53_foldl_prime_lazy_elements`,
+`m53_foldl_prime_lazy_accumulator`, `m53_replacestrings_lazy_to`,
+`m53_list_literal_lazy_elements` -- the last one locks in the general
+list-literal fix independent of any specific builtin:
+`[elemAt [1 (throw) ] 0, head [42 (throw)], length [1 (throw)]]` =>
+`[1 42 2]`). `make test` green (full unit suite); `make test-e2e` green
+(202 e2e, up from 198). `test-conformance`: ran a clean before/after
+diff using this worktree's own binary both times (not the shared
+`~/asnix/asnix` the stock adapter points at, which may be mid-edit from
+other concurrent milestones' worktrees) -- before: 633 passed / 169
+failed / 0 known / 62 skipped, identical to the stated baseline; after:
+636 passed / 166 failed / 0 known / 62 skipped. Diffing the two FAIL
+lists directly: exactly the three targeted tests flip from FAIL to
+passing, zero other tests change in either direction -- no regressions.

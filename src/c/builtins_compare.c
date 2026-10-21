@@ -203,8 +203,6 @@ static Value replaceStrings3_impl(const Value *args, int64_t argc) {
 
     const char **from_bytes = nfrom > 0 ? malloc((size_t)nfrom * sizeof(char *)) : NULL;
     int64_t *from_lens = nfrom > 0 ? malloc((size_t)nfrom * sizeof(int64_t)) : NULL;
-    const char **to_bytes = nfrom > 0 ? malloc((size_t)nfrom * sizeof(char *)) : NULL;
-    int64_t *to_lens = nfrom > 0 ? malloc((size_t)nfrom * sizeof(int64_t)) : NULL;
     for (int64_t i = 0; i < nfrom; i++) {
         /* List elements are lazy (e.g. a `map`-produced list's elements are
          * deliberately unforced thunks, M23) -- force each one before
@@ -213,8 +211,19 @@ static Value replaceStrings3_impl(const Value *args, int64_t argc) {
          * someList) s`-shaped calls crashed with "expected a string
          * argument" on an unforced Thunk. */
         asnix_bshared_string_bytes(asnix_force_for_print(from_elems[i]), &from_bytes[i], &from_lens[i], "replaceStrings");
-        asnix_bshared_string_bytes(asnix_force_for_print(to_elems[i]), &to_bytes[i], &to_lens[i], "replaceStrings");
     }
+    /* M53: `to_elems[i]` is deliberately NOT forced here, unlike
+     * `from_elems[i]` just above -- every `from` entry must be read
+     * upfront since the scan below tests *all* of them at every
+     * position, but a `to` entry's value/bytes are only ever actually
+     * needed at the single position (if any) where its paired `from`
+     * entry matches, found and read lazily in the `found >= 0` branch
+     * below. Forcing every `to[i]` here unconditionally -- the
+     * previous version of this loop did exactly that -- forced entries
+     * that are never substituted in at all. Confirmed against real
+     * Nix: `replaceStrings [ "oo" "XX" ] [ "u" (throw "unreachable") ]
+     * "foobar"` => "fubar", no throw, since "XX" never occurs in
+     * "foobar" so its paired `to` entry is never read. */
 
     int64_t slen;
     const char *sbytes;
@@ -233,12 +242,14 @@ static Value replaceStrings3_impl(const Value *args, int64_t argc) {
             }
         }
         if (found >= 0) {
-            int64_t tl = to_lens[found];
+            const char *tb;
+            int64_t tl;
+            asnix_bshared_string_bytes(asnix_force_for_print(to_elems[found]), &tb, &tl, "replaceStrings");
             if (outlen + (size_t)tl + 1 > cap) {
                 cap = (outlen + (size_t)tl + 1) * 2;
                 out = realloc(out, cap);
             }
-            if (tl > 0) memcpy(out + outlen, to_bytes[found], (size_t)tl);
+            if (tl > 0) memcpy(out + outlen, tb, (size_t)tl);
             outlen += (size_t)tl;
             if (from_lens[found] == 0) {
                 if (p < slen) out[outlen++] = sbytes[p];
@@ -258,8 +269,6 @@ static Value replaceStrings3_impl(const Value *args, int64_t argc) {
     free(out);
     free(from_bytes);
     free(from_lens);
-    free(to_bytes);
-    free(to_lens);
     return result;
 }
 static Value build_replaceStrings(void) { return asnix_bshared_make_curried_native((void *)replaceStrings3_impl, 3); }

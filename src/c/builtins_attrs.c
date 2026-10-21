@@ -251,7 +251,13 @@ static Value prim_removeAttrs_apply2(const Value *args, int64_t argc) {
     int64_t nnames = list_count(namelist);
     uint32_t *remove_syms = asnix_arena_alloc((uint64_t)nnames * sizeof(uint32_t));
     for (int64_t i = 0; i < nnames; i++) {
-        Value nv = list_elem(namelist, i);
+        /* M53: `namelist`'s elements can now be unforced Thunks -- list
+         * literals (`removeAttrs set [ "b" ]`'s common shape) wrap each
+         * element in its own thunk as of this milestone (compiler.c's
+         * AST_LIST), the same way map/mapAttrs already did (M23). Force
+         * before reading the raw tag/bytes, same fix M34 already applied
+         * to the other direct list-element-reading builtins. */
+        Value nv = asnix_force_for_print(list_elem(namelist, i));
         require_string(nv, "removeAttrs");
         remove_syms[i] = asnix_intern(string_bytes(nv), (size_t)string_len(nv));
     }

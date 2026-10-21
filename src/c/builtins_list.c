@@ -78,6 +78,21 @@ static Value make_primop1(void *fn, int64_t arity, Value cap0) {
     return (Value){ .raw = (uint64_t)(uintptr_t)mem | ASNIX_TAG_PRIMOP };
 }
 
+/* Same as make_primop1, but sets ASNIX_PRIMOP_OFF_NOFORCE (heap.h) so
+ * op_call.S/apply.S do NOT force this primop's own argument before
+ * calling it. M53: used only for foldl''s stage2 -- see
+ * prim_foldl_prime's own comment for why plain make_primop1 (which
+ * leaves every other curried stage's forcing untouched, correctly) is
+ * wrong specifically here. */
+static Value make_primop1_noforce(void *fn, int64_t arity, Value cap0) {
+    void *mem = asnix_arena_alloc(ASNIX_PRIMOP_SIZE + sizeof(Value));
+    *(void **)((char *)mem + ASNIX_PRIMOP_OFF_FN) = fn;
+    *(int64_t *)((char *)mem + ASNIX_PRIMOP_OFF_ARITY) = arity;
+    *(int64_t *)((char *)mem + ASNIX_PRIMOP_OFF_NOFORCE) = 1;
+    *(Value *)((char *)mem + ASNIX_PRIMOP_SIZE) = cap0;
+    return (Value){ .raw = (uint64_t)(uintptr_t)mem | ASNIX_TAG_PRIMOP };
+}
+
 /* PrimOp with two trailing captured Values (foldl''s stage3: op + acc). */
 static Value make_primop2(void *fn, int64_t arity, Value cap0, Value cap1) {
     void *mem = asnix_arena_alloc(ASNIX_PRIMOP_SIZE + 2 * sizeof(Value));
@@ -245,7 +260,25 @@ static Value prim_foldl_prime_stage2(const Value *args, int64_t argc) {
 
 static Value prim_foldl_prime(const Value *args, int64_t argc) {
     (void)argc;
-    return make_primop1((void *)prim_foldl_prime_stage2, 1, args[0]);
+    /* M53: NOFORCE here -- the *next* call (supplying `acc`, handled by
+     * prim_foldl_prime_stage2) must not force its argument. Real Nix's
+     * own foldl' (primops.cc's prim_foldlStrict) never forces the
+     * initial accumulator merely because it was passed in: for a
+     * nonempty list it's threaded straight into `op` as a raw value
+     * (only forced if `op`'s body actually reads it), and only an EMPTY
+     * list forces it (since then it just *is* the already-to-be-forced
+     * result). Confirmed against real nix-instantiate: `builtins.foldl'
+     * (_: x: x) (throw "never forced") ["a" 42]` => 42, no throw --
+     * `op`'s first parameter is never read. Previously, stage2's primop
+     * had ordinary (forcing) semantics, so op_call.S's blanket M25
+     * argument-forcing (needed for primops that *do* read their args'
+     * raw tag) forced `acc` the instant `(foldl' op) acc` was called --
+     * before stage2's own body (which only captures it, never inspects
+     * its tag) ever ran. stage3 (supplying `list`) deliberately keeps
+     * ordinary forcing -- it genuinely needs the list's own
+     * ASNIX_TAG_LIST tag/count/elems (check_list), matching real Nix's
+     * own `state.forceList(*args[2], ...)`. */
+    return make_primop1_noforce((void *)prim_foldl_prime_stage2, 1, args[0]);
 }
 
 /* --------------------------------------------------------------------- */
