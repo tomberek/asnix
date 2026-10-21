@@ -8,6 +8,9 @@
 asnix_op_halt:
     subq $8, %r12
     movq (%r12), %rax                   // final result
+    decq asnix_eval_depth(%rip)         // pop -- frees this depth's slot in force_scratch.c's
+                                         // per-depth eval-scratch cache (dispatch.S) for reuse
+                                         // by the NEXT call that reaches this same depth
     // Restore the enclosing asnix_eval's (if any) VALSTACK/RETSP limits --
     // see dispatch.S's prologue for why this matters: without it, a nested
     // asnix_eval returning (e.g. `import`'s eval_file.c -> asnix_eval) would

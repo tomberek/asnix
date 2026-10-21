@@ -21,6 +21,7 @@
 // Every handler ends with the same "NEXT" tail: advance IP by one record,
 // load its handler address, and `jmp` straight to it -- no central
 // dispatch loop is ever re-entered after the first jump.
+#include "asnix/force_scratch.h" // asnix_eval_scratch_{valstack,retstack} (perf)
 #include "asnix/ir.h"
 
     // Sized generously and bounds-checked (see include/asnix/stackcheck.h)
@@ -35,6 +36,22 @@
     // bugs" list.
     .equ ASNIX_VALSTACK_BYTES, 8388608 // 1,048,576 Values, 8 MiB
     .equ ASNIX_RETSTACK_BYTES, 2097152 // 65,536 call frames (ASNIX_RETFRAME_SIZE=32), 2 MiB
+
+    // asnix_eval's own nested-recursion depth (every `import` of an
+    // uncached file, eval_file.c, re-enters asnix_eval, and imports can
+    // themselves nest) -- same per-depth-cache role/discipline as
+    // force.S's asnix_force_depth/apply.S's asnix_apply_depth, see
+    // force_scratch.h's header comment on asnix_eval_scratch_valstack
+    // for why this one turned out to matter most: a full nixpkgs
+    // evaluation imports hundreds of distinct files, each previously
+    // minting a fresh 10 MiB (8 MiB + 2 MiB) pair from the never-free
+    // bump arena. Decremented in op_halt.S, this function's one exit
+    // point.
+    .bss
+    .align 8
+    .globl asnix_eval_depth
+asnix_eval_depth:
+    .quad 0
 
     .text
 
@@ -67,17 +84,25 @@ asnix_eval:                             // Value asnix_eval(IrProgram *prog, Env
     movq asnix_retsp_limit(%rip), %rcx
     pushq %rcx
 
-    movq $ASNIX_VALSTACK_BYTES, %rdi
-    call asnix_arena_alloc
+    // perf: asnix_eval_scratch_{valstack,retstack} (force_scratch.c)
+    // cache one buffer pair PER DEPTH instead of minting a brand-new
+    // pair from the never-free bump arena on every single call -- see
+    // this file's own asnix_eval_depth comment above. %rbx/%rbp (prog/
+    // root_env) survive both calls: ordinary SysV calls, both
+    // callee-saved.
+    movq asnix_eval_depth(%rip), %rdi
+    call asnix_eval_scratch_valstack
     movq %rax, %r12                     // VALSTACK base
     leaq ASNIX_VALSTACK_BYTES(%r12), %rcx
     movq %rcx, asnix_valstack_limit(%rip) // one past the last valid Value slot
 
-    movq $ASNIX_RETSTACK_BYTES, %rdi
-    call asnix_arena_alloc
+    movq asnix_eval_depth(%rip), %rdi
+    call asnix_eval_scratch_retstack
     movq %rax, %r14                     // RETSP base
     leaq ASNIX_RETSTACK_BYTES(%r14), %rcx
     movq %rcx, asnix_retsp_limit(%rip)  // one past the last valid RetFrame slot
+
+    incq asnix_eval_depth(%rip)
 
     movq %rbx, %rcx                     // rcx = prog
     movq %rbp, %rdi                     // ENV = root_env

@@ -45,3 +45,67 @@ void *asnix_force_scratch_retstack(int64_t depth) {
     if (!slot->retstack) slot->retstack = asnix_arena_alloc(ASNIX_FORCE_RETSTACK_BYTES);
     return slot->retstack;
 }
+
+/* Independent per-depth cache for src/asm/apply.S's asnix_apply -- see
+ * force_scratch.h's own comment on asnix_apply_scratch_valstack for why
+ * this exists and why it's a second, separate cache rather than reusing
+ * g_slots above. */
+static ForceScratchSlot *g_apply_slots = NULL;
+static size_t g_apply_cap = 0;
+
+static void apply_ensure_cap(size_t depth) {
+    if (depth < g_apply_cap) return;
+    size_t new_cap = g_apply_cap ? g_apply_cap * 2 : 8;
+    while (new_cap <= depth) new_cap *= 2;
+    g_apply_slots = realloc(g_apply_slots, new_cap * sizeof(ForceScratchSlot));
+    for (size_t i = g_apply_cap; i < new_cap; i++) {
+        g_apply_slots[i].valstack = NULL;
+        g_apply_slots[i].retstack = NULL;
+    }
+    g_apply_cap = new_cap;
+}
+
+void *asnix_apply_scratch_valstack(int64_t depth) {
+    apply_ensure_cap((size_t)depth);
+    ForceScratchSlot *slot = &g_apply_slots[depth];
+    if (!slot->valstack) slot->valstack = asnix_arena_alloc(ASNIX_FORCE_VALSTACK_BYTES);
+    return slot->valstack;
+}
+
+void *asnix_apply_scratch_retstack(int64_t depth) {
+    apply_ensure_cap((size_t)depth);
+    ForceScratchSlot *slot = &g_apply_slots[depth];
+    if (!slot->retstack) slot->retstack = asnix_arena_alloc(ASNIX_FORCE_RETSTACK_BYTES);
+    return slot->retstack;
+}
+
+/* Independent per-depth cache for src/asm/dispatch.S's asnix_eval -- see
+ * force_scratch.h's own comment on asnix_eval_scratch_valstack for why. */
+static ForceScratchSlot *g_eval_slots = NULL;
+static size_t g_eval_cap = 0;
+
+static void eval_ensure_cap(size_t depth) {
+    if (depth < g_eval_cap) return;
+    size_t new_cap = g_eval_cap ? g_eval_cap * 2 : 8;
+    while (new_cap <= depth) new_cap *= 2;
+    g_eval_slots = realloc(g_eval_slots, new_cap * sizeof(ForceScratchSlot));
+    for (size_t i = g_eval_cap; i < new_cap; i++) {
+        g_eval_slots[i].valstack = NULL;
+        g_eval_slots[i].retstack = NULL;
+    }
+    g_eval_cap = new_cap;
+}
+
+void *asnix_eval_scratch_valstack(int64_t depth) {
+    eval_ensure_cap((size_t)depth);
+    ForceScratchSlot *slot = &g_eval_slots[depth];
+    if (!slot->valstack) slot->valstack = asnix_arena_alloc(ASNIX_EVAL_VALSTACK_BYTES);
+    return slot->valstack;
+}
+
+void *asnix_eval_scratch_retstack(int64_t depth) {
+    eval_ensure_cap((size_t)depth);
+    ForceScratchSlot *slot = &g_eval_slots[depth];
+    if (!slot->retstack) slot->retstack = asnix_arena_alloc(ASNIX_EVAL_RETSTACK_BYTES);
+    return slot->retstack;
+}

@@ -22,10 +22,28 @@
 // messages below, since op_call.S's are file-local `.L` labels, but
 // worded the same way for a consistent user-facing error style).
 #include "asnix/env.h"
+#include "asnix/force_scratch.h" // asnix_apply_scratch_{valstack,retstack} (perf)
 #include "asnix/heap.h"
 #include "asnix/ir.h"
 #include "asnix/stackcheck.h"
 #include "asnix/value.h"
+
+    // asnix_apply's own nested-recursion depth, same role/discipline as
+    // force.S's asnix_force_depth (see force_scratch.h's header comment
+    // on asnix_apply_scratch_valstack for why this is a SEPARATE counter,
+    // not the same one) -- doubles as the index into force_scratch.c's
+    // per-depth apply-scratch cache below, replacing this function's own
+    // previous "mint a brand-new 320 KiB pair from the never-free bump
+    // arena on every single call" behavior (found chasing a memory-usage
+    // question: this was the single largest contributor to
+    // asnix_arena's own total_allocated counter evaluating d.nix, by far
+    // more than force.S's already-fixed equivalent, since every
+    // `map`/`filter`/`foldl'`-style builtin call reaches here).
+    .bss
+    .align 8
+    .globl asnix_apply_depth
+asnix_apply_depth:
+    .quad 0
 
     // Same sizing as force.S's own nested-forcing buffers (see that
     // file's comment and docs/architecture.md's "Known bugs" list for why
@@ -265,17 +283,25 @@ asnix_apply:                            // Value asnix_apply(Value fn, const Val
     movq asnix_retsp_limit(%rip), %rax
     pushq %rax
 
-    movq $ASNIX_APPLY_VALSTACK_BYTES, %rdi
-    call asnix_arena_alloc
+    // perf: asnix_apply_scratch_{valstack,retstack} (force_scratch.c)
+    // cache one buffer pair PER DEPTH instead of minting a brand-new
+    // pair from the never-free bump arena on every single call -- see
+    // this file's own asnix_apply_depth comment above. %rbx/%rbp/%r15
+    // (the live Closure*/args ptr/argc) survive both calls: ordinary
+    // SysV calls, and all three are callee-saved.
+    movq asnix_apply_depth(%rip), %rdi
+    call asnix_apply_scratch_valstack
     movq %rax, %r12
     leaq ASNIX_APPLY_VALSTACK_BYTES(%r12), %rcx
     movq %rcx, asnix_valstack_limit(%rip)
 
-    movq $ASNIX_APPLY_RETSTACK_BYTES, %rdi
-    call asnix_arena_alloc
+    movq asnix_apply_depth(%rip), %rdi
+    call asnix_apply_scratch_retstack
     movq %rax, %r14
     leaq ASNIX_APPLY_RETSTACK_BYTES(%r14), %rcx
     movq %rcx, asnix_retsp_limit(%rip)
+
+    incq asnix_apply_depth(%rip)
 
     // Allocate the new call frame (size = 8 + argc*8, same layout as
     // op_call.S's closure path) and copy args in from our caller's plain
@@ -316,6 +342,10 @@ asnix_apply:                            // Value asnix_apply(Value fn, const Val
 
 asnix_apply_epilogue:
     movq -8(%r12), %rax                 // result, left on VALSTACK by the closure body's own OP_RET
+    decq asnix_apply_depth(%rip)        // pop -- frees this depth's slot in force_scratch.c's
+                                         // per-depth apply-scratch cache for reuse by the NEXT
+                                         // call that reaches this same depth (the buffers
+                                         // themselves are never freed, only their "in use" status)
     popq %rcx                           // restore the enclosing context's RETSP limit (pushed
     movq %rcx, asnix_retsp_limit(%rip)  // last above, so popped first)
     popq %rcx                           // ditto for the VALSTACK limit

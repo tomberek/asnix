@@ -42,6 +42,52 @@
 void *asnix_force_scratch_valstack(int64_t depth);
 void *asnix_force_scratch_retstack(int64_t depth);
 
+/*
+ * src/asm/apply.S's asnix_apply (the re-entrant "call this Value from C"
+ * entry point `map`/`filter`/`foldl'`/etc. use) was modeled on
+ * asnix_force_for_print's own "own fresh VALSTACK+RETSP via
+ * asnix_arena_alloc" pattern -- including the exact same per-call-fresh-
+ * allocation inefficiency this file's own functions above were added to
+ * fix, just never updated to match once that fix landed. Found chasing
+ * a memory-usage question (asnix's own `asnix_arena.total_allocated`
+ * read 4.4 GB evaluating d.nix against only ~227 MB of actual resident
+ * memory -- the gap is virtual-address-space waste from unused mmap'd
+ * pages, harmless on its own, but `asnix_apply` turned out to be BY FAR
+ * the larger of the two culprits: it's reached far more often than
+ * force_for_print, via every `map`/`filter`/`foldl'`-style builtin call
+ * in a real nixpkgs evaluation). Separate depth counter/cache from the
+ * force_for_print one above -- apply.S's own header comment is explicit
+ * that this context is never shared with an enclosing force_for_print
+ * (or eval, or another apply) invocation, so keeping the two caches
+ * independent matches that existing design intent rather than
+ * introducing new coupling between them. Same buffer sizes
+ * (ASNIX_FORCE_VALSTACK_BYTES/ASNIX_FORCE_RETSTACK_BYTES above happen to
+ * equal apply.S's own ASNIX_APPLY_VALSTACK_BYTES/ASNIX_APPLY_RETSTACK_BYTES
+ * equ constants -- reused here rather than duplicating the same two
+ * numbers under a second name).
+ */
+void *asnix_apply_scratch_valstack(int64_t depth);
+void *asnix_apply_scratch_retstack(int64_t depth);
+
+#endif /* __ASSEMBLER__ */
+
+/*
+ * src/asm/dispatch.S's own asnix_eval -- the main entry point, called
+ * fresh for EVERY file import (eval_file.c's asnix_eval_file et al.),
+ * which can nest (`import` inside an imported file) -- had the exact
+ * same per-call-fresh-allocation pattern as force_for_print/apply
+ * above, at 10x the size (8 MiB + 2 MiB vs. 256 KiB + 64 KiB each): a
+ * full nixpkgs evaluation imports hundreds of distinct files, so this
+ * turned out to be the single largest contributor to asnix_arena's
+ * total_allocated figure, well above apply.S's own (already-fixed)
+ * share.
+ */
+#define ASNIX_EVAL_VALSTACK_BYTES 8388608 /* 1,048,576 Values, 8 MiB -- must match dispatch.S's own equ */
+#define ASNIX_EVAL_RETSTACK_BYTES 2097152 /* 65,536 call frames, 2 MiB -- must match dispatch.S's own equ */
+
+#ifndef __ASSEMBLER__
+void *asnix_eval_scratch_valstack(int64_t depth);
+void *asnix_eval_scratch_retstack(int64_t depth);
 #endif /* __ASSEMBLER__ */
 
 #endif /* ASNIX_FORCE_SCRATCH_H */

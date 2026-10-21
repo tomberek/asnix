@@ -90,7 +90,8 @@ what's actually implemented and the scope decisions made along the way.
 | M75 — real store-copying (NAR-hash + content-addressed path) for local (non-`/nix/store`) Path literals coerced via genuine string interpolation or inside a `derivation {...}` attribute | done, **scoped** (see below; `./asnix d.nix`'s `hello.outPath` STILL doesn't match real Nix — the remaining gap is real Nix's *string context*, a materially larger feature, see below) |
 | M76 — real string context: an invisible dependency-provenance set attached to string Values, surviving concatenation/coercion, so a derivation reference reaching an attribute only through prior string interpolation (not a bare attrset/Path) is now tracked in `inputDrvs`/`inputSrcs` too; also fixed `__ignoreNulls` (found while verifying) | done, **scoped** (see below; `./asnix d.nix`'s `hello.outPath` now has the exact right `inputDrvs`/`inputSrcs`/`__json` *shape*, but still doesn't match bit-for-bit — the remaining gap is the FULL nixpkgs bootstrap chain's own hash parity, a much larger, open-ended undertaking, see below) |
 | M77 — `make test-nixpkgs-hash`: a real-nixpkgs derivation-hash correctness regression test (non-gating, like `test-nix-conformance`), filling a gap the user flagged directly — M58-M76's entire bug-chase had zero automated coverage of its own actual target; found and fixed `builtins.toFile` never attaching self-referential string context (a second, independent M76-class gap) and a `curl.outPath` crash (registered as a known-failing case, not yet root-caused) | done (see below) |
-| M78+ | not started |
+| M78 — `asnix_apply`/`asnix_eval` (dispatch.S's own main entry point) both had the exact never-free-arena scratch-buffer waste M74's own `asnix_force_for_print` fix had already fixed, just never applied to these two siblings; found chasing a direct "memory usage seems high" question | done (see below; `./asnix d.nix`'s `asnix_arena.total_allocated` 4.69 GB → 151 MB, peak RSS 226 MB → 169 MB, ~1.8x → ~1.35x of real Nix's own usage) |
+| M79+ | not started |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
 
@@ -8215,3 +8216,72 @@ caught immediately instead of discovered by accident.
 
 `make test`/`test-e2e`/`test-conformance`/`test-nix-conformance` all
 green, zero regressions (the new target is additive and non-gating).
+
+## M78: `asnix_apply`/`asnix_eval` never-free scratch-buffer waste (memory)
+
+Following up a direct question ("memory usage seems high compared to
+`nix eval`"): measured `./asnix d.nix`'s peak RSS at 226 MB vs. real
+`nix-instantiate`/`nix eval`'s ~125 MB (~1.8x). Root cause confirmed via
+`asnix_arena`'s own `total_allocated` counter (`include/asnix/arena.h`):
+4.69 GB had been requested from the bump arena over the course of one
+evaluation, vs. only 226 MB of that ever actually becoming resident
+(RSS) -- the gap is virtual-address-space waste from mmap'd-but-never-
+written pages (anonymous mmap is lazily committed; "allocated" via the
+bump pointer is not the same as "physically touched"), harmless to the
+OS on its own, but a strong signal that something is requesting far
+more than it uses.
+
+Found two instances of the exact pattern M74's own perf fix
+(`perf: cache asnix_force_for_print's scratch buffers per recursion
+depth`, this session, src/asm/force.S) had already fixed for
+`asnix_force_for_print`, just never applied to its two siblings:
+`src/asm/apply.S`'s `asnix_apply` (the re-entrant "call this Value from
+C" entry point `map`/`filter`/`foldl'`/etc. use) and `src/asm/
+dispatch.S`'s `asnix_eval` itself (the MAIN entry point, re-entered
+fresh for every `import` of an uncached file, per `eval_file.c`) were
+both still minting a brand-new VALSTACK+RETSTACK pair from the
+never-free arena on EVERY call -- `asnix_apply`'s own header comment
+even says so explicitly ("own fresh VALSTACK+RETSP via
+asnix_arena_alloc ... modeled closely on asnix_force_for_print's self-
+contained-dispatch-context pattern"), written before that pattern's own
+inefficiency was known.
+
+**Fix**: the identical per-depth-cache treatment, extended to both
+(`force_scratch.c`/`.h` gained two more independent depth-keyed caches --
+`asnix_apply_scratch_*`/`asnix_eval_scratch_*`, each with its OWN depth
+counter, `asnix_apply_depth`/`asnix_eval_depth`, deliberately NOT shared
+with `asnix_force_depth` or each other, matching each call site's own
+existing "never shared with whatever else might be active" header
+comment). `asnix_eval`'s own buffers (8 MiB + 2 MiB, 10x
+force/apply's 256 KiB + 64 KiB each) turned out to matter far more:
+a full nixpkgs evaluation imports hundreds of distinct files, each
+previously paying this cost fresh.
+
+Safety argument identical to M74's own fix: VALSTACK/RETSTACK are pure
+scratch space for ONE evaluation's active execution -- the eventual
+"result" is always an 8-byte `Value` word copied out into a register
+(`asnix_op_halt`'s `movq (%r12), %rax`), never a pointer lingering INTO
+the stack itself (actual heap data -- strings, lists, attrsets -- lives
+in separate arena allocations the stack only ever points AT), and depth
+is strictly LIFO (single-threaded, nesting only ever happens via the
+native C call stack returning before a shallower depth's slot could be
+reused) -- the same two invariants that already made the force.S fix
+safe apply unchanged here.
+
+Verified: `asnix_arena.total_allocated` evaluating `d.nix` went
+4.69 GB -> 2.5 GB (`asnix_apply`'s fix alone) -> 151 MB (`asnix_eval`'s
+fix on top) -- a ~97% reduction, essentially eliminating the
+virtual-memory waste entirely. Peak RSS: 226 MB -> 171 MB (`apply`) ->
+169 MB (`eval`, no further RSS change expected or seen, since the
+remaining waste was already almost entirely unwritten pages) -- net
+~25% real memory reduction, narrowing the gap to real Nix from ~1.8x to
+~1.35x. The residual gap is the expected, accepted cost of this
+project's "never free anything" bump-arena design (no GC at all, by
+design) -- not something this milestone attempts to close further.
+
+`make test`/`test-e2e`/`test-conformance`/`test-nix-conformance`/
+`test-nixpkgs-hash` all identical to the pre-fix baseline (same
+628/30/148, same nixpkgs-hash pass=1/fail=7 with the exact same 7
+failures) -- zero behavioral change, confirming the two new caches are
+correctness-preserving, matching every expectation the safety argument
+above already set.
