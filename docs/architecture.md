@@ -84,7 +84,8 @@ what's actually implemented and the scope decisions made along the way.
 | M69 — `derivation`/`derivationStrict`'s `__structuredAttrs = true;` mode (JSON-serialized input attrs instead of per-attribute stringified env vars) | done, **scoped** (see below) |
 | M70 — multi-segment `a.b.c or default`: every segment of a dotted chain now shares ONE `or` guard, matching real Nix's `ExprSelect::eval` (M67's documented residual gap, blocking `./asnix d.nix` on real nixpkgs) | done (see below) |
 | M71 — `builtins.storeDir` (plain constant, `"/nix/store"`) | done (see below) |
-| M72+ | not started |
+| M72 — bumped `derivation`'s fixed attribute-count cap from 64 to 256; **`./asnix d.nix` now evaluates to completion with no crash** (the standing bug-chase's own goal) | done (see below) |
+| M73+ | not started |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
 
@@ -7586,3 +7587,57 @@ test`/`test-e2e` green (one new `m71_*` fixture, verified against real
 `nix-instantiate --eval --strict` first), `test-conformance` (mined
 subset) unchanged. `d.nix` progresses past this exact blocker to the
 next one.
+
+## M72 scope notes: bumped `derivation`'s attribute-count cap; `d.nix` reaches completion
+
+Found continuing to chase `d.nix` right after M71: the next (and, it
+turned out, final) blocker was "asnix: derivation: too many attributes
+(max 64)" -- `derivation.c`'s `asnix_prim_derivation` stores every
+input attribute into a few fixed-size C stack arrays
+(`env[ASNIX_DRV_MAX_ENV]`, `json_syms`/`json_vals[ASNIX_DRV_MAX_ENV]`,
+M69's `__structuredAttrs` support), bounded at a hardcoded 64 -- never
+hit by any fixture or conformance case so far, but a real
+`stdenv.mkDerivation` call (the structuredAttrs-era
+`make-derivation.nix`, M67/M69's own area) unconditionally sets a
+couple dozen attributes (`enableParallelBuilding`, `strictDeps`,
+`depsBuildBuild`, `depsHostHostPropagated`, `__structuredAttrs`, `env`,
+`outputChecks`, ...) before the package itself contributes any of its
+own, exceeding 64 easily once a few package-specific attributes are
+added on top.
+
+Fix: bumped `ASNIX_DRV_MAX_ENV` from 64 to 256. These are plain fixed-
+size stack arrays, not an arena allocation -- the only cost of a larger
+bound is a few more KB of stack per `derivation {...}` call, negligible
+at this size (`ASNIX_DRV_MAX_ARGS`, the separate, unrelated `args`-list
+cap, left at 64 -- not what tripped this). Verified with a synthetic
+100-attribute `derivation {...}` call (new `tests/e2e/m72_*` fixture)
+that previously hit the cap and now succeeds on both engines.
+
+**`./asnix d.nix` now evaluates to completion with no crash** --
+the exact standing goal this whole `d.nix`-driven bug-chase (every
+milestone from M33 through this one, across many single-session passes
+and seven parallel background agents) was aimed at. It prints a real-
+looking Nix store path for `hello.outPath`:
+```
+asnix:      "/nix/store/z7zqhkm36dgjarhrwn6sf7akzx00zc0p-hello-2.12.3"
+real Nix:   "/nix/store/wpr3vw194dl8g7bj94d54rj76v3rp3c0-hello-2.12.3"
+```
+The STRING SHAPE matches (a valid-looking `/nix/store/<32-char-hash>-
+hello-2.12.3` path), but the HASH itself does not match real Nix's --
+expected and out of scope, not a bug to chase further: bit-exact
+derivation-hash equality across `hello`'s entire real dependency
+closure (the full stdenv bootstrap chain, every intermediate
+derivation's exact `.drv` content) would require this project's
+already-and-repeatedly-documented scope cuts to not exist at all --
+real string-context/`hashDerivationModulo` tracking through actual
+input derivations (M61, M62's own notes), exact real-Nix-matching
+`__structuredAttrs`/`__json` serialization (M69's own documented
+scope), fixed-output multi-output derivations, and more. Getting the
+hash to match would mean building all of that, a vastly larger project
+than "find and fix crashes" -- this milestone's success criterion was
+always "evaluates without crashing," which is now met.
+
+`make test`/`test-e2e`/`test-conformance` all green (one new `m72_*`
+fixture). `make test-nix-conformance`: `pass=624 fail=34 skip=148`,
+unchanged (this fix isn't exercised by that corpus -- no test case
+constructs a 65+ attribute derivation).

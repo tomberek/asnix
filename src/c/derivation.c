@@ -19,7 +19,16 @@
 #include "value_util.h"
 
 #define ASNIX_DRV_MAX_ARGS    64
-#define ASNIX_DRV_MAX_ENV     64
+/* M72: bumped from 64 -- found via d.nix, a real stdenv.mkDerivation
+ * call (structuredAttrs-era make-derivation.nix sets a couple dozen
+ * attributes unconditionally -- enableParallelBuilding, strictDeps,
+ * depsBuildBuild, depsHostHostPropagated, __structuredAttrs, env,
+ * outputChecks, ... -- before the package itself adds any of its own)
+ * exceeded this on its very first attribute-count check. These are
+ * plain fixed-size stack arrays (`env[ASNIX_DRV_MAX_ENV]` etc. below),
+ * not an arena allocation, so the cost of a larger bound is just more
+ * stack space per `derivation {...}` call, negligible at this size. */
+#define ASNIX_DRV_MAX_ENV     256
 /* Real nixpkgs derivations rarely declare more than ~6 outputs
  * (out/bin/dev/lib/man/doc/debug being the usual full set); 16 is a
  * generous cap matching this file's existing "small bounded arrays,
