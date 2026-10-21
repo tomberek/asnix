@@ -195,6 +195,32 @@ Value asnix_bshared_select_dynamic(Value target, Value name_val) {
     return asnix_force_for_print(asnix_bshared_attrs_value(target, idx));
 }
 
+/* `expr.${nameExpr} or default` (M28) -- OP_SELECT_DYNAMIC_OR's C half.
+ * Unlike asnix_bshared_select_dynamic above (fatal on a non-attrset
+ * target or a missing key), a non-attrset target here falls through
+ * gracefully to the default too (same "not even an attrset simply means
+ * not found" rule OP_SELECT_OR/OP_HAS_ATTR already established for `or`/
+ * `?`) -- only the name itself being a non-string is still a hard fatal
+ * (that's a genuine misuse, not a "not found"). Returns 1 and writes the
+ * forced value through `*out` on a hit, 0 (leaving `*out` untouched) on
+ * a miss -- the caller (op_select_dynamic_or.S) decides whether to push
+ * the value or jump to the default's code, same split OP_SELECT_OR's own
+ * inline asm makes for the static case. */
+int asnix_bshared_select_dynamic_or(Value target, Value name_val, Value *out) {
+    if (asnix_tag_of(target) != ASNIX_TAG_ATTRS) return 0;
+    if (asnix_tag_of(name_val) != ASNIX_TAG_PTR || asnix_value_is_path(name_val)) {
+        fprintf(stderr, "asnix: a dynamic '.${...}' attribute name must be a string\n");
+        exit(1);
+    }
+    int64_t len;
+    const char *bytes = asnix_ptr_bytes(name_val, &len);
+    uint32_t sym = asnix_intern(bytes, (size_t)len);
+    int64_t idx = asnix_bshared_attrs_find(target, sym);
+    if (idx < 0) return 0;
+    *out = asnix_force_for_print(asnix_bshared_attrs_value(target, idx));
+    return 1;
+}
+
 int asnix_bshared_value_lt(Value a, Value b, const char *who) {
     int ta = asnix_tag_of(a), tb = asnix_tag_of(b);
     if (ta == ASNIX_TAG_INT && tb == ASNIX_TAG_INT) {

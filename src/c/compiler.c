@@ -724,6 +724,27 @@ static void compile_expr(IrBuilder *b, Ast *node, ScopeFrame *scope) {
             free(syms);
             free(order);
             free(sorted_syms);
+
+            /* `${expr} = value;` entries (M28), applied one at a time
+             * after the static part above -- the exact attrs Value is
+             * already on top of the VALSTACK regardless of which branch
+             * ran (ib_mk_attrs, then ib_frame_exit for `rec`). Each
+             * iteration: push the name, push a thunk wrapping the value
+             * (same laziness as every other attrset value), then
+             * OP_INSERT_DYNAMIC_ATTR pops all three and pushes the
+             * updated attrs -- fatal on a name collision, matching real
+             * Nix. See ast.h's AST_ATTRSET.dyn_bindings comment for why
+             * these never get a ScopeFrame slot (no lexical/recursive
+             * visibility, even in `rec {}` -- confirmed against real
+             * Nix). */
+            for (size_t i = 0; i < node->as.attrset.dyn_count; i++) {
+                compile_expr(b, node->as.attrset.dyn_bindings[i].name_expr, scope);
+                IrBuilder *thunk_b = ib_new();
+                compile_expr(thunk_b, node->as.attrset.dyn_bindings[i].value, scope);
+                ib_ret(thunk_b);
+                ib_mk_thunk(b, ib_finish(thunk_b));
+                ib_insert_dynamic_attr(b);
+            }
             return;
         }
         case AST_SELECT: {
@@ -734,12 +755,23 @@ static void compile_expr(IrBuilder *b, Ast *node, ScopeFrame *scope) {
                  * name expr's *value* (a string) is pushed and
                  * OP_SELECT_DYNAMIC (src/asm/ops/op_select_dynamic.S)
                  * interns/looks it up at runtime (see
-                 * asnix_bshared_select_dynamic, builtins_shared.c). `or`
-                 * combined with a dynamic name is rejected at parse time
-                 * (parser.c), so attr_expr and default_ are never both
-                 * set here. */
+                 * asnix_bshared_select_dynamic, builtins_shared.c). */
                 compile_expr(b, node->as.select.attr_expr, scope);
-                ib_select_dynamic(b);
+                if (!node->as.select.default_) {
+                    ib_select_dynamic(b);
+                    return;
+                }
+                /* `.${expr} or default` (M28) -- same try/jmp/default
+                 * shape as the static OP_SELECT_OR case below, just
+                 * emitting OP_SELECT_DYNAMIC_OR instead (see that op's
+                 * own comment, ir.h). */
+                size_t try_site = ib_select_dynamic_or(b);
+                size_t jmp_site = ib_jmp(b);
+                size_t default_idx = ib_len(b);
+                ib_patch_delta(b, try_site, default_idx);
+                compile_expr(b, node->as.select.default_, scope);
+                size_t end_idx = ib_len(b);
+                ib_patch_delta(b, jmp_site, end_idx);
                 return;
             }
             uint32_t sym = asnix_intern(node->as.select.attr, node->as.select.attr_len);

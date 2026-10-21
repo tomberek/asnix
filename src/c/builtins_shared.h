@@ -123,6 +123,12 @@ int asnix_bshared_value_lt(Value a, Value b, const char *who);
  * OP_SELECT's laziness. */
 Value asnix_bshared_select_dynamic(Value target, Value name_val);
 
+/* `expr.${nameExpr} or default` (M28) -- see the full comment in
+ * builtins_shared.c. Returns 1 and writes the forced value through
+ * `*out` on a hit, 0 (not a non-attrset/missing-key fatal, unlike the
+ * plain form above) on a miss -- a non-string name is still fatal. */
+int asnix_bshared_select_dynamic_or(Value target, Value name_val, Value *out);
+
 /* M23: builds a genuinely LAZY Thunk that, when first forced, computes
  * `f arg` (asnix_bshared_make_lazy_call1) or the curried `(f arg1) arg2`
  * (asnix_bshared_make_lazy_call2) -- NOT an eager asnix_apply call made

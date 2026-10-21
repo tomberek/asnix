@@ -12,4 +12,16 @@
  * unforced Thunk) are copied through unchanged. */
 Value asnix_attrs_update(Value lhs, Value rhs);
 
+/* `${nameExpr} = value;` inside a plain `{...}`/`rec {...}` literal
+ * (`OP_INSERT_DYNAMIC_ATTR`, ir.h): inserts one dynamically-named entry
+ * into `attrs` (already fully built from the literal's static bindings),
+ * keeping the sorted-by-symbol-id invariant. Fatal if `name_val` isn't a
+ * string, or if the name collides with an entry already in `attrs`
+ * (matching real Nix's own behavior: a plain attrset literal's duplicate
+ * key -- static or dynamic -- is a hard error, "attribute ... already
+ * defined", unlike `//`'s silent right-wins semantics above). `attrs`
+ * itself is never mutated (same never-mutate convention as
+ * asnix_attrs_update) -- a fresh, one-larger sorted array is built. */
+Value asnix_attrs_insert_dynamic(Value attrs, Value name_val, Value value);
+
 #endif /* ASNIX_ATTRS_UPDATE_H */

@@ -84,6 +84,14 @@ typedef struct {
     int is_inherit;
 } AstBinding;
 
+/* One `${expr} = value;` entry in a plain `{...}`/`rec {...}` literal --
+ * see AST_ATTRSET's own `dyn_bindings` field comment. Plain-malloc'd,
+ * same rationale as AstBinding above. */
+typedef struct {
+    Ast *name_expr;
+    Ast *value;
+} AstDynBinding;
+
 struct Ast {
     AstKind kind;
     union {
@@ -145,6 +153,19 @@ struct Ast {
             AstBinding *bindings;
             size_t count;
             int is_rec; /* `rec { ... }` vs plain `{ ... }` */
+            AstDynBinding *dyn_bindings; /* `${expr} = value;` entries -- NULL/0 unless this
+                                            * literal had any (plain `{...}`/`rec {...}` only;
+                                            * `let` rejects these at parse time, see parser.c's
+                                            * parse_binding_stmt). Applied at runtime, after
+                                            * `bindings` above is fully built -- see compiler.c's
+                                            * AST_ATTRSET case and OP_INSERT_DYNAMIC_ATTR (ir.h).
+                                            * Real Nix also doesn't give these lexical/recursive
+                                            * visibility even in `rec {}` (confirmed: `rec {
+                                            * ${k}=1; b=a; }` with `k="a"` still errors
+                                            * "undefined variable 'a'") -- consistent with never
+                                            * threading them through this project's own
+                                            * ScopeFrame mechanism at all. */
+            size_t dyn_count;
         } attrset; /* AST_ATTRSET */
         struct {
             Ast *target;
@@ -154,11 +175,11 @@ struct Ast {
                                        `attr`/`attr_len` are unused in that case. The name is
                                        resolved (interned) at runtime, not compile time -- see
                                        compiler.c's AST_SELECT case and
-                                       src/asm/ops/op_select_dynamic.S. Real Nix's `.${expr} or
-                                       default` combination is a documented, narrower scope cut:
-                                       parser.c rejects it outright (fatal at parse time) rather
-                                       than silently mishandling it, since it isn't needed by
-                                       anything this project has hit yet. */
+                                       src/asm/ops/op_select_dynamic.S. `.${expr} or default`
+                                       is supported too (M28, found needed: nixpkgs's own
+                                       lib/lists.nix groupBy uses `r.${key} or [ ]`) -- see
+                                       OP_SELECT_DYNAMIC_OR (ir.h) and
+                                       src/asm/ops/op_select_dynamic_or.S. */
             Ast *default_; /* `expr.attr or default` -- NULL for a plain select (fatal if
                               * missing/wrong type, see compiler.c's AST_SELECT case). Scope
                               * cut: only the single select this node represents is covered,

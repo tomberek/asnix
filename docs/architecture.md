@@ -40,7 +40,8 @@ what's actually implemented and the scope decisions made along the way.
 | M25 — real call-by-need for function arguments (core evaluator fix) | done (see below) |
 | M26 — unary `-` (negate) | done (see below) |
 | M27 — `fromTOML` bare global + corrected understanding of real Nix's bare-global rule | done (see below) |
-| M28+ | not started |
+| M28 — dynamic attrset-literal keys (`{${k} = v;}`) + `expr.${k} or default` | done, **scoped** (see below) |
+| M29+ | not started |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
 
@@ -2930,3 +2931,75 @@ Fixed by adding `asnix_make_fromTOML_primop()` (`builtins_toml.c`,
 alongside the existing `prim_fromTOML`) -- same established pattern as
 every other bare-global wrapper. Root `Env`/`ScopeFrame` grew from 11 to
 12 slots.
+
+## M28 scope notes: dynamic attrset-literal keys + `.${k} or default`
+
+Found continuing to chase `d.nix`: `lib/lists.nix`'s `groupBy` uses
+`r // { ${key} = (r.${key} or [ ]) ++ [ e ]; }` -- a dynamic attrset-
+literal key (`${key} = ...;`) combined with a dynamic select-with-
+default (`r.${key} or [ ]`). Both were documented, deliberate scope cuts
+from M22 ("dynamic attrset-literal keys... wasn't attempted since
+nothing hit so far has actually needed it" / "`.${name} or default`...
+rejected at parse time... not yet needed") -- both are now actually
+needed, so both are implemented here.
+
+**Dynamic attrset-literal keys**: cross-checked against real Nix before
+designing anything -- a plain `{...}`/`rec {...}` literal allows
+`${expr} = value;` (a *hard* duplicate-key error on collision with any
+other key, static or dynamic, unlike `//`'s silent right-wins -- `{ a =
+1; a = 2; }` and `{ a = 1; ${k} = 2; }` with `k = "a"` both error
+"...already defined"), but `let` explicitly rejects it ("dynamic
+attributes not allowed in let", confirmed directly in cppnix's grammar,
+`~/nix/src/libexpr/parser.y`'s `LET binds IN_KW ...` action -- `let`
+reuses the exact same `binds` grammar rule as attrsets, then rejects
+after the fact if any dynamic attr was found). Also confirmed: even
+`rec {}` does NOT give a dynamic entry lexical/recursive visibility --
+`rec { ${k}=1; b=a; }` with `k="a"` still errors "undefined variable
+'a'", meaning this is purely a runtime attrset-construction concern,
+never threaded through this project's own `ScopeFrame`/lexical-scoping
+mechanism at all, for any binding form.
+
+Implemented with a new parallel collection, `DynBindingVec`/
+`AstDynBinding` (`parser.c`/`ast.h`), kept entirely separate from the
+existing `BTVec`/`BTNode` static-key tree (which can't accommodate a
+runtime-only name at all): `parse_binding_stmt` grew a `dyn_out`
+parameter -- `NULL` at the one call site (`let`) where real Nix rejects
+this, a real vector at the three call sites that build a literal `{...}`/
+`rec {...}` (including the legacy `let { ...; body = ...; }` form, which
+desugars to `rec {}` under the hood and inherits its rules). `compiler.c`'s
+`AST_ATTRSET` case builds the static part exactly as before (completely
+unchanged), then applies each dynamic entry afterward via a new IR op,
+`OP_INSERT_DYNAMIC_ATTR` -- pops the already-built attrs, the computed
+name, and a thunk wrapping the value (same laziness as every other
+attrset value), interns the name at runtime (`asnix_intern`, already
+used for `OP_SELECT_DYNAMIC`), and inserts it into a freshly-built,
+one-larger sorted array (`asnix_attrs_insert_dynamic`, `attrs_update.c`)
+-- fatal on a collision, matching real Nix's hard-error semantics
+exactly (not `//`'s silent overwrite).
+
+**`.${expr} or default`**: a new `OP_SELECT_DYNAMIC_OR`
+(`op_select_dynamic_or.S`) mirrors the static `OP_SELECT_OR`'s try/jmp/
+default shape exactly, but defers the actual lookup to a new C function
+(`asnix_bshared_select_dynamic_or`, `builtins_shared.c`) instead of
+hand-rolling a binary search in asm, since the name isn't a compile-time
+constant here -- same reasoning `OP_SELECT_DYNAMIC` itself already used.
+Matches `OP_SELECT_OR`'s own graceful-on-non-attrset rule (falls through
+to the default rather than fataling, unlike the plain `OP_SELECT_DYNAMIC`
+form) -- confirmed: `(5).${k} or 99` returns `99` in real Nix, not a type
+error. The parser's own `or`-after-`.select` handling (already shared
+between the static and dynamic cases structurally) needed no new logic
+at all once the earlier, now-obsolete fatal check was simply removed.
+
+**Verified**: the exact `groupBy` pattern from `lib/lists.nix`, run
+end-to-end, matches real `nix-instantiate --eval --strict` byte-for-byte
+(`{ hi = [ 3 4 5 ]; lo = [ 1 2 ]; }`). `make test`/`test-e2e`/
+`test-conformance` all green (167 e2e, 19 conformance, full unit suite).
+
+**Scope cuts, deliberate, narrower than real Nix**: only a single
+dynamic segment is supported per binding (`${k} = v;`), not a dynamic
+segment followed by more attrpath segments (`${k}.a = v;`) or preceded
+by a static one (`a.${k} = v;`); the "regrettable merge" path
+(`reopen_attrset_into`, NixOS/nix#9020's `a = rec {...}; a.c = ...;`
+quirk) fatals cleanly if the literal being reopened has any dynamic
+entries rather than silently dropping them. None of these were needed by
+anything hit so far.

@@ -190,6 +190,22 @@ enum {
     OP_DIV,        /* `/` integer division (M23): pops rhs,lhs (both must be TAG_INT, else
                      * fatal; rhs == 0 is also fatal, "division by zero"), pushes the
                      * truncated-toward-zero quotient -- see op_arith.S's asnix_op_div. */
+    OP_INSERT_DYNAMIC_ATTR, /* `${nameExpr} = value;` inside a plain `{...}`/`rec {...}`
+                     * literal (M28): pops value, name, attrs (reverse push order --
+                     * compiler.c's AST_ATTRSET case pushes the already-built static
+                     * attrs first, then the name, then the value thunk); interns the
+                     * name (must be a string, fatal otherwise) and inserts it into
+                     * attrs, fatal on a collision with an existing key (matching real
+                     * Nix's own "attribute ... already defined" for a plain literal's
+                     * duplicate key) -- see asnix_attrs_insert_dynamic,
+                     * attrs_update.c. */
+    OP_SELECT_DYNAMIC_OR, /* `expr.${nameExpr} or default` (M28): a = byte delta to jump
+                     * to (not found / wrong type) on a miss. Pops the name Value then
+                     * the select target (same reverse-push order as OP_SELECT_DYNAMIC).
+                     * On a hit: forces the matching entry if it's an unforced thunk and
+                     * falls through with it on top of VALSTACK, same shape as
+                     * OP_SELECT_OR. See asnix_bshared_select_dynamic_or,
+                     * builtins_shared.c. */
     OP_COUNT
 };
 
