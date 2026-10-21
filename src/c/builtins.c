@@ -11,6 +11,7 @@
 #include "builtins_attrs2.h"
 #include "builtins_closure.h"
 #include "builtins_compare.h"
+#include "builtins_flakeref.h"
 #include "builtins_json.h"
 #include "builtins_list.h"
 #include "builtins_list2.h"
@@ -358,12 +359,18 @@ static Value asnix_make_builtins_attrs_ex(int skip_derivation_wrapper) {
      * it's visually obvious which pass added what. */
     const AsnixBuiltinM54Def *const m54_tables[] = { ASNIX_M54_BUILTINS };
     const size_t m54_counts[] = { ASNIX_M54_BUILTINS_COUNT };
+    /* M61: builtins.parseFlakeRef/flakeRefToString -- same {name,build()}
+     * shape, own table for the same "separate translation unit, separate
+     * agent" reason M54's table is split out (builtins_flakeref.h). */
+    const AsnixBuiltinFlakerefDef *const flakeref_tables[] = { ASNIX_FLAKEREF_BUILTINS };
+    const size_t flakeref_counts[] = { ASNIX_FLAKEREF_BUILTINS_COUNT };
 
     size_t n = 0;
     for (size_t t = 0; t < sizeof(plain_counts) / sizeof(plain_counts[0]); t++) n += plain_counts[t];
     for (size_t t = 0; t < sizeof(list_shaped_counts) / sizeof(list_shaped_counts[0]); t++) n += list_shaped_counts[t];
     for (size_t t = 0; t < sizeof(build_counts) / sizeof(build_counts[0]); t++) n += build_counts[t];
     for (size_t t = 0; t < sizeof(m54_counts) / sizeof(m54_counts[0]); t++) n += m54_counts[t];
+    for (size_t t = 0; t < sizeof(flakeref_counts) / sizeof(flakeref_counts[0]); t++) n += flakeref_counts[t];
 
     uint32_t *syms = malloc(n * sizeof(uint32_t));
     Value *vals = malloc(n * sizeof(Value));
@@ -396,6 +403,12 @@ static Value asnix_make_builtins_attrs_ex(int skip_derivation_wrapper) {
         for (size_t i = 0; i < m54_counts[t]; i++, k++) {
             syms[k] = asnix_intern(m54_tables[t][i].name, strlen(m54_tables[t][i].name));
             vals[k] = m54_tables[t][i].build();
+        }
+    }
+    for (size_t t = 0; t < sizeof(flakeref_counts) / sizeof(flakeref_counts[0]); t++) {
+        for (size_t i = 0; i < flakeref_counts[t]; i++, k++) {
+            syms[k] = asnix_intern(flakeref_tables[t][i].name, strlen(flakeref_tables[t][i].name));
+            vals[k] = flakeref_tables[t][i].build();
         }
     }
 
