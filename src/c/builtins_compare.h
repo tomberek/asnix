@@ -22,4 +22,15 @@
 extern const AsnixBuiltinMiscDef ASNIX_COMPARE_BUILTINS[];
 extern const size_t ASNIX_COMPARE_BUILTINS_COUNT;
 
+/* M69: the exact same recursive, compact JSON encoding `builtins.toJSON`
+ * itself uses internally (`json_encode`: sorted attrset keys, nlohmann-
+ * compatible float/string/UTF-8 rules) -- exposed as its own entry point
+ * so derivation.c's `__structuredAttrs` support can reuse it to serialize
+ * a whole attrset of input attributes (including values that aren't
+ * coercible to a plain string, like a nested attrset: `env = { foo =
+ * "bar"; }`) instead of writing a second JSON serializer from scratch.
+ * `prim_toJSON` itself is now just this function plus the Value-wrapping
+ * step. Returns a malloc'd, NUL-terminated string (caller frees). */
+char *asnix_toJSON_cstr(Value v);
+
 #endif /* ASNIX_BUILTINS_COMPARE_H */

@@ -21,6 +21,20 @@
  * bin ..."` string var, consumed by build-time setup hooks, alongside
  * the structured per-output info in the ATerm's own `Outputs` section).
  *
+ * `__structuredAttrs = true;` (M67) switches the "every other attr
+ * becomes an env var" rule above off: instead, every attr (except
+ * `args`) is JSON-serialized (the exact `builtins.toJSON` encoder,
+ * `asnix_toJSON_cstr` in builtins_compare.c) into one `__json` env var,
+ * which is what lets an attribute whose value isn't coercible to a
+ * plain string (e.g. `env = { foo = "bar"; };`, a nested attrset) flow
+ * through instead of hitting `asnix_coerce_to_string`'s fatal path --
+ * see derivation.c's `asnix_prim_derivation` and docs/architecture.md's
+ * M67 scope notes for the full algorithm (ported directly from
+ * `~/nix/src/libexpr/primops.cc`'s `derivationStrictInternal`). The
+ * masked/real two-pass output-path hashing below is unaffected either
+ * way -- every declared output still gets its own env var, structured
+ * mode or not.
+ *
  * One distinct store path is computed per declared output name (the
  * masked/self-referential-hash two-pass scheme generalizes directly:
  * ONE masked hash covers every output's blanked entry at once, then

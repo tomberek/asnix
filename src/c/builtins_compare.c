@@ -576,13 +576,23 @@ static void json_encode(Value v, JsonBuf *out) {
     }
 }
 
-static Value prim_toJSON(const Value *args, int64_t argc) {
-    (void)argc;
+/* M69: NUL-terminated-cstring entry point onto the same `json_encode`
+ * recursive encoder, for callers outside this translation unit (see
+ * builtins_compare.h's header comment) -- `prim_toJSON` below is just this
+ * function plus the Value-wrapping step. */
+char *asnix_toJSON_cstr(Value v) {
     JsonBuf jb;
     jb_init(&jb);
-    json_encode(args[0], &jb);
-    Value result = asnix_make_string_value(jb.buf, jb.len);
-    free(jb.buf);
+    json_encode(v, &jb);
+    jb_putc(&jb, '\0');
+    return jb.buf;
+}
+
+static Value prim_toJSON(const Value *args, int64_t argc) {
+    (void)argc;
+    char *s = asnix_toJSON_cstr(args[0]);
+    Value result = asnix_make_string_value(s, strlen(s));
+    free(s);
     return result;
 }
 static Value build_toJSON(void) { return asnix_bshared_make_primop((void *)prim_toJSON, 1); }

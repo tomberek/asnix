@@ -81,7 +81,8 @@ what's actually implemented and the scope decisions made along the way.
 | M66 — `builtins.parseFlakeRef`/`builtins.flakeRefToString`: flake-ref URL-like syntax (github/gitlab/indirect/path/git+/tarball+/file+) | done, **scoped** (see below) |
 | M67 — external-conformance grab-bag: derivation `==` by `outPath`, dynamic-attrs scope fixes (rec-sibling visibility, attrpath-merge-into-a-dynamic-key, `${"literal"}` in `let`), `or` as an ordinary identifier, path-interpolation existence check, `fromJSON` deep-nesting stack fix, printer `<PRIMOP>`/`<LAMBDA>` | done, **scoped** (see below; function/slot-identity equality, `__curPos`, `tryEval` thunk re-eval, multi-segment `or default`, and `<PRIMOP-APP>` skipped) |
 | M68 — a hand-written POSIX-ERE backtracking engine (`src/c/regex_engine.c`) to fix the 33 real behavioral gaps M55 triaged-but-didn't-fix between glibc's `<regex.h>` and real Nix's libstdc++ `std::regex` | done, **scoped** (see below; the 6 already-known-unfixable Class C patterns from M55 are still unfixed, deliberately) |
-| M69+ | not started |
+| M69 — `derivation`/`derivationStrict`'s `__structuredAttrs = true;` mode (JSON-serialized input attrs instead of per-attribute stringified env vars) | done, **scoped** (see below) |
+| M70+ | not started |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
 
@@ -7260,3 +7261,190 @@ milestone targets plus M55's 6 already-known-unfixable Class C ones)
 M55's Class C, untouched). All 33 targeted regex tests now pass; the
 non-regex failure lists before and after are identical -- zero
 regressions anywhere else in the corpus.
+## M69 scope notes: `derivation`/`derivationStrict`'s `__structuredAttrs = true;` mode
+
+**The blocker.** This milestone picked back up the `d.nix` standing bug-
+chase right after M62/M63/M64/M65's work had each cleared an earlier
+blocker in turn: `./asnix d.nix` (`(builtins.import /home/tbereknyei/
+nixpkgs/default.nix {}).hello.outPath`) aborted with "asnix: cannot
+coerce this value to a string". Root-caused directly with gdb,
+breaking at `value_util.c:200` (the fatal path inside
+`asnix_coerce_to_string`) and inspecting the calling frame -- the
+caller was `derivation.c`'s `asnix_prim_derivation`, mid-way through
+its per-attribute loop, trying to coerce an attrset value to a string.
+Walked up one more frame to the actual input attrset and confirmed
+directly (forcing the offending attribute's own `__structuredAttrs`
+sibling, tag IMM/subtag TRUE) that some package deep in nixpkgs' real
+dependency graph sets `__structuredAttrs = true;` on its `derivation
+{...}` call.
+
+**Minimal verified repro** (matches real Nix, which succeeds and
+prints a `{ ...; outPath = "..."; ... }` attrset; asnix previously
+aborted):
+```
+derivation {
+  name = "x";
+  system = "x86_64-linux";
+  builder = "/bin/sh";
+  __structuredAttrs = true;
+  env = { foo = "bar"; };
+}
+```
+
+**Real Nix's actual behavior, read directly from source before
+implementing anything** (`~/nix/src/libexpr/primops.cc`'s
+`derivationStrictInternal`, cross-checked against a real `.drv` file
+produced by `nix-instantiate` on the repro above, not just the source
+read): `__structuredAttrs`'s own value is looked up with a dedicated
+`attrs->get(...)` call *before* the per-attribute loop even starts
+(the attribute can appear anywhere in the input attrset, not
+necessarily first) -- if true, the loop's generic "stringify every
+attribute into its own env var" branch is replaced with "accumulate
+every attribute's own `printValueAsJSON`'d value into one in-memory
+JSON object", for every key except `args` (handled identically either
+way, never part of the JSON) and `__structuredAttrs` itself (skipped
+entirely, but -- confirmed by producing a real `.drv` for
+`__structuredAttrs = false;` and reading it -- ONLY when the mode is
+actually active; an explicit `false` falls through to the ordinary
+per-attribute path like any other key, becoming a literal
+`__structuredAttrs=""` env var, since `coerceToString false == ""`).
+`name`/`system`/`builder`/`outputHash`/`outputHashAlgo`/
+`outputHashMode` are *also* still individually recovered as plain C
+strings inside this same branch (real Nix's own nested `switch` inside
+its `jsonObject` case still calls `forceString`/`forceStringNoCtx` on
+exactly these keys) -- they just don't ALSO become their own env var
+the way they do outside structured-attrs mode. The masked/real two-
+pass output-path hashing scheme (M8/M62) is completely untouched: every
+declared output still gets its own blanked-then-filled env var exactly
+as before, confirmed by reading the real `.drv` file byte-for-byte
+(`nix-instantiate` on the repro above, with `nix-instantiate
+--eval --strict` to get `drvPath`, then `cat`-ing that store path
+directly):
+```
+Derive([("out","/nix/store/85k3fnwmzp95ccbwmn2ixisp0y8gdqjj-x","","")],
+[],[],"x86_64-linux","/bin/sh",[],
+[("__json","{\"builder\":\"/bin/sh\",\"env\":{\"foo\":\"bar\"},\"name\":\"x\",\"system\":\"x86_64-linux\"}"),
+("out","/nix/store/85k3fnwmzp95ccbwmn2ixisp0y8gdqjj-x")])
+```
+-- confirming directly that structured-attrs mode's `env` section ends
+up with EXACTLY the per-output vars plus one `__json` entry, nothing
+else, and that `__json`'s own content is just an ordinary alphabetical-
+key-order JSON object (`~/nix/src/libstore/derivation/aterm.cc`'s
+`unparse`: `drv.structuredAttrs->unparse()` returns a single
+`("__json", <nlohmann dump>)` pair merged into a copy of `drv.env`
+right before ATerm serialization -- the exact same serialization used
+for both the masked-hash pass and the final `.drv`, since nothing in
+this project's scope makes the JSON content itself depend on output
+paths). `aterm.c`'s `asnix_build_derivation_aterm` needed **zero**
+changes: `__json` is just one more ordinary `(key,value)` env pair to
+it, and its existing escaping (`\n \r \t \" \\`) already handles a
+JSON string's embedded quotes/backslashes correctly.
+
+**The fix.** `derivation.c`'s `asnix_prim_derivation` gained a
+dedicated pre-scan for `__structuredAttrs` (mirroring real Nix's own
+`attrs->get` lookup before the main loop) setting a `structured_attrs`
+flag, then the main per-attribute loop's generic tail was restructured
+so that: (1) every key reaching that point (except `args`, excluded
+earlier via its own `continue`) is unconditionally collected as a raw
+`(sym, forced-Value)` pair into a new `json_syms`/`json_vals` scratch
+array when `structured_attrs` is set; (2) the six scalar fields
+(`name`/`system`/`builder`/`outputHash*`) are *always* coerced to C
+strings regardless of mode (needed internally either way); (3) the
+*push into the ordinary `env` array* only happens when NOT in
+structured-attrs mode. After the loop, if structured-attrs mode is
+active, the collected pairs are folded into one attrset
+(`asnix_bshared_make_attrs`) and handed to a *new* exported function,
+`asnix_toJSON_cstr` (`builtins_compare.c`/`.h`) -- the exact same
+recursive `json_encode` that backs `builtins.toJSON` itself, now
+factored out into its own entry point rather than duplicated, per the
+task's own hint that `builtins_json.c` (which turned out to only
+implement `fromJSON`; `toJSON` actually lives in `builtins_compare.c`)
+shouldn't need a second serializer written from scratch. Its result
+(arena-copied, the malloc'd scratch freed immediately -- matching
+every other env value in this function) becomes the single `__json`
+env var, added to the `env` array before the existing masked/real
+two-pass hashing runs, completely unchanged otherwise.
+
+**Verification methodology.** Because the masked/real two-pass hashing
+machinery (M8/M62) is a byte-for-byte port of real Nix's own ATerm
+format, and `json_encode` was already verified byte-for-byte against
+`nlohmann::json::dump()` (M19/M51/M57d), a correct structured-attrs
+implementation should reproduce real Nix's EXACT store-path hashes,
+not just the right shape -- used this as the primary verification
+signal rather than only checking "does it crash": the minimal repro
+above produces `drvPath = "/nix/store/3g9b3db4qr9ybd2mjhwxmf3d51xn4rbl-
+x.drv"` and `outPath = "/nix/store/85k3fnwmzp95ccbwmn2ixisp0y8gdqjj-x"`
+on asnix, matching real `nix-instantiate --eval --strict` on the same
+file exactly, byte-for-byte, including the hash. Also caught one real
+bug this way during development: an initial version used `strlen
+("__structuredAttrs")` miscounted as 18 (it's 17) in both the pre-scan
+`asnix_intern` call and the loop's own `continue` check, silently
+leaving `structured_attrs` false in every case -- caught immediately
+because the minimal repro kept hitting the exact same "cannot coerce"
+crash it was supposed to fix, not some subtler wrong-output bug.
+
+**Scope cuts, explicitly out of scope:**
+- `__ignoreNulls`, `__contentAddressed`, `__impure` (real Nix features
+  that interact with structured-attrs mode's own per-attribute switch)
+  remain unimplemented -- pre-existing gaps, not touched or widened by
+  this milestone.
+- Byte-for-byte matching real Nix's exact `nlohmann::json::dump()`
+  whitespace/ordering was NOT separately re-verified here beyond what
+  M19/M51/M57d already established for `builtins.toJSON` itself (this
+  milestone just reuses that same code path) -- the exact store-path
+  hash matches found above are themselves strong evidence it's still
+  correct.
+- No support for a `__json`-named user attribute colliding with the
+  synthesized one (real Nix has a dedicated `StructuredAttrs::
+  checkKeyNotInUse` rejection for this; asnix simply lets the
+  synthesized `__json` env entry stand -- not reproduced, no fixture
+  exercises it).
+- Does not implement any build-time behavior for structured-attrs mode
+  (writing an actual `.attrs.json`/`.attrs.sh` file, `NIX_ATTRS_JSON_
+  FILE`/`NIX_ATTRS_SH_FILE` env vars) -- out of scope by the same
+  pre-existing "this project doesn't build anything" convention
+  `derivation.c`'s own header comment already documents; the `__json`
+  env var's *content* (and therefore the resulting store-path hashes)
+  is still computed correctly, which is everything this project's own
+  scope needs.
+
+**`./asnix d.nix`**: confirmed the exact "cannot coerce this value to a
+string" blocker is gone (baseline reproduced first via the minimal
+repro above, independent of the actual nixpkgs checkout); `d.nix`
+itself now progresses to a new, later blocker ("attribute 'stdenv'
+missing, aborting") -- the next iteration of this standing chase, not
+pursued further here per this task's explicit scope.
+
+`make test`/`make test-e2e` both green, zero regressions, plus two new
+`tests/e2e/m69_structured_attrs_*.nix` fixtures (one matching the
+minimal repro above, one with a deeper `env` nesting -- an attrset
+containing an int, a list with a bool, and a doubly-nested attrset with
+an empty list), both checking exact `drvPath`/`outPath` store-path
+strings verified against real `nix-instantiate --eval --strict` first.
+`make test-nix-conformance`: pass=574/fail=84 -> pass=576/fail=82
+(skip=148 unchanged) -- a clean +2/-0, verified by diffing the full
+failed-file list before/after rather than trusting the aggregate counts
+alone (the sweep has a small amount of pre-existing, unrelated flake --
+a different single file, never the same one twice, intermittently
+failed/passed across repeated runs both before and after this change;
+re-running isolated the genuine, stable delta). The two newly-passing
+files: `eval-okay-drv-structured-attrs.nix` (exact store-path match
+across four structured-attrs shapes: empty, several JSON-typeable
+values including a nested attrset, multi-output, and a string needing
+JSON escaping) and `eval-okay-derivation-legacy.nix` (`__structuredAttrs`
+alongside the now-structured-attrs-only `allowedReferences`/
+`disallowedReferences`/`allowedRequisites`/`disallowedRequisites`/
+`maxSize`/`maxClosureSize` attributes, via `builtins.derivationStrict`
+directly rather than the `derivation` wrapper). A third related file,
+`eval-fail-derivation-structuredAttrs-stack-overflow.nix` (a 100,000-
+deep nested linked-list attrset under structured attrs, expecting "a
+controlled stack overflow error rather than a segfault"), was already
+counted as passing before this change (via the unrelated "cannot
+coerce" crash) and still counts as passing after (verified: it now
+genuinely evaluates/serializes most of the way through before a real
+native stack overflow in the recursive JSON encoder/printer, exit code
+139) -- this project's conformance harness only checks "`eval-fail-*`
+exits nonzero and didn't time out", not *which* error occurred, so
+this isn't a behavioral claim that asnix now has real recursion-depth
+guards anywhere in this path (it doesn't; same pre-existing gap as
+every other unbounded-recursion C function in this codebase).

@@ -10,7 +10,8 @@
 #include "asnix/ir.h" /* asnix_force_for_print */
 #include "aterm.h"
 #include "base32.h"
-#include "builtins_shared.h" /* asnix_bshared_make_primop */
+#include "builtins_compare.h" /* asnix_toJSON_cstr -- M69's __structuredAttrs support */
+#include "builtins_shared.h" /* asnix_bshared_make_primop, asnix_bshared_make_attrs */
 #include "eval_file.h"       /* asnix_eval_file -- M58's derivation.nix wrapper */
 #include "hash_shim.h"
 #include "store_path.h"
@@ -202,6 +203,47 @@ Value asnix_prim_derivation(const Value *args, int64_t argc) {
     size_t noutputs = 0;
     int saw_outputs_attr = 0;
 
+    /* M69: `__structuredAttrs = true;` switches derivationStrict's whole
+     * attribute-passing mode (~/nix/src/libexpr/primops.cc's
+     * derivationStrictInternal, verified directly against real Nix --
+     * see this milestone's scope notes in docs/architecture.md). Found
+     * the attribute's own value with a dedicated pre-scan, exactly like
+     * real Nix's own `attrs->get(state.s.structuredAttrs)` lookup BEFORE
+     * its per-attribute loop even starts -- the attribute can appear
+     * anywhere in the input attrset, not necessarily before the
+     * attributes whose handling it changes. */
+    int structured_attrs = 0;
+    {
+        uint32_t sa_sym = asnix_intern("__structuredAttrs", 17);
+        for (int64_t i = 0; i < count; i++) {
+            const char *entry = base + ASNIX_ATTRS_OFF_ENTRIES + i * ASNIX_ATTR_SIZE;
+            uint32_t sym = *(const uint32_t *)(entry + ASNIX_ATTR_OFF_SYM);
+            if (sym != sa_sym) continue;
+            Value raw_val = *(const Value *)(entry + ASNIX_ATTR_OFF_VALUE);
+            Value val = asnix_force_for_print(raw_val);
+            if (asnix_tag_of(val) == ASNIX_TAG_IMM && asnix_imm_subtag(val) == ASNIX_IMM_TRUE) {
+                structured_attrs = 1;
+            } else if (!(asnix_tag_of(val) == ASNIX_TAG_IMM && asnix_imm_subtag(val) == ASNIX_IMM_FALSE)) {
+                fprintf(stderr, "asnix: derivation: '__structuredAttrs' must be a boolean\n");
+                exit(1);
+            }
+            break;
+        }
+    }
+    /* In structured-attrs mode, every attribute except `args` (handled
+     * identically either way, see below) and `__structuredAttrs` itself
+     * gets JSON-serialized into one `__json` env var instead of each
+     * becoming its own stringified env var -- this is the whole point:
+     * an attribute whose value isn't coercible to a plain string (e.g.
+     * `env = { foo = "bar"; }`) must flow into the JSON blob rather than
+     * being rejected by `asnix_coerce_to_string`. Collected here as raw
+     * (sym, forced-value) pairs and turned into one JSON string with
+     * `asnix_toJSON_cstr` (the exact `builtins.toJSON` encoder, reused
+     * rather than writing a second JSON serializer) after the loop. */
+    uint32_t json_syms[ASNIX_DRV_MAX_ENV];
+    Value json_vals[ASNIX_DRV_MAX_ENV];
+    size_t njson = 0;
+
     for (int64_t i = 0; i < count; i++) {
         const char *entry = base + ASNIX_ATTRS_OFF_ENTRIES + i * ASNIX_ATTR_SIZE;
         uint32_t sym = *(const uint32_t *)(entry + ASNIX_ATTR_OFF_SYM);
@@ -215,6 +257,19 @@ Value asnix_prim_derivation(const Value *args, int64_t argc) {
 
         size_t keylen;
         const char *key = asnix_sym_name(sym, &keylen);
+
+        /* When the mode is actually active, `__structuredAttrs` itself is
+         * never pushed into `env` OR the JSON blob -- matches real Nix's
+         * own `if (i->name == state.s.structuredAttrs) continue;`, which
+         * only fires inside its `jsonObject` branch. Confirmed directly
+         * against real Nix that an explicit `__structuredAttrs = false;`
+         * is NOT special-cased this way -- it falls through to the
+         * ordinary per-attribute path like any other key, ending up as a
+         * literal (empty-string, since `coerceToString false == ""`)
+         * `__structuredAttrs` env var in the .drv -- so this `continue`
+         * must be conditional on `structured_attrs`, not unconditional,
+         * to keep that (admittedly obscure) pre-existing behavior. */
+        if (keylen == 17 && memcmp(key, "__structuredAttrs", 17) == 0 && structured_attrs) continue;
 
         if (keylen == 4 && memcmp(key, "args", 4) == 0) {
             if (asnix_tag_of(val) != ASNIX_TAG_LIST) {
@@ -281,25 +336,102 @@ Value asnix_prim_derivation(const Value *args, int64_t argc) {
             }
         }
 
-        Value sv = asnix_coerce_to_string(val);
-        char *valcstr = asnix_string_value_to_cstr(sv);
-        char *keycstr = asnix_arena_alloc(keylen + 1);
-        memcpy(keycstr, key, keylen);
-        keycstr[keylen] = '\0';
+        /* M69: in structured-attrs mode, EVERY key reaching this point
+         * (ordinary attrs, `outputs`, and the handful of scalar fields
+         * below) gets collected for the single `__json` env var -- the
+         * raw, already-forced Value, not a string coercion, which is
+         * exactly what lets a non-coercible value like a nested attrset
+         * flow through instead of hitting `asnix_coerce_to_string`'s
+         * fatal path. Matches real Nix's own unconditional
+         * `jsonObject->structuredAttrs.emplace(key, printValueAsJSON(...))`
+         * inside its own per-attribute default case (primops.cc) -- every
+         * key gets JSON-serialized, `args` being the only generic-path
+         * key excluded (handled above, via `continue`, in both modes). */
+        if (structured_attrs) {
+            if (njson >= ASNIX_DRV_MAX_ENV) {
+                fprintf(stderr, "asnix: derivation: too many attributes (max %d)\n", ASNIX_DRV_MAX_ENV);
+                exit(1);
+            }
+            json_syms[njson] = sym;
+            json_vals[njson] = val;
+            njson++;
+        }
 
-        if (keylen == 4 && memcmp(key, "name", 4) == 0) name = valcstr;
-        else if (keylen == 6 && memcmp(key, "system", 6) == 0) system = valcstr;
-        else if (keylen == 7 && memcmp(key, "builder", 7) == 0) builder = valcstr;
-        else if (keylen == 10 && memcmp(key, "outputHash", 10) == 0) output_hash = valcstr;
-        else if (keylen == 14 && memcmp(key, "outputHashAlgo", 14) == 0) output_hash_algo = valcstr;
-        else if (keylen == 14 && memcmp(key, "outputHashMode", 14) == 0) output_hash_mode = valcstr;
+        /* `name`/`system`/`builder`/`outputHash*` must always be
+         * recovered as plain C strings for this function's own internal
+         * use (store-path/ATerm computation) regardless of
+         * `__structuredAttrs` -- real Nix does the same: its own nested
+         * switch inside the `jsonObject` branch still calls
+         * `forceString`/`forceStringNoCtx` on exactly these keys. Every
+         * OTHER key is only coerced (and only ever pushed into `env`) in
+         * non-structured mode -- skipping that coercion in structured
+         * mode for a non-special key is the actual fix for the "cannot
+         * coerce this value to a string" crash this milestone exists to
+         * fix (e.g. `env = { foo = "bar"; };`, a nested attrset). */
+        int is_special = (keylen == 4 && memcmp(key, "name", 4) == 0) ||
+                         (keylen == 6 && memcmp(key, "system", 6) == 0) ||
+                         (keylen == 7 && memcmp(key, "builder", 7) == 0) ||
+                         (keylen == 10 && memcmp(key, "outputHash", 10) == 0) ||
+                         (keylen == 14 && memcmp(key, "outputHashAlgo", 14) == 0) ||
+                         (keylen == 14 && memcmp(key, "outputHashMode", 14) == 0);
+        if (!structured_attrs || is_special) {
+            Value sv = asnix_coerce_to_string(val);
+            char *valcstr = asnix_string_value_to_cstr(sv);
+
+            if (keylen == 4 && memcmp(key, "name", 4) == 0) name = valcstr;
+            else if (keylen == 6 && memcmp(key, "system", 6) == 0) system = valcstr;
+            else if (keylen == 7 && memcmp(key, "builder", 7) == 0) builder = valcstr;
+            else if (keylen == 10 && memcmp(key, "outputHash", 10) == 0) output_hash = valcstr;
+            else if (keylen == 14 && memcmp(key, "outputHashAlgo", 14) == 0) output_hash_algo = valcstr;
+            else if (keylen == 14 && memcmp(key, "outputHashMode", 14) == 0) output_hash_mode = valcstr;
+
+            if (!structured_attrs) {
+                char *keycstr = asnix_arena_alloc(keylen + 1);
+                memcpy(keycstr, key, keylen);
+                keycstr[keylen] = '\0';
+
+                if (nenv >= ASNIX_DRV_MAX_ENV) {
+                    fprintf(stderr, "asnix: derivation: too many attributes (max %d)\n", ASNIX_DRV_MAX_ENV);
+                    exit(1);
+                }
+                env[nenv].key = keycstr;
+                env[nenv].value = valcstr;
+                nenv++;
+            }
+        }
+    }
+
+    /* Structured-attrs mode: fold every collected (sym, value) pair into
+     * one attrset and hand it to the exact `builtins.toJSON` encoder
+     * (`asnix_toJSON_cstr`, builtins_compare.c) to get the single `__json`
+     * env var's value -- this is the ONE place real Nix's own JSON blob
+     * (`drv.structuredAttrs`) and this project's ordinary per-output `env`
+     * array meet: `StructuredAttrs::unparse()`'s `("__json", <dump>)` pair
+     * is merged into `drv.env` right before ATerm serialization
+     * (~/nix/src/libstore/derivation/aterm.cc's `unparse`), which is
+     * exactly what happens here too, just eagerly rather than at
+     * serialization time (no behavioral difference for this project,
+     * since nothing else reads `env` in between). */
+    if (structured_attrs) {
+        Value json_attrs = asnix_bshared_make_attrs(json_syms, json_vals, (int64_t)njson);
+        /* asnix_toJSON_cstr mallocs its result (it's a generic, reusable
+         * helper also used by `builtins.toJSON`, which returns an
+         * ordinary heap-allocated Value string) -- copied into the arena
+         * here and freed immediately after, matching every other env
+         * value in this function (`asnix_string_value_to_cstr`, used for
+         * every OTHER attribute's value, is arena-allocated too). */
+        char *json_tmp = asnix_toJSON_cstr(json_attrs);
+        size_t json_len = strlen(json_tmp);
+        char *json_cstr = asnix_arena_alloc(json_len + 1);
+        memcpy(json_cstr, json_tmp, json_len + 1);
+        free(json_tmp);
 
         if (nenv >= ASNIX_DRV_MAX_ENV) {
             fprintf(stderr, "asnix: derivation: too many attributes (max %d)\n", ASNIX_DRV_MAX_ENV);
             exit(1);
         }
-        env[nenv].key = keycstr;
-        env[nenv].value = valcstr;
+        env[nenv].key = "__json";
+        env[nenv].value = json_cstr;
         nenv++;
     }
 
