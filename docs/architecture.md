@@ -76,7 +76,8 @@ what's actually implemented and the scope decisions made along the way.
 | M61 — real string-context tracking (`getContext`/`appendContext`/derivation-input propagation) | investigated, **no fix** (see below) |
 | M62 — `derivationStrict` generalized to real multi-output derivations (`outputs = [ "out" "bin" ... ]`), one distinct store path per declared output | done, **scoped** (see below) |
 | M63 — `asnix_apply`'s PrimOp path didn't populate `args[-1]` ("self"), crashing any of this codebase's own self-capturing curried builtins (`elemAt`, `map`, `filter`, `foldl'`) when invoked through it rather than an ordinary `OP_CALL` | done (see below) |
-| M64+ | not started |
+| M64 — `~`-prefixed ("home") path literals, interpolated path literals (`./${foo}`, `~/${foo}`, ...); `builtins.path` | done, **scoped** (see below; `builtins.path` itself not implemented) |
+| M65+ | not started |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
 
@@ -6321,3 +6322,172 @@ exact segfault to whatever comes next in the standing chase.
 `make test`/`test-e2e` both green (one new `m63_*` fixture, verified
 against real `nix-instantiate --eval --strict` first), zero
 regressions. `make test-conformance` (mined subset) unchanged.
+## M64 scope notes: `~`/interpolated path literals; `builtins.path` (scoped out)
+
+`make test-nix-conformance` triage: `eval-okay-home-path-not-normalised.nix`
+and `eval-okay-path-string-interpolation.nix` both failed with `asnix:
+unrecognized character '~' in source` -- this lexer had no support at all
+for `~`-prefixed ("home") path literals. `eval-okay-path.nix` failed
+separately with `attribute 'path' missing, aborting` (`builtins.path` not
+implemented at all).
+
+**`~` semantics, verified against real `nix-instantiate --eval --strict`
+with `HOME=/fake-home` set** (cppnix's own `src/libexpr/parser.y`,
+`path_start: HPATH { ... }` action): a home literal's text (after the
+leading `~`) is concatenated onto `$HOME` *literally* -- no `canonPath`
+call at all, unlike an ordinary `./`/absolute path literal (which this
+project's `resolve_path_literal`/`asnix_canon_path` already collapses
+`.`/`..`/doubled slashes in at compile time). This is exactly what the
+fixture's name ("not normalised") is about: `~/a/../b` stays
+`$HOME/a/../b`, never collapsed to `$HOME/b`.
+
+**The harder discovery**: fixing just `~` wasn't enough for
+`eval-okay-path-string-interpolation.nix` -- that file also exercises
+`./${foo}`, `/${foo}`, `./a-${foo}-b`, etc., and interpolated path
+literals (independent of `~`) turned out to be *entirely unimplemented*
+already (`let foo = "x"; in toString ./${foo}` gave a parse error before
+this milestone, with no `~` involved at all). Since
+`eval-okay-home-path-not-normalised.nix` itself has one interpolated-home
+case (`~/${"a"}/../b`), there was no way to scope this down to "just `~`,
+no interpolation" and still fix either target file. Implemented general
+path-literal interpolation as the real underlying feature, with `~`
+support riding on top of it.
+
+**Grammar, ported from cppnix's `src/libexpr/lexer.l`/`parser.y`
+directly** (verified line-by-line against both, then against
+`nix-instantiate`): a path literal's lexing works exactly like a
+double-quoted string's (`TOK_STR_START`/`TOK_STR_PART`/
+`TOK_DOLLAR_LBRACE`/`TOK_STR_END`, already in this codebase since the M5
+interpolation work) -- `./${foo}` lexes as an initial `PATH`-equivalent
+chunk ("./"), `TOK_DOLLAR_LBRACE`, the embedded expr, `TOK_RBRACE`, then
+a final chunk + a new `TOK_PATH_END` boundary marker (mirrors real Nix's
+own `PATH_END` token, which fires unconditionally after *every* path
+literal, interpolated or not -- this project only emits it when
+interpolation is actually present, to avoid touching the existing
+single-token `TOK_PATH` path for the common case). One real-grammar
+subtlety ported faithfully: real Nix's `PATH`/`HPATH` regex requires at
+least one full `/PATH_CHAR+` group, which can't match a bare `/`
+immediately followed by `${` (zero chars between); a separate
+`PATH_SEG`/`HPATH_START`-before-`${` lookahead rule handles exactly that
+case. Ported as `scan_path_groups` (lexer.c): its group-loop only
+special-cases a `/` with zero following path-chars when it's *directly*
+followed by `${` -- gated this way specifically so an in-progress `//`
+(update operator) is never miscounted as a 1-or-2-char path (verified:
+a blind "always consume a trailing bare slash" version of this function
+broke `a // b` parsing by eating both slashes as separate paths before
+`scan_path_groups`'s `saw_group`-gating was added).
+
+**Compiler/runtime, mirroring real Nix's `ExprConcatStrings::eval`
+exactly** (`~/nix/src/libexpr/eval.cc`, verified directly): the FIRST
+chunk of an interpolated path resolves to a genuine Path *constant* at
+compile time (`resolve_path_chunk` in compiler.c) -- for the `~` case,
+the same no-canon concat-onto-`$HOME` formula as the plain literal case
+(same formula either way, confirmed in cppnix's source: the HPATH parser
+action doesn't distinguish "complete literal" from "first chunk before
+interpolation", it's the same grammar rule either way); for the plain/
+absolute case, canonicalized same as an ordinary literal, but with ONE
+difference -- a trailing `/` is preserved (real Nix: "add back in the
+trailing '/' to the first segment") rather than rejected, since it's
+exactly what lets the next part glue on with the right separator (`./`'s
+resolved form must end in `/` so concatenating `"foo"` after it reads
+`.../foo`, not `.../dirfoo`) -- EXCEPT when the whole chunk is just a
+bare `/` (`literal.size() > 1` in real Nix's own condition; ported
+verbatim as `len > 1`), since `CanonPath("/")` is already `"/"` and a
+second slash would wrongly produce `//foo`. Every subsequent chunk/part
+pushes as an ordinary String constant or compiles as an ordinary
+expression; a new op, `OP_PATH_CONCAT` (`src/asm/ops/op_path_concat.S`,
+`asnix_concat_path` in value_util.c), concatenates everything exactly
+like the existing `OP_STR_CONCAT`/`asnix_concat_strings` (string
+interpolation's runtime half) does, then *unconditionally*
+re-canonicalizes the whole result and rewraps it as a Path -- matching
+real Nix's own unconditional re-canonicalization of the full
+concatenated string whenever the first operand was a Path, regardless of
+that first operand's own text having been deliberately left
+un-canonicalized (real Nix's comment: "skip canonization of first path,
+which would only be not canonized in the first place if it's coming from
+a `./${foo}` type path"). This is why `~/${"a"}/../b` canonicalizes to
+`$HOME/b` even though a bare `~/a/../b` (no interpolation at all) stays
+`$HOME/a/../b` uncollapsed -- same `~` formula for the first chunk either
+way, the difference is entirely in whether anything downstream of it
+ever re-canonicalizes. `canon_wrap_as_path`, the inner canon+rewrap
+helper, is shared with `asnix_add_values`'s existing `path + string`
+handling (M57g) rather than duplicated.
+
+Verified end-to-end against real `nix-instantiate --eval --strict` with
+`HOME=/fake-home` set (sandboxed `HOME=` assignment required routing
+through a tiny wrapper script rather than an inline shell prefix, purely
+a tooling quirk of this session, not relevant to the fix itself): both
+target fixtures now match byte-for-byte --
+`eval-okay-home-path-not-normalised.nix`'s `[ "/fake-home/a/../b"
+"/fake-home/./a" "/fake-home/a/.." "/fake-home/../x" "/fake-home/a/b"
+"/fake-home/b" ]` and `eval-okay-path-string-interpolation.nix`'s `{
+absolute = /foo; expr = /pwd/lang/foo/bar; home = /fake-home/foo;
+notfirst = /pwd/lang/bar/foo; simple = /pwd/lang/foo; slashes = /foo/bar;
+surrounded = /pwd/lang/a-foo-b; }` (the `/pwd` placeholder is
+`test-nix-conformance`'s own repo-root substitution, added below, not
+baked into asnix's output).
+
+**`make test-nix-conformance` harness gap, fixed alongside**: the target
+didn't set `HOME` or do nix-conformance's own `/pwd` repo-root
+substitution (`run`'s `printf '%s\n' "${out//$root//pwd}"`), both part of
+the corpus's own documented adapter protocol (`README.md`'s "Writing an
+adapter": `HOME=/fake-home` is one of the fixed env vars every adapter is
+invoked with). Without both, neither target fixture's `.exp` could ever
+byte-match no matter how correct asnix's own resolution was. Added both
+to the `Makefile` recipe, matching the upstream protocol exactly rather
+than inventing a separate convention -- safe for the same reason in both
+cases: a `.exp` file can never itself contain this clone's real `$HOME`
+or local checkout path, so the substitution/env-var is a no-op on every
+comparison that wasn't already destined to fail. (Bonus, not required by
+this milestone: a handful of other already-failing, already-documented
+"not mechanically comparable yet" cases -- `eval-okay-dotslash-path-
+fatal.nix` and siblings -- are now comparable too, though none happened
+to flip to passing on this pass.)
+
+**`builtins.path`: scoped out entirely, not implemented.** Real Nix's
+`builtins.path { path; name; filter; recursive; sha256; }` needs to walk
+a real directory tree, build a NAR serialization of it (calling the
+user's `filter` callback per entry when given), hash that with SHA-256,
+then assemble a content-addressed store path from the result (or, for
+`recursive = false`, hash the raw bytes of a single real file instead) --
+genuine filesystem content-addressing infrastructure this project has
+already, repeatedly decided not to build (same documented precedent as
+`derivation.c`'s fixed-output-derivation validation, M48: "this... does
+NOT change how the derivation's store path is actually computed... which
+would need actual content fetching infra this project doesn't have", and
+`<nix/fetchurl.nix>`'s M46 notes). Unlike `builtins.toFile` (M45), which
+computes a *real*, correct store-path hash because its content is an
+ordinary Nix string already in memory (no filesystem read needed),
+`builtins.path` has no such shortcut -- every one of its three
+real-Nix-shaped behaviors (`recursive = true` NAR hashing with a filter
+callback, `recursive = false` flat-file hashing, and the implicit
+default-is-recursive case) needs the real file's bytes, and two of the
+three additionally need the NAR directory format and a Nix-callback-
+per-entry filter mechanism that don't exist here at all. A narrower
+"flat-file-only" slice was considered (tractable in isolation: this
+project already has SHA-256, base32, and store-path-assembly
+primitives, see `store_path.h`) but was rejected as not worth the risk
+here -- `eval-okay-path.nix`'s own `.exp` is one 3-element list compared
+as a single string, and two of its three elements are the `recursive`
+(NAR) case that's out of scope regardless, so even a byte-perfect flat
+implementation couldn't flip this specific conformance file to passing.
+`builtins.path` continues to fail exactly as before ("attribute 'path'
+missing, aborting").
+
+Two new e2e fixtures: `tests/e2e/m64_home_path.nix` (`~`-prefixed
+literals, with and without interpolation; self-contained via
+`builtins.getEnv "HOME"` rather than a baked-in path, so it isn't tied to
+whatever `$HOME` happens to be wherever this suite runs) and
+`tests/e2e/m64_path_interp.nix` (plain/absolute interpolated paths,
+self-contained via comparing against an equivalent non-interpolated
+literal rather than printing an absolute path, so it isn't tied to this
+clone's checkout location). Both verified against real `nix-instantiate
+--eval --strict` first.
+
+`make test`/`make test-e2e` both green, zero regressions (239 e2e cases,
+two new `m59_*` fixtures). `make test-nix-conformance`: 556 passed/102
+failed/148 skipped before this milestone, 558/100/148 after -- the two
+target fixtures flip to passing, nothing else in the 806-file total
+changes (totals match exactly both times; the net shift is entirely and
+only those two files moving fail->pass). `eval-okay-path.nix` remains in
+the fail bucket, as documented above.

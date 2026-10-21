@@ -200,6 +200,10 @@ size_t ib_str_concat(IrBuilder *b, int64_t count) {
     return ib_emit(b, OP_STR_CONCAT, count, 0);
 }
 
+size_t ib_path_concat(IrBuilder *b, int64_t count) {
+    return ib_emit(b, OP_PATH_CONCAT, count, 0);
+}
+
 size_t ib_with(IrBuilder *b) {
     return ib_emit(b, OP_WITH, 0, 0);
 }

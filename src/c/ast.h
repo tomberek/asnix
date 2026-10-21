@@ -216,9 +216,20 @@ struct Ast {
                                        ${final.rust.rustcTargetSpec}`. */
         } has_attr; /* AST_HAS_ATTR: `target ? attr` */
         struct {
-            const char *text; /* raw lexeme: e.g. "./foo.nix", or the bare name for a search path */
+            const char *text; /* raw lexeme: e.g. "./foo.nix", or the bare name for a search path --
+                                * for an interpolated path (interp_count > 0), this is just the
+                                * FIRST chunk (e.g. "./" in "./${foo}") */
             size_t len;
             int is_search; /* 1 for `<name>`-style search-path literals, 0 for ordinary path literals */
+            int is_home;   /* M59: 1 if this literal (or its first chunk) started with `~` --
+                             * see compiler.c's resolve_path_literal/resolve_path_chunk. Always 0
+                             * when is_search is set. */
+            AstStringPart *interp_parts; /* M59: NULL/0 for a plain, non-interpolated literal
+                                           * (the pre-existing, common case) -- otherwise the parts
+                                           * AFTER `text`, each a literal chunk or an interpolated
+                                           * expression, same shape AST_STRING already uses (reused
+                                           * directly rather than inventing a second one). */
+            size_t interp_count;
         } path; /* AST_PATH */
     } as;
 };

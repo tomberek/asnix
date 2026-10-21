@@ -320,6 +320,42 @@ Value asnix_concat_strings(const Value *parts, int64_t count) {
     return (Value){ .raw = (uint64_t)(uintptr_t)mem | ASNIX_TAG_PTR };
 }
 
+/* Shared by asnix_add_values (`path + string`) and asnix_concat_path
+ * (M59, `~`/path-literal interpolation): re-canonicalizes a plain String
+ * Value's bytes (which must already start with '/' -- true for both
+ * callers, since each only reaches this once it's established the
+ * concatenation's first operand was already an absolute Path) and
+ * rewraps it as a Path. */
+static Value canon_wrap_as_path(Value string_result) {
+    int64_t len;
+    const char *bytes = asnix_ptr_bytes(string_result, &len);
+    char *nul_terminated = malloc((size_t)len + 1);
+    memcpy(nul_terminated, bytes, (size_t)len);
+    nul_terminated[len] = '\0';
+    char *canon = asnix_canon_path(nul_terminated);
+    free(nul_terminated);
+    Value out = asnix_make_path_value(canon, strlen(canon));
+    free(canon);
+    return out;
+}
+
+/* M59: the runtime half of path-literal interpolation (`./${foo}`,
+ * `~/${foo}`, `/${foo}`, ...) -- see OP_PATH_CONCAT's comment in ir.h for
+ * why unconditionally canon-wrapping is safe here (compiler.c's AST_PATH
+ * case only ever emits this op when `parts[0]` is already a Path
+ * constant). Reuses asnix_concat_strings for the actual byte-level
+ * concatenation (which already coerces a Path part to its plain text --
+ * see coerce_to_string_for_interp above -- exactly what's needed for
+ * `parts[0]` here), then re-canonicalizes the WHOLE result, matching real
+ * Nix's `ExprConcatStrings::eval` exactly (it re-canonicalizes
+ * unconditionally too, even though the first chunk's own text was
+ * deliberately left un-canonicalized when it was built -- see
+ * resolve_path_chunk in compiler.c). */
+Value asnix_concat_path(const Value *parts, int64_t count) {
+    Value result = asnix_concat_strings(parts, count);
+    return canon_wrap_as_path(result);
+}
+
 Value asnix_add_values(Value lhs, Value rhs) {
     int lt = asnix_tag_of(lhs), rt = asnix_tag_of(rhs);
     if (lt == ASNIX_TAG_INT && rt == ASNIX_TAG_INT) {
@@ -356,17 +392,9 @@ Value asnix_add_values(Value lhs, Value rhs) {
          * at compile time (compiler.c's AST_PATH case) -- a runtime
          * `path + string` concatenation previously just kept the raw,
          * uncollapsed text. `result`'s bytes always start with '/'
-         * here since `lhs` is already an absolute Path. */
-        int64_t len;
-        const char *bytes = asnix_ptr_bytes(result, &len);
-        char *nul_terminated = malloc((size_t)len + 1);
-        memcpy(nul_terminated, bytes, (size_t)len);
-        nul_terminated[len] = '\0';
-        char *canon = asnix_canon_path(nul_terminated);
-        free(nul_terminated);
-        Value out = asnix_make_path_value(canon, strlen(canon));
-        free(canon);
-        return out;
+         * here since `lhs` is already an absolute Path. M59: shares
+         * canon_wrap_as_path with asnix_concat_path now, same logic. */
+        return canon_wrap_as_path(result);
     }
     return result;
 }
