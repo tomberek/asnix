@@ -80,7 +80,8 @@ what's actually implemented and the scope decisions made along the way.
 | M65 — `import`-value caching (a second `import` of the same resolved path re-evaluated from scratch instead of sharing the first's result) | done (see below) |
 | M66 — `builtins.parseFlakeRef`/`builtins.flakeRefToString`: flake-ref URL-like syntax (github/gitlab/indirect/path/git+/tarball+/file+) | done, **scoped** (see below) |
 | M67 — external-conformance grab-bag: derivation `==` by `outPath`, dynamic-attrs scope fixes (rec-sibling visibility, attrpath-merge-into-a-dynamic-key, `${"literal"}` in `let`), `or` as an ordinary identifier, path-interpolation existence check, `fromJSON` deep-nesting stack fix, printer `<PRIMOP>`/`<LAMBDA>` | done, **scoped** (see below; function/slot-identity equality, `__curPos`, `tryEval` thunk re-eval, multi-segment `or default`, and `<PRIMOP-APP>` skipped) |
-| M68+ | not started |
+| M68 — a hand-written POSIX-ERE backtracking engine (`src/c/regex_engine.c`) to fix the 33 real behavioral gaps M55 triaged-but-didn't-fix between glibc's `<regex.h>` and real Nix's libstdc++ `std::regex` | done, **scoped** (see below; the 6 already-known-unfixable Class C patterns from M55 are still unfixed, deliberately) |
+| M69+ | not started |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
 
@@ -7082,3 +7083,180 @@ was missing the variable).
   fix merely got far enough to actually reach (confirmed: before M67e,
   this file failed at the PARSE stage, before this semantic gap was
   even reachable).
+
+## M68 scope notes: a hand-written POSIX-ERE backtracking engine to actually fix M55's 33 regex gaps
+
+M55 triaged 39 `nix-conformance` regex failures into three classes and
+shipped **no fix**, concluding the first two (27 + 6 = 33 tests) were
+genuine glibc-`<regex.h>`-vs-libstdc++-`std::regex` engine differences
+with "no fix available short of a different regex engine". This pass
+built that engine: `src/c/regex_engine.c`/`.h`, a small hand-written
+POSIX ERE parser + continuation-passing backtracking matcher, used
+alongside (not instead of) the existing glibc-based
+`builtins_regex.c`. Net result: all 33 of M55's Class A/Class B
+failures now pass; M55's Class C (6 tests, `(a){24998}`/collating-
+symbol-as-range-endpoint patterns real Nix rejects for libstdc++-
+internal-complexity reasons with no discoverable rule) remains
+unfixed, exactly as M55 already concluded was correct to leave alone.
+
+**Root cause, restated precisely.** M55 already correctly identified
+*that* glibc and libstdc++ disagree; this pass needed to pin down
+*exactly how*, since "a different engine" only works if it reproduces
+libstdc++'s specific algorithm, not some other (equally "valid")
+backtracking convention. Verified directly against real
+`nix-instantiate` (2.35.2) dozens of small hand-picked cases before
+writing a line of matcher code (see `regex_engine.c`'s own header
+comment for the final, citable summary) to separate three
+independent behaviors that all look superficially similar but turned
+out to need different handling:
+
+1. **Alternation is ordered, not "pick the longest branch"**:
+   `(aa|a)(aa|a)` on `"aaa"` gives `[ "aa" "a" ]` (first-listed "aa"
+   wins simply because it's tried first and happens to work), while
+   `(a|aa)(a|aa)` on the same string gives `[ "a" "aa" ]` (first-listed
+   "a" wins, also just because it's tried first) -- neither result is
+   about which branch is longer, both are "try branches in the order
+   they're written, first one whose entire remaining match eventually
+   succeeds wins".
+2. **Repetition has one specific, well-known backtracking-engine quirk**:
+   a `*`/`+`/`{m,}` loop, once its real (non-empty) iterations are
+   exhausted, still greedily attempts exactly one more iteration even
+   if the loop body can only match empty there, and *that* iteration's
+   capture (even though zero-width) overwrites whatever the last real
+   iteration had recorded, before the loop finally gives up (confirmed:
+   `(a*)*` on `"aa"` → `[ "" ]`, not `[ "aa" ]`; the subtler
+   `((a)*)*` on `"aa"` → `[ "" "a" ]`, confirming a repetition that
+   runs its body *zero* times leaves an enclosing group's capture
+   completely untouched, as opposed to resetting it -- a different and
+   narrower thing than "overwritten by an empty iteration").
+3. **Unanchored search (`builtins.split`) doesn't always find the
+   same match *span* as glibc, not just different captures for the
+   same span** -- this is the one M55 didn't catch, because M55 only
+   tested `builtins.match` (implicitly anchored) by hand: `builtins.split
+   "(x*)(xy)?" "xy"` gives real Nix 3 matches (`"x"`, then two
+   zero-width ones) because the greedy `x*` commits to consuming "x"
+   and libstdc++ never backtracks that choice just because the
+   optional `(xy)?` after it could have matched more -- but glibc's
+   `regexec`, being actually-POSIX-compliant here, *does* find the
+   longer 2-character `"xy"` span instead. Confirmed by `eval-okay-regex-184`
+   through `-193`'s `sp` fields: `m` (match) was already correct
+   without any of this milestone's split-specific fix (match's
+   whole-string anchoring already forces the right answer, by luck of
+   how anchoring interacts with greedy backtracking), but `sp` needed
+   the custom engine to find the match *boundary* itself, not just
+   recompute captures for a boundary glibc had already decided on.
+
+**Implementation.** `regex_engine.c` parses the ERE subset
+nix-conformance's regex corpus and nixpkgs actually use (literals,
+`.`, anchors, `*`/`+`/`?`/`{m,n}` with stacking, `()` capturing groups,
+`|` alternation, `[...]` bracket expressions including POSIX class
+names, named collating symbols, and equivalence classes -- no
+lookaround/backreferences/lazy quantifiers, none of which ERE has
+anyway) into a small AST, then matches via continuation-passing-style
+backtracking (`m`/`run_cont`/`match_rep` -- see the file's own header
+comment for the full design writeup). Two matching modes share nearly
+all the same code: *anchored* (`asnix_regex_match_anchored`, fixed
+target length, ordinary accept-first-success backtracking -- this
+alone reproduces both quirks 1 and 2 above, since fixing the required
+end position is exactly what forces backtracking into an earlier
+branch/rep-count choice when needed) and *search* (`asnix_regex_search`,
+no fixed length -- same accept-first-success everywhere **except**
+`RN_ALT` nodes with more than one branch, which explicitly try every
+branch to its own completion and keep whichever reaches furthest, the
+mechanism that reproduces quirk 3 without over-applying "prefer
+longest" to repetition's own rep-count choice, which quirk 2's own
+test cases prove must NOT happen).
+
+`builtins_regex.c`'s `match2_impl`/`split2_impl` route by how much a
+given pattern actually needs this: a pattern using none of the three
+bracket-expression extensions (M55's Class B) and having zero capture
+groups never touches `regex_engine.c` at all -- glibc's regexec is
+already both correct and faster for that case, unchanged. A pattern
+using a Class B extension bypasses glibc entirely (it often can't even
+`regcomp` these). Everything else with at least one capture group gets
+captures recomputed by the custom engine for the span glibc's regexec
+already found (`groups_to_list_recomputed`); `split2_impl` additionally
+re-derives the match *boundary* itself via the custom engine (not just
+recomputing captures for glibc's boundary) whenever there's a capture
+group and the subject is short enough to be safe (see "performance"
+below) -- this is the fix for quirk 3.
+
+**Two real pitfalls found and fixed during verification, not just
+theorizing**:
+
+- **Native-recursion stack depth, not time complexity.** This CPS
+  matcher's `*`/`+` handling recurses once per repetition (not an
+  iterative loop), so a repetition matched over N real characters
+  costs O(N) C call-stack depth. A dedicated probe harness (not part
+  of this project's test suite) found this segfaults somewhere in the
+  low thousands of matched characters even for a trivial pattern like
+  `(a|b)*`, confirmed live by nix-conformance's own
+  `eval-okay-regex-264` (`(a|b)*` against a >10000-character string)
+  crashing the instant the custom engine's capture-recompute was wired
+  in unconditionally. Converting repetition to use an explicit
+  heap-allocated backtracking stack instead of C recursion would be
+  the real fix; out of scope for this pass given the actual target
+  patterns are all tiny. Mitigated instead with
+  `ASNIX_REGEX_CUSTOM_MAX_SPAN` (2000 characters, comfortably below the
+  measured crash threshold with margin for this process having less
+  free stack than the standalone probe did, and comfortably above
+  every pattern this milestone actually targets): above that span,
+  `groups_to_list_recomputed`/`split2_impl` fall back to glibc's own
+  (unimproved, but also unregressed) results.
+- **Exponential blowup from exploring every alternative of a*
+  *repeated* ambiguous alternation.** Quirk 3's fix (explore every
+  `RN_ALT` branch to completion in search mode) is, by itself,
+  genuinely exponential when the repeated body *is* an ambiguous
+  alternation -- confirmed by three more previously-passing
+  nix-conformance long-input tests (`(a|aa)*b`, `((a|b)(c|d))+`,
+  `(ab|a)*b`, all well under the 2000-character span cap, none of them
+  anywhere near stack-depth territory) hanging past the harness's
+  10-second timeout the instant the search-boundary fix landed. Fixed
+  with a shared, decrementing step budget (`MCtx.budget`,
+  `ASNIX_REGEX_SEARCH_BUDGET` = 300000 node visits) that makes `RN_ALT`
+  degrade from "explore every branch" back to plain
+  accept-first-success once exhausted -- bounded-but-possibly-
+  degraded beats exponential, and for every pattern this engine is
+  actually meant to handle (nix-conformance's regex-NNN corpus is all
+  single/low-double-digit-character inputs), the budget is never
+  remotely close to exhausted, so this never actually changes behavior
+  for anything in scope.
+
+One more gap found and fixed along the way, inside M55's own already-
+"mostly fixed" Class C detection: `[[=a=]-c]` (an equivalence class
+used as a bracket-range *endpoint*) newly round-tripped as
+successfully-compiling-and-matching once the custom engine started
+handling Class B patterns, where it previously hit glibc's own
+rejection first. Confirmed real Nix also rejects this (same family as
+M55's already-documented collating-symbol-as-range-endpoint
+rejections, just for equivalence classes instead) and added the
+matching rejection to `regex_engine.c`'s own bracket parser
+(`eval-fail-regex-invalid-041`).
+
+**Verified** against real `nix-instantiate --eval --strict` (2.35.2)
+for every behavioral claim above before trusting it (dozens of small
+hand-picked `match`/`split` probes, not just the corpus's own `.exp`
+files -- same discipline M55's own investigation used). New
+`tests/e2e/m68_regex_*.nix` fixtures (6 files) cover the specific
+shapes fixed: nested/optional capture under repetition, the
+zero-reps-leaves-group-untouched case, split's greedy-quantifier-vs-
+optional boundary divergence, and all three bracket-expression
+extensions. `make test` (including a new `tests/c/test_regex_engine_scratch.c`
+unit battery exercising ~38 hand-verified match/capture shapes
+directly against `regex_engine.c`, bypassing the Nix layer entirely)
+and `make test-e2e` both green.
+
+`make test-nix-conformance` before/after (this shared worktree sees
+concurrent unrelated work from other agents landing throughout, same
+caveat M55's own numbers carried, and the host was also under heavy
+concurrent load while these were taken -- load average in the 20s-40s
+-- which sporadically times out unrelated, individually-fast
+(millisecond-scale, confirmed by timing several directly) tests under
+the harness's 10-second-per-file budget; the numbers below are from a
+clean, re-confirmed run, not a lucky one): **556 passed/102 failed**
+before this milestone (39 of those 102 were regex: the 33 this
+milestone targets plus M55's 6 already-known-unfixable Class C ones)
+→ **589 passed/69 failed** after (6 of those 69 are regex: exactly
+M55's Class C, untouched). All 33 targeted regex tests now pass; the
+non-regex failure lists before and after are identical -- zero
+regressions anywhere else in the corpus.

@@ -7,15 +7,20 @@
 
 /*
  * `builtins.match`/`builtins.split` -- POSIX Extended Regular Expression
- * (ERE) support, wired directly onto glibc's <regex.h> (`regcomp`/
- * `regexec`/`regfree`), which already implements POSIX leftmost-longest
- * semantics -- the same engine class real Nix's own `std::regex` (built
- * with `std::regex::extended`) uses, so this matches real Nix's behavior
- * for ordinary ERE patterns without needing a hand-rolled regex engine.
- * See builtins_regex.c for the match/split algorithms themselves and
- * docs/architecture.md's scope notes for what's deliberately not chased
- * (anything outside plain POSIX ERE -- backreferences aren't part of ERE
- * at all, so that's not a scope cut, just not a thing to support).
+ * (ERE) support, built on glibc's <regex.h> (`regcomp`/`regexec`/
+ * `regfree`) for the common case -- it's both correct and fast for any
+ * pattern with no capture groups and none of a handful of bracket-
+ * expression extensions glibc can't be trusted for -- plus
+ * `regex_engine.c`, a small hand-rolled POSIX ERE backtracking matcher
+ * (M68), used whenever a pattern actually needs it: to recompute
+ * capture groups (and, for `split`, sometimes the match boundary
+ * itself) the way real Nix's libstdc++ `std::regex` would, which
+ * glibc's regexec doesn't always agree with for a specific, identified
+ * family of ambiguous/repeated subexpressions -- see regex_engine.c's
+ * own header comment and docs/architecture.md's M68 scope notes for the
+ * full story (M55's scope notes cover the triage that preceded it).
+ * See builtins_regex.c for the match/split algorithms and routing
+ * logic themselves.
  */
 
 extern const AsnixBuiltinMiscDef ASNIX_REGEX_BUILTINS[];

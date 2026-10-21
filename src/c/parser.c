@@ -798,7 +798,7 @@ static void parse_binding_stmt(Parser *p, BTVec *out, DynBindingVec *dyn_out) {
     free(segs.items);
 }
 
-/* M59: an interpolated path literal's tail -- `t` is the already-consumed
+/* M64: an interpolated path literal's tail -- `t` is the already-consumed
  * first TOK_PATH chunk (e.g. "./" in "./${foo}", "~/" in "~/${foo}"),
  * known by the caller to be immediately followed by TOK_DOLLAR_LBRACE.
  * Collects zero or more TOK_PATH_PART literal chunks interleaved with
@@ -950,7 +950,7 @@ static Ast *parse_atom(Parser *p) {
         }
         case TOK_PATH: {
             advance(p);
-            /* M59: the lexer only ever follows a TOK_PATH with
+            /* M64: the lexer only ever follows a TOK_PATH with
              * TOK_DOLLAR_LBRACE when this chunk is the first (possibly
              * only) part of a path literal that continues into
              * interpolation (`./${foo}`, `~/${foo}`, ...) -- see

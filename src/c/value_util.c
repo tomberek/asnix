@@ -458,7 +458,7 @@ Value asnix_add_values(Value lhs, Value rhs) {
          * at compile time (compiler.c's AST_PATH case) -- a runtime
          * `path + string` concatenation previously just kept the raw,
          * uncollapsed text. `result`'s bytes always start with '/'
-         * here since `lhs` is already an absolute Path. M59: shares
+         * here since `lhs` is already an absolute Path. M64: shares
          * canon_wrap_as_path with asnix_concat_path now, same logic. */
         return canon_wrap_as_path(result);
     }

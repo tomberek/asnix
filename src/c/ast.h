@@ -229,10 +229,10 @@ struct Ast {
                                 * FIRST chunk (e.g. "./" in "./${foo}") */
             size_t len;
             int is_search; /* 1 for `<name>`-style search-path literals, 0 for ordinary path literals */
-            int is_home;   /* M59: 1 if this literal (or its first chunk) started with `~` --
+            int is_home;   /* M64: 1 if this literal (or its first chunk) started with `~` --
                              * see compiler.c's resolve_path_literal/resolve_path_chunk. Always 0
                              * when is_search is set. */
-            AstStringPart *interp_parts; /* M59: NULL/0 for a plain, non-interpolated literal
+            AstStringPart *interp_parts; /* M64: NULL/0 for a plain, non-interpolated literal
                                            * (the pre-existing, common case) -- otherwise the parts
                                            * AFTER `text`, each a literal chunk or an interpolated
                                            * expression, same shape AST_STRING already uses (reused

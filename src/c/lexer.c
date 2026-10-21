@@ -35,7 +35,7 @@ static int path_char(char c) {
 }
 
 /* True iff src[j..] is exactly "${" -- the interpolation-hole marker
- * (M59). Shared by scan_path_groups below and the main dispatch loop's
+ * (M64). Shared by scan_path_groups below and the main dispatch loop's
  * path-literal cases (plain, absolute, and `~`/home). */
 static int at_dollar_brace(const char *src, size_t j) {
     return src[j] == '$' && src[j + 1] == '{';
@@ -49,7 +49,7 @@ static int at_dollar_brace(const char *src, size_t j) {
  * slash, even though zero path_chars followed it) instead of just
  * stopping -- matching real Nix's PATH_SEG/HPATH_START-before-
  * interpolation special lexer rule (needed for `./${foo}`/`~/${foo}`,
- * M59, see docs/architecture.md). Deliberately does NOT special-case a
+ * M64, see docs/architecture.md). Deliberately does NOT special-case a
  * trailing bare '/' with nothing useful after it (no "${", no further
  * path chars) -- that's left for the caller to optionally consume as the
  * grammar's own separate trailing `/?`, gated on `*saw_group` already
@@ -80,7 +80,7 @@ static size_t scan_path_groups(const char *src, size_t j, int *saw_group) {
 
 /* Returns the length of a path literal starting at src[i], or 0 if this
  * position isn't one (in which case the caller falls through to ordinary
- * digit/ident/single-char scanning). M59: also succeeds on a prefix that
+ * digit/ident/single-char scanning). M64: also succeeds on a prefix that
  * ends right before "${" (e.g. "./" in "./${foo}", or "/" in "/${foo}"),
  * even though that prefix alone wouldn't otherwise satisfy the "at least
  * one full /PATH_CHAR+ group" rule -- see scan_path_groups. The caller
@@ -98,7 +98,7 @@ static size_t try_scan_path(const char *src, size_t i) {
     return j - i;
 }
 
-/* `~`-prefixed ("home") path literal (M59): unlike a plain path, there's
+/* `~`-prefixed ("home") path literal (M64): unlike a plain path, there's
  * no PATH_CHAR* prefix allowed before the first '/' at all -- real Nix's
  * HPATH grammar is exactly `~(/PATH_CHAR+)+/?`, so this only looks for a
  * literal "~/" at src[i] and then reuses scan_path_groups starting right
@@ -390,7 +390,7 @@ static void lex_indented_run(const char *src, size_t *i, ModeStack *modes, TokVe
     }
 }
 
-/* M59: scans one run of path-literal content starting at *i (positioned
+/* M64: scans one run of path-literal content starting at *i (positioned
  * just after a closed "${ ... }" interpolation inside a path literal
  * whose FIRST chunk already established it continues past one -- see the
  * MODE_PATH push sites in asnix_lex's main loop above), up to the next
@@ -535,7 +535,7 @@ Token *asnix_lex(const char *src, size_t *out_count) {
         }
 
         /* Tried before digit/string/ident/single-char below -- see
-         * try_scan_path's comment for why this has to come first. M59:
+         * try_scan_path's comment for why this has to come first. M64:
          * `~`-prefixed home paths are tried alongside (src[i]=='~' is
          * never itself a path_char, so try_scan_path can never fire at
          * this position on its own -- a separate probe is required). Both

@@ -114,7 +114,9 @@ static void print_attr_name(const char *name, size_t len) {
     }
 }
 
-/* M59: real Nix's printer tracks which ATTRS/LIST heap objects are
+/* M58-adjacent (no new milestone number -- a same-day follow-up, see
+ * docs/architecture.md's M58 scope notes): real Nix's printer tracks
+ * which ATTRS/LIST heap objects are
  * currently *active* -- on the stack of values being printed right
  * now, i.e. an actual ancestor in the DFS -- and prints `«repeated»`
  * instead of recursing when a value already on that stack comes back

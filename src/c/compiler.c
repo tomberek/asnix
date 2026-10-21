@@ -245,7 +245,7 @@ Value asnix_resolve_search_path_value(Value name_val) {
     return v;
 }
 
-/* M59: `~`-prefixed ("home") path resolution. Unlike an ordinary path
+/* M64: `~`-prefixed ("home") path resolution. Unlike an ordinary path
  * literal, real Nix's own HPATH parser action concatenates $HOME onto
  * the literal text *verbatim* -- NO canon_path call at all, no `.`/`..`/
  * doubled-slash collapsing (confirmed directly against `nix-instantiate
@@ -259,7 +259,7 @@ Value asnix_resolve_search_path_value(Value name_val) {
  * HPATH always requires at least "~/"). Applies identically whether or
  * not interpolation follows afterward (real Nix's path_start: HPATH {...}
  * grammar action is the same either way; only the TEXT captured by the
- * token differs, not the formula -- see docs/architecture.md's M59
+ * token differs, not the formula -- see docs/architecture.md's M64
  * notes). */
 static char *resolve_home_literal(const char *text, size_t len) {
     const char *home = getenv("HOME");
@@ -278,7 +278,7 @@ static char *resolve_home_literal(const char *text, size_t len) {
 
 /* Resolves one ordinary (non-search, see asnix_resolve_search_path_value
  * above for that case) AST_PATH node's raw lexeme to an absolute,
- * canonicalized path string (malloc'd, NUL-terminated). M59: dispatches
+ * canonicalized path string (malloc'd, NUL-terminated). M64: dispatches
  * to resolve_home_literal (no canon at all) for `~`-prefixed literals --
  * the trailing-slash-is-fatal check above that dispatch still applies to
  * both (real Nix's INPATH_SLASH "path has a trailing slash" error fires
@@ -315,7 +315,7 @@ static char *resolve_path_literal(Ast *node) {
     return canon;
 }
 
-/* M59: resolves the FIRST chunk of an interpolated path literal
+/* M64: resolves the FIRST chunk of an interpolated path literal
  * (`./${foo}`'s "./", `~/${foo}`'s "~/", `/${foo}`'s "/") directly to an
  * absolute Path VALUE (not just a string -- this becomes parts[0] of an
  * OP_PATH_CONCAT chain, and that op's whole correctness rests on
@@ -1256,7 +1256,7 @@ static void compile_expr(IrBuilder *b, Ast *node, ScopeFrame *scope) {
                 return;
             }
             if (node->as.path.interp_count > 0) {
-                /* M59: `./${foo}`/`~/${foo}`/`/${foo}`/... -- the first
+                /* M64: `./${foo}`/`~/${foo}`/`/${foo}`/... -- the first
                  * chunk resolves to a genuine Path constant right here
                  * (resolve_path_chunk, NOT resolve_path_literal: a
                  * trailing '/' is expected and must be preserved, not

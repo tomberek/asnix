@@ -74,7 +74,7 @@ Value asnix_coerce_to_string(Value v);
  * an explicit `builtins.toString` in the source, same as real Nix. */
 Value asnix_concat_strings(const Value *parts, int64_t count);
 
-/* M59: the runtime half of `~`/path-literal interpolation (`./${foo}`,
+/* M64: the runtime half of `~`/path-literal interpolation (`./${foo}`,
  * `~/${foo}`, `/${foo}`, ...) -- see OP_PATH_CONCAT in ir.h. Identical to
  * asnix_concat_strings except the result is re-canonicalized and
  * rewrapped as a Path afterward (matching real Nix's

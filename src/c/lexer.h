@@ -79,17 +79,17 @@ typedef enum {
     TOK_AT,        /* '@' -- lambda-pattern whole-arg alias (`n@{...}` / `{...}@n`) */
     TOK_ELLIPSIS,  /* '...' -- lambda-pattern "allow extra fields" marker */
     TOK_PATH,        /* bare path literal: ./foo, ../foo, /foo, foo/bar (see lexer.c's
-                      * try_scan_path/try_scan_home_path), OR -- M59 -- the FIRST chunk of
+                      * try_scan_path/try_scan_home_path), OR -- M64 -- the FIRST chunk of
                       * an interpolated path literal (`./${foo}`'s "./", `~/${foo}`'s "~/",
                       * ...), in which case this token is immediately followed by
                       * TOK_DOLLAR_LBRACE rather than standing alone; see Token.is_home and
                       * TOK_PATH_PART/TOK_PATH_END below. */
-    TOK_PATH_PART,   /* M59: a literal chunk inside an interpolated path literal, AFTER the
+    TOK_PATH_PART,   /* M64: a literal chunk inside an interpolated path literal, AFTER the
                       * first (`./a-${foo}-b`'s "-b", possibly zero-length between two
                       * adjacent interpolations) -- no escapes exist in path-literal syntax
                       * at all, so (unlike TOK_STR_PART) this always points directly into
                       * the original source buffer, never a decoded copy. */
-    TOK_PATH_END,    /* M59: closes an interpolated path literal -- a boundary marker only,
+    TOK_PATH_END,    /* M64: closes an interpolated path literal -- a boundary marker only,
                       * no payload (mirrors TOK_STR_END). */
     TOK_SEARCH_PATH, /* <nixpkgs>-style NIX_PATH search-path literal */
     TOK_EOF,
@@ -115,7 +115,7 @@ typedef struct {
                                 * sequence (''$, ''', ''\<c> -- treated as a boundary,
                                 * not scanned for leading whitespace, exactly like real
                                 * Nix's StringToken::hasIndentation). */
-    int is_home; /* TOK_PATH only (M59): 1 if this path literal (or this interpolated
+    int is_home; /* TOK_PATH only (M64): 1 if this path literal (or this interpolated
                    * literal's first chunk) started with `~` -- see try_scan_home_path and
                    * compiler.c's resolve_path_chunk/resolve_path_literal. Always 0 for
                    * TOK_SEARCH_PATH and every other TOK_PATH use. */
