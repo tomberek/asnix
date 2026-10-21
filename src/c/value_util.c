@@ -345,8 +345,28 @@ Value asnix_coerce_to_string_for_derivation(Value v) {
  * when `/foo/bar` doesn't exist, while `"${./bar}"` on the same
  * nonexistent path fails) -- found as a regression this fix introduced
  * (`tests/e2e/m57g_path_canon_concat.nix`, path `+` string, broke when
- * the existence check below was first added unconditionally). */
-static Value coerce_to_string_for_interp(Value v, int check_path_exists) {
+ * the existence check below was first added unconditionally).
+ *
+ * Follow-up (chasing d.nix/nixpkgs-hash-parity): `copy_to_store` is a
+ * SEPARATE flag from `check_path_exists`, not implied by it. Real Nix's
+ * `ExprConcatStrings::eval` (~/nix/src/libexpr/eval.cc) calls
+ * `coerceToString` with `coerceMore=false`, `copyToStore=(firstType ==
+ * nString)`, `canonicalizePath=!first` for EVERY operand of a
+ * `+`/string-concat chain -- `copyToStore` tracks
+ * whether the chain's FIRST operand was a plain string (never gated on
+ * existence-checking at all). A `+` chain whose first operand is a
+ * string (e.g. nixpkgs's own `minimal-bootstrap/mes/libc.nix`:
+ * `libc_gnu1_SOURCES + " " + ./ldexpl.c`) DOES copy a later Path operand
+ * to the store and attach its Opaque context -- confirmed directly
+ * against a real `.drv`: the resulting env var's text embeds
+ * `/nix/store/<hash>-ldexpl.c`, and that path is listed in `inputSrcs`,
+ * not the bare local filesystem path. `asnix_add_values` below passes
+ * `copy_to_store = !asnix_value_is_path(lhs)` -- valid because asnix's
+ * binary-chain structure always re-wraps an intermediate `+` result as a
+ * Path (via `canon_wrap_as_path`) exactly when the chain's first operand
+ * was a Path, so checking the immediate `lhs`'s tag is equivalent to
+ * real Nix's single `firstType` tracked across the whole n-ary chain. */
+static Value coerce_to_string_for_interp(Value v, int check_path_exists, int copy_to_store) {
     if (asnix_tag_of(v) == ASNIX_TAG_PTR) {
         /* A Path is a second, differently-shaped ASNIX_TAG_PTR kind (see
          * value_util.h) -- returning it unchanged, as if every TAG_PTR were
@@ -370,9 +390,7 @@ static Value coerce_to_string_for_interp(Value v, int check_path_exists) {
              * `check_path_exists` -- see this function's own header
              * comment for why `+`'s reuse of this same coercion needs to
              * skip it (that case is text reassembly of a NEW path
-             * literal, not a Path VALUE being embedded in a string, so
-             * neither the existence check nor the store-copy below
-             * apply). */
+             * literal, not a Path VALUE being embedded in a string). */
             int64_t len;
             const char *bytes = asnix_ptr_bytes(v, &len);
             char *nul_terminated = malloc((size_t)len + 1);
@@ -390,17 +408,16 @@ static Value coerce_to_string_for_interp(Value v, int check_path_exists) {
              * derivation's own output) is used verbatim -- real Nix
              * never re-copies something that's already in the store.
              * Anything else is NAR-hashed and copied (M75's
-             * asnix_copy_path_to_store), gated on `check_path_exists`
-             * for the same reason the existence check above is: this is
-             * real Nix's `copyToStore=true` coercion, which `+`'s reuse
-             * of this function must not trigger. */
+             * asnix_copy_path_to_store), gated on `copy_to_store` -- see
+             * this function's own header comment (follow-up): this flag
+             * is real Nix's `copyToStore` exactly, independent of
+             * `check_path_exists`. */
             /* M76: same Opaque-context origin point as
              * asnix_coerce_to_string_for_derivation's identical Path
              * branch -- see its own comment. Only reached when
-             * `check_path_exists` (genuine interpolation, not `+`'s
-             * reuse of this function), matching exactly when the
-             * store-copy itself is gated. */
-            if (check_path_exists) {
+             * `copy_to_store`, matching exactly when the store-copy
+             * itself is gated. */
+            if (copy_to_store) {
                 int in_store = len > 11 && memcmp(nul_terminated, "/nix/store/", 11) == 0;
                 char store_path[300];
                 const char *final_path = nul_terminated;
@@ -482,12 +499,40 @@ static Value coerce_to_string_for_interp(Value v, int check_path_exists) {
     exit(1);
 }
 
+/* `builtins.concatStringsSep`'s own per-element coercion
+ * (builtins_misc.c's concatStringsSep2_impl) -- real Nix's
+ * `prim_concatStringsSep` (`~/nix/src/libexpr/primops.cc`) calls
+ * `EvalState::coerceToString` with its default arguments, i.e.
+ * `coerceMore=false, copyToStore=true` -- the EXACT same coercion rules
+ * as genuine `"${...}"` string interpolation (strings/paths/attrsets
+ * with `__toString`/`outPath` accepted; ints/bools/null/lists rejected,
+ * since those need `coerceMore=true`, which only `builtins.toString`
+ * passes), not `toString`'s more permissive rules. Confirmed needed by
+ * nixpkgs's curl build: some `concatStringsSep`-driven derivation
+ * attribute's list genuinely contains a derivation attrset (e.g. a
+ * `buildInputs`/`propagatedBuildInputs` entry threaded through
+ * unmodified rather than pre-stringified via `"${x}/bin"`-style
+ * interpolation before reaching the list) -- `concatStringsSep2_impl`
+ * previously required every element to already be a bare ASNIX_TAG_PTR
+ * string (via its own stricter `as_string` helper), which fatals on
+ * that attrset even though real Nix accepts it via exactly this
+ * coercion (peeling its `outPath`). Just a thin exported wrapper around
+ * `coerce_to_string_for_interp` with `check_path_exists=1,
+ * copy_to_store=1` -- same as `asnix_concat_strings`'s own use of it
+ * below -- so a bare Path element (if one ever appears here) is copied
+ * to the store the same way a `"${somePath}"` interpolation's would
+ * be, not given special-cased, narrower treatment. */
+Value asnix_coerce_to_string_for_concat_sep(Value v) {
+    return coerce_to_string_for_interp(v, 1, 1);
+}
+
 /* Shared by `asnix_concat_strings` (real `"${...}"` interpolation,
- * `check_path_exists=1`) and `asnix_add_values`'s path-concat case (`+`,
- * `check_path_exists=0`) -- see `coerce_to_string_for_interp`'s own
- * header comment for why the two need different existence-checking
- * behavior despite sharing every other coercion rule. */
-static Value concat_strings_impl(const Value *parts, int64_t count, int check_path_exists) {
+ * `check_path_exists=1, copy_to_store=1`) and `asnix_add_values`'s
+ * path-concat case (`+`, `check_path_exists=0` always, `copy_to_store`
+ * depending on the chain's first operand) -- see
+ * `coerce_to_string_for_interp`'s own header comment for why the two
+ * flags are independent despite sharing every other coercion rule. */
+static Value concat_strings_impl(const Value *parts, int64_t count, int check_path_exists, int copy_to_store) {
     if (count <= 0) return asnix_make_string_value("", 0);
 
     Value *coerced = malloc((size_t)count * sizeof(Value));
@@ -495,7 +540,7 @@ static Value concat_strings_impl(const Value *parts, int64_t count, int check_pa
     AsnixStringContext ctx;
     asnix_ctx_init(&ctx);
     for (int64_t i = 0; i < count; i++) {
-        coerced[i] = coerce_to_string_for_interp(parts[i], check_path_exists);
+        coerced[i] = coerce_to_string_for_interp(parts[i], check_path_exists, copy_to_store);
         asnix_ctx_union_into(&ctx, asnix_string_context_of(coerced[i]));
         const char *s = (const char *)(coerced[i].raw & ~0x7ULL);
         total_len += *(const int64_t *)(s + ASNIX_STRING_OFF_LEN);
@@ -559,12 +604,15 @@ static Value canon_wrap_as_path(Value string_result) {
  * deliberately left un-canonicalized when it was built -- see
  * resolve_path_chunk in compiler.c). */
 Value asnix_concat_path(const Value *parts, int64_t count) {
-    Value result = concat_strings_impl(parts, count, 0);
+    /* firstType == nPath for this chain (parts[0] is always a Path
+     * constant, per this function's own header comment) -- matches real
+     * Nix's `copyToStore = firstType == nString` being false here. */
+    Value result = concat_strings_impl(parts, count, 0, 0);
     return canon_wrap_as_path(result);
 }
 
 Value asnix_concat_strings(const Value *parts, int64_t count) {
-    return concat_strings_impl(parts, count, 1);
+    return concat_strings_impl(parts, count, 1, 1);
 }
 
 Value asnix_add_values(Value lhs, Value rhs) {
@@ -595,7 +643,24 @@ Value asnix_add_values(Value lhs, Value rhs) {
         exit(1);
     }
     Value parts[2] = { lhs, rhs };
-    Value result = concat_strings_impl(parts, 2, 0); /* M67: `+` never requires a Path to exist */
+    /* M67: `+` never requires a Path to exist (check_path_exists=0).
+     * Follow-up (chasing d.nix/nixpkgs-hash-parity): `copy_to_store`,
+     * unlike `check_path_exists`, is NOT unconditionally 0 here -- real
+     * Nix's `copyToStore = firstType == nString` (~/nix/src/libexpr/
+     * eval.cc's `ExprConcatStrings::eval`) ties it to whether the WHOLE
+     * `+` chain's first operand was a string, not a path. `lhs` (this
+     * call's left operand) is exactly that: asnix's binary-chain
+     * `+`-folding always re-wraps an intermediate result as a Path (via
+     * `canon_wrap_as_path` below) whenever the chain started with a
+     * Path, so `lhs` already being a non-Path here means the chain's
+     * first operand was a string -- confirmed needed directly:
+     * nixpkgs's own `libc_gnu1_SOURCES + " " + ./ldexpl.c`
+     * (minimal-bootstrap/mes/libc.nix) is a `+` chain starting with a
+     * string, and real Nix's resulting `.drv` embeds `./ldexpl.c` as a
+     * real copied `/nix/store/...` path (also listed in `inputSrcs`),
+     * not the bare local filesystem path this project previously left
+     * unconverted (copy_to_store was always 0 for `+` before this). */
+    Value result = concat_strings_impl(parts, 2, 0, !asnix_value_is_path(lhs));
     if (asnix_value_is_path(lhs)) {
         /* M57g: canonicalize `.`/`..`/doubled-slash segments the result
          * may now have (e.g. `/foo/bar + "/../xyzzy/./foo.txt"` ==

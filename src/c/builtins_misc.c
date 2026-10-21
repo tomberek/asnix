@@ -206,12 +206,43 @@ static Value concatStringsSep2_impl(const Value *args, int64_t argc) {
     const Value *elems = (const Value *)(list_base + ASNIX_LIST_OFF_ELEMS);
 
     int64_t total = 0;
+    /* M76/M77 follow-up, merged from two independent fixes found chasing
+     * the d.nix/nixpkgs-hash-parity bug-chase:
+     *  - each element is coerced the same way a genuine `"${...}"` string
+     *    interpolation would (strings/paths/attrsets with `__toString`/
+     *    `outPath` -- see asnix_coerce_to_string_for_concat_sep's own
+     *    comment in value_util.c), NOT required to already be a bare
+     *    string -- matches real Nix's `prim_concatStringsSep`, which
+     *    calls `coerceToString` with its default (non-`coerceMore`)
+     *    arguments on each raw list element. Found needed by nixpkgs's
+     *    curl build: a `concatStringsSep`'d list there contains a
+     *    derivation attrset element outright.
+     *  - every element's own string context (if any -- including any
+     *    NEW context the coercion above just attached, e.g. a bare
+     *    already-in-store Path element) is unioned into the joined
+     *    result's context, same pattern as value_util.c's
+     *    `concat_strings_impl` and the ASNIX_TAG_LIST branch of
+     *    `asnix_coerce_to_string`. Without this, `lib.makeBinPath`/
+     *    `lib.makeSearchPath` (nixpkgs-level, `concatStringsSep ":"
+     *    (map (p: "${p}/bin") pkgs)`) silently drop every referenced
+     *    derivation's context, so a `derivation {...}` attribute built
+     *    that way (e.g. a bootstrap derivation's `PATH` env var) is
+     *    missing those derivations from its `InputDrvs` entirely --
+     *    confirmed: asnix's own `bootstrap-coreutils-5.0.drv` had only 2
+     *    of the real 7 `InputDrvs` entries, the missing 5 appearing
+     *    ONLY inside its `PATH` var's `makeBinPath`-joined string.
+     * Coerced once per element up front into a scratch array so the two
+     * passes below (length-sum, then copy) don't re-run any
+     * `__toString` call twice. */
+    AsnixStringContext ctx;
+    asnix_ctx_init(&ctx);
+    Value *forced = malloc((size_t)(count > 0 ? count : 1) * sizeof(Value));
     for (int64_t i = 0; i < count; i++) {
         const char *b;
         int64_t l;
-        /* Lazy list elements (M23's `map`, etc.) -- force before reading
-         * bytes, same class of fix M23's own concatLists needed. */
-        as_string(asnix_force_for_print(elems[i]), &b, &l, "concatStringsSep");
+        forced[i] = asnix_coerce_to_string_for_concat_sep(asnix_force_for_print(elems[i]));
+        as_string(forced[i], &b, &l, "concatStringsSep");
+        asnix_ctx_union_into(&ctx, asnix_string_context_of(forced[i]));
         total += l;
         if (i + 1 < count) total += sep_len;
     }
@@ -221,7 +252,7 @@ static Value concatStringsSep2_impl(const Value *args, int64_t argc) {
     for (int64_t i = 0; i < count; i++) {
         const char *b;
         int64_t l;
-        as_string(asnix_force_for_print(elems[i]), &b, &l, "concatStringsSep");
+        as_string(forced[i], &b, &l, "concatStringsSep");
         memcpy(cur, b, (size_t)l);
         cur += l;
         if (i + 1 < count) {
@@ -229,7 +260,10 @@ static Value concatStringsSep2_impl(const Value *args, int64_t argc) {
             cur += sep_len;
         }
     }
-    return asnix_make_string_value(out, (size_t)total);
+    free(forced);
+    Value result = asnix_make_string_value(out, (size_t)total);
+    asnix_string_attach_context(result, &ctx);
+    return result;
 }
 
 static Value build_concatStringsSep(void) {

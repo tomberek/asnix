@@ -16,6 +16,7 @@
 #include "asnix/heap.h"
 #include "asnix/ir.h"
 #include "builtins_shared.h"
+#include "nar.h" /* asnix_copy_path_to_store -- see json_encode's Path case below */
 #include "symtab.h"
 #include "value_util.h"
 
@@ -330,13 +331,34 @@ static Value build_stringToCharacters(void) { return asnix_bshared_make_primop((
  * `builtins.toJSON (a: a)` errors on real Nix ("cannot convert a function
  * to JSON") -- functions/primops are rejected here too.
  *
- * A Path argument is emitted as its own plain (absolute) text, not
- * copied into the Nix store the way real Nix's `toJSON` does (verified:
- * `builtins.toJSON ./.` there produces a `"/nix/store/..."` string) --
- * this project has no `AddToStore` wired up at all (see
- * docs/architecture.md's M8/M15 scope notes on string context), so this
- * is the same already-accepted, already-documented divergence `toString`
- * and `"${path}"` interpolation both already have, not a new one.
+ * A Path argument IS copied into the content-addressed store before
+ * being emitted, matching real Nix's `toJSON` (verified: `builtins.toJSON
+ * ./.` there produces a `"/nix/store/..."` string, not the literal
+ * filesystem path) -- this was a known, documented gap when M8/M15 first
+ * wrote this encoder (no `AddToStore` existed anywhere in the project
+ * yet), but M75 later wired up exactly that (`asnix_copy_path_to_store`,
+ * nar.c) for `coerce_to_string_for_interp`'s identical Path case and for
+ * `asnix_coerce_to_string_for_derivation`; this encoder was missed at the
+ * time. Found chasing `bash-interactive`'s `__structuredAttrs`-mode
+ * derivation: its own `nativeBuildInputs`/`patches` lists each embed a
+ * raw Path literal (`../../build-support/setup-hooks/
+ * separate-debug-info.sh`, `./pgrp-pipe-5.patch`) straight into the
+ * `__json` env var via this encoder, bypassing the string-coercion call
+ * sites that already had the M75 fix -- `asnix_collect_input_refs`
+ * (derivation.c) independently walks the same raw attribute Values (not
+ * this JSON text) and already added the correctly-copied store paths to
+ * `inputSrcs`, so only the literal text *inside* `__json` was stale,
+ * silently rotating `bash.outPath`/`bash.drvPath`'s hash. Mirrors
+ * `coerce_to_string_for_interp`'s own already-in-`/nix/store/` verbatim
+ * special case for consistency with the rest of the codebase, though a
+ * quick manual check against real `nix-instantiate --eval` suggests real
+ * Nix's `toJSON` may actually re-copy (double-wrap) even an
+ * already-in-store Path literal rather than using it verbatim -- not
+ * fixed here since no nixpkgs recipe this project evaluates exercises
+ * that edge case (every Path literal reaching this encoder names a
+ * plain source-tree file, never an already-in-store path), and matching
+ * the established convention elsewhere is the safer, non-speculative
+ * choice.
  * --------------------------------------------------------------------- */
 typedef struct {
     char *buf;
@@ -531,8 +553,27 @@ static void json_encode(Value v, JsonBuf *out) {
                 jb_puts(out, buf, n);
                 break;
             }
+            if (asnix_value_is_path(v)) {
+                /* See this function's own header comment (toJSON's Path
+                 * handling) -- copy to store (unless already a store
+                 * path) instead of emitting the raw filesystem text. */
+                int64_t plen;
+                const char *pbytes = asnix_ptr_bytes(v, &plen);
+                char *path = malloc((size_t)plen + 1);
+                memcpy(path, pbytes, (size_t)plen);
+                path[plen] = '\0';
+                const char *final_path = path;
+                char store_path[300];
+                if (!(plen > 11 && memcmp(path, "/nix/store/", 11) == 0)) {
+                    asnix_copy_path_to_store(path, store_path, sizeof(store_path));
+                    final_path = store_path;
+                }
+                jb_escape_string(out, final_path, (int64_t)strlen(final_path));
+                free(path);
+                break;
+            }
             int64_t len;
-            const char *bytes = asnix_ptr_bytes(v, &len); /* string or path, see header comment */
+            const char *bytes = asnix_ptr_bytes(v, &len); /* plain string, see header comment */
             if (!utf8_is_valid(bytes, len)) {
                 asnix_bshared_fatal("toJSON", "string is not valid UTF-8");
             }

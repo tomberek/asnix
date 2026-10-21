@@ -68,6 +68,15 @@ Value asnix_coerce_to_string(Value v);
  * string-interpolation coercion alone provide this combination. */
 Value asnix_coerce_to_string_for_derivation(Value v);
 
+/* `builtins.concatStringsSep`'s per-element coercion -- same rules as
+ * genuine `"${...}"` string interpolation (strings, paths -- copied to
+ * the store if not already there --, and attrsets with `__toString`/
+ * `outPath`; ints/bools/null/lists are rejected, unlike
+ * `asnix_coerce_to_string`/`toString`). See value_util.c's own comment
+ * on this function for why concatStringsSep needs this exact subset
+ * rather than either existing coercion function's rules. */
+Value asnix_coerce_to_string_for_concat_sep(Value v);
+
 /* Concatenates `count` values into one freshly arena-allocated String --
  * the runtime half of string interpolation ("foo ${expr} bar"): the
  * compiler pushes each literal chunk (already a string constant) and each

@@ -91,7 +91,8 @@ what's actually implemented and the scope decisions made along the way.
 | M76 — real string context: an invisible dependency-provenance set attached to string Values, surviving concatenation/coercion, so a derivation reference reaching an attribute only through prior string interpolation (not a bare attrset/Path) is now tracked in `inputDrvs`/`inputSrcs` too; also fixed `__ignoreNulls` (found while verifying) | done, **scoped** (see below; `./asnix d.nix`'s `hello.outPath` now has the exact right `inputDrvs`/`inputSrcs`/`__json` *shape*, but still doesn't match bit-for-bit — the remaining gap is the FULL nixpkgs bootstrap chain's own hash parity, a much larger, open-ended undertaking, see below) |
 | M77 — `make test-nixpkgs-hash`: a real-nixpkgs derivation-hash correctness regression test (non-gating, like `test-nix-conformance`), filling a gap the user flagged directly — M58-M76's entire bug-chase had zero automated coverage of its own actual target; found and fixed `builtins.toFile` never attaching self-referential string context (a second, independent M76-class gap) and a `curl.outPath` crash (registered as a known-failing case, not yet root-caused) | done (see below) |
 | M78 — `asnix_apply`/`asnix_eval` (dispatch.S's own main entry point) both had the exact never-free-arena scratch-buffer waste M74's own `asnix_force_for_print` fix had already fixed, just never applied to these two siblings; found chasing a direct "memory usage seems high" question | done (see below; `./asnix d.nix`'s `asnix_arena.total_allocated` 4.69 GB → 151 MB, peak RSS 226 MB → 169 MB, ~1.8x → ~1.35x of real Nix's own usage) |
-| M79+ | not started |
+| M79 — **`./asnix d.nix` and `./asnix e.nix` now match real `nix-instantiate --eval --strict` byte-for-byte** (`hello.outPath`/`hello.drvPath` against real nixpkgs) — the standing bug-chase's own ultimate goal since it was set after M72. Three parallel investigations (`concatStringsSep` context-loss + missing per-element coercion, the `+` operator's `copyToStore` flag being wrongly tied to `check_path_exists`, `toJSON`'s Path handling never copying to the store) each independently traced different symptoms (missing `InputDrvs`, a `curl.outPath` crash, a stale `bash-interactive` `__json` blob) back to real, fixable asnix gaps; merging all three together (not any single one alone) closed the entire remaining bootstrap-chain gap at once | done (see below; `make test-nixpkgs-hash`: pass=1/fail=7 → **pass=8/fail=0**) |
+| M80+ | not started |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
 
@@ -8285,3 +8286,70 @@ design) -- not something this milestone attempts to close further.
 failures) -- zero behavioral change, confirming the two new caches are
 correctness-preserving, matching every expectation the safety argument
 above already set.
+
+## M79 scope notes: `d.nix`/`e.nix` reach bit-exact parity with real Nix
+
+The standing bug-chase's own goal, set back when M72 only achieved
+"evaluates without crashing" and the user pushed back ("We don't
+reproduce the same value"), is now met: `./asnix d.nix`
+(`hello.outPath`) and `./asnix e.nix` (`hello.drvPath`) both match real
+`nix-instantiate --eval --strict`'s output on the real nixpkgs checkout
+byte-for-byte, confirmed directly.
+
+Three background investigations, each independently chasing a
+different symptom of the same underlying class of bug (a Nix-level
+value's dependency provenance getting silently dropped somewhere
+between being produced and being read back by `derivation.c`'s M74/M76
+collection machinery), converged on three real, distinct asnix fixes
+that only together closed the whole remaining gap:
+
+1. **`concatStringsSep` dropped string context entirely, and required
+   every element to already be a bare string.** `lib.makeBinPath`/
+   `lib.makeSearchPath` (nixpkgs-level, `concatStringsSep ":" (map (p:
+   "${p}/bin") pkgs)`) is exactly how a bootstrap derivation's `PATH`
+   env var gets built -- without context propagation through this
+   function, every referenced derivation silently vanished from
+   `InputDrvs` (confirmed: asnix's own `bootstrap-coreutils-5.0.drv`
+   had only 2 of the real 7 entries, the missing 5 appearing only
+   inside its `PATH` var's joined string). Separately, `curl`'s build
+   passes a bare derivation attrset (not yet string-coerced) into a
+   `concatStringsSep` call, which the function's own stricter
+   `as_string` helper fataled on. Fixed by coercing each element the
+   same way genuine `"${...}"` interpolation would (new
+   `asnix_coerce_to_string_for_concat_sep`, matching real Nix's
+   `prim_concatStringsSep`'s own `coerceToString` call exactly) AND
+   unioning each coerced element's context into the joined result.
+2. **The `+` operator's `copyToStore` was wrongly tied to
+   `check_path_exists`.** Real Nix's `ExprConcatStrings::eval`
+   (`~/nix/src/libexpr/eval.cc`) ties `copyToStore` to whether the
+   WHOLE `+`-chain's first operand was a string (`firstType ==
+   nString`), completely independent of the existence-check gating --
+   confirmed directly against real Nix's own source. A `+` chain
+   starting with a string (e.g. nixpkgs's own `minimal-bootstrap/mes/
+   libc.nix`: `libc_gnu1_SOURCES + " " + ./ldexpl.c`) DOES copy a later
+   Path operand to the store and attach its context; asnix previously
+   never did this for `+` at all. Split `coerce_to_string_for_interp`'s
+   single flag into two independent ones.
+3. **`builtins.toJSON`'s Path handling never copied to the store.** A
+   known, documented gap since M8/M15 (before this project had any
+   `AddToStore` infrastructure at all) that M75 fixed for every OTHER
+   coercion call site but missed this one. `bash-interactive`'s own
+   `__structuredAttrs`-mode derivation embeds raw Path literals
+   (`separate-debug-info.sh`, `pgrp-pipe-5.patch`) straight into its
+   `__json` env var via this encoder, silently rotating its hash even
+   though `inputSrcs` (collected separately, from the raw attribute
+   Values) already had the correctly-copied paths.
+
+Each was found and verified independently (in isolated worktrees,
+against real `nix-instantiate --eval --strict`, with `make test`/
+`test-e2e` green throughout) -- the key insight tying them together is
+that NONE of them alone fully explained `hello`'s own remaining
+mismatch, but merging all three onto the same tree did, since the
+bootstrap chain's dependency graph exercises all three gaps
+simultaneously across its ~30+ packages.
+
+`make test-nixpkgs-hash`: `pass=1 fail=7` (baseline before this
+milestone) → **`pass=8 fail=0`** -- every attribute path in the corpus
+(`hello`, `hello.src`, `bash`, `curl`, `.outPath`/`.drvPath` each) now
+matches real Nix exactly. `make test`/`test-e2e`/`test-conformance`/
+`test-nix-conformance` all green, zero regressions.
