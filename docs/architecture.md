@@ -87,7 +87,8 @@ what's actually implemented and the scope decisions made along the way.
 | M72 — bumped `derivation`'s fixed attribute-count cap from 64 to 256; **`./asnix d.nix` now evaluates to completion with no crash** (the standing bug-chase's own goal) | done (see below) |
 | M73 — fixed-output derivations now compute their real output/`.drv` paths via real Nix's actual `makeFixedOutputPath` formula (prerequisite for M74's `hashDerivationModulo` work) | done (see below) |
 | M74 — real `hashDerivationModulo`: input derivations' own hashes are now substituted into a dependent derivation's `InputDrvs` before hashing, instead of every output/drvPath being computed from each derivation's own attributes in isolation | done, **scoped** (see below; `./asnix d.nix`'s `hello.outPath` still doesn't match real Nix bit-for-bit — a separately tracked, still-open gap, see below) |
-| M75+ | not started |
+| M75 — real store-copying (NAR-hash + content-addressed path) for local (non-`/nix/store`) Path literals coerced via genuine string interpolation or inside a `derivation {...}` attribute | done, **scoped** (see below; `./asnix d.nix`'s `hello.outPath` STILL doesn't match real Nix — the remaining gap is real Nix's *string context*, a materially larger feature, see below) |
+| M76+ | not started |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
 
@@ -7862,3 +7863,135 @@ methodology this milestone itself used.
 verified byte-for-byte against real `nix-instantiate --eval --strict`
 before being written). `make test-nix-conformance`:
 `pass=627 fail=31 skip=148` -- +1 net over M73, zero regressions.
+
+## M75 scope notes: real store-copying (NAR-hash) for local Path literals
+
+Chasing `d.nix` past M74: `hello.outPath` still didn't match real
+Nix's. Root cause, confirmed by diffing real Nix's actual
+`hello-2.12.3.drv` byte-for-byte against this project's own computed
+ATerm: real Nix's `inputSrcs`/`args` embed `/nix/store/...-source-
+stdenv.sh` and `/nix/store/...-default-builder.sh` -- `pkgs/stdenv/
+generic`'s own local `.sh` files, referenced as plain Path literals
+and copied into the content-addressed store when coerced to a string.
+`asnix` had never implemented this at all: `value_util.c`'s
+`coerce_to_string_for_interp` had an explicit, long-standing, *known*
+comment admitting as much ("real Nix additionally copies the path to
+the store... not implemented... produces the plain path text instead"),
+and `derivation.c`'s own M74 input-reference collector only ever
+tracked a bare Path already under `/nix/store/`, never one that still
+needed copying there first.
+
+**Fix**: a new `src/c/nar.c`/`nar.h`, `asnix_copy_path_to_store`,
+implementing real Nix's own `addToStore` (method=NixArchive/
+"recursive", hashAlgo=sha256) exactly: NAR-serialize the path (file,
+directory, or symlink -- format verified byte-for-byte against
+`~/nix/src/libutil/archive.cc`/`serialise.cc`: each string field is an
+8-byte little-endian length, the raw bytes, then zero-padded to the
+next 8-byte boundary; directory entries sorted ascending by name),
+SHA-256 the result, then feed that digest through the EXACT SAME
+`makeStorePath("source", digest, name)` formula M73's
+`compute_fixed_output_path` already implements for its own
+sha256+recursive branch -- no new path-computation logic needed, only
+the NAR-serialization step was missing. Like `derivation`/`toFile`,
+does not perform the real filesystem side effect (no actual
+`/nix/store` writes) -- only the resulting path *string* is computed,
+same stance this project has taken since M8. Memoized by literal
+input path (linear-scan array, M65's import-cache convention) so the
+SAME local path being both collected (M74's `asnix_collect_input_refs`)
+and coerced (the actual env-var/string value) doesn't get NAR-hashed
+twice.
+
+Wiring turned out to need THREE call sites, not one, because real
+Nix's `coerceToString` has independent `coerceMore`/`copyToStore`
+flags and this project previously only had the two combinations that
+happen to share neither:
+- `coerce_to_string_for_interp` (genuine `"${...}"` string
+  interpolation, `copyToStore=true`, `coerceMore=false`): now actually
+  performs the copy where it previously only had the existence check
+  (M67f) in front of a documented no-op.
+- A brand new `asnix_coerce_to_string_for_derivation`
+  (`value_util.c`/`.h`): `derivation {...}`'s own attribute coercion
+  needs `coerceMore=true` (plain ints/bools/null become "7"/"1"/""
+  like `toString`, verified: ordinary nixpkgs derivation attributes
+  are frequently non-strings) **and** `copyToStore=true` together --
+  a combination neither `asnix_coerce_to_string` (has the former, not
+  the latter) nor `coerce_to_string_for_interp` (has the latter, not
+  the former) provides alone. Recurses into itself (not
+  `asnix_coerce_to_string`) for nested ATTRS (`__toString`/`outPath`)
+  and LIST cases, so a Path nested inside either also gets copied --
+  matches real `hello.drv`'s own `args` list, which contains exactly
+  two such local-file references. `derivation.c`'s three existing
+  coercion call sites (`args`, `outputs`, the generic per-attribute
+  path) switched to it.
+- `asnix_collect_input_refs`'s bare-Path case (M74, `derivation.c`):
+  previously only recorded an `inputSrcs` entry for a path ALREADY
+  under `/nix/store/`; now computes (via the same memoized
+  `asnix_copy_path_to_store`) and records the COPIED path for anything
+  else, so the `.drv`'s `inputSrcs` section agrees with what the
+  coercion above actually embedded as the literal env-var/arg text --
+  required, since a `.drv`'s `inputSrcs` and its own attribute values
+  have to name the same store path.
+
+**Regression found and fixed in the same pass**: `tests/e2e/
+m67_path_interp_exists.nix` (`"${/.}"`, M67f) exercised this new copy
+path for the first time and tried to NAR-serialize the entire
+filesystem root -- which even REAL Nix fails on, on this machine
+(`error: opening '/boot/System.map-...': Permission denied`,
+confirmed directly). That fixture's choice of `/.`  was always a
+placeholder (its own M67 scope notes already flagged "note its own
+exact output isn't byte-identical to what real Nix would do," since
+the copy wasn't implemented yet at the time) -- not a real scenario
+worth preserving now that copying actually happens. Changed it to
+self-reference the fixture file itself (always exists, small,
+deterministic), and corrected its `.expected` to the real computed
+store path (removing the long-standing caveat).
+
+Verified against real `nix-instantiate --eval --strict`: a plain file
+interpolated into a string, a whole directory (recursive NAR,
+multiple files/subdirectories) interpolated into a string, and a
+local file referenced from inside a `derivation {...}`'s `args` --
+all three match exactly (`tests/e2e/m75_path_copy_*`).
+
+**Still open**: `./asnix d.nix`'s `hello.outPath` STILL doesn't match
+real Nix after this fix (it changed -- confirming this fix did take
+effect -- but didn't converge). Diffing asnix's own computed ATerm for
+`hello-2.12.3` against real Nix's actual `.drv` found the next gap is
+qualitatively different and larger than either M74 or M75: real Nix's
+`hello.drv` has FOUR `inputDrvs` (`bash`, `stdenv-linux`,
+`version-check-hook`, the `fetchurl` source), but asnix's only has
+THREE -- missing `bash` entirely, even though `bash`'s own store path
+*is* correctly present as the literal `builder` string. Root cause:
+nixpkgs sets `builder = stdenvShell;` where `stdenvShell` ultimately
+traces back to `shell = "${stage0.bash}/bin/bash";` (`pkgs/stdenv/
+linux/default.nix`) -- a STRING INTERPOLATION of a derivation
+reference, concatenated with a literal suffix, evaluated to a plain
+string long before `derivation {...}`'s primop ever sees it. By the
+time `asnix_collect_input_refs`'s structural walk (M74: looks for a
+bare derivation attrset, a list of derivations, or an already-resolved
+store Path) sees the `builder` attribute's value, it's just an opaque
+string with no trace of "this came from derivation bash's output" --
+exactly the information real Nix's actual *string context* (an
+invisible, attached-to-the-string-Value dependency set, threaded
+through `coerceToString`/concatenation/substring/etc.) exists to
+preserve. This is the same broader feature M61 (and implicitly M45/
+M54/M60) already explicitly declined as disproportionate to its own
+user-facing payoff (`getContext`/`hasContext`/
+`addDrvOutputDependencies`) -- M74's plan deliberately scoped around
+it with a narrower, call-scoped structural collector specifically
+because the full feature is large. That narrower collector is
+necessarily blind to the (idiomatically very common in real nixpkgs)
+case of a dependency reference flowing through a string
+interpolation rather than staying a bare attrset/Path -- which is
+exactly what `hello`'s own `builder` attribute does. Separately
+(smaller, independent): asnix's `__json` blob also has two EXTRA keys
+real Nix's doesn't (`__ignoreNulls`, `userHook`) -- real Nix's
+structured-attrs serialization drops any attribute whose value is
+`null` when `__ignoreNulls = true` is set (including `__ignoreNulls`
+itself), not yet implemented here. Both are tracked as a follow-up,
+not blocking this milestone's own (verified, scoped) completion.
+
+`make test`/`test-e2e` green (3 new `m75_path_copy_*` fixtures --
+file, directory, and derivation-attribute cases -- plus the
+`m67_path_interp_exists` fixture/expected correction above).
+`make test-nix-conformance`: `pass=628 fail=30 skip=148` -- +1 net
+over M74, zero regressions.

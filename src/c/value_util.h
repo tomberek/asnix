@@ -57,6 +57,17 @@ const char *asnix_ptr_bytes(Value v, int64_t *out_len);
  * real Nix. */
 Value asnix_coerce_to_string(Value v);
 
+/* M75: `derivation {...}`'s own attribute coercion -- same
+ * permissiveness as `asnix_coerce_to_string` (int/bool/null/list/attrs
+ * with `__toString`/`outPath` all accepted) but, unlike it, a Path NOT
+ * already under `/nix/store/` is NAR-hashed and copied into the store
+ * (matching real Nix's `coerceToString(..., copyToStore=true)`,
+ * `~/nix/src/libexpr/primops.cc`'s `derivationStrictInternal`) instead
+ * of being left as plain literal text. See value_util.c's own comment
+ * for why neither `asnix_coerce_to_string` nor the (separate, stricter)
+ * string-interpolation coercion alone provide this combination. */
+Value asnix_coerce_to_string_for_derivation(Value v);
+
 /* Concatenates `count` values into one freshly arena-allocated String --
  * the runtime half of string interpolation ("foo ${expr} bar"): the
  * compiler pushes each literal chunk (already a string constant) and each

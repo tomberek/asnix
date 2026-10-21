@@ -15,6 +15,7 @@
 #include "builtins_shared.h" /* asnix_bshared_make_primop, asnix_bshared_make_attrs */
 #include "eval_file.h"       /* asnix_eval_file -- M58's derivation.nix wrapper */
 #include "hash_shim.h"
+#include "nar.h" /* asnix_copy_path_to_store -- M75 */
 #include "store_path.h"
 #include "symtab.h"
 #include "value_util.h"
@@ -498,11 +499,25 @@ static void asnix_collect_input_refs(Value v, InputRefSet *out) {
     if (tag == ASNIX_TAG_PTR && asnix_value_is_path(v)) {
         int64_t len;
         const char *bytes = asnix_ptr_bytes(v, &len);
+        char *path = dup_cstr(bytes, (size_t)len);
         if (len > 11 && memcmp(bytes, "/nix/store/", 11) == 0) {
-            char *path = dup_cstr(bytes, (size_t)len);
             input_ref_add_src(out, path);
-            free(path);
+        } else {
+            /* M75: a Path NOT already under `/nix/store/` still becomes
+             * an `inputSrcs` entry -- just the COPIED store path, not
+             * the literal filesystem path -- matching
+             * asnix_coerce_to_string_for_derivation's own handling of
+             * the SAME attribute value (value_util.c), which this
+             * collector must agree with exactly: the `.drv`'s `env`
+             * entry and its `inputSrcs` entry have to name the same
+             * path. asnix_copy_path_to_store's own cache (nar.c) means
+             * computing it here and again during coercion doesn't
+             * re-walk/re-hash the file twice. */
+            char store_path[300];
+            asnix_copy_path_to_store(path, store_path, sizeof(store_path));
+            input_ref_add_src(out, store_path);
         }
+        free(path);
     }
 }
 
@@ -622,7 +637,7 @@ Value asnix_prim_derivation(const Value *args, int64_t argc) {
                     exit(1);
                 }
                 Value ev = asnix_force_for_print(elems[j]);
-                Value sv = asnix_coerce_to_string(ev);
+                Value sv = asnix_coerce_to_string_for_derivation(ev);
                 arg_strs[nargs++] = asnix_string_value_to_cstr(sv);
             }
             continue;
@@ -649,7 +664,7 @@ Value asnix_prim_derivation(const Value *args, int64_t argc) {
             noutputs = 0;
             for (int64_t j = 0; j < lcount; j++) {
                 Value ev = asnix_force_for_print(elems[j]);
-                Value osv = asnix_coerce_to_string(ev);
+                Value osv = asnix_coerce_to_string_for_derivation(ev);
                 const char *oname = asnix_string_value_to_cstr(osv);
                 if (strcmp(oname, "drvPath") == 0) {
                     fprintf(stderr, "asnix: derivation: invalid derivation output name 'drvPath'\n");
@@ -712,7 +727,7 @@ Value asnix_prim_derivation(const Value *args, int64_t argc) {
                          (keylen == 14 && memcmp(key, "outputHashAlgo", 14) == 0) ||
                          (keylen == 14 && memcmp(key, "outputHashMode", 14) == 0);
         if (!structured_attrs || is_special) {
-            Value sv = asnix_coerce_to_string(val);
+            Value sv = asnix_coerce_to_string_for_derivation(val);
             char *valcstr = asnix_string_value_to_cstr(sv);
 
             if (keylen == 4 && memcmp(key, "name", 4) == 0) name = valcstr;

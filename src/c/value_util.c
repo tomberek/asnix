@@ -13,6 +13,7 @@
 #include "asnix/heap.h"
 #include "asnix/ir.h" /* asnix_force_for_print, asnix_apply */
 #include "builtins_shared.h"
+#include "nar.h"
 #include "symtab.h"
 
 Value asnix_make_string_value(const char *s, size_t len) {
@@ -205,6 +206,81 @@ Value asnix_coerce_to_string(Value v) {
     exit(1);
 }
 
+/* M75: `derivation {...}`'s own attribute coercion (derivation.c) --
+ * real Nix's `derivationStrictInternal` (`~/nix/src/libexpr/
+ * primops.cc`) calls `coerceToString` with `coerceMore=true` (accept
+ * int/bool/null, same permissiveness as `builtins.toString`) AND
+ * `copyToStore=true` (a Path NOT already under `/nix/store/` gets
+ * NAR-hashed and copied, same as genuine `"${...}"` string
+ * interpolation, M75's `coerce_to_string_for_interp` above) -- a
+ * combination NEITHER existing coercion function provides on its own
+ * (`asnix_coerce_to_string` has the former but not the latter;
+ * `coerce_to_string_for_interp` has the latter but rejects int/bool/
+ * null outright). Confirmed needed directly: nixpkgs's own
+ * `hello.drv` embeds `pkgs/stdenv/generic/source-stdenv.sh`/
+ * `default-builder.sh` (plain local Path literals, in `args`) as
+ * real `/nix/store/...` paths. Recurses into itself (not
+ * `asnix_coerce_to_string`) for the ATTRS `__toString`/`outPath` and
+ * LIST cases, so a Path nested inside either also gets copied. */
+Value asnix_coerce_to_string_for_derivation(Value v) {
+    if (asnix_tag_of(v) == ASNIX_TAG_PTR && asnix_value_is_path(v)) {
+        int64_t len;
+        const char *bytes = asnix_ptr_bytes(v, &len);
+        char *nul_terminated = malloc((size_t)len + 1);
+        memcpy(nul_terminated, bytes, (size_t)len);
+        nul_terminated[len] = '\0';
+        if (len > 11 && memcmp(nul_terminated, "/nix/store/", 11) == 0) {
+            Value out = asnix_make_string_value(nul_terminated, (size_t)len);
+            free(nul_terminated);
+            return out;
+        }
+        struct stat st;
+        if (lstat(nul_terminated, &st) != 0) {
+            fprintf(stderr, "asnix: path '%s' does not exist\n", nul_terminated);
+            free(nul_terminated);
+            exit(1);
+        }
+        char store_path[300];
+        asnix_copy_path_to_store(nul_terminated, store_path, sizeof(store_path));
+        free(nul_terminated);
+        return asnix_make_string_value(store_path, strlen(store_path));
+    }
+    if (asnix_tag_of(v) == ASNIX_TAG_ATTRS) {
+        uint32_t sym_tostring = asnix_intern("__toString", 10);
+        int64_t idx = asnix_bshared_attrs_find(v, sym_tostring);
+        if (idx >= 0) {
+            Value fn = asnix_force_for_print(asnix_bshared_attrs_value(v, idx));
+            Value result = asnix_apply(fn, &v, 1);
+            return asnix_coerce_to_string_for_derivation(asnix_force_for_print(result));
+        }
+        uint32_t sym_outpath = asnix_intern("outPath", 7);
+        idx = asnix_bshared_attrs_find(v, sym_outpath);
+        if (idx >= 0) {
+            return asnix_coerce_to_string_for_derivation(asnix_force_for_print(asnix_bshared_attrs_value(v, idx)));
+        }
+    }
+    if (asnix_tag_of(v) == ASNIX_TAG_LIST) {
+        int64_t count = asnix_bshared_list_count(v);
+        const Value *elems = asnix_bshared_list_elems(v);
+        char *result = NULL;
+        size_t result_len = 0;
+        for (int64_t i = 0; i < count; i++) {
+            Value piece = asnix_coerce_to_string_for_derivation(asnix_force_for_print(elems[i]));
+            int64_t piece_len;
+            const char *piece_bytes = asnix_ptr_bytes(piece, &piece_len);
+            int has_sep = (i + 1 < count);
+            result = realloc(result, result_len + (size_t)piece_len + (has_sep ? 1 : 0));
+            memcpy(result + result_len, piece_bytes, (size_t)piece_len);
+            result_len += (size_t)piece_len;
+            if (has_sep) result[result_len++] = ' ';
+        }
+        Value out = asnix_make_string_value(result ? result : "", result_len);
+        free(result);
+        return out;
+    }
+    return asnix_coerce_to_string(v);
+}
+
 /* String *interpolation* coercion is strictly narrower than `toString`'s
  * (asnix_coerce_to_string, above) -- verified directly against real Nix:
  * `nix-instantiate --eval -E '"${7}"'` and `'"${true}"'` and `'"${null}"'`
@@ -243,12 +319,7 @@ static Value coerce_to_string_for_interp(Value v, int check_path_exists) {
          * `"${./foo}"` segfaulted). Real Nix accepts a path here without
          * `builtins.toString` (unlike ints/bools/null -- see this
          * function's own comment above), so reject isn't right either;
-         * coerce it the same way `asnix_coerce_to_string` does. Real Nix
-         * additionally copies the path to the store and substitutes the
-         * resulting store path here -- not implemented (no daemon
-         * AddToStore yet, see docs/architecture.md's import/path-literals
-         * scope notes) -- so this produces the plain path text instead,
-         * a known, documented behavioral gap, not a crash. */
+         * coerce it the same way `asnix_coerce_to_string` does. */
         if (asnix_value_is_path(v)) {
             /* M67: real Nix additionally requires the path *exist* on
              * disk at this specific call site -- string interpolation of
@@ -257,32 +328,43 @@ static Value coerce_to_string_for_interp(Value v, int check_path_exists) {
              * checks existence: confirmed `toString ./nonexistent`
              * succeeds against real `nix-instantiate --eval`, while
              * `"${./nonexistent}"` fails with `error: path '...' does
-             * not exist`). No actual store-copy is implemented here (see
-             * this function's own comment just above), but the
-             * existence check that gates it is cheap and independently
-             * observable, so add just that much: `eval-fail-nonexist-
-             * path.nix` (`"${./fnord}/xyzzy"`) and `eval-fail-bad-
-             * string-interpolation-2.nix` (`"${./fnord}"`) both expect a
-             * fatal error here, verified against real Nix. `lstat`, not
-             * `stat`, so a dangling symlink still counts as "exists" --
-             * matches `builtins.pathExists`'s own existing convention in
-             * builtins_m23.c. Gated on `check_path_exists` -- see this
-             * function's own header comment for why `+`'s reuse of this
-             * same coercion needs to skip it. */
+             * not exist`). `lstat`, not `stat`, so a dangling symlink
+             * still counts as "exists" -- matches `builtins.pathExists`'s
+             * own existing convention in builtins_m23.c. Gated on
+             * `check_path_exists` -- see this function's own header
+             * comment for why `+`'s reuse of this same coercion needs to
+             * skip it (that case is text reassembly of a NEW path
+             * literal, not a Path VALUE being embedded in a string, so
+             * neither the existence check nor the store-copy below
+             * apply). */
+            int64_t len;
+            const char *bytes = asnix_ptr_bytes(v, &len);
+            char *nul_terminated = malloc((size_t)len + 1);
+            memcpy(nul_terminated, bytes, (size_t)len);
+            nul_terminated[len] = '\0';
             if (check_path_exists) {
-                int64_t len;
-                const char *bytes = asnix_ptr_bytes(v, &len);
-                char *nul_terminated = malloc((size_t)len + 1);
-                memcpy(nul_terminated, bytes, (size_t)len);
-                nul_terminated[len] = '\0';
                 struct stat st;
-                int missing = (lstat(nul_terminated, &st) != 0);
-                if (missing) {
+                if (lstat(nul_terminated, &st) != 0) {
                     fprintf(stderr, "asnix: path '%s' does not exist\n", nul_terminated);
+                    free(nul_terminated);
+                    exit(1);
                 }
-                free(nul_terminated);
-                if (missing) exit(1);
             }
+            /* M75: a path already under `/nix/store/` (e.g. a prior
+             * derivation's own output) is used verbatim -- real Nix
+             * never re-copies something that's already in the store.
+             * Anything else is NAR-hashed and copied (M75's
+             * asnix_copy_path_to_store), gated on `check_path_exists`
+             * for the same reason the existence check above is: this is
+             * real Nix's `copyToStore=true` coercion, which `+`'s reuse
+             * of this function must not trigger. */
+            if (check_path_exists && !(len > 11 && memcmp(nul_terminated, "/nix/store/", 11) == 0)) {
+                char store_path[300];
+                asnix_copy_path_to_store(nul_terminated, store_path, sizeof(store_path));
+                free(nul_terminated);
+                return asnix_make_string_value(store_path, strlen(store_path));
+            }
+            free(nul_terminated);
             return asnix_coerce_to_string(v);
         }
         /* M51: a bare Float is a THIRD such kind -- same memory-corruption
