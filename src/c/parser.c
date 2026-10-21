@@ -719,6 +719,47 @@ static void parse_binding_stmt(Parser *p, BTVec *out, DynBindingVec *dyn_out) {
     free(segs.items);
 }
 
+/* M59: an interpolated path literal's tail -- `t` is the already-consumed
+ * first TOK_PATH chunk (e.g. "./" in "./${foo}", "~/" in "~/${foo}"),
+ * known by the caller to be immediately followed by TOK_DOLLAR_LBRACE.
+ * Collects zero or more TOK_PATH_PART literal chunks interleaved with
+ * TOK_DOLLAR_LBRACE ... TOK_RBRACE interpolated expressions (same shape
+ * parse_dquote_string uses for TOK_STR_PART, reusing AstStringPart
+ * directly) up to the closing TOK_PATH_END, and builds an AST_PATH node
+ * whose `text`/`len`/`is_home` are the first chunk and whose
+ * `interp_parts`/`interp_count` hold everything after it -- see
+ * compiler.c's AST_PATH case (resolve_path_chunk) for how the first
+ * chunk alone becomes a Path constant and the rest becomes a runtime
+ * OP_PATH_CONCAT chain. */
+static Ast *parse_path_literal_interp(Parser *p, Token *t) {
+    Ast *n = asnix_ast_new(AST_PATH);
+    n->as.path.text = t->start;
+    n->as.path.len = t->len;
+    n->as.path.is_search = 0;
+    n->as.path.is_home = t->is_home;
+
+    PartVec parts = { 0 };
+    while (cur(p)->kind != TOK_PATH_END) {
+        if (cur(p)->kind == TOK_PATH_PART) {
+            Token *pt = cur(p);
+            partvec_push(&parts, (AstStringPart){ .is_expr = 0, .text = pt->start, .text_len = pt->len });
+            advance(p);
+        } else if (cur(p)->kind == TOK_DOLLAR_LBRACE) {
+            advance(p);
+            Ast *e = parse_expr(p);
+            expect(p, TOK_RBRACE, "'}' closing a path interpolation");
+            partvec_push(&parts, (AstStringPart){ .is_expr = 1, .expr = e });
+        } else {
+            fprintf(stderr, "asnix: parse error: malformed path literal\n");
+            exit(1);
+        }
+    }
+    advance(p); /* TOK_PATH_END */
+    n->as.path.interp_parts = parts.items;
+    n->as.path.interp_count = parts.len;
+    return n;
+}
+
 /* "foo ${expr} bar": zero or more TOK_STR_PART literal chunks interleaved
  * with TOK_DOLLAR_LBRACE ... TOK_RBRACE interpolated expressions, parsed
  * at full `expr` precedence (so e.g. `"${a} ${b}"` or `"${if c then x else
@@ -829,10 +870,24 @@ static Ast *parse_atom(Parser *p) {
         }
         case TOK_PATH: {
             advance(p);
+            /* M59: the lexer only ever follows a TOK_PATH with
+             * TOK_DOLLAR_LBRACE when this chunk is the first (possibly
+             * only) part of a path literal that continues into
+             * interpolation (`./${foo}`, `~/${foo}`, ...) -- see
+             * lexer.c's at_dollar_brace checks in asnix_lex's main loop.
+             * A bare "${" can't otherwise appear here at all (it's not
+             * valid Nix syntax outside a string/path literal), so this
+             * peek is unambiguous. */
+            if (cur(p)->kind == TOK_DOLLAR_LBRACE) {
+                return parse_path_literal_interp(p, t);
+            }
             Ast *n = asnix_ast_new(AST_PATH);
             n->as.path.text = t->start;
             n->as.path.len = t->len;
             n->as.path.is_search = 0;
+            n->as.path.is_home = t->is_home;
+            n->as.path.interp_parts = NULL;
+            n->as.path.interp_count = 0;
             return n;
         }
         case TOK_SEARCH_PATH: {
@@ -841,6 +896,9 @@ static Ast *parse_atom(Parser *p) {
             n->as.path.text = t->start;
             n->as.path.len = t->len;
             n->as.path.is_search = 1;
+            n->as.path.is_home = 0;
+            n->as.path.interp_parts = NULL;
+            n->as.path.interp_count = 0;
             return n;
         }
         case TOK_LPAREN: {

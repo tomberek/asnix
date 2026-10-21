@@ -34,24 +34,86 @@ static int path_char(char c) {
     return isalnum((unsigned char)c) || c == '.' || c == '_' || c == '-' || c == '+';
 }
 
-/* Returns the length of a path literal starting at src[i], or 0 if this
- * position isn't one (in which case the caller falls through to ordinary
- * digit/ident/single-char scanning). */
-static size_t try_scan_path(const char *src, size_t i) {
-    size_t j = i;
-    while (path_char(src[j])) j++;
-    if (src[j] != '/') return 0; /* no `/segment` group at all -- not a path */
-    int saw_group = 0;
-    while (src[j] == '/') {
+/* True iff src[j..] is exactly "${" -- the interpolation-hole marker
+ * (M59). Shared by scan_path_groups below and the main dispatch loop's
+ * path-literal cases (plain, absolute, and `~`/home). */
+static int at_dollar_brace(const char *src, size_t j) {
+    return src[j] == '$' && src[j + 1] == '{';
+}
+
+/* Scans zero or more "/PATH_CHAR+" groups starting at *j (which must
+ * already be positioned past any PATH_CHAR* prefix -- i.e. the very next
+ * decision is "is src[j] a '/'?"), mirroring real Nix's own PATH/HPATH
+ * lexer.l grammar's group-loop, generalized with ONE addition: a '/'
+ * immediately followed by "${" ends the scan right there (consuming that
+ * slash, even though zero path_chars followed it) instead of just
+ * stopping -- matching real Nix's PATH_SEG/HPATH_START-before-
+ * interpolation special lexer rule (needed for `./${foo}`/`~/${foo}`,
+ * M59, see docs/architecture.md). Deliberately does NOT special-case a
+ * trailing bare '/' with nothing useful after it (no "${", no further
+ * path chars) -- that's left for the caller to optionally consume as the
+ * grammar's own separate trailing `/?`, gated on `*saw_group` already
+ * being true, so a `//` (update operator) immediately after an
+ * as-yet-ungrouped position is never miscounted as a path (critical: if
+ * this function consumed an ungrouped trailing '/' unconditionally, "a
+ * // b" would mis-lex its first '/' as a 1-char path and its second '/'
+ * as another, silently breaking TOK_SLASHSLASH detection). Returns the
+ * new position. */
+static size_t scan_path_groups(const char *src, size_t j, int *saw_group) {
+    for (;;) {
+        if (src[j] != '/') break;
         size_t seg_start = j + 1;
         size_t k = seg_start;
         while (path_char(src[k])) k++;
-        if (k == seg_start) break; /* '/' not followed by any path chars -- stop before consuming it */
+        if (k == seg_start) {
+            if (at_dollar_brace(src, k)) {
+                j = k;
+                *saw_group = 1;
+            }
+            break;
+        }
         j = k;
-        saw_group = 1;
+        *saw_group = 1;
     }
+    return j;
+}
+
+/* Returns the length of a path literal starting at src[i], or 0 if this
+ * position isn't one (in which case the caller falls through to ordinary
+ * digit/ident/single-char scanning). M59: also succeeds on a prefix that
+ * ends right before "${" (e.g. "./" in "./${foo}", or "/" in "/${foo}"),
+ * even though that prefix alone wouldn't otherwise satisfy the "at least
+ * one full /PATH_CHAR+ group" rule -- see scan_path_groups. The caller
+ * (asnix_lex's main loop) is responsible for noticing that case (checking
+ * at_dollar_brace right after this returns) and switching into MODE_PATH
+ * instead of emitting one complete, standalone TOK_PATH. */
+static size_t try_scan_path(const char *src, size_t i) {
+    size_t j = i;
+    while (path_char(src[j])) j++;
+    int saw_group = 0;
+    j = scan_path_groups(src, j, &saw_group);
     if (!saw_group) return 0;
-    if (src[j] == '/') j++; /* optional trailing slash -- rejected later, in the compiler */
+    if (src[j] == '/') j++; /* optional trailing slash -- rejected later, in the compiler,
+                              * unless interpolation continues right after it */
+    return j - i;
+}
+
+/* `~`-prefixed ("home") path literal (M59): unlike a plain path, there's
+ * no PATH_CHAR* prefix allowed before the first '/' at all -- real Nix's
+ * HPATH grammar is exactly `~(/PATH_CHAR+)+/?`, so this only looks for a
+ * literal "~/" at src[i] and then reuses scan_path_groups starting right
+ * at that '/'. Returns the full token length (including the leading
+ * '~'), or 0 if src[i] isn't the start of a valid HPATH (e.g. a bare "~"
+ * not followed by '/', or "~/" followed by neither a path char nor
+ * "${" -- in which case the caller leaves `i` untouched and falls
+ * through to ordinary single-char scanning, same as every other
+ * not-actually-a-token probe in this lexer). */
+static size_t try_scan_home_path(const char *src, size_t i) {
+    if (src[i] != '~' || src[i + 1] != '/') return 0;
+    int saw_group = 0;
+    size_t j = scan_path_groups(src, i + 1, &saw_group);
+    if (!saw_group) return 0;
+    if (src[j] == '/') j++; /* optional trailing slash, same rule as try_scan_path */
     return j - i;
 }
 
@@ -104,7 +166,7 @@ static const Keyword KEYWORDS[] = {
  * STRING/ISTRING underneath does the "}" that closed an interpolation
  * actually mean "resume string-content lexing" -- the asm/dispatch loop
  * terminology doesn't apply here, this is purely a lexer-internal stack. */
-typedef enum { MODE_NORMAL, MODE_STRING, MODE_ISTRING } LexMode;
+typedef enum { MODE_NORMAL, MODE_STRING, MODE_ISTRING, MODE_PATH } LexMode;
 
 typedef struct {
     LexMode *modes;
@@ -328,6 +390,49 @@ static void lex_indented_run(const char *src, size_t *i, ModeStack *modes, TokVe
     }
 }
 
+/* M59: scans one run of path-literal content starting at *i (positioned
+ * just after a closed "${ ... }" interpolation inside a path literal
+ * whose FIRST chunk already established it continues past one -- see the
+ * MODE_PATH push sites in asnix_lex's main loop above), up to the next
+ * boundary: either another "${" or the first character that isn't a
+ * path continuation at all (ending the whole literal). Pushes exactly
+ * one TOK_PATH_PART (the literal chunk just scanned, possibly
+ * zero-length -- e.g. between two adjacent interpolations, same
+ * allowance lex_dquote_run makes for TOK_STR_PART) followed by the
+ * boundary token (TOK_DOLLAR_LBRACE or TOK_PATH_END). Unlike
+ * lex_dquote_run/lex_indented_run, there is no escape processing at all
+ * in path-literal syntax (no backslash is ever a path_char), so the
+ * chunk can point straight into the original source buffer instead of
+ * a decoded copy -- no ByteBuf needed. A chunk may start with plain
+ * path_chars, a '/'-group run, or both, exactly like a fresh path
+ * literal's own scan (reuses scan_path_groups the same way
+ * try_scan_path does), EXCEPT it's never required to contain any
+ * group at all (a bare trailing `-b`-style run with no slash, like
+ * `./a-${foo}-b`'s "-b", is perfectly valid here -- only the very
+ * FIRST chunk of a path literal needs that requirement, to tell a path
+ * apart from "not a path at all"). */
+static void lex_path_run(const char *src, size_t *i, ModeStack *modes, TokVec *v) {
+    size_t start = *i;
+    size_t j = *i;
+    while (path_char(src[j])) j++;
+    int saw_group = 0;
+    j = scan_path_groups(src, j, &saw_group);
+    if (saw_group && src[j] == '/') j++; /* optional trailing slash, same rule as try_scan_path */
+    *i = j;
+
+    if (at_dollar_brace(src, *i)) {
+        push_tok(v, (Token){ .kind = TOK_PATH_PART, .start = src + start, .len = *i - start });
+        *i += 2;
+        mode_push(modes, MODE_NORMAL); /* MODE_PATH underneath is left in place -- the matching
+                                         * '}' pops back to it, re-entering this same function */
+        push_tok(v, (Token){ .kind = TOK_DOLLAR_LBRACE });
+        return;
+    }
+    push_tok(v, (Token){ .kind = TOK_PATH_PART, .start = src + start, .len = *i - start });
+    mode_pop(modes);
+    push_tok(v, (Token){ .kind = TOK_PATH_END });
+}
+
 /* Shared tail-scan + strtod for a float literal already known to match
  * (either a digit run followed by '.', or a bare '.' followed by a
  * digit) -- see asnix_lex's two call sites above. `*i` arrives already
@@ -384,6 +489,10 @@ Token *asnix_lex(const char *src, size_t *out_count) {
             lex_indented_run(src, &i, &modes, &v);
             continue;
         }
+        if (mode == MODE_PATH) {
+            lex_path_run(src, &i, &modes, &v);
+            continue;
+        }
 
         /* mode == MODE_NORMAL: ordinary expression/identifier/operator lexing. */
         char c = src[i];
@@ -426,12 +535,42 @@ Token *asnix_lex(const char *src, size_t *out_count) {
         }
 
         /* Tried before digit/string/ident/single-char below -- see
-         * try_scan_path's comment for why this has to come first. */
+         * try_scan_path's comment for why this has to come first. M59:
+         * `~`-prefixed home paths are tried alongside (src[i]=='~' is
+         * never itself a path_char, so try_scan_path can never fire at
+         * this position on its own -- a separate probe is required). Both
+         * branches below handle the "immediately followed by ${" case
+         * identically: emit just this chunk as TOK_PATH (is_home set
+         * accordingly), then push MODE_PATH (so the matching '}' that
+         * closes the interpolation's expression returns here, not to
+         * plain MODE_NORMAL) underneath a fresh MODE_NORMAL for the
+         * expression itself, and emit TOK_DOLLAR_LBRACE -- exactly the
+         * same push-two-modes-and-emit-the-boundary-token shape
+         * lex_dquote_run/lex_indented_run already use for "${" inside a
+         * string. */
         {
+            size_t hlen = try_scan_home_path(src, i);
+            if (hlen > 0) {
+                push_tok(&v, (Token){ .kind = TOK_PATH, .start = src + i, .len = hlen, .pos = src + tok_start, .is_home = 1 });
+                i += hlen;
+                if (at_dollar_brace(src, i)) {
+                    i += 2;
+                    mode_push(&modes, MODE_PATH);
+                    mode_push(&modes, MODE_NORMAL);
+                    push_tok(&v, (Token){ .kind = TOK_DOLLAR_LBRACE });
+                }
+                continue;
+            }
             size_t plen = try_scan_path(src, i);
             if (plen > 0) {
                 push_tok(&v, (Token){ .kind = TOK_PATH, .start = src + i, .len = plen, .pos = src + tok_start });
                 i += plen;
+                if (at_dollar_brace(src, i)) {
+                    i += 2;
+                    mode_push(&modes, MODE_PATH);
+                    mode_push(&modes, MODE_NORMAL);
+                    push_tok(&v, (Token){ .kind = TOK_DOLLAR_LBRACE });
+                }
                 continue;
             }
         }

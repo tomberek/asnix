@@ -74,6 +74,18 @@ Value asnix_coerce_to_string(Value v);
  * an explicit `builtins.toString` in the source, same as real Nix. */
 Value asnix_concat_strings(const Value *parts, int64_t count);
 
+/* M59: the runtime half of `~`/path-literal interpolation (`./${foo}`,
+ * `~/${foo}`, `/${foo}`, ...) -- see OP_PATH_CONCAT in ir.h. Identical to
+ * asnix_concat_strings except the result is re-canonicalized and
+ * rewrapped as a Path afterward (matching real Nix's
+ * `ExprConcatStrings::eval`, which always does this once the first
+ * operand is a Path, regardless of whether that first operand's OWN
+ * text was deliberately left un-canonicalized -- see compiler.c's
+ * resolve_path_chunk). Only ever called with `parts[0]` already a Path
+ * constant (compiler.c's AST_PATH case is the only caller, via
+ * ib_path_concat/OP_PATH_CONCAT). */
+Value asnix_concat_path(const Value *parts, int64_t count);
+
 /* The `+` operator's full dispatch, not just integer arithmetic -- real
  * Nix's `+` does int addition for two ints, but string/path concatenation
  * (same coercion rules `asnix_concat_strings` already implements for

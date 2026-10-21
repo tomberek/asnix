@@ -287,6 +287,25 @@ enum {
                      * and OP_FRAME_EXIT that normally follow it don't need to know which
                      * path ran. See asnix_bshared_rec_overrides_merge,
                      * builtins_shared.c. */
+    OP_PATH_CONCAT, /* M59: `~`/path-literal interpolation (`./${foo}`, `~/${foo}`, ...):
+                     * a = count; pops `count` values (same reverse-push-order convention
+                     * as OP_STR_CONCAT), coerces each to a string and concatenates them in
+                     * order -- IDENTICAL to OP_STR_CONCAT except for what happens to the
+                     * result: real Nix's `ExprConcatStrings::eval` always re-canonicalizes
+                     * the whole concatenated string (collapsing `.`/`..`/doubled slashes)
+                     * and wraps it back up as a Path, whenever the FIRST operand was
+                     * itself a Path (~/nix's eval.cc: "v.mkPath(state.rootPath(CanonPath
+                     * (resultStr)), ...)"); it does NOT matter that the first operand's
+                     * OWN text was deliberately left un-canonicalized at compile time (see
+                     * compiler.c's resolve_path_chunk) -- that's a SEPARATE, narrower skip
+                     * (real Nix's own comment: "skip canonization of first path, which
+                     * would only be not canonized in the first place if it's coming from a
+                     * ./${foo} type path"), only relevant to the no-interpolation-at-all
+                     * literal case OP_PATH_CONCAT is never used for. compiler.c's AST_PATH
+                     * case only ever emits this op when the first part is guaranteed to
+                     * already be a Path constant (see resolve_path_chunk), so
+                     * asnix_concat_path (value_util.c) can unconditionally canon+wrap the
+                     * final result with no runtime type check. */
     OP_COUNT
 };
 

@@ -113,6 +113,12 @@ size_t ib_assert_fail(IrBuilder *b, const char *msg, size_t len);
  * String -- see OP_STR_CONCAT in ir.h. */
 size_t ib_str_concat(IrBuilder *b, int64_t count);
 
+/* M59: same as ib_str_concat, but the result is re-canonicalized and
+ * wrapped as a Path -- see OP_PATH_CONCAT in ir.h. Only ever emitted when
+ * the first of the `count` pushed values is already a Path constant
+ * (compiler.c's AST_PATH case). */
+size_t ib_path_concat(IrBuilder *b, int64_t count);
+
 /* `with`: pops the with-expr thunk (pushed by a preceding ib_mk_thunk, same
  * convention as ib_let) into a new with-tagged 1-slot Env frame -- see
  * ASNIX_ENV_WITH_TAG in env.h and op_with.S. */

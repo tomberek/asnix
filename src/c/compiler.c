@@ -245,9 +245,45 @@ Value asnix_resolve_search_path_value(Value name_val) {
     return v;
 }
 
+/* M59: `~`-prefixed ("home") path resolution. Unlike an ordinary path
+ * literal, real Nix's own HPATH parser action concatenates $HOME onto
+ * the literal text *verbatim* -- NO canon_path call at all, no `.`/`..`/
+ * doubled-slash collapsing (confirmed directly against `nix-instantiate
+ * --eval`: numtide/nix-conformance's eval-okay-home-path-not-normalised.nix
+ * is built specifically to probe this -- `~/a/../b` stays literally
+ * "$HOME/a/../b", never collapsed to "$HOME/b"; the comment right at the
+ * top of that fixture even names the reason: "parser.y's HPATH rule does
+ * not call absPath"). `text`/`len` include the leading '~' (e.g.
+ * "~/a/../b", or just "~/" for an interpolated path's first chunk --
+ * lexer.c's try_scan_home_path guarantees `len >= 2` either way, since
+ * HPATH always requires at least "~/"). Applies identically whether or
+ * not interpolation follows afterward (real Nix's path_start: HPATH {...}
+ * grammar action is the same either way; only the TEXT captured by the
+ * token differs, not the formula -- see docs/architecture.md's M59
+ * notes). */
+static char *resolve_home_literal(const char *text, size_t len) {
+    const char *home = getenv("HOME");
+    if (!home || !home[0]) {
+        fprintf(stderr, "asnix: cannot resolve '~' -- $HOME is not set\n");
+        exit(1);
+    }
+    size_t home_len = strlen(home);
+    size_t rest_len = len - 1; /* skip the leading '~' */
+    char *joined = malloc(home_len + rest_len + 1);
+    memcpy(joined, home, home_len);
+    memcpy(joined + home_len, text + 1, rest_len);
+    joined[home_len + rest_len] = '\0';
+    return joined;
+}
+
 /* Resolves one ordinary (non-search, see asnix_resolve_search_path_value
  * above for that case) AST_PATH node's raw lexeme to an absolute,
- * canonicalized path string (malloc'd, NUL-terminated). */
+ * canonicalized path string (malloc'd, NUL-terminated). M59: dispatches
+ * to resolve_home_literal (no canon at all) for `~`-prefixed literals --
+ * the trailing-slash-is-fatal check above that dispatch still applies to
+ * both (real Nix's INPATH_SLASH "path has a trailing slash" error fires
+ * the same way for a home path ending in '/' with nothing continuing it,
+ * per its own lexer.l rule, which doesn't distinguish PATH from HPATH). */
 static char *resolve_path_literal(Ast *node) {
     const char *text = node->as.path.text;
     size_t len = node->as.path.len;
@@ -255,6 +291,10 @@ static char *resolve_path_literal(Ast *node) {
     if (len > 0 && text[len - 1] == '/') {
         fprintf(stderr, "asnix: path has a trailing slash\n");
         exit(1);
+    }
+
+    if (node->as.path.is_home) {
+        return resolve_home_literal(text, len);
     }
 
     char *joined;
@@ -273,6 +313,66 @@ static char *resolve_path_literal(Ast *node) {
     char *canon = canon_path(joined);
     free(joined);
     return canon;
+}
+
+/* M59: resolves the FIRST chunk of an interpolated path literal
+ * (`./${foo}`'s "./", `~/${foo}`'s "~/", `/${foo}`'s "/") directly to an
+ * absolute Path VALUE (not just a string -- this becomes parts[0] of an
+ * OP_PATH_CONCAT chain, and that op's whole correctness rests on
+ * parts[0] already being a genuine Path, see ir.h). Unlike
+ * resolve_path_literal (a complete, standalone literal), a trailing '/'
+ * here is completely ordinary -- it's exactly what lets the following
+ * interpolated/literal parts glue on with the right separator (e.g.
+ * "./${foo}"'s first chunk must resolve to this file's own directory
+ * *with* a trailing slash, so concatenating "foo" after it reads
+ * ".../foo" rather than ".../dirfoo") -- so it must be preserved, not
+ * rejected. Mirrors real Nix's parser.y own path_start action exactly,
+ * including its one subtlety: `canon_path` always strips a trailing
+ * slash by construction, so it has to be re-added afterward, but only
+ * when the ORIGINAL text both ended in '/' AND had more than that one
+ * character -- a lone "/" (the whole of `/${foo}`'s first chunk) must
+ * NOT gain a second slash (`CanonPath("/").abs()` is already just "/";
+ * real Nix's own re-add condition is literally `literal.size() > 1 &&
+ * literal.back() == '/'`, checked against `nix-instantiate --eval
+ * '/${"foo"}'` -> "/foo", not "//foo"). The `~` branch reuses
+ * resolve_home_literal verbatim -- no canon, no re-add logic needed at
+ * all, since it's a plain concatenation that already preserves whatever
+ * trailing characters the original text had. */
+static Value resolve_path_chunk(const char *text, size_t len, int is_home) {
+    if (is_home) {
+        char *joined = resolve_home_literal(text, len);
+        Value v = asnix_make_path_value(joined, strlen(joined));
+        free(joined);
+        return v;
+    }
+    int had_trailing_slash = (len > 1 && text[len - 1] == '/');
+    char *joined;
+    if (len > 0 && text[0] == '/') {
+        joined = malloc(len + 1);
+        memcpy(joined, text, len);
+        joined[len] = '\0';
+    } else {
+        size_t base_len = strlen(g_compile_base_dir);
+        joined = malloc(base_len + 1 + len + 1);
+        memcpy(joined, g_compile_base_dir, base_len);
+        joined[base_len] = '/';
+        memcpy(joined + base_len + 1, text, len);
+        joined[base_len + 1 + len] = '\0';
+    }
+    char *canon = canon_path(joined);
+    free(joined);
+    if (had_trailing_slash) {
+        size_t clen = strlen(canon);
+        char *with_slash = malloc(clen + 2);
+        memcpy(with_slash, canon, clen);
+        with_slash[clen] = '/';
+        with_slash[clen + 1] = '\0';
+        free(canon);
+        canon = with_slash;
+    }
+    Value v = asnix_make_path_value(canon, strlen(canon));
+    free(canon);
+    return v;
 }
 
 /* One compile-time scope level == one runtime Env frame: `count` names,
@@ -1121,6 +1221,34 @@ static void compile_expr(IrBuilder *b, Ast *node, ScopeFrame *scope) {
                 Value name_v = asnix_make_string_value(node->as.path.text, node->as.path.len);
                 ib_push_const(b, (int64_t)name_v.raw);
                 ib_resolve_search_path(b);
+                return;
+            }
+            if (node->as.path.interp_count > 0) {
+                /* M59: `./${foo}`/`~/${foo}`/`/${foo}`/... -- the first
+                 * chunk resolves to a genuine Path constant right here
+                 * (resolve_path_chunk, NOT resolve_path_literal: a
+                 * trailing '/' is expected and must be preserved, not
+                 * rejected -- see that function's comment), then every
+                 * subsequent literal chunk becomes a plain String
+                 * constant and every interpolated part compiles
+                 * normally, and OP_PATH_CONCAT (runtime) concatenates
+                 * them all and re-canonicalizes the result as a Path --
+                 * exactly ExprConcatStrings's own treatment of a
+                 * Path-first operand (see ir.h's OP_PATH_CONCAT
+                 * comment), generalizing the plain AST_STRING case right
+                 * above this one in this same switch. */
+                Value first = resolve_path_chunk(node->as.path.text, node->as.path.len, node->as.path.is_home);
+                ib_push_const(b, (int64_t)first.raw);
+                for (size_t i = 0; i < node->as.path.interp_count; i++) {
+                    AstStringPart *part = &node->as.path.interp_parts[i];
+                    if (part->is_expr) {
+                        compile_expr(b, part->expr, scope);
+                    } else {
+                        Value sv = asnix_make_string_value(part->text, part->text_len);
+                        ib_push_const(b, (int64_t)sv.raw);
+                    }
+                }
+                ib_path_concat(b, (int64_t)(1 + node->as.path.interp_count));
                 return;
             }
             /* Resolved once, here, against g_compile_base_dir -- not at

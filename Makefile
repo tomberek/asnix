@@ -129,6 +129,25 @@ test-conformance: asnix
 # (signal, e.g. a segfault) also counts as "pass" here, same coincidental-
 # pass caveat already documented for a few mined fixtures in
 # tests/conformance/, not a true clean-error pass.
+# M59: two env/comparison details, both matching numtide/nix-conformance's
+# own documented adapter protocol (README.md's "Writing an adapter"
+# section) exactly, rather than inventing a separate convention here:
+#   - HOME=/fake-home is one of the fixed env vars the protocol says every
+#     adapter is invoked with -- needed for `~`-prefixed path literals
+#     (eval-okay-home-path-not-normalised.nix, eval-okay-path-string-
+#     interpolation.nix's "home" field); no other currently-passing case
+#     in this corpus references $HOME at all (grepped), so this can only
+#     ever change a currently-FAILING comparison, never break a passing one.
+#   - The repo root -> "/pwd" substitution mirrors the corpus's own `run`
+#     script (`printf '%s\n' "${out//$root//pwd}"`) -- several `.exp` files
+#     (e.g. eval-okay-path-string-interpolation.exp, eval-okay-short-path-
+#     literal-warn.exp) bake in that placeholder for a relative path
+#     literal's resolved absolute form, which this target previously had
+#     no way to match (see docs/architecture.md's old "not mechanically
+#     comparable yet" note on those cases -- superseded by this). Safe for
+#     the same reason as above: a `.exp` file can never itself contain this
+#     clone's literal local path, so this substitution is a no-op on every
+#     comparison that wasn't already going to fail.
 NIX_CONFORMANCE_DIR ?= /tmp/nix-conformance
 test-nix-conformance: asnix
 	@dir="$(NIX_CONFORMANCE_DIR)/lang"; \
@@ -139,6 +158,8 @@ test-nix-conformance: asnix
 		     "(or pass NIX_CONFORMANCE_DIR=/path/to/it) first" >&2; \
 		exit 1; \
 	fi; \
+	export HOME=/fake-home; \
+	root="$(NIX_CONFORMANCE_DIR)"; \
 	pass=0; fail=0; skip=0; failed=""; \
 	cd "$$dir" && \
 	for f in eval-okay-*.nix; do \
@@ -147,6 +168,7 @@ test-nix-conformance: asnix
 		exp="$$base.exp"; \
 		if [ ! -f "$$exp" ]; then skip=$$((skip+1)); continue; fi; \
 		got=$$(timeout 10 "$$bin" "$$f" 2>/dev/null); \
+		got="$${got//$$root//pwd}"; \
 		want=$$(cat "$$exp"); \
 		if [ "$$got" = "$$want" ]; then pass=$$((pass+1)); \
 		else fail=$$((fail+1)); failed="$$failed $$f"; fi; \
