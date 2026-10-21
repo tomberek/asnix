@@ -4,6 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "asnix/env.h" /* Env, for asnix_bshared_rec_overrides_merge */
 #include "asnix/value.h"
 #include "builtins_list.h" /* shared AsnixPrimFn/AsnixBuiltinDef typedefs */
 
@@ -110,6 +111,21 @@ int64_t asnix_bshared_attrs_find(Value attrs, uint32_t sym);
  * small (see sorted_name_order's identical rationale in builtins_attrs.c). */
 Value asnix_bshared_make_attrs(uint32_t *syms, Value *vals, int64_t count);
 
+/* `rec { ... __overrides = {...}; ... }` (M57c, OP_REC_OVERRIDES_MERGE --
+ * see that op's long comment, ir.h, for the full picture). `env` is the
+ * rec's own just-OP_FRAME_ALLOC'd Env (`rdi` at op-handler entry); `n` and
+ * `meta` are the op's `a`/pool-at-`b` operands verbatim: `meta[0..n-1]`
+ * are the n static bindings' symbol ids in original (= Env slot) order,
+ * `meta[n]` is which of those n slots holds `__overrides` itself. Forces
+ * `env->values[meta[n]]`, requires it's an Attrs (fatal otherwise), merges
+ * it into the n static (sym, env->values[i]) pairs -- matched syms
+ * overwrite BOTH the output pair's value AND env->values[i] itself (so
+ * sibling bindings referencing that slot see the override), unmatched
+ * override keys are appended as extra output-only pairs -- and returns
+ * the one finished, freshly-sorted Attrs Value OP_REC_OVERRIDES_MERGE
+ * pushes. */
+Value asnix_bshared_rec_overrides_merge(Env *env, int64_t n, const int64_t *meta);
+
 /* Fatal if `v` isn't ASNIX_TAG_PTR (string OR path -- same dual-kind
  * dispatch as value_util.c's asnix_ptr_bytes; callers that specifically
  * need a *string*, not a path, should ASNIX_REQUIRE_STRING first, which
@@ -138,16 +154,18 @@ void asnix_bshared_string_bytes(Value v, const char **bytes_out, int64_t *len_ou
  * aggregates is pervasive in real nixpkgs code). */
 int asnix_bshared_value_eq(Value a, Value b);
 
-/* Ordering used by lessThan/sort: INT<INT (numeric) or string<string
- * (lexicographic byte compare, shorter-is-less on a shared prefix) only --
- * deliberately narrower than real Nix's `lessThan` (which also orders
- * paths, and lists lexicographically -- see ~/nix/src/libexpr/primops.cc's
- * CompareValues), matching the existing `<`/`>` operator's own INT-only
- * scope cut (op_cmp.S) extended just far enough to make `sort`/`lessThan`
- * useful on the string lists this subset's actual callers have (nixpkgs-
- * style name/version sorting). Fatal on any other type, or a type
- * mismatch, matching real Nix's error class (not necessarily its exact
- * wording). */
+/* Ordering used by lessThan/sort: INT<INT (numeric), string<string
+ * (lexicographic byte compare, shorter-is-less on a shared prefix), and
+ * (M57a) list<list (lexicographic element-by-element, recursing this same
+ * function on the first differing pair -- shorter-is-less on an equal
+ * common prefix) -- still narrower than real Nix's `lessThan` (which also
+ * orders paths -- see ~/nix/src/libexpr/primops.cc's CompareValues),
+ * matching the existing `<`/`>` operator's own INT-only scope cut
+ * (op_cmp.S) extended just far enough to make `sort`/`lessThan`/
+ * `genericClosure` useful on the string/list keys this subset's actual
+ * callers have (nixpkgs-style name/version sorting, list-keyed closures).
+ * Fatal on any other type, or a type mismatch, matching real Nix's error
+ * class (not necessarily its exact wording). */
 int asnix_bshared_value_lt(Value a, Value b, const char *who);
 
 /* Runtime implementation of `expr.${nameExpr}` (dynamic attribute select,

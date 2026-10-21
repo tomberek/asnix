@@ -3891,3 +3891,70 @@ against an expected success value, not exit codes; the conformance
 suite already covers that). `make test`/`test-e2e` green (201 e2e);
 `test-conformance` 637 passed (+2), 165 failed (-2), 0 known, 62
 skipped -- no other test's result moved.
+
+### M57c: `__overrides` type-checking + propagation into sibling self-references
+
+`__overrides` (a legacy `rec {}`-only feature) had no handling in asnix
+at all before this pass: `grep -r overrides src/c` turned up nothing
+except an unrelated daemon-protocol field. Ported real Nix's own
+mechanism (`ExprAttrs::eval`, `~/nix/src/libexpr/eval.cc`): when a
+`rec {}` literal has a field literally named `__overrides`, evaluating
+the rec forces that field's value, requires it's a set, and for every
+`(sym, value)` pair in it that matches one of the rec's OWN field
+names, swaps that field's ENTRY to the override's value -- critically,
+including the slot in the rec's OWN `Env` frame, which is what makes
+every sibling binding that references the overridden name (even ones
+whose thunk was already built and filed before the swap runs) see the
+new value once they're eventually forced, since nothing has forced
+anything yet at this point (`rec {}` fields are lazy). An override key
+with no matching field is just appended to the output as a new,
+non-self-referenceable entry (no frame slot exists for it). A non-`rec`
+`{ __overrides = ...; }` is NOT special -- confirmed against real Nix
+(only the `recursive` branch of `ExprAttrs::eval` even looks for it).
+
+Implemented as one new op, `OP_REC_OVERRIDES_MERGE` (ir.h/irbuild.h/.c,
+new `src/asm/ops/op_rec_overrides_merge.S`, C half `asnix_bshared_
+rec_overrides_merge` in builtins_shared.c), emitted by compiler.c's
+AST_ATTRSET `rec` branch INSTEAD of the usual `OP_FRAME_GET*n +
+OP_MK_ATTRS` pair, but only when a binding named `__overrides` is
+detected at compile time (a plain string-name check on the AST, no
+runtime cost for every OTHER `rec {}` in existence). The op takes no
+VALSTACK input (unlike every other "defer to C" op in this directory)
+-- its job is entirely reading/mutating the current Env's own slots,
+which the preceding `OP_FRAME_SET` loop already filled; its pool
+operand carries each binding's symbol id in original (= Env slot)
+order (so slot i's sym is pool entry i -- no separate translation
+table needed) plus which slot is `__overrides` itself. The C half
+forces `__overrides`, fatals if it's not a set (`asnix_bshared_type_
+name` reports the actual type, matching this project's own message
+style elsewhere), then builds the merged (sym, value) list and calls
+the existing `asnix_bshared_make_attrs` (already does its own
+insertion sort by sym) to finish it off -- reusing that helper meant
+the override-introduces-a-new-key case (append, no slot) came for
+free, not just the common "matches an existing field" case the two
+`eval-okay-overrides*` fixtures exercise.
+
+Verified against real `nix-instantiate --eval`: `(rec { __overrides =
+{ a = 2; }; x = a; a = 1; }).x` => `2` (was `1` before this fix); the
+full `eval-okay-overrides-thunks.nix` scenario (four sub-cases: a
+matched override with a nested non-`rec` `{ inherit a; }` also seeing
+the override through the shared frame, an override feeding a string
+interpolation, an empty `__overrides = {}` no-op, and a `let` -- not
+`rec` -- `__overrides` confirmed to have NO effect) matches its `.exp`
+byte-for-byte; `rec { __overrides = 1; }` now exits non-zero
+("'__overrides' must be a set (got an integer)"); a hand-written extra
+check (an override introducing a brand-new key not in the original
+rec, `tests/e2e/m57c_overrides_extra_key.nix`) also matches real Nix
+exactly, including that the new key has no effect on sibling bindings
+that don't explicitly reference it.
+
+Two new e2e fixtures (`m57c_overrides_propagate.nix`/
+`m57c_overrides_extra_key.nix`); `make test`/`test-e2e` green (203
+e2e); `test-conformance` 641 passed (+4), 161 failed (-4), 0 known, 62
+skipped -- no other test's result moved (checked the full fail list
+for anything override/rec-attrset-related; none).
+
+(In the same pass, touched up `asnix_bshared_value_lt`'s own header
+comment in builtins_shared.h, which had gone stale after M57a added
+list ordering to it but before this M57c commit -- a documentation-
+only fix, no behavior change.)

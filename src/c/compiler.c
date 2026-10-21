@@ -786,6 +786,24 @@ static void compile_expr(IrBuilder *b, Ast *node, ScopeFrame *scope) {
                  * thunk is built). */
                 ScopeFrame skip = { .up = scope, .names = NULL, .name_lens = NULL, .count = 0 };
 
+                /* M57c: `__overrides` (legacy feature -- allows a `rec {}`
+                 * field's value to be swapped out, with the swap visible
+                 * to every *other* field that references it, something
+                 * `//` alone can't do since by the time you `//` the
+                 * result, sibling thunks have already captured the
+                 * original value through this same frame). Detected
+                 * purely by binding NAME at compile time (a plain, non-
+                 * `rec` `{ __overrides = ...; }` is NOT special -- verified
+                 * against real Nix: only `rec {}`'s own ExprAttrs::eval
+                 * special-cases it, eval.cc). */
+                int64_t overrides_slot = -1;
+                for (size_t i = 0; i < n; i++) {
+                    if (bindings[i].name_len == 11 && memcmp(bindings[i].name, "__overrides", 11) == 0) {
+                        overrides_slot = (int64_t)i;
+                        break;
+                    }
+                }
+
                 ib_frame_alloc(b, (int64_t)n);
                 for (size_t i = 0; i < n; i++) {
                     ScopeFrame *value_scope = bindings[i].is_inherit ? &skip : &frame;
@@ -795,8 +813,18 @@ static void compile_expr(IrBuilder *b, Ast *node, ScopeFrame *scope) {
                     ib_mk_thunk(b, ib_finish(thunk_b));
                     ib_frame_set(b, (int64_t)i);
                 }
-                for (size_t i = 0; i < n; i++) ib_frame_get(b, (int64_t)order[i]);
-                ib_mk_attrs(b, (int64_t)n, sorted_syms);
+                if (overrides_slot >= 0) {
+                    /* `syms` (built above, BEFORE the symbol-id sort into
+                     * `order`/`sorted_syms`) is already in original,
+                     * per-slot order -- exactly what OP_REC_OVERRIDES_MERGE
+                     * needs (see ir.h). Replaces the plain path's
+                     * OP_FRAME_GET*n + OP_MK_ATTRS pair with the one op
+                     * that merges `__overrides` in first. */
+                    ib_rec_overrides_merge(b, (int64_t)n, syms, overrides_slot);
+                } else {
+                    for (size_t i = 0; i < n; i++) ib_frame_get(b, (int64_t)order[i]);
+                    ib_mk_attrs(b, (int64_t)n, sorted_syms);
+                }
                 ib_frame_exit(b);
                 free(names);
                 free(name_lens);

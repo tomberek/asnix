@@ -247,6 +247,37 @@ enum {
                      * op_has_attr_dynamic.S. Found needed evaluating real nixpkgs:
                      * lib/systems/default.nix has `rustc-target-env ?
                      * ${final.rust.rustcTargetSpec}`. */
+    OP_REC_OVERRIDES_MERGE, /* `rec { ... __overrides = {...}; ... }` (M57c), replacing the
+                     * plain `OP_FRAME_GET*n + OP_MK_ATTRS` sequence compiler.c's
+                     * AST_ATTRSET case normally emits after a rec literal's per-binding
+                     * OP_FRAME_SET loop, but ONLY when one of the rec's own binding names
+                     * is literally `__overrides`: a = n (the rec's own static binding
+                     * count), b = pool index of n+1 int64 entries -- [0..n-1]: each
+                     * binding's symbol id, in the SAME original order as its
+                     * OP_FRAME_SET slot (slot i's sym is entry i, no translation table
+                     * needed); [n]: which slot is `__overrides` itself. Reads the
+                     * CURRENT Env (set up by the already-executed OP_FRAME_ALLOC)
+                     * directly, with no VALSTACK input -- unlike OP_MK_ATTRS, there's
+                     * nothing to pop, the n values all already live in ENV.values[].
+                     * Forces slot `meta[n]` and requires TAG_ATTRS (fatal otherwise,
+                     * "__overrides must be a set" -- matches real Nix's
+                     * `state.forceAttrs(*vOverrides, ...)`, called unconditionally the
+                     * moment the rec literal is evaluated, not lazily deferred to first
+                     * select). For each (sym, value) pair in that forced override set:
+                     * if sym matches one of the n static syms at original index i,
+                     * OVERWRITES ENV.values[i] with the override's value (so every
+                     * OTHER binding in this same rec that references slot i --
+                     * including ones already OP_FRAME_SET before this op runs, since
+                     * none of them have been forced yet -- sees the override, not the
+                     * original expression); unmatched override keys are appended to the
+                     * output as brand-new attrset entries with no Env slot (can't be
+                     * self-referenced, matching real Nix). Pushes ONE finished Attrs
+                     * Value (the merge of all n static entries, with matches replaced,
+                     * plus any unmatched extras) -- same "one Value on top of VALSTACK"
+                     * postcondition OP_MK_ATTRS leaves, so the dynamic-`${k} = v;` loop
+                     * and OP_FRAME_EXIT that normally follow it don't need to know which
+                     * path ran. See asnix_bshared_rec_overrides_merge,
+                     * builtins_shared.c. */
     OP_COUNT
 };
 

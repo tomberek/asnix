@@ -248,6 +248,50 @@ Value asnix_bshared_make_attrs(uint32_t *syms, Value *vals, int64_t count) {
     return (Value){ .raw = (uint64_t)(uintptr_t)mem | ASNIX_TAG_ATTRS };
 }
 
+Value asnix_bshared_rec_overrides_merge(Env *env, int64_t n, const int64_t *meta) {
+    int64_t overrides_slot = meta[n];
+    Value overrides_val = asnix_force_for_print(env->values[overrides_slot]);
+    if (asnix_tag_of(overrides_val) != ASNIX_TAG_ATTRS) {
+        fprintf(stderr, "asnix: '__overrides' must be a set (got %s)\n",
+                asnix_bshared_type_name(overrides_val));
+        exit(1);
+    }
+
+    /* Working (sym, value) pairs: the n static bindings first (by Env
+     * slot order, matched ones replaced below), then any override-only
+     * extras appended -- asnix_bshared_make_attrs sorts the whole lot by
+     * sym at the end, so this function never needs to track order itself. */
+    int64_t ocount = asnix_bshared_attrs_count(overrides_val);
+    int64_t cap = n + ocount;
+    uint32_t *syms = malloc((size_t)cap * sizeof(uint32_t));
+    Value *vals = malloc((size_t)cap * sizeof(Value));
+    for (int64_t i = 0; i < n; i++) {
+        syms[i] = (uint32_t)meta[i];
+        vals[i] = env->values[i];
+    }
+    int64_t total = n;
+    for (int64_t oi = 0; oi < ocount; oi++) {
+        uint32_t osym = asnix_bshared_attrs_sym(overrides_val, oi);
+        Value oval = asnix_bshared_attrs_value(overrides_val, oi);
+        int64_t match = -1;
+        for (int64_t i = 0; i < n; i++) {
+            if (syms[i] == osym) { match = i; break; }
+        }
+        if (match >= 0) {
+            vals[match] = oval;
+            env->values[match] = oval; /* propagate into sibling self-references */
+        } else {
+            syms[total] = osym;
+            vals[total] = oval;
+            total++;
+        }
+    }
+    Value out = asnix_bshared_make_attrs(syms, vals, total);
+    free(syms);
+    free(vals);
+    return out;
+}
+
 void asnix_bshared_string_bytes(Value v, const char **bytes_out, int64_t *len_out, const char *who) {
     if (asnix_tag_of(v) != ASNIX_TAG_PTR) {
         fprintf(stderr, "asnix: %s: expected a string argument\n", who);
