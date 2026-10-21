@@ -76,6 +76,14 @@ size_t ib_frame_set(IrBuilder *b, int64_t slot);
 size_t ib_frame_get(IrBuilder *b, int64_t slot);
 size_t ib_frame_exit(IrBuilder *b);
 
+/* `rec { ... __overrides = {...}; ... }` (M57c) -- see OP_REC_OVERRIDES_MERGE's
+ * own long comment, ir.h. `syms` is n entries in ORIGINAL (OP_FRAME_SET slot)
+ * order, NOT sorted; `overrides_slot` is which of those n slots is
+ * `__overrides` itself. Emitted by compiler.c's AST_ATTRSET case in place
+ * of the usual `ib_frame_get(...)*n + ib_mk_attrs(...)` pair, only when a
+ * rec literal has a binding literally named `__overrides`. */
+size_t ib_rec_overrides_merge(IrBuilder *b, int64_t n, const uint32_t *syms, int64_t overrides_slot);
+
 /* "operators" milestone: comparisons (INT-only for ordering, see
  * op_cmp.S), booleans, attrset update, assert. `&&`/`||` have no
  * dedicated op -- see ir.h's OP_EQ block comment. */

@@ -1,4 +1,4 @@
-/* realpath() is POSIX, not C11 -- needs an explicit feature-test macro
+/* getcwd() is POSIX, not C11 -- needs an explicit feature-test macro
  * under -std=c11 (see Makefile's CFLAGS). */
 #define _DEFAULT_SOURCE
 
@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include "asnix/env.h"
 #include "asnix/ir.h"
@@ -22,6 +23,7 @@
 #include "lexer.h"
 #include "parser.h"
 #include "symtab.h"
+#include "value_util.h" /* asnix_canon_path, M57h symlink fix */
 
 static char *read_file(const char *path) {
     FILE *f = fopen(path, "rb");
@@ -58,8 +60,8 @@ static int is_directory(const char *path) {
     return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
 }
 
-/* Directory part of an absolute path (as produced by realpath(), so
- * always starts with '/' and has no trailing slash itself). "/foo.nix"
+/* Directory part of an absolute path (as produced by resolve_import_path,
+ * so always starts with '/' and has no trailing slash itself). "/foo.nix"
  * -> "/" (the one case where the result legitimately keeps its slash). */
 static char *dir_of(const char *abs_path) {
     const char *slash = strrchr(abs_path, '/');
@@ -71,20 +73,59 @@ static char *dir_of(const char *abs_path) {
     return dir;
 }
 
-/* Resolves `path` to its final absolute form (following the `import
- * somedir` => `somedir/default.nix` rule) and reads+lexes+parses it,
- * writing the resolved path and its containing directory out through
- * `*resolved_out`/`*base_dir_out` (both caller-owned, malloc'd -- the
- * caller frees them once done with `base_dir_out`, which asnix_compile/
- * asnix_compile_scoped only reads during the one compile call). Shared by
- * asnix_eval_file and asnix_eval_file_scoped (M54) below, which differ
- * only in what root Env/ScopeFrame they build around the parsed Ast. */
-static Ast *parse_file(const char *path, char **resolved_out, char **base_dir_out) {
-    char *resolved = realpath(path, NULL);
-    if (!resolved) {
-        fprintf(stderr, "asnix: cannot resolve path '%s'\n", path);
-        exit(1);
+/* M57h: makes `path` absolute (prepending the cwd if it's relative) and
+ * lexically canonicalizes it (`.`/`..`/doubled slashes -- asnix_canon_path,
+ * value_util.c), WITHOUT resolving symlinks on disk the way `realpath()`
+ * does. This matters for relative imports reached *through* a symlinked
+ * directory: `eval-okay-symlink-resolution.nix`'s fixture tree has
+ * `symlink-resolution/foo/overlays -> ../overlays` (a symlink), and
+ * `symlink-resolution/foo/overlays/overlay.nix` (the real file, reached
+ * via that symlink) does `import ../lib`. Real Nix resolves that `..`
+ * against the path AS WRITTEN/imported (`.../foo/overlays/overlay.nix`'s
+ * own directory, `.../foo/overlays`) landing on `.../foo/lib` (which
+ * exists) -- confirmed directly against `nix-instantiate --eval` on this
+ * exact fixture tree. The previous `realpath()`-based approach instead
+ * fully resolved the `foo/overlays` symlink FIRST, landing base_dir on
+ * the symlink's physical TARGET directory (`symlink-resolution/overlays`,
+ * since `overlays -> ../overlays`), so the same `../lib` instead resolved
+ * to `symlink-resolution/lib`, which doesn't exist -- "asnix: cannot
+ * resolve path" (actually a `is_directory`/`read_file` failure one level
+ * down, since nothing here needs `realpath` to still successfully open
+ * the file: `fopen`/`stat` already follow symlinks transparently at the
+ * OS level regardless of whether *we* fully resolved the path ourselves). */
+static char *resolve_import_path(const char *path) {
+    char *abs;
+    if (path[0] == '/') {
+        abs = malloc(strlen(path) + 1);
+        memcpy(abs, path, strlen(path) + 1);
+    } else {
+        char cwd[4096];
+        if (!getcwd(cwd, sizeof cwd)) {
+            fprintf(stderr, "asnix: cannot determine the current directory\n");
+            exit(1);
+        }
+        size_t cwd_len = strlen(cwd), path_len = strlen(path);
+        abs = malloc(cwd_len + 1 + path_len + 1);
+        memcpy(abs, cwd, cwd_len);
+        abs[cwd_len] = '/';
+        memcpy(abs + cwd_len + 1, path, path_len + 1);
     }
+    char *canon = asnix_canon_path(abs);
+    free(abs);
+    return canon;
+}
+
+/* Resolves `path` to its final absolute form (following the `import
+ * somedir` => `somedir/default.nix` rule, and M57h's symlink-preserving
+ * resolution above) and reads+lexes+parses it, writing the resolved path
+ * and its containing directory out through `*resolved_out`/`*base_dir_out`
+ * (both caller-owned, malloc'd -- the caller frees them once done with
+ * `base_dir_out`, which asnix_compile/asnix_compile_scoped only reads
+ * during the one compile call). Shared by asnix_eval_file and
+ * asnix_eval_file_scoped (M54) below, which differ only in what root
+ * Env/ScopeFrame they build around the parsed Ast. */
+static Ast *parse_file(const char *path, char **resolved_out, char **base_dir_out) {
+    char *resolved = resolve_import_path(path);
     /* `import somedir` means `import somedir/default.nix` in real Nix
      * (verified against `nix-instantiate --eval`) -- found evaluating
      * real nixpkgs (`pkgs/top-level/impure.nix` does `import ./.`, i.e.
@@ -160,7 +201,7 @@ Value asnix_eval_file(const char *path) {
  * same as any other attrset field) become an extra, innermost lexical
  * ScopeFrame, resolved at compile time; at runtime that frame is one more
  * Env hop (`scope_env`, holding `scope`'s own field values in the same
- * order its names were listed) wrapped around the ordinary 13-slot root
+ * order its names were listed) wrapped around the ordinary 14-slot root
  * env (`up = scope_env`'s own `up`). */
 Value asnix_eval_file_scoped(const char *path, Value scope) {
     char *resolved, *base_dir;
@@ -187,4 +228,25 @@ Value asnix_eval_file_scoped(const char *path, Value scope) {
     free(resolved);
     free(base_dir);
     return result;
+}
+
+/* M57i: CLI `--arg`/`--argstr` expression evaluation (main.c) -- the same
+ * lex/parse/compile/fresh-root-env/eval pipeline `asnix_eval_file` runs
+ * over a file's contents, but over a caller-supplied source STRING with
+ * no file of its own; relative path literals in `src` resolve against the
+ * process's cwd (confirmed: real Nix's own `--arg x ./foo.nix` resolves
+ * `./foo.nix` against the invoking shell's cwd, not any particular
+ * file's directory). */
+Value asnix_eval_expr_source(const char *src) {
+    char cwd[4096];
+    if (!getcwd(cwd, sizeof cwd)) {
+        fprintf(stderr, "asnix: cannot determine the current directory\n");
+        exit(1);
+    }
+    size_t ntoks;
+    Token *toks = asnix_lex(src, &ntoks);
+    Ast *ast = asnix_parse(toks, ntoks);
+    IrProgram *prog = asnix_compile(ast, cwd);
+    Env *root_env = make_root_env(NULL);
+    return asnix_eval(prog, root_env);
 }

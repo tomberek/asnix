@@ -68,7 +68,8 @@ what's actually implemented and the scope decisions made along the way.
 | M54 — a batch of missing builtins: `bitAnd`/`bitOr`/`bitXor`, `trace`, `zipAttrsWith`, `toXML`, `convertHash`, `getContext`/`appendContext`, `scopedImport` | done, **scoped** (see below) |
 | M55 — regex engine gaps triage (`builtins.match`/`builtins.split`, 39 conformance failures) | investigated, **no fix** (see below) |
 | M56 — integer-overflow detection (`+`/`-`/`*`/`/`, `builtins.add/sub/mul/div`) + `fromTOML` validation gaps (bare/incomplete time literals, calendar-range checks, duplicate table headers, leading-zero/double-underscore integers, invalid bare tokens, embedded NUL bytes, integer-literal overflow) | done (see below) |
-| M57 | in progress (parallel agent: misc backlog) |
+| M57 — conformance grab-bag (9 sub-items a-i): `lessThan`/`sort` on lists, `genericClosure` key-comparability, `__overrides` propagation, `toJSON` UTF-8 validation, `import`'s `__toString` coercion, `compareVersions`' int-overflow quirk, path-concat canonicalization, import symlink resolution, CLI `--arg`/`--argstr`/`-A` | done, **scoped** (see below; function/derivation-equality, `-I`, and context-attr-name skipped) |
+| M58+ | not started |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
 
@@ -4943,3 +4944,454 @@ just the aggregate count) that exactly these 3 tests are the only
 change -- 663 passed before this fix, 660 after, net -3, entirely
 accounted for by the documented `outputs`-validation gap above, not a
 regression in list-to-string coercion's own correctness.
+
+## M57 scope notes: conformance grab-bag
+
+A "pick off what you can" pass over a list of smaller numtide/
+nix-conformance gaps, sub-numbered M57a/b/... per item (one commit
+each).
+
+### M57a: `lessThan`/`sort` ordering of lists
+
+`asnix_bshared_value_lt` (builtins_shared.c, backs both `builtins.
+lessThan` and `builtins.sort`'s default-ish comparator usage) only
+handled int-vs-int and string-vs-string; real Nix also orders lists
+lexicographically (`CompareValues::operator()`'s `nList` case in
+`~/nix/src/libexpr/primops.cc`): walk both lists pairwise, and at the
+first index where the elements aren't *equal* (full structural `==`,
+not `<`), recurse `lessThan` on just that pair; if one list runs out
+first while still equal on the common prefix, the shorter one is less;
+equal-length all-equal lists are not less (false, matching the
+`lessThan [1 2] [1 2] == false` / `[] [] == false` real-Nix results
+confirmed below).
+
+Added a `ASNIX_TAG_LIST`-vs-`ASNIX_TAG_LIST` branch to `asnix_bshared_
+value_lt` doing exactly this: force both top-level args and each
+element pair (lists are lazy, same as every other list-consuming
+builtin already does via `asnix_force_for_print`), use the existing
+`asnix_bshared_value_eq` to decide "equal, move on" vs. "recurse `lt`
+on this differing pair", and fall back to the prior fatal "cannot
+compare" error (now mentioning list-vs-list in its message) for any
+other type combination -- including a type mismatch discovered only
+once two elements are reached, matching real Nix's `lessThan [1]
+["a"]` => `error: cannot compare an integer with a string`.
+
+Verified against real `nix-instantiate --eval`: `lessThan [1 2] [1
+3]` => true, `[1 2] [1 2]` => false, `[1] [1 2]` => true, `[1 2] [1]`
+=> false, `[] []` => false, `[] [1]` => true, `[1] ["a"]` => throws.
+`eval-okay-sort.nix` (asnix's own output byte-for-byte matches its
+`.exp`, including the list-of-lists case) and `eval-okay-eq-slot-sort.
+nix` (relies on `builtins.lessThan`'s list case falling through to
+`asnix_bshared_value_eq`'s existing pointer-identity fast path for a
+shared closure value referenced from two different list literals --
+already correct, unchanged by this fix) both now pass. Two new e2e
+fixtures: `m57a_lessthan_lists.nix`/`m57a_sort_lists.nix`. `make
+test`/`test-e2e` green (200 e2e); `test-conformance` 635 passed (+2),
+167 failed (-2), 0 known, 62 skipped -- no other test's result moved.
+
+### M57b: `genericClosure` key-comparability validation
+
+`builtins_closure.c`'s own top comment already documented the scope
+cut: dedup by `asnix_bshared_value_eq` instead of a real ordered
+`std::map<Value*, CompareValues>` like real Nix's, deliberately not
+replicating the "incomparable key types" error. Closed that gap
+without needing a real ordering: added a `value_key_comparable(Value,
+Value)` helper (same int/string/list type scope M57a's `value_lt`
+supports) and call it against every already-seen key right before the
+existing equality check in the dedup loop, `asnix_bshared_fatal`-ing
+out on a mismatch. Confirmed against real Nix that the comparator is
+consulted on every insertion attempt *regardless of actual equality*
+-- even `{key=true;}` twice throws "cannot compare a Boolean with a
+Boolean; values of that type are incomparable" -- so the new check
+intentionally runs unconditionally before the equality check, not only
+when values turn out unequal.
+
+Verified against real `nix-instantiate --eval`: int-vs-string keys
+throws "cannot compare a string with an integer"; two `{key={};}`
+(attrset keys, same type but never comparable) throws "...
+incomparable"; two `{key=true;}` throws the same way; ordinary
+string-keyed closures are unaffected. Both `eval-fail-genericClosure-
+keys-incompatible-types.nix` and `eval-fail-genericClosure-keys-
+uncomparable.nix` now exit non-zero as required. One new e2e fixture,
+`m57b_genericclosure_ok_strings.nix` (a same-type-string-keys closure,
+confirming the ordinary path is untouched -- no e2e fixture for the
+fail cases themselves since `test-e2e`'s harness only diffs stdout
+against an expected success value, not exit codes; the conformance
+suite already covers that). `make test`/`test-e2e` green (201 e2e);
+`test-conformance` 637 passed (+2), 165 failed (-2), 0 known, 62
+skipped -- no other test's result moved.
+
+### M57c: `__overrides` type-checking + propagation into sibling self-references
+
+`__overrides` (a legacy `rec {}`-only feature) had no handling in asnix
+at all before this pass: `grep -r overrides src/c` turned up nothing
+except an unrelated daemon-protocol field. Ported real Nix's own
+mechanism (`ExprAttrs::eval`, `~/nix/src/libexpr/eval.cc`): when a
+`rec {}` literal has a field literally named `__overrides`, evaluating
+the rec forces that field's value, requires it's a set, and for every
+`(sym, value)` pair in it that matches one of the rec's OWN field
+names, swaps that field's ENTRY to the override's value -- critically,
+including the slot in the rec's OWN `Env` frame, which is what makes
+every sibling binding that references the overridden name (even ones
+whose thunk was already built and filed before the swap runs) see the
+new value once they're eventually forced, since nothing has forced
+anything yet at this point (`rec {}` fields are lazy). An override key
+with no matching field is just appended to the output as a new,
+non-self-referenceable entry (no frame slot exists for it). A non-`rec`
+`{ __overrides = ...; }` is NOT special -- confirmed against real Nix
+(only the `recursive` branch of `ExprAttrs::eval` even looks for it).
+
+Implemented as one new op, `OP_REC_OVERRIDES_MERGE` (ir.h/irbuild.h/.c,
+new `src/asm/ops/op_rec_overrides_merge.S`, C half `asnix_bshared_
+rec_overrides_merge` in builtins_shared.c), emitted by compiler.c's
+AST_ATTRSET `rec` branch INSTEAD of the usual `OP_FRAME_GET*n +
+OP_MK_ATTRS` pair, but only when a binding named `__overrides` is
+detected at compile time (a plain string-name check on the AST, no
+runtime cost for every OTHER `rec {}` in existence). The op takes no
+VALSTACK input (unlike every other "defer to C" op in this directory)
+-- its job is entirely reading/mutating the current Env's own slots,
+which the preceding `OP_FRAME_SET` loop already filled; its pool
+operand carries each binding's symbol id in original (= Env slot)
+order (so slot i's sym is pool entry i -- no separate translation
+table needed) plus which slot is `__overrides` itself. The C half
+forces `__overrides`, fatals if it's not a set (`asnix_bshared_type_
+name` reports the actual type, matching this project's own message
+style elsewhere), then builds the merged (sym, value) list and calls
+the existing `asnix_bshared_make_attrs` (already does its own
+insertion sort by sym) to finish it off -- reusing that helper meant
+the override-introduces-a-new-key case (append, no slot) came for
+free, not just the common "matches an existing field" case the two
+`eval-okay-overrides*` fixtures exercise.
+
+Verified against real `nix-instantiate --eval`: `(rec { __overrides =
+{ a = 2; }; x = a; a = 1; }).x` => `2` (was `1` before this fix); the
+full `eval-okay-overrides-thunks.nix` scenario (four sub-cases: a
+matched override with a nested non-`rec` `{ inherit a; }` also seeing
+the override through the shared frame, an override feeding a string
+interpolation, an empty `__overrides = {}` no-op, and a `let` -- not
+`rec` -- `__overrides` confirmed to have NO effect) matches its `.exp`
+byte-for-byte; `rec { __overrides = 1; }` now exits non-zero
+("'__overrides' must be a set (got an integer)"); a hand-written extra
+check (an override introducing a brand-new key not in the original
+rec, `tests/e2e/m57c_overrides_extra_key.nix`) also matches real Nix
+exactly, including that the new key has no effect on sibling bindings
+that don't explicitly reference it.
+
+Two new e2e fixtures (`m57c_overrides_propagate.nix`/
+`m57c_overrides_extra_key.nix`); `make test`/`test-e2e` green (203
+e2e); `test-conformance` 641 passed (+4), 161 failed (-4), 0 known, 62
+skipped -- no other test's result moved (checked the full fail list
+for anything override/rec-attrset-related; none).
+
+(In the same pass, touched up `asnix_bshared_value_lt`'s own header
+comment in builtins_shared.h, which had gone stale after M57a added
+list ordering to it but before this M57c commit -- a documentation-
+only fix, no behavior change.)
+
+### M57d: `toJSON` rejects invalid UTF-8
+
+`builtins_compare.c`'s `json_encode`'s string case passed raw bytes
+straight through unescaped/unvalidated (its own header comment even
+documented this as deliberate for *valid* UTF-8: "this project has no
+Unicode awareness anywhere else either"). Real Nix's `toJSON` goes
+through `nlohmann::json`, which validates every string byte-for-byte
+and throws (confirmed: a single stray `0xFF` byte, `eval-fail-toJSON-
+non-utf-8.nix`'s exact fixture, throws "JSON serialization error: ...
+invalid UTF-8 byte at index 16: 0xFF"). Added a structural UTF-8
+validator (`utf8_is_valid`: leading-byte class + the right count of
+`0x80`-`0xBF` continuation bytes, truncation-safe) called on every
+string value `json_encode` emits, fatal on a hit -- deliberately not
+as strict as nlohmann's decoder (doesn't additionally reject overlong
+encodings or out-of-range/surrogate codepoints), but every genuinely
+malformed byte (a lone continuation byte, or `0xF8`-`0xFF`, never valid
+UTF-8 leading bytes at all) is still always caught, which is what the
+one real test here exercises.
+
+Verified: real fixture now exits non-zero; valid multi-byte UTF-8
+(`builtins.toJSON { s = "héllo"; }`) still round-trips byte-for-byte
+identically to real Nix's own output. One new e2e fixture
+(`m57d_tojson_unicode_ok.nix`, a regression check for the valid-UTF-8
+path -- no fixture for the fail case itself, same `test-e2e`-can't-
+check-exit-codes reason as M57b). `make test`/`test-e2e` green (205
+e2e, see M57e below too); `test-conformance` 642 passed (+1), 160
+failed (-1), 0 known, 62 skipped.
+
+### M57e: `import` tries `__toString` before rejecting
+
+Real Nix's `import` argument goes through the same general
+`coerceToString` every other path/string consumer does (`eval.cc`),
+trying `__toString` (then `outPath`) on an attrset before giving up --
+confirmed: `import { __toString = _: toString ./foo.nix; }` works in
+real Nix. asnix's `prim_import` (builtins.c) only ever accepted a Path
+or an absolute-path String, rejecting everything else outright. Fixed
+by falling back to the project's own existing `asnix_coerce_to_string`
+(value_util.c -- already implements the identical `__toString`-then-
+`outPath` protocol for `toString`/string interpolation/`toJSON`'s Path
+case) whenever the argument is neither already a path nor a string,
+before the absolute-path check runs; `asnix_coerce_to_string` always
+either returns a string/path or exits(1) itself on a genuinely
+incoercible value, so the old "argument must be a path or an absolute-
+path string" branch stays as an now-unreachable-but-harmless fallback.
+
+Verified against real Nix: `eval-okay-import-tostring.nix` (both the
+plain-`__toString` case and the `__toString`-before-`outPath`-priority
+case) now matches its `.exp` byte-for-byte. One new e2e fixture pair
+(`m57e_import_tostring.nix` + a helper target under the new
+`m57e_import_fixtures/` subdirectory -- NOT directly glob-matched by
+`test-e2e`'s `tests/e2e/*.nix`, same "helper file, not a standalone
+case" pattern M11's own `m11_import_fixtures/` already established).
+`make test`/`test-e2e` green (205 e2e); `test-conformance` 643 passed
+(+1 over M57d's 642), 159 failed (-1), 0 known, 62 skipped -- no other
+test's result moved across either of these two sub-items.
+
+### M57f: `compareVersions`' int-overflow-to-string quirk
+
+Real Nix's `nextComponent`/`componentsLT` (`~/nix/src/libstore/names.cc`)
+parses a numeric version component with `string2Int<int>` -- `int`, not
+`int64_t` -- so a component whose numeric VALUE exceeds `INT32_MAX`
+(2147483647) fails that parse and falls back to being compared as a
+plain string for that round, not as a (correctly-valued) big integer.
+asnix's `component_is_int` (builtins_compare.c, used only by
+`compareVersions`'s `components_lt`, not by plain `splitVersion`) just
+accumulated into an `int64_t` with no bound at all. Added the same
+32-bit check upstream has, inline in the existing digit-accumulation
+loop (bail to "not a number" the instant the running value exceeds
+2147483647) -- checking the accumulated VALUE rather than e.g. the
+component's string length matters: confirmed `"0000000000000000000002"`
+(23 digits, value 2) is still numeric, only `"2147483648"` (2^31, over
+the boundary despite being a *shorter* string) isn't.
+
+Verified against real `nix-instantiate --eval`, all five
+`compareVersions` cases in `eval-okay-versions-int-range.nix`:
+`"2147483648"` vs `"9"` => -1 (over the boundary, loses to numeric `9`
+by the existing non-numeric-sorts-before-numeric rule); `"2147483647"`
+vs `"9"` => 1 (`INT32_MAX` itself still parses, compares numerically,
+correctly wins); `"0.0.0-20191109021931"` vs `"0.0.0-100"` => -1;
+leading-zeros case => 1; `"1.0-4294967296"` vs `"1.0-5"` => -1 -- all
+now match. `splitVersion`/`parseDrvName` (same fixture's other two
+sub-cases) were already correct, confirming the bug was scoped exactly
+to `components_lt`'s numeric check as expected. One new e2e fixture
+(`m57f_compareversions_int_overflow.nix`). `make test`/`test-e2e`
+green (207 e2e); `test-conformance` 644 passed (+1), 158 failed (-1),
+0 known, 62 skipped.
+
+### M57g: `path + string` canonicalizes `.`/`..` segments
+
+Path *literals* (`./a/../b`) were already lexically canonicalized at
+compile time by a `canon_path` helper local to compiler.c -- but a
+RUNTIME `path + string` concatenation (`asnix_add_values`, value_util.c)
+just concatenated the raw text and re-wrapped it as a Path verbatim, no
+canonicalization at all. Confirmed against real Nix this is wrong:
+`toString (/foo/bar + "/../xyzzy/./foo.txt")` == `/foo/xyzzy/foo.txt`,
+not the literal uncollapsed concatenation -- `eval-okay-string.nix`
+exercises exactly this (and, as a contrast case in the same fixture,
+confirms plain STRING + STRING concatenation involving `/../`-looking
+text is NOT canonicalized, since it's never a Path value to begin
+with: `"/../foo" + toString /x/y` stays literally `/../foo/x/y`).
+
+Fixed by promoting `canon_path` from a compiler.c-local `static` to a
+shared `asnix_canon_path` (value_util.c/.h) -- compiler.c keeps every
+one of its existing call sites working unchanged via a same-file
+`#define canon_path asnix_canon_path` alias, rather than touching each
+call site -- and having `asnix_add_values`'s Path-result branch run
+the concatenated text through it (NUL-terminating into a temp buffer
+first, since `asnix_canon_path` expects a C string but asnix strings
+aren't NUL-terminated) before building the final Path Value.
+
+Verified: `eval-okay-string.nix`'s full expected output now matches
+byte-for-byte, including the contrast case confirming plain strings
+are correctly left untouched. One new e2e fixture
+(`m57g_path_canon_concat.nix`). `make test`/`test-e2e` green (208
+e2e); `test-conformance` 645 passed (+1), 157 failed (-1), 0 known, 62
+skipped.
+
+### M57h: import path resolution no longer over-resolves symlinks
+
+`asnix_eval_file` (eval_file.c) resolved every import target with
+`realpath()`, which does two things at once: makes the path absolute,
+AND fully resolves every symlink on disk along the way. The second
+part is wrong for computing the BASE DIRECTORY used to resolve a
+*subsequent* relative import inside that file: `eval-okay-symlink-
+resolution.nix`'s fixture tree has `symlink-resolution/foo/overlays ->
+../overlays` (a symlink) with `symlink-resolution/foo/overlays/
+overlay.nix` (the real file, reached THROUGH that symlink) containing
+`import ../lib`. Real Nix resolves that `..` against the file's path
+AS WRITTEN (`.../foo/overlays/overlay.nix`'s own directory,
+`.../foo/overlays`), landing on `.../foo/lib` (exists) -- confirmed
+directly against `nix-instantiate --eval` on this exact fixture tree.
+`realpath()` instead fully resolved the `foo/overlays` symlink FIRST,
+landing the base directory on the symlink's physical TARGET
+(`symlink-resolution/overlays`, since `overlays -> ../overlays`), so
+the same `../lib` resolved to the nonexistent `symlink-resolution/lib`
+-- "asnix: cannot resolve path" (one level down, inside the nested
+`import`, not the top-level file itself).
+
+Fixed by replacing `realpath()` with a new `resolve_import_path`:
+makes the path absolute (prepending `getcwd()` if relative) and runs
+it through the now-shared `asnix_canon_path` (M57g) -- pure text-level
+`.`/`..`/doubled-slash collapsing, no filesystem access, so a symlink
+anywhere in the chain is left exactly as named. Nothing downstream
+needed `realpath`'s symlink-following for its own sake: `stat()`
+(the `import somedir` => `somedir/default.nix` directory check) and
+`fopen()` (actually reading the file) both already follow symlinks
+transparently at the OS level regardless of whether this project
+pre-resolves them itself. Lost, deliberately: `realpath()`'s own
+"does this path exist at all" check -- a nonexistent import now fails
+one step later, inside `read_file`'s `fopen` ("asnix: cannot open
+'...'"), which was already a graceful, non-crashing exit(1) path, just
+with a slightly different message.
+
+Verified: `eval-okay-symlink-resolution.nix` now returns `"test"`,
+matching its `.exp`; `eval-okay-readDir-symlinked-directory.nix` (a
+different symlink case, `readDir` not `import`) was already passing
+and still is, confirming this change didn't touch anything it didn't
+need to; `eval-okay-import-follows-symlink.nix` still fails, but for an
+unrelated reason (`scopedImport`/`__curPos`, not implemented at all --
+not a regression, not touched by this fix). Diffed the full
+conformance fail list before/after: only the five tests from M57d
+through M57h moved from fail to pass, nothing else changed. One new
+e2e fixture (`m57h_symlink_resolution.nix` + a `m57h_symlink_fixtures/`
+tree with a real symlink committed to the repo, mirroring numtide's
+own fixture shape). `make test`/`test-e2e` green (209 e2e);
+`test-conformance` 646 passed (+1), 156 failed (-1), 0 known, 62
+skipped.
+
+### M57i: CLI flags -- `--arg`/`--argstr`/`-A`
+
+`src/c/main.c` had zero flag parsing at all (hard-required exactly one
+argument, the file path). Added real Nix's `nix-instantiate --eval`
+three most load-bearing flags:
+
+- **`--argstr name str`**: builds a plain String Value directly, no
+  parsing needed.
+- **`--arg name EXPR`**: `EXPR` is an arbitrary Nix expression (real
+  Nix's own CLI treats it as one too, not a literal string) -- run
+  through the exact same lex/parse/compile/eval pipeline a top-level
+  file gets, via a new `asnix_eval_expr_source` (eval_file.c, factored
+  out of `asnix_eval_file`'s existing `eval_source` so both share one
+  fresh-root-env/`builtins` setup), with the process's cwd as the base
+  directory any relative path literal INSIDE the expression resolves
+  against (confirmed against real Nix: a `--arg`/`--argstr` value has
+  no "containing file" of its own the way an ordinary import does).
+- **`-A attrpath`**: force-and-select one dotted segment at a time into
+  the final result after evaluation (and after any `--arg`/`--argstr`
+  auto-call below), same semantics as a chain of plain `.` selections
+  written in source, fatal on a non-attrset or missing key partway
+  through (naming the specific segment).
+- **`--arg`/`--argstr` also trigger real Nix's `autoCallFunction`**
+  (`eval.cc`): if the evaluated file is a lambda-PATTERN function
+  (`{a, b ? d, ...}: ...` -- introspected via the same `functionArgs`-
+  shaped `ASNIX_CLOSURE_OFF_FORMALS` M37 already precomputes per
+  closure, not new machinery), build an argument attrset containing
+  only the formals a CLI arg actually matched by name, calling the
+  closure with it; an unmatched formal is fine if it has a default
+  (the lambda's own `OP_CHECK_FORMALS` default machinery supplies it,
+  exactly as if that formal were simply omitted from an ordinary call
+  site) but fatal ("you must specify a value for the argument 'X'") if
+  required. A plain single-identifier lambda (`functionArgs` == `{}`)
+  is left uncalled, matching real Nix.
+
+Deliberately NOT implemented: **`-I`** (search-path entries feeding
+`<name>` resolution) -- would need a first-class `builtins.findFile`/
+`builtins.nixPath` (real Nix represents the search path as an actual
+Nix-level list of `{prefix;path;}` attrsets queryable from source),
+which is a separate, much larger feature this pass doesn't build; and
+no generic "skip any other flag real `nix-instantiate` accepts" logic
+-- an unrecognized flag is a hard usage error in `main.c`, by design
+(see below for why).
+
+Also updated `/tmp/nix-conformance/adapters/asnix` (a scratch file
+outside this repo, no commit needed for it) to actually forward a
+case's `.flags` sidecar -- it previously ignored `.flags` entirely, so
+nothing in the whole corpus ever exercised any CLI flag regardless of
+what asnix itself supported. Critically, it does NOT forward `.flags`
+blindly: a corpus-wide scan found 12 distinct flag names across ~140
+`.flags` files, only 3 of which asnix implements -- the rest
+(`--extra-experimental-features X`, three different `--lint-*-
+literals X` variants, `--max-call-depth N`, and bare boolean
+`--eval`/`--strict`/`--no-show-trace`/`--impure`) are real-Nix-only
+concepts (experimental-features gating, path-literal linting) asnix
+has no notion of at all. Since `main.c` treats any unrecognized flag
+as a hard usage error (by design, see above), blindly forwarding
+these would have turned every one of those ~140 OTHER cases (mostly
+`eval-{okay,fail}-fromTOML-*`, previously passing on their own merits
+since the adapter never even looked at `.flags` before) into a crash
+instead of a pass -- the adapter's flag-forwarding loop explicitly
+whitelists `--arg`/`--argstr`/`-A` (forwarded) and explicitly,
+individually drops every other flag name found in this exact corpus
+(both the value-taking ones, consuming their one argument, and the
+bare boolean ones, consuming none) -- a `*) shift ;;` catch-all at the
+end is pure defense-in-depth for any single-token flag not already
+named above, not the primary mechanism.
+
+Verified against real `nix-instantiate --eval`: `eval-okay-autoargs.
+nix` with its exact `.flags` string (`--arg lib import(lang/lib.nix)
+--argstr xyzzy xyzzy! -A result`) now produces `"xyzzy!xyzzy!foobar"`,
+matching its `.exp` byte-for-byte; a hand-run missing-required-argument
+case (`{a}: a` with only `--argstr b x` supplied) fatals with "you must
+specify a value for the argument 'a'", matching real Nix's own
+rejection class. Diffed the full conformance fail list before/after
+this adapter change: only `eval-okay-autoargs.nix` moved from fail to
+pass, confirming the other ~140 `.flags`-having cases were correctly
+unaffected by now actually reading (and selectively dropping from)
+their `.flags` file. No new e2e fixture: `test-e2e`'s harness
+(Makefile) invokes `./asnix "$f"` with no flags at all, so it
+structurally can't exercise `--arg`/`--argstr`/`-A` -- covered by the
+manual verification above and the conformance fixture instead. `make
+test`/`test-e2e` green (209 e2e, unchanged); `test-conformance` 647
+passed (+1 over M57h's 646), 155 failed (-1), 0 known, 62 skipped.
+
+### M57: items investigated and explicitly skipped
+
+- **Function/derivation equality quirks** (item 3 in the original
+  ask): confirmed real Nix's surprising `let f = x: x; in f == f` =>
+  `false` is genuine (`EvalState::eqValues`, eval.cc: functions are
+  unconditionally incomparable, `case nFunction: return false;`), BUT
+  also confirmed the reason `eval-okay-eq-slot-sort.nix` (M57a) still
+  passes without this fix is a SEPARATE, unrelated quirk: `eqValues`
+  short-circuits on C++ pointer identity (`if (&v1 == &v2) return
+  true;`, a documented-as-a-hack fast path) BEFORE the type switch,
+  and `ExprOpEq::eval` evaluates each side into a fresh *stack-local*
+  `Value v1; Value v2;`, so `f == f` never actually hits that fast
+  path (two different stack addresses) even though a shared heap
+  object (e.g. the same closure referenced from two different list
+  elements) does. Implementing real function-non-self-equality in
+  asnix would require replicating this exact "was this Value freshly
+  copied into a fresh temporary, or dereferenced from existing
+  storage" distinction, which has no clean analog in asnix's
+  architecture (variable references return the underlying heap Value
+  directly, never a fresh copy) -- skipped as genuinely more involved
+  than the task's own "skip if more involved than expected" allowance
+  anticipated, not from lack of trying to understand it. Derivation-
+  equality's `isDerivation`-style eager `type`-forcing during `==` was
+  not investigated in depth given the above; left for a future pass.
+
+- **CLI flag plumbing** (item 8): `--arg`/`--argstr`/`-A` WERE
+  implemented (see M57i above); `-I` specifically was not, since it
+  needs a first-class `builtins.findFile`/`builtins.nixPath` this pass
+  doesn't build (a separate, much larger feature -- see M57i's own
+  scope note). Both conformance fixtures that need `-I`
+  (`eval-okay-search-path.nix`, `eval-okay-search-path-prefix-slash.
+  nix`) also depend on things well beyond just the flag itself:
+  `eval-okay-search-path.nix` asserts against `<nix/fetchurl.nix>`
+  (real Nix's bundled `corepkgs`, which doesn't exist in asnix's world
+  at all) and `length __nixPath == 5`; `eval-okay-search-path-prefix-
+  slash.nix` needs `builtins.findFile`/`builtins.nixPath` directly as
+  first-class builtins, not just `<name>` literal resolution. Neither
+  would pass even with `-I` itself wired up, so building just the flag
+  without the builtins it feeds would have had zero conformance payoff
+  -- left undone for a future pass that tackles the search-path
+  builtins properly.
+
+- **Context-attr-name throwing on a string-with-context dynamic
+  attribute name** (item 5's third sub-item): confirmed string-context
+  tracking does not exist in this codebase at all -- `value_util.c`'s
+  own `asnix_coerce_to_string` comment is explicit about it ("the
+  separate, larger 'string context' feature (dependency tracking
+  through string ops) this project deliberately doesn't implement"),
+  and a repo-wide grep for any context-tracking data structure turned
+  up nothing beyond that one acknowledging comment and unrelated
+  daemon-protocol/error-context mentions. Not fixable without that
+  missing infrastructure, which is well out of this grab-bag's scope --
+  skipped per the task's own explicit "skip if the infrastructure
+  doesn't exist" instruction.

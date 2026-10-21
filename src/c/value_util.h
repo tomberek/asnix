@@ -75,6 +75,19 @@ Value asnix_concat_strings(const Value *parts, int64_t count);
  * whenever both operands aren't already known to be ints. */
 Value asnix_add_values(Value lhs, Value rhs);
 
+/* M57g: lexically canonicalizes an absolute path (collapses `.`/`..`
+ * components and doubled slashes, same as real Nix's `canonPath` --
+ * never touches the filesystem, no symlink resolution, just text).
+ * `in` must start with '/'. Returns a freshly malloc'd, NUL-terminated
+ * string the caller owns. Originally a compiler.c-only static helper
+ * for canonicalizing path *literals* at compile time (`./a/../b`); M57g
+ * reuses it in `asnix_add_values` too, so a `path + string`
+ * concatenation's result gets the exact same canonicalization once it's
+ * printed/`toString`-ed, matching real Nix (confirmed:
+ * `toString (/foo/bar + "/../xyzzy/./foo.txt")` == `/foo/xyzzy/foo.txt`
+ * in real Nix; asnix previously left `.`/`..` in literally, uncollapsed). */
+char *asnix_canon_path(const char *in);
+
 /* The `++` operator (list concatenation) -- NOT the same as `+`, which has
  * no list case at all in real Nix (`[1] + [2]` is a type error there).
  * Fatal if either side isn't a list, matching real Nix's exact wording

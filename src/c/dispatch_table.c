@@ -56,6 +56,7 @@ extern void asnix_op_insert_dynamic_attr(void);
 extern void asnix_op_select_dynamic_or(void);
 extern void asnix_op_resolve_search_path(void);
 extern void asnix_op_has_attr_dynamic(void);
+extern void asnix_op_rec_overrides_merge(void);
 
 void *asnix_handler_table[OP_COUNT] = {
     [OP_PUSH_INT] = (void *)asnix_op_push_int,
@@ -106,6 +107,7 @@ void *asnix_handler_table[OP_COUNT] = {
     [OP_SELECT_DYNAMIC_OR] = (void *)asnix_op_select_dynamic_or,
     [OP_RESOLVE_SEARCH_PATH] = (void *)asnix_op_resolve_search_path,
     [OP_HAS_ATTR_DYNAMIC] = (void *)asnix_op_has_attr_dynamic,
+    [OP_REC_OVERRIDES_MERGE] = (void *)asnix_op_rec_overrides_merge,
 };
 
 void ir_link(IrOp *ops, size_t n) {

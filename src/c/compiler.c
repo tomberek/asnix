@@ -29,49 +29,16 @@
  * returned) -- see src/c/eval_file.c. */
 static const char *g_compile_base_dir = NULL;
 
-/* Lexically canonicalizes an absolute path in place: collapses `.` and
- * `..` components and doubled slashes, same as real Nix's `canonPath`
+/* Lexically canonicalizes an absolute path: collapses `.` and `..`
+ * components and doubled slashes, same as real Nix's `canonPath`
  * (verified against `nix-instantiate --eval 'builtins.toString
  * ./sub/../foo.nix'`), but -- unlike `canonPath` -- never touches the
  * filesystem (no symlink resolution): cheap, and sufficient for every
- * case this project's fixtures exercise. `in` must start with '/'. */
-static char *canon_path(const char *in) {
-    size_t len = strlen(in);
-    char *out = malloc(len + 2);
-    char **comps = malloc((len + 1) * sizeof(char *));
-    size_t ncomps = 0;
-
-    size_t i = 0;
-    while (i < len) {
-        while (i < len && in[i] == '/') i++;
-        size_t start = i;
-        while (i < len && in[i] != '/') i++;
-        size_t clen = i - start;
-        if (clen == 0) continue;
-        if (clen == 1 && in[start] == '.') continue; /* "." -- drop */
-        if (clen == 2 && in[start] == '.' && in[start + 1] == '.') {
-            if (ncomps > 0) ncomps--; /* ".." -- pop (no-op at root, like real Nix) */
-            continue;
-        }
-        char *c = malloc(clen + 1);
-        memcpy(c, in + start, clen);
-        c[clen] = '\0';
-        comps[ncomps++] = c;
-    }
-
-    size_t pos = 0;
-    for (size_t k = 0; k < ncomps; k++) {
-        out[pos++] = '/';
-        size_t clen = strlen(comps[k]);
-        memcpy(out + pos, comps[k], clen);
-        pos += clen;
-        free(comps[k]);
-    }
-    free(comps);
-    if (pos == 0) out[pos++] = '/';
-    out[pos] = '\0';
-    return out;
-}
+ * case this project's fixtures exercise. `in` must start with '/'.
+ * M57g: moved to value_util.c as `asnix_canon_path` so `asnix_add_values`
+ * (`path + string` concatenation) can reuse it too -- see that
+ * function's own comment, value_util.h. */
+#define canon_path asnix_canon_path
 
 /* Resolves a NIX_PATH search-path entry name (the text inside `<...>`,
  * e.g. "nixpkgs" or "nixpkgs/lib") the same way real Nix's `findFile`
@@ -935,6 +902,24 @@ static void compile_expr(IrBuilder *b, Ast *node, ScopeFrame *scope) {
                  * thunk is built). */
                 ScopeFrame skip = { .up = scope, .names = NULL, .name_lens = NULL, .count = 0 };
 
+                /* M57c: `__overrides` (legacy feature -- allows a `rec {}`
+                 * field's value to be swapped out, with the swap visible
+                 * to every *other* field that references it, something
+                 * `//` alone can't do since by the time you `//` the
+                 * result, sibling thunks have already captured the
+                 * original value through this same frame). Detected
+                 * purely by binding NAME at compile time (a plain, non-
+                 * `rec` `{ __overrides = ...; }` is NOT special -- verified
+                 * against real Nix: only `rec {}`'s own ExprAttrs::eval
+                 * special-cases it, eval.cc). */
+                int64_t overrides_slot = -1;
+                for (size_t i = 0; i < n; i++) {
+                    if (bindings[i].name_len == 11 && memcmp(bindings[i].name, "__overrides", 11) == 0) {
+                        overrides_slot = (int64_t)i;
+                        break;
+                    }
+                }
+
                 ib_frame_alloc(b, (int64_t)n);
                 for (size_t i = 0; i < n; i++) {
                     ScopeFrame *value_scope = bindings[i].is_inherit ? &skip : &frame;
@@ -944,8 +929,18 @@ static void compile_expr(IrBuilder *b, Ast *node, ScopeFrame *scope) {
                     ib_mk_thunk(b, ib_finish(thunk_b));
                     ib_frame_set(b, (int64_t)i);
                 }
-                for (size_t i = 0; i < n; i++) ib_frame_get(b, (int64_t)order[i]);
-                ib_mk_attrs(b, (int64_t)n, sorted_syms);
+                if (overrides_slot >= 0) {
+                    /* `syms` (built above, BEFORE the symbol-id sort into
+                     * `order`/`sorted_syms`) is already in original,
+                     * per-slot order -- exactly what OP_REC_OVERRIDES_MERGE
+                     * needs (see ir.h). Replaces the plain path's
+                     * OP_FRAME_GET*n + OP_MK_ATTRS pair with the one op
+                     * that merges `__overrides` in first. */
+                    ib_rec_overrides_merge(b, (int64_t)n, syms, overrides_slot);
+                } else {
+                    for (size_t i = 0; i < n; i++) ib_frame_get(b, (int64_t)order[i]);
+                    ib_mk_attrs(b, (int64_t)n, sorted_syms);
+                }
                 ib_frame_exit(b);
                 free(names);
                 free(name_lens);

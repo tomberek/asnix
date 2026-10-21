@@ -136,6 +136,20 @@ size_t ib_frame_exit(IrBuilder *b) {
     return ib_emit(b, OP_FRAME_EXIT, 0, 0);
 }
 
+size_t ib_rec_overrides_merge(IrBuilder *b, int64_t n, const uint32_t *syms, int64_t overrides_slot) {
+    size_t pool_idx = (size_t)-1;
+    for (int64_t i = 0; i < n; i++) {
+        size_t idx = ib_pool_add(b, (int64_t)syms[i]);
+        if (i == 0) pool_idx = idx;
+    }
+    size_t slot_idx = ib_pool_add(b, overrides_slot);
+    if (n == 0) pool_idx = slot_idx; /* n == 0 can't actually happen (there's always at
+                                       * least the __overrides binding itself), but keep
+                                       * `b` valid regardless, same defensive habit
+                                       * ib_mk_attrs's own count==0 case has. */
+    return ib_emit(b, OP_REC_OVERRIDES_MERGE, n, (int64_t)pool_idx);
+}
+
 size_t ib_eq(IrBuilder *b) {
     return ib_emit(b, OP_EQ, 0, 0);
 }

@@ -279,6 +279,50 @@ Value asnix_bshared_make_attrs(uint32_t *syms, Value *vals, int64_t count) {
     return (Value){ .raw = (uint64_t)(uintptr_t)mem | ASNIX_TAG_ATTRS };
 }
 
+Value asnix_bshared_rec_overrides_merge(Env *env, int64_t n, const int64_t *meta) {
+    int64_t overrides_slot = meta[n];
+    Value overrides_val = asnix_force_for_print(env->values[overrides_slot]);
+    if (asnix_tag_of(overrides_val) != ASNIX_TAG_ATTRS) {
+        fprintf(stderr, "asnix: '__overrides' must be a set (got %s)\n",
+                asnix_bshared_type_name(overrides_val));
+        exit(1);
+    }
+
+    /* Working (sym, value) pairs: the n static bindings first (by Env
+     * slot order, matched ones replaced below), then any override-only
+     * extras appended -- asnix_bshared_make_attrs sorts the whole lot by
+     * sym at the end, so this function never needs to track order itself. */
+    int64_t ocount = asnix_bshared_attrs_count(overrides_val);
+    int64_t cap = n + ocount;
+    uint32_t *syms = malloc((size_t)cap * sizeof(uint32_t));
+    Value *vals = malloc((size_t)cap * sizeof(Value));
+    for (int64_t i = 0; i < n; i++) {
+        syms[i] = (uint32_t)meta[i];
+        vals[i] = env->values[i];
+    }
+    int64_t total = n;
+    for (int64_t oi = 0; oi < ocount; oi++) {
+        uint32_t osym = asnix_bshared_attrs_sym(overrides_val, oi);
+        Value oval = asnix_bshared_attrs_value(overrides_val, oi);
+        int64_t match = -1;
+        for (int64_t i = 0; i < n; i++) {
+            if (syms[i] == osym) { match = i; break; }
+        }
+        if (match >= 0) {
+            vals[match] = oval;
+            env->values[match] = oval; /* propagate into sibling self-references */
+        } else {
+            syms[total] = osym;
+            vals[total] = oval;
+            total++;
+        }
+    }
+    Value out = asnix_bshared_make_attrs(syms, vals, total);
+    free(syms);
+    free(vals);
+    return out;
+}
+
 void asnix_bshared_string_bytes(Value v, const char **bytes_out, int64_t *len_out, const char *who) {
     if (asnix_tag_of(v) != ASNIX_TAG_PTR) {
         fprintf(stderr, "asnix: %s: expected a string argument\n", who);
@@ -389,6 +433,8 @@ int asnix_bshared_has_attr_dynamic(Value target, Value name_val) {
 }
 
 int asnix_bshared_value_lt(Value a, Value b, const char *who) {
+    a = asnix_force_for_print(a);
+    b = asnix_force_for_print(b);
     int ta = asnix_tag_of(a), tb = asnix_tag_of(b);
     if (ta == ASNIX_TAG_INT && tb == ASNIX_TAG_INT) {
         return asnix_int_value(a) < asnix_int_value(b);
@@ -402,7 +448,29 @@ int asnix_bshared_value_lt(Value a, Value b, const char *who) {
         if (c != 0) return c < 0;
         return la < lb;
     }
-    fprintf(stderr, "asnix: %s: cannot compare these two values (only int-vs-int and string-vs-string are supported)\n",
+    /* Lists order lexicographically, recursively comparing elements
+     * pairwise (shorter-is-less on a common prefix) -- verified against
+     * real `nix-instantiate --eval`: `lessThan [1 2] [1 3]` == true,
+     * `lessThan [1] [1 2]` == true, `lessThan [1 2] [1]` == false,
+     * `lessThan [] []` == false, equal-length-equal-elements lists are
+     * neither less (`lessThan [1 2] [1 2]` == false). A type mismatch
+     * between two elements at the first differing index is the same
+     * fatal "cannot compare" error as a top-level mismatch (confirmed:
+     * `lessThan [1] ["a"]` throws "cannot compare an integer with a
+     * string" in real Nix too). */
+    if (ta == ASNIX_TAG_LIST && tb == ASNIX_TAG_LIST) {
+        int64_t na = asnix_bshared_list_count(a), nb = asnix_bshared_list_count(b);
+        const Value *ea = asnix_bshared_list_elems(a), *eb = asnix_bshared_list_elems(b);
+        int64_t n = na < nb ? na : nb;
+        for (int64_t i = 0; i < n; i++) {
+            Value ea_i = asnix_force_for_print(ea[i]);
+            Value eb_i = asnix_force_for_print(eb[i]);
+            if (asnix_bshared_value_eq(ea_i, eb_i)) continue;
+            return asnix_bshared_value_lt(ea_i, eb_i, who);
+        }
+        return na < nb;
+    }
+    fprintf(stderr, "asnix: %s: cannot compare these two values (only int-vs-int, string-vs-string, and list-vs-list are supported)\n",
             who);
     exit(1);
 }

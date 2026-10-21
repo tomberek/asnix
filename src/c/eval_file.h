@@ -15,9 +15,11 @@
  * against `path`'s OWN directory, not the process's cwd or whichever
  * file imported it -- verified against `nix-instantiate --eval` (see
  * docs/architecture.md's import/path scope notes); implemented by
- * resolving `path` to an absolute path with `realpath()` and passing its
- * directory to `asnix_compile()` as the base_dir every AST_PATH node in
- * this file resolves against (see compiler.c's AST_PATH case).
+ * resolving `path` to an absolute, lexically-canonicalized path (M57h:
+ * does NOT resolve symlinks on disk, unlike `realpath()` -- see
+ * eval_file.c's resolve_import_path for why) and passing its directory
+ * to `asnix_compile()` as the base_dir every AST_PATH node in this file
+ * resolves against (see compiler.c's AST_PATH case).
  *
  * Aborts the process (message to stderr, exit 1) if `path` can't be
  * opened or resolved to an absolute path. */
@@ -35,5 +37,13 @@ Value asnix_eval_file(const char *path);
  * laziness as any other attrset field, M6) -- only its NAMES are needed
  * up front, to build the compile-time ScopeFrame. */
 Value asnix_eval_file_scoped(const char *path, Value scope);
+
+/* M57i: runs the same lex -> parse -> compile -> eval pipeline over a
+ * source STRING (not a file) -- used by main.c's `--arg name EXPR` CLI
+ * flag, whose EXPR is an arbitrary Nix expression, not a plain value.
+ * Relative path literals inside `src` resolve against the process's
+ * current working directory (matching real Nix: a `--arg`/`--argstr`
+ * value has no "containing file" of its own to resolve against). */
+Value asnix_eval_expr_source(const char *src);
 
 #endif /* ASNIX_EVAL_FILE_H */
