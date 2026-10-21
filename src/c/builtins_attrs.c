@@ -155,8 +155,10 @@ static Value make_curried2(Value captured, IrProgram *inner_prog) {
     *(int64_t *)((char *)mem + ASNIX_CLOSURE_OFF_ARITY) = 1;
     *(void **)((char *)mem + ASNIX_CLOSURE_OFF_POOL) = inner_prog->pool;
     /* Never a lambda-pattern -- `builtins.functionArgs` on any of these
-     * closures is `{}`, same as real Nix (M37). */
-    *(uint64_t *)((char *)mem + ASNIX_CLOSURE_OFF_FORMALS) = asnix_bshared_make_attrs(NULL, NULL, 0).raw;
+     * closures is `{}`, same as real Nix (M37). M80: the shared canonical
+     * marker, not a fresh allocation -- see builtins_shared.h's
+     * asnix_bshared_native_formals_marker. */
+    *(uint64_t *)((char *)mem + ASNIX_CLOSURE_OFF_FORMALS) = asnix_bshared_native_formals_marker().raw;
     return (Value){ .raw = (uint64_t)(uintptr_t)mem | ASNIX_TAG_CLOSURE };
 }
 

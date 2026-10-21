@@ -51,6 +51,27 @@ Value asnix_bshared_make_primop_noforce(void *fn, int64_t arity);
  * arity>=2 builtin added in this pass. */
 Value asnix_bshared_make_curried_native(void *native_fn, int64_t arity);
 
+/* M80: a single, lazily-allocated, byte-correct empty-attrset Value
+ * (count=0), shared by every curry-stage Closure this file's/
+ * builtins_misc.c's/builtins_m54.c's/builtins_attrs.c's native-builtin-
+ * currying helpers (asnix_bshared_make_curried_native, builtins_misc.c's
+ * own make_curried_native, builtins_m54.c's make_curried_native_noforce,
+ * builtins_attrs.c's make_curried2) build for their Closures' OFF_FORMALS
+ * field -- see main.c's ASNIX_TAG_CLOSURE print case for why this needs
+ * to be ONE canonical address rather than each call site's own fresh
+ * `asnix_bshared_make_attrs(NULL, NULL, 0)` (which is what every one of
+ * those call sites used before M80, and is still exactly what this
+ * function's first call computes/returns -- so `builtins.functionArgs`
+ * on any of these closures is completely unaffected, still a genuinely
+ * valid, correct `{ }`). The only purpose this adds is a RELIABLE,
+ * pointer-identity-based way for the printer to recognize "this Closure
+ * is a native-builtin curry stage, not user Nix code": compiler.c's own
+ * AST_LAMBDA case calls the plain `asnix_bshared_make_attrs(NULL, NULL,
+ * 0)` fresh for every single compiled non-pattern lambda (never this
+ * function), so a real user lambda's formals pointer can never coincide
+ * with this one, no matter how many are compiled. */
+Value asnix_bshared_native_formals_marker(void);
+
 /* `fn a b` via two successive single-argument asnix_apply calls -- same
  * shape as builtins_list.c's local (file-static) apply2. */
 Value asnix_bshared_apply2(Value fn, Value a, Value b);

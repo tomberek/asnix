@@ -31,6 +31,21 @@ Value asnix_bshared_make_primop_noforce(void *fn, int64_t arity) {
     return (Value){ .raw = (uint64_t)(uintptr_t)mem | ASNIX_TAG_PRIMOP };
 }
 
+/* M80: the ONE canonical marker Value used by every native-builtin-
+ * currying helper in this codebase -- see builtins_shared.h's own long
+ * comment on the declaration for the full rationale. Lazily built on
+ * first use (happens very early, during the one-time builtin-table
+ * registration pass that runs before any Nix source is even parsed, let
+ * alone compiled) and memoized in a function-local static, the same
+ * "compute once, cache in a static" shape this codebase already uses
+ * elsewhere (e.g. builtins_attrs.c's prim_hasAttr/prim_getAttr `static
+ * IrProgram *inner`). */
+Value asnix_bshared_native_formals_marker(void) {
+    static Value marker = { .raw = 0 };
+    if (marker.raw == 0) marker = asnix_bshared_make_attrs(NULL, NULL, 0);
+    return marker;
+}
+
 /* Ported straight from builtins_misc.c's make_curried_native -- see that
  * file's long header comment for the full rationale (equivalent to
  * compiling the fictitious Nix source `a1: a2: ... aN: __native a1 a2 ... aN`
@@ -40,8 +55,11 @@ Value asnix_bshared_make_curried_native(void *native_fn, int64_t arity) {
     Value native_primop = asnix_bshared_make_primop(native_fn, arity);
     /* Never a lambda-pattern -- `builtins.functionArgs` on any of these
      * closures is `{}`, same as real Nix's `functionArgs builtins.add`
-     * (M37). */
-    Value empty_formals = asnix_bshared_make_attrs(NULL, NULL, 0);
+     * (M37). M80: uses the shared canonical marker (see above) instead of
+     * a fresh `asnix_bshared_make_attrs` call so the printer can
+     * recognize these as native-builtin curry stages (still a completely
+     * valid, correct `{ }` for `functionArgs` itself). */
+    Value empty_formals = asnix_bshared_native_formals_marker();
 
     IrBuilder *b = ib_new();
     ib_push_const(b, (int64_t)native_primop.raw);

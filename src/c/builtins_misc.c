@@ -96,8 +96,9 @@ static Value make_curried_native(void *native_fn, int64_t arity) {
     Value native_primop = make_primop_value(native_fn, arity);
     /* Never a lambda-pattern -- `builtins.functionArgs` on any of these
      * closures is `{}`, same as real Nix's `functionArgs builtins.add`
-     * (M37). */
-    Value empty_formals = asnix_bshared_make_attrs(NULL, NULL, 0);
+     * (M37). M80: the shared canonical marker, not a fresh allocation --
+     * see builtins_shared.h's asnix_bshared_native_formals_marker. */
+    Value empty_formals = asnix_bshared_native_formals_marker();
 
     /* Innermost program: runs once the *last* curried argument has been
      * supplied, in the Env chain built up by `arity` nested single-slot

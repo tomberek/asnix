@@ -193,7 +193,9 @@ static Value trace2_impl(const Value *args, int64_t argc) {
  * wants force-args-on, the ordinary default). */
 static Value make_curried_native_noforce(void *native_fn, int64_t arity) {
     Value native_primop = asnix_bshared_make_primop_noforce(native_fn, arity);
-    Value empty_formals = asnix_bshared_make_attrs(NULL, NULL, 0);
+    /* M80: shared canonical marker, not a fresh allocation -- see
+     * builtins_shared.h's asnix_bshared_native_formals_marker. */
+    Value empty_formals = asnix_bshared_native_formals_marker();
 
     IrBuilder *b = ib_new();
     ib_push_const(b, (int64_t)native_primop.raw);

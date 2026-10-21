@@ -262,15 +262,16 @@ static void print_value_inner(Value v) {
             print_active_pop();
             return;
         }
-        /* M67: real Nix's printer (print.cc) shows `<PRIMOP>` for an
-         * unapplied builtin and `<LAMBDA>` for a bytecode closure (and
+        /* M67/M80: real Nix's printer (print.cc) shows `<PRIMOP>` for an
+         * unapplied builtin, `<LAMBDA>` for a bytecode closure, and
          * `<PRIMOP-APP>` for a *partially*-applied multi-arg builtin --
-         * see this case's own note below on why that third one isn't
-         * replicated here). Previously both tags fell to the generic
-         * `default:` branch below and printed `<unprintable value,
-         * tag=N>` -- found via eval-okay-print.nix (`builtins.trace
-         * [...] [ null toString (deepSeq "x") (a: a) ... ]`), verified
-         * against real `nix-instantiate --eval`.
+         * found via eval-okay-print.nix (`builtins.trace [...] [ null
+         * toString (deepSeq "x") (a: a) ... ]`), verified against real
+         * `nix-instantiate --eval` (also directly: `[ builtins.sub
+         * (builtins.sub 1) ]` prints `[ <PRIMOP> <PRIMOP-APP> ]`
+         * regardless of the builtin's real arity -- real Nix has exactly
+         * one "PrimOpApp" state for "not fully applied yet", it doesn't
+         * matter how many of N args still remain).
          *
          * ASNIX_TAG_PRIMOP is always a *fully unapplied* native builtin:
          * every multi-arg builtin visible from Nix source is pre-curried
@@ -286,28 +287,43 @@ static void print_value_inner(Value v) {
             return;
         /* ASNIX_TAG_CLOSURE is NOT always a genuine user-written lambda
          * -- a *partially*-applied multi-arg native builtin (e.g.
-         * `deepSeq "x"`, one of two args bound) is, per the above,
-         * ALSO represented as one of make_curried_native's synthetic
-         * wrapper closures, which is bit-for-bit indistinguishable at
-         * this tag from an ordinary closure: same ASNIX_TAG_CLOSURE,
-         * same closure layout, no spare field anywhere in it currently
-         * marks "I am a curry stage of a native builtin, not user
-         * code" (its `formals`/`up` fields take the same values an
-         * ordinary top-level lambda's can legitimately take too, so
-         * neither is a safe signal). Reliably telling the two apart
-         * would need a dedicated marker threaded through the closure
-         * heap layout (heap.h) and every .S site that builds one --
-         * out of proportion for this pass. So every ASNIX_TAG_CLOSURE,
-         * applied-native-builtin-stage or not, prints as `<LAMBDA>`;
-         * `eval-okay-print.nix` specifically expects `<PRIMOP-APP>` for
-         * its `(deepSeq "x")` case and so still fails on that one
-         * element (a known, documented approximation, not a crash --
-         * the rest of that test's output, including the `<PRIMOP>`/
-         * `<LAMBDA>` elements and the self-referential-list "«repeated»"
-         * case, is correct). */
-        case ASNIX_TAG_CLOSURE:
-            printf("<LAMBDA>");
+         * `deepSeq "x"`, one of two args bound; also a multi-arg
+         * builtin's "zero args applied" top-of-curry-chain state, e.g.
+         * bare `deepSeq`, which the M67 comment this replaces missed
+         * entirely -- see builtins_m23.c's build_deepSeq, ALWAYS a
+         * Closure, never an ASNIX_TAG_PRIMOP, for any arity>=2 builtin)
+         * is, per the above, ALSO represented as one of
+         * make_curried_native's (or make_curried2's/
+         * make_curried_native_noforce's) synthetic wrapper closures.
+         * M80: every one of those now stamps its OFF_FORMALS field with
+         * `asnix_bshared_native_formals_marker()`'s ONE canonical
+         * address (instead of each call site's own fresh, unshared
+         * empty-attrset allocation) specifically so this case can tell
+         * the two apart reliably -- compiler.c's own AST_LAMBDA case
+         * always calls the plain, un-marked `asnix_bshared_make_attrs`
+         * for every real compiled lambda, so a genuine user closure's
+         * formals pointer can never coincide with the marker. Once
+         * recognized as a curry stage, `UP == NULL` means "zero args
+         * applied yet" (`asnix_bshared_make_curried_native`'s own
+         * top-level closure, returned with UP explicitly NULL since
+         * nothing has been bound yet) -- real Nix's `<PRIMOP>` state --
+         * and any other UP (a real, >=1-slot Env, captured by actually
+         * calling into the chain) is `<PRIMOP-APP>`, matching real Nix's
+         * single undifferentiated "some but not all args bound" state
+         * regardless of how many of the curry chain's remaining stages
+         * are still pending. Every other ASNIX_TAG_CLOSURE (FORMALS not
+         * the marker) is a genuine user lambda, `<LAMBDA>`. */
+        case ASNIX_TAG_CLOSURE: {
+            const char *base = (const char *)(v.raw & ~0x7ULL);
+            Value formals = *(const Value *)(base + ASNIX_CLOSURE_OFF_FORMALS);
+            if (formals.raw == asnix_bshared_native_formals_marker().raw) {
+                void *up = *(void **)(base + ASNIX_CLOSURE_OFF_UP);
+                printf(up == NULL ? "<PRIMOP>" : "<PRIMOP-APP>");
+            } else {
+                printf("<LAMBDA>");
+            }
             return;
+        }
         default:
             printf("<unprintable value, tag=%d>", asnix_tag_of(v));
             return;
