@@ -311,4 +311,12 @@ int asnix_bshared_has_attr_dynamic(Value target, Value name_val);
 Value asnix_bshared_make_lazy_call1(Value f, Value arg);
 Value asnix_bshared_make_lazy_call2(Value f, Value arg1, Value arg2);
 
+/* Shared-env variant for N calls that all share the same `f` (mapAttrs/
+ * zipAttrsWith) -- see builtins_shared.c's own comment for the exact
+ * size win. Build the shared Env ONCE per builtin call (outside the
+ * per-attribute loop) via the first function, then call the second once
+ * per attribute. */
+Env *asnix_bshared_make_call2_shared_env(Value f);
+Value asnix_bshared_make_lazy_call2_indexed(Env *shared, Value arg1, Value arg2);
+
 #endif /* ASNIX_BUILTINS_SHARED_H */

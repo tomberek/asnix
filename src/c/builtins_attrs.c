@@ -360,6 +360,10 @@ static Value prim_mapAttrs_apply2(const Value *args, int64_t argc) {
     int64_t n = attrs_count(attrs);
     uint32_t *syms = asnix_arena_alloc((uint64_t)n * sizeof(uint32_t));
     Value *vals = asnix_arena_alloc((uint64_t)n * sizeof(Value));
+    /* M109: one shared Env holding `f`, instead of re-storing it into a
+     * fresh 3-slot Env on every one of n per-attribute thunks -- see
+     * asnix_bshared_make_lazy_call2_indexed's own comment. */
+    Env *shared = asnix_bshared_make_call2_shared_env(f);
     for (int64_t i = 0; i < n; i++) {
         uint32_t sym = attrs_entry_sym(attrs, i);
         size_t len;
@@ -367,7 +371,7 @@ static Value prim_mapAttrs_apply2(const Value *args, int64_t argc) {
         Value name_val = asnix_make_string_value(name, len);
         Value orig = attrs_entry_value(attrs, i);
         syms[i] = sym;
-        vals[i] = asnix_bshared_make_lazy_call2(f, name_val, orig);
+        vals[i] = asnix_bshared_make_lazy_call2_indexed(shared, name_val, orig);
     }
     return make_attrs_from_sorted(syms, vals, n);
 }

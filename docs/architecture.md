@@ -122,6 +122,7 @@ what's actually implemented and the scope decisions made along the way.
 | M107 — the bytecode cache's own lookup path did MORE file opens than no caching at all: the cache key required hashing the entire source file's content before even checking for a hit, so a warm-cache run was "1 source open (always) + 1 cache-entry open (on a hit)" against disabled's single open. Added a cheap mtime+size fast path (reusing the `lstat()` M83's `follow_symlink_chain` already does, no extra syscall in the common case) with a content-hash fallback + atomic self-heal when mtime/size drifts but content hasn't | done (see below; `openat` count on `d.nix`'s 1056-file closure: disabled 2444 → warm-cache 3500 (pre-fix) → **2447** (post-fix, +3 fully explained: one embedded-stub file always needs the verify path); zero regressions) |
 | M106 — packed `Thunk`'s `state` field into the low tag bits of its own `prog` field instead of a separate 8-byte word: `prog` is always a plain `IrProgram*` (malloc/calloc-aligned, low 3 bits always free, written once at creation, read once more at UNFORCED→IN_PROGRESS), unlike the originally-proposed target (`env`, whose FORCED case caches a raw `Value.raw` that already saturates all 8 combinations of the low 3 bits via `ASNIX_TAG_MASK` -- a genuine dead end, confirmed before picking `prog` instead); `ASNIX_THUNK_SIZE` 24 → 16 bytes, unlike M100's earlier rejected narrowing this one is already 8-byte-aligned so the arena's rounding doesn't claw it back | done (see below; found and tagged the 4th thunk state, `ASNIX_THUNK_STATE_FAILED` from M82's `tryEval` memoization, that an earlier description had missed; peak RSS on `d.nix` 741,976 → 723,820 KB (~2.5%); zero regressions) |
 | M108 — a permanent, always-on `NIX_SHOW_STATS=1`-equivalent (`ASNIX_SHOW_STATS=1`): per-category object counters (env/thunk/closure/attrs/list/cell/string/primop/path, plus element/entry sub-counts for env/attrs/list) incremented at every real allocation site -- `asnix_env_alloc` plus the four hot-path-inlined env-frame sites (`op_frame.S`/`op_let.S`/`op_call.S`/`op_with.S`/`apply.S`) that bypass it entirely, so a first attempt at just the shared helper undercounted envs by ~3x until all five sites were found and instrumented | done (see below; env/thunk/cell counts cross-checked exactly against this session's own independent arena-tracer investigation -- 1,675,074 / 2,342,967 / 836,471 -- confirming correctness; zero regressions) |
+| M109 — ported real Nix's `IndexedCallDescriptor` idea (`tomberek/nix#52`) to `mapAttrs`/`zipAttrsWith`: both build N lazy `(f name) value` thunks per call that all share the same `f`, but the per-thunk Env was re-storing `f` into a fresh 3-slot Env every time. Factored `f` out into one shared 1-slot Env (allocated once per builtin call, `asnix_bshared_make_call2_shared_env`), each per-attribute thunk now uses a 2-slot Env `{arg1, arg2}` whose `up` points at the shared Env, reading `f` via depth=1 instead of depth=0 (`asnix_bshared_make_lazy_call2_indexed`) -- no new Value kind, no new asm, no new force-path case, unlike the fuller `IndexedCallThunk` design the same PR also explores (deferring the attribute-name String's construction until the thunk is actually forced), which needs a new bytecode op or a native-call escape hatch in the force path and was left as a documented follow-on, out of scope for a one-shot | done (see below; per-thunk cost Env(3)+Thunk=48B -> Env(2)+Thunk=40B (~17%); measured on `d.nix`'s real ffmpeg closure: peak RSS 674,584 KB -> 670,796 KB (~0.56%, modest since ffmpeg's own closure doesn't lean on `mapAttrs`/`zipAttrsWith` heavily -- matches real Nix's own measured -2.1% to -4.2% gain for the analogous change); `mapAttrs` laziness canary (`attrNames (mapAttrs throw {...})` must not throw) and basic `mapAttrs`/`zipAttrsWith` correctness spot-checked directly; zero regressions) |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
 
@@ -11962,3 +11963,101 @@ stashed out): `make test`/`test-e2e`/`test-conformance` all green;
 op_mk_thunk,op_lambda,op_mk_attrs,op_mk_list}.S`, `src/asm/apply.S`,
 `src/c/builtins_shared.c`, `src/c/value_util.c`, `src/c/main.c`,
 `docs/architecture.md`.
+
+## M109: ported real Nix's `IndexedCallDescriptor` (`tomberek/nix#52`) to `mapAttrs`/`zipAttrsWith` -- shared `f` Env instead of a fresh one per attribute
+
+User-prompted follow-up to the architecture discussion earlier this
+session on why `UnionHdr` is heavier than real Nix's `Bindings`
+layering, and to a sibling investigation into whether `mapAttrs` could
+avoid its 2-arg curried-call overhead (that one correctly declined a
+general fix as architecture-sized, since asnix has no multi-arg
+call-chain flattening anywhere). This milestone ports a real, narrower,
+already-measured-upstream idea instead: `tomberek/nix#52`'s
+`IndexedCallDescriptor`.
+
+**What real Nix's PR does**: `mapAttrs`/`zipAttrsWith`-shaped per-
+attribute lazy calls all share the same mapping function `f` across N
+attributes. The PR adds a `tIndexedCall` Value kind riding on real
+Nix's existing "pair of pointers" storage (zero new allocation shape,
+since `tApp`/`tThunk`/`tLambda` already share that slot): one
+`IndexedCallDescriptor{fun, original}` per call, and one
+`IndexedCallThunk{descriptor, packedIndex}` per attribute -- resolved
+lazily on force by looking up the attribute at `index` directly and
+calling `fun` on it. Real Nix measured -2.1% to -4.2% peak RSS.
+
+**What was ported here -- the narrower half of the idea.** Full parity
+with the PR would mean a new asnix Value kind (following M92's `Cell`
+precedent -- a reserved negative marker riding on `ASNIX_TAG_PTR`,
+`ASNIX_CELL_MARKER` is `-3`, this would be `-4`) plus a new force-path
+case resolving `(descriptor, index)` into `(name, value)` by indexing
+into the original attrset -- which, for a layered `UnionHdr` original,
+would additionally need to reuse M93's own leaf-walk logic. That's real
+new asm/force-path work, correctness-sensitive given it's the hottest
+code in the interpreter, and was judged out of scope for a one-shot
+pass (same discipline as declining the general curried-call fix).
+
+Ported the *allocation-sharing* half instead, which needs none of that:
+`asnix_bshared_make_lazy_call2` (`builtins_shared.c`) already builds
+one `Thunk` per attribute, each wrapping a fresh 3-slot `Env` holding
+`{f, name_val, origvalue}` -- but `f` is identical across every one of
+the N thunks a single `mapAttrs`/`zipAttrsWith` call produces, so
+re-storing it N times is pure waste. Added:
+
+- `asnix_bshared_make_call2_shared_env(Value f)`: allocates ONE 1-slot
+  `Env{values[0]=f}` with `up=NULL`, called once per builtin call,
+  before the per-attribute loop.
+- `asnix_bshared_make_lazy_call2_indexed(Env *shared, arg1, arg2)`: the
+  same `(f arg1) arg2` bytecode body as the generic function, except
+  `f` is read via `ib_var_ref(b, 1, 0)` (depth=1, one `up` hop into
+  `shared`) instead of depth=0, and the per-attribute `Env` only needs
+  2 slots `{arg1, arg2}` with `up=shared`.
+
+Both `prim_mapAttrs_apply2` (`builtins_attrs.c`) and `zipAttrsWith`'s
+own implementation (`builtins_m54.c`) now build the shared Env once and
+call the indexed variant per attribute/key, instead of the generic
+3-slot version.
+
+**Size win per thunk**: `Env(3 slots)=8+24=32B + Thunk=16B = 48B` (old)
+-> `Env(2 slots)=8+16=24B + Thunk=16B = 40B` (new), ~17% smaller per
+attribute -- the one shared 1-slot Env (24B) is a fixed, one-time cost
+per `mapAttrs`/`zipAttrsWith` *call*, not per attribute, so it
+amortizes away for any non-trivial attrset.
+
+**Correctness, verified directly, not just via the fixture suite**:
+- `builtins.attrNames (builtins.mapAttrs builtins.throw { a = 1; b = 2;
+  })` -> `[ "a" "b" ]`, does NOT throw -- confirms the real-Nix-matching
+  laziness canary (M18/M23's own fix) still holds: `f` being read one
+  `up`-hop away doesn't force it or anything else prematurely.
+- `let m = builtins.mapAttrs (n: v: n + "=" + toString v) { a = 1; b =
+  2; }; in [ m.a m.b ]` -> `[ "a=1" "b=2" ]` -- correctness of the
+  depth-1 `f` read plus the 2-slot per-attribute Env.
+- `builtins.zipAttrsWith (n: vs: builtins.foldl (a: b: a + b) 0 vs) [ {
+  a = 1; b = 2; } { a = 10; b = 20; } ]` -> `{ a = 11; b = 22; }`.
+
+`make test`/`make test-e2e`/`make test-conformance`: unchanged, all
+green. `make test-nix-conformance`: `pass=655 fail=3 skip=148`,
+identical to the pre-existing baseline. `make test-nixpkgs-hash`:
+`pass=148 fail=0` (hash-parity harness unaffected, as expected -- this
+touches builtin-call allocation shape, not derivation/hash machinery).
+
+**Measured real-world impact**: before/after RSS on `./asnix d.nix`
+(real nixpkgs's `ffmpeg.outPath`), measured by stashing and restoring
+this milestone's own diff within the same build to eliminate
+machine-load noise between runs: **674,584 KB -> 670,796 KB (~0.56%
+reduction)**. Modest, honestly reported as modest -- real Nix's own
+measured gain for the identical idea was -2.1% to -4.2%, and ffmpeg's
+actual dependency closure apparently doesn't lean on `mapAttrs`/
+`zipAttrsWith` heavily enough to see the larger end of that range. The
+win should scale with how `mapAttrs`/`zipAttrsWith`-heavy a given
+nixpkgs evaluation actually is -- not separately measured here beyond
+the one real workload this session has consistently used as its
+yardstick.
+
+**Left as a documented follow-on, not attempted**: the fuller
+`IndexedCallThunk` design (deferring the attribute-name `String`'s
+construction until the thunk is actually forced, eliminating today's
+eager `asnix_make_string_value` call for every attribute regardless of
+whether it's ever forced) -- real correctness-sensitive work needing a
+new Value kind and force-path case, flagged for a dedicated pass if the
+`ASNIX_SHOW_STATS`-measured `mapAttrs`/`zipAttrsWith` call volume on a
+`mapAttrs`-heavy real nixpkgs evaluation ever justifies it.

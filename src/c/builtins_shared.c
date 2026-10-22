@@ -823,3 +823,47 @@ Value asnix_bshared_make_lazy_call2(Value f, Value arg1, Value arg2) {
     env->values[2] = arg2;
     return make_thunk_from(prog, env);
 }
+
+/* mapAttrs/zipAttrsWith variant of asnix_bshared_make_lazy_call2: both
+ * callers build N lazy `(f arg1) arg2` thunks per call (one per output
+ * attribute) that all share the exact same `f` -- the generic version
+ * above wastefully re-stores that same Value into a fresh 3-slot Env on
+ * every one of the N thunks. Ported from real Nix's own
+ * IndexedCallDescriptor idea (tomberek/nix#52): factor `f` out into ONE
+ * shared 1-slot Env (allocated once, up front, by the caller via
+ * asnix_bshared_make_call2_shared_env below), and give each individual
+ * thunk only a 2-slot Env {arg1, arg2} whose `up` points at that shared
+ * Env -- `f` is then read via depth=1 (one `up` hop) instead of depth=0.
+ * Per-thunk cost: Env(2 slots)=24B + Thunk=16B = 40B, down from the
+ * generic version's Env(3 slots)=32B + Thunk=16B = 48B, an ~17%
+ * reduction, for free (same single `ib_finish`-compiled shared program,
+ * just a different, smaller per-call Env shape) -- no new Value kind,
+ * no new asm, no new force-path case, unlike the fuller IndexedCallThunk
+ * design the PR itself also explores (which additionally defers
+ * building the attribute-name String until the thunk is actually
+ * forced -- not done here: that needs a new bytecode op or a native-call
+ * escape hatch in the force path, correctness-sensitive work out of
+ * scope for this one-shot pass; left as a documented follow-on). */
+Env *asnix_bshared_make_call2_shared_env(Value f) {
+    Env *shared = asnix_env_alloc(NULL, 1);
+    shared->values[0] = f;
+    return shared;
+}
+
+Value asnix_bshared_make_lazy_call2_indexed(Env *shared, Value arg1, Value arg2) {
+    static IrProgram *prog = NULL;
+    if (!prog) {
+        IrBuilder *b = ib_new();
+        ib_var_ref(b, 1, 0); /* f, from the shared outer Env */
+        ib_var_ref(b, 0, 0); /* arg1 */
+        ib_call(b, 1);       /* -> step1 = f arg1 */
+        ib_var_ref(b, 0, 1); /* arg2 (step1 stays underneath on VALSTACK) */
+        ib_call(b, 1);       /* -> step1 arg2 */
+        ib_ret(b);
+        prog = ib_finish(b);
+    }
+    Env *env = asnix_env_alloc(shared, 2);
+    env->values[0] = arg1;
+    env->values[1] = arg2;
+    return make_thunk_from(prog, env);
+}
