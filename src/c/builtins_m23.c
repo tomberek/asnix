@@ -217,7 +217,26 @@ static Value prim_readFileType(const Value *args, int64_t argc) {
 
 /* `builtins.readDir p` -- an attrset of directory-entry-name -> file-type
  * string (same four strings as readFileType, same lstat-not-following
- * convention for each entry). `.`/`..` are skipped, matching real Nix. */
+ * convention for each entry). `.`/`..` are skipped, matching real Nix.
+ *
+ * Perf (found via `strace -c`: 23392 of a real nixpkgs ffmpeg closure's
+ * 25389 total newfstatat/lstat calls -- 92% -- traced directly to this
+ * loop's unconditional per-entry lstat, driven by nixpkgs's
+ * pkgs/top-level/by-name-overlay.nix doing a two-level `readDir` over
+ * ~759 shard dirs and ~20000+ package dirs under pkgs/by-name): `readdir`
+ * already returns `d_type` (populated straight from the `getdents64`
+ * buffer on any filesystem that supports it -- ext4/btrfs/xfs/tmpfs/
+ * overlayfs, i.e. everything a Nix store normally lives on) for FREE, no
+ * extra syscall. Trust it when it's not DT_UNKNOWN: DT_DIR/DT_REG/DT_LNK
+ * map directly to the same three non-"unknown" strings stat_type_str
+ * would've produced from an lstat of the same entry (device/fifo/socket
+ * entries -- DT_BLK/DT_CHR/DT_FIFO/DT_SOCK -- map to "unknown" the same
+ * way stat_type_str's own S_ISDIR/S_ISREG/S_ISLNK-only checks already
+ * did, so this is not a behavior change, just skipping a redundant
+ * syscall). Only fall back to the old lstat path when d_type genuinely
+ * can't tell us (DT_UNKNOWN -- some filesystems/FUSE mounts never
+ * populate it), so this is correct on every filesystem, just faster on
+ * the common ones. */
 static Value prim_readDir(const Value *args, int64_t argc) {
     (void)argc;
     char *path = resolve_fs_path(args[0], "readDir");
@@ -233,11 +252,21 @@ static Value prim_readDir(const Value *args, int64_t argc) {
     while ((ent = readdir(dir)) != NULL) {
         if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) continue;
         size_t namelen = strlen(ent->d_name);
-        char *entpath = malloc(strlen(path) + 1 + namelen + 1);
-        snprintf(entpath, strlen(path) + 1 + namelen + 1, "%s/%s", path, ent->d_name);
-        struct stat st;
-        const char *kind = (lstat(entpath, &st) == 0) ? stat_type_str(&st) : "unknown";
-        free(entpath);
+        const char *kind;
+        switch (ent->d_type) {
+            case DT_DIR: kind = "directory"; break;
+            case DT_REG: kind = "regular"; break;
+            case DT_LNK: kind = "symlink"; break;
+            case DT_UNKNOWN: {
+                char *entpath = malloc(strlen(path) + 1 + namelen + 1);
+                snprintf(entpath, strlen(path) + 1 + namelen + 1, "%s/%s", path, ent->d_name);
+                struct stat st;
+                kind = (lstat(entpath, &st) == 0) ? stat_type_str(&st) : "unknown";
+                free(entpath);
+                break;
+            }
+            default: kind = "unknown"; break; /* DT_BLK/DT_CHR/DT_FIFO/DT_SOCK */
+        }
         if (n == cap) {
             cap = cap ? cap * 2 : 16;
             syms = realloc(syms, cap * sizeof(uint32_t));

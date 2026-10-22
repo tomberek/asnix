@@ -13438,3 +13438,118 @@ test-nix-conformance` across the full 806-file corpus with the whole
 6-pass pipeline active gives the identical `pass=655 fail=3 skip=148`
 baseline, and `ASNIX_IR_OPT=1 ./asnix d.nix` on real nixpkgs's
 `ffmpeg.outPath` still produces the byte-identical output hash.
+
+## M123: two bounded speed fixes from a cross-evaluator speed investigation -- lexer token-vector presizing and readDir's d_type fast path
+
+A dedicated investigation comparing asnix against a sibling evaluator,
+`iets` (~/gnix/iets, Rust), on real wall-clock/cycle/instruction/page-
+fault/syscall terms (not just the object-count comparisons M90-M122
+focused on) found a fair, single-threaded (`iets --workers 1 --no-cache`)
+gap of ~2.35x wall-clock, ~2.07x instructions, with IPC actually close
+between the two (asnix ~1.76, iets ~1.91) -- meaning most of the gap
+tracks raw instruction count, not per-instruction inefficiency. One sharp
+outlier: page-faults were 6.71x higher in asnix (174,407 vs 25,998)
+despite only 1.83x more peak RSS. Two bounded, independently-verified
+fixes landed from that investigation; several bigger findings (documented
+separately below) did not land here and need their own follow-on work.
+
+**Lexer token-vector presizing** (`src/c/lexer.c`, `asnix_lex`): `push_
+tok`'s capacity grew from scratch (0->64->128->...) on every one of the
+1057 files a real nixpkgs eval imports -- measured directly (temporary
+instrumentation): 24,405,685 source bytes -> 2,836,205 tokens, 3,688 total
+reallocs across the whole corpus. Presizing `TokVec` from `strlen(src)/3
++ 32` (a generous margin over the measured ~8.6 bytes/token average)
+drops reallocs to exactly 0. Measured (perf stat -r 5, two separate
+sessions): wall time 1.893s->1.704s and 2.199s->1.920s, consistently
+~10-13% faster. Page faults barely moved (174,407->173,303, -0.6%) --
+this is NOT a page-fault fix, it's pure saved CPU from fewer realloc/
+memcpy calls (glibc's free-list reuse mostly satisfies a growing buffer's
+reallocs from already-first-touched heap space, not fresh pages) --
+confirmed directly, disproving the "doubling-copy causes extra page
+faults" theory the same investigation initially suspected.
+
+**`readDir`'s `d_type` fast path** (`src/c/builtins_m23.c`, `prim_
+readDir`): `strace -c` found asnix made 25,388 `newfstatat` calls vs
+iets's 6,326 stat-family calls on the SAME real nixpkgs eval, while
+`openat`/`close`/`getdents64` counts were nearly identical -- meaning the
+actual file-touching work was the same, but asnix paid ~4x more stat
+syscalls for it. Root cause, confirmed via a full path trace: 92% of
+those calls were to `pkgs/by-name/*` -- nixpkgs's `by-name-overlay.nix`
+does a two-level `builtins.readDir` over ~759 shard directories and
+~20,000+ package directories, and `prim_readDir` called `lstat()`
+unconditionally on every entry, ignoring the `d_type` field `getdents64`/
+`readdir` already populates for free on ext4/btrfs/xfs/tmpfs/overlayfs.
+Fix: trust `ent->d_type` (DT_DIR/DT_REG/DT_LNK map directly to the same
+strings an lstat-based check would produce; DT_BLK/DT_CHR/DT_FIFO/DT_SOCK
+map to "unknown", matching the old code's own S_ISDIR/S_ISREG/S_ISLNK-only
+coverage), falling back to the original `lstat` path only when `d_type ==
+DT_UNKNOWN` -- correct on every filesystem, faster on the common ones.
+Measured: `newfstatat` calls 25,388 -> 12,965 (49% reduction), output hash
+unchanged.
+
+**Verified** (both fixes combined): `make test`/`test-e2e`/`test-conformance`
+all green. `make test-nix-conformance`: `pass=655 fail=3 skip=148` (same 3
+pre-existing pos-tracking failures). `make test-nixpkgs-hash`: `pass=148
+fail=0` (one transient `ruby.outPath(crash)` on a run taken under heavy
+concurrent-agent machine load, reproduced clean standalone and on a full
+rerun -- this session's familiar contention-flakiness pattern, not a real
+regression). Output hash on `d.nix` (ffmpeg's closure) unchanged:
+`/nix/store/29iacg6h530yx7rxz4k1fhvi0kxxhsam-ffmpeg-9.0.1-bin`. A clean
+wall-clock before/after on THIS machine right now was inconclusive (3
+other background workflows were actively running, consuming real CPU) --
+trusting the originating investigation's own controlled, isolated
+measurements above rather than re-litigating under worse conditions.
+
+**Bigger findings from the same investigation, NOT landed here -- flagged
+for follow-on work, not forgotten**:
+- **Lex/parse/compile is estimated ~8x slower per byte than iets's own
+  pipeline**, accounting for roughly HALF of the entire cycle gap --
+  `asnix_eval_file`'s own subtree is 43.9% of all cycles (16.9% compile,
+  10.6% lex, 9.9% parse). Root cause for the parser's own share:
+  `parser.c`'s binary-operator precedence chain is 15 separate, mostly-
+  non-inlined C functions deep for every leaf expression
+  (`parse_expr->...->parse_atom`), vs iets's single `parse_op(min_bp)`
+  precedence-climbing function (~4 calls/leaf). Rewriting this is
+  correctness-sensitive (associativity, the `parse_not`/`->`-desugaring
+  insertion points) and was deliberately NOT attempted as part of this
+  milestone -- flagged as the single biggest remaining lever, needing its
+  own dedicated milestone with full conformance-suite gating.
+- **The 6.71x page-fault outlier remains largely unexplained** after
+  ruling out the doubling-copy theory (disproven above) and porting iets's
+  own `madvise(MADV_HUGEPAGE)` hint (measured zero effect on this host --
+  `/proc/self/smaps_rollup`'s `AnonHugePages` stayed `0 kB` with or
+  without the hint, in both the real binary and an isolated
+  microbenchmark; transparent huge pages are evidently not being granted
+  for anonymous mappings on this shared, contended machine). A SEPARATE,
+  follow-up architectural investigation found iets ALSO calls
+  `madvise(MADV_POPULATE_WRITE)` on its arena chunks (not just
+  `MADV_HUGEPAGE`) -- a distinct mechanism that bulk-pre-faults a whole
+  region in one syscall regardless of huge-page availability, which was
+  NOT what got tested here. Worth a focused, narrow follow-up
+  specifically on `MADV_POPULATE_WRITE` before concluding this lead is
+  fully dead.
+- **`asnix_attrs_eager_merge`'s own `//`-merge memcpy** was 17.11% of the
+  page-fault profile -- identified, not root-caused or attempted.
+- A real, independently-measured `masked_hash_cache_find` O(n)->hash-index
+  fix in `derivation.c` (not from this investigation -- found sitting
+  uncommitted in one of its worktrees, left untouched, flagged for its
+  own author to land) and a real `asnix_copy_path_to_store` lstat-caching
+  fix (found via a shared-stash collision mid-investigation, recovered
+  and pushed back for its original author) are both real, complementary,
+  already-measured fixes waiting to be landed by whoever owns them --
+  combined with this milestone's `readDir` fix, `newfstatat` was observed
+  to drop as low as 2,772 (9.2x off the original 25,388) when briefly
+  combined in one worktree.
+- An `-O2`->`-O3` build-wide flip measured a real but small ~4.9%
+  instruction reduction (byte-identical output) with zero page-fault
+  change (confirming faults track allocation pattern, not codegen) --
+  not shipped as part of this milestone (a build-wide flag change
+  deserves its own explicit decision, not bundling into a code fix).
+  A matching LTO build hit a real structural blocker (GCC's LTO plugin
+  vs. the hand-written `.S`-files-in-a-static-archive link step) requiring
+  Makefile restructuring, out of scope here.
+- Process-startup overhead, link-time settings (PIE/dynamic, stack
+  protector), and the always-on `ASNIX_SHOW_STATS` counter-increment cost
+  were all investigated and ruled out as contributing to the gap (asnix's
+  own bare-startup latency is already 10-30x FASTER than iets's, if
+  anything an argument in asnix's favor, not a lead).
