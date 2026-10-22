@@ -126,6 +126,7 @@ what's actually implemented and the scope decisions made along the way.
 | M110 — Ast nodes moved from the main never-free arena into their own dedicated, resettable chunk allocator, freed right after each top-level `asnix_compile`/`asnix_compile_scoped` call returns (an Ast tree is pure compile-time scratch, fully dead once walked into an `IrProgram`); a prior attempt at this exact change crashed on the real workload (`undefined variable 'list'` on `d.nix`, several real nixpkgs packages crashing in `test-nixpkgs-hash`) despite passing the small fixture suite -- root-caused via a zero-vs-garbage A/B test (poisoning freed chunks changed nothing, ruling out simple use-after-free; switching the chunk allocator from `malloc` to `calloc` fixed it outright): the arena it replaced is backed by zero-filled `mmap`, and at least one `Ast` constructor implicitly relied on an unset union field defaulting to zero, a latent assumption the whole codebase never had to confront until this allocator stopped providing it for free | done (see below; peak RSS on `d.nix` 736,920 → 691,780 KB (~6.2%), measured as a true paired before/after in one worktree/build; `make test-nixpkgs-hash`: `pass=148 fail=0`, including the specific packages (glib/gtk3/nix) that crashed under the original broken attempt; zero regressions) |
 | M111 — `op_select.S`'s `a.b` point lookup on a lazy union (M88/M93's `UnionHdr`) used to call `asnix_bshared_attrs_resolve`, which ALWAYS fully flattens+caches every leaf before any lookup -- even for a single key, meaning M88's deferral provided essentially zero benefit the moment a `//` result was read even once. New `asnix_bshared_attrs_probe` walks leaves highest-priority-first and binary-searches each flat leaf directly, matching real Nix's own layered `Bindings::get()` (point lookups walk the layer chain, never materializing); wired into `op_select.S` only (the hottest, most common access pattern), not into `attrs_find`/`_count`/`_sym`/`_value`'s 35+ callers, which need a stable positional index a bounded probe can't provide without materializing anyway | done (see below; peak RSS on `d.nix`: 673,748 -> 665,108 KB, ~1.3% reduction; instructions essentially flat, 10.874B -> 10.938B, within measurement noise; zero regressions) |
 | M112 — `asnix_attrs_eager_merge` (the `//`-operator eager-copy path) never incremented `asnix_stats_attrs`/`asnix_stats_attrs_entries` (M108), making its real allocation cost invisible to `ASNIX_SHOW_STATS=1` -- a dedicated investigation found this was the dominant source (116.0 MB of ~142MB) of an "unattributed" arena gap a manual stats-based tally couldn't explain. Added the missing increment (using the actual post-dedup entry count `k`, not the worst-case upper bound allocated) | done (see below; `sets` count jumped 246,871 → 404,878 and `entries` 1,314,751 → 10,742,641 once this call site's real volume became visible; zero regressions) |
+| M113 — fused `mapAttrs`/`zipAttrsWith`'s per-element `Env`+`Thunk` into one `asnix_arena_alloc` call (private, never-shared pair, created+consumed together every time) instead of two -- halves the allocation call count (2N -> N, same total bytes) for the single mechanism the thunk/env-count investigation found responsible for 53.1% of the env-count gap and 48.3% of the thunk-count gap vs real Nix | done (see below; mapAttrs/zipAttrsWith correctness and laziness canary verified directly; zero regressions) |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
 
@@ -12265,3 +12266,37 @@ whole program.
 `make test`/`test-e2e`/`test-conformance` unchanged, all green.
 `make test-nix-conformance`: `pass=655 fail=3 skip=148` unchanged.
 `make test-nixpkgs-hash`: `pass=148 fail=0` unchanged.
+
+## M113: fuse mapAttrs/zipAttrsWith's per-element Env+Thunk into one allocation
+
+The thunk/env-count investigation (see `docs/memory-accounting-asnix-
+vs-nix.md`) found `map`/`mapAttrs`/`zipAttrsWith` allocate 2 separate
+heap objects (one `Env`, one `Thunk`) per output element where real
+Nix's own `FunctionApplicationThunk` mechanism needs something closer
+to 1 -- the single largest contributor to both the env-count gap
+(53.1%) and the thunk-count gap (48.3%) versus real Nix.
+
+`asnix_bshared_make_lazy_call2_indexed`'s Env is private to exactly
+one Thunk, created and consumed as a pair every time, never shared or
+aliased elsewhere. Fused them into one `asnix_arena_alloc` call
+(Thunk's 16 bytes immediately followed by the Env's 24 bytes in the
+same block) instead of two separate allocations -- the Thunk's `env`
+field is still just a plain pointer afterward, now computed to point
+into the same block rather than a separately-allocated one, so this is
+invisible to force.S or any other consumer. No new Value kind, no new
+force-path case, unlike the fuller real-Nix-equivalent redesign (which
+needs both and is already correctly deferred as a dedicated milestone).
+
+Reduces mapAttrs/zipAttrsWith's own per-element allocation CALL count
+2N -> N (same total bytes -- this is a call-count/instruction-count
+optimization, not a memory-size one).
+
+Verified directly: mapAttrs correctness (`mapAttrs (n: v: n +
+toString v) {a=1;b=2;c=3;}` -> `{a="a1"; b="b2"; c="c3";}`), the
+mapAttrs laziness canary (`attrNames (mapAttrs throw {...})` doesn't
+throw), zipAttrsWith correctness. `make test`/`test-e2e`/
+`test-conformance` all green (one transient flake on a rerun,
+reproduced clean immediately after, matching this session's own
+documented contention-flakiness pattern). `make test-nix-conformance`:
+`pass=655 fail=3 skip=148` unchanged. `make test-nixpkgs-hash`:
+`pass=148 fail=0` unchanged.

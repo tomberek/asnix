@@ -944,8 +944,28 @@ Value asnix_bshared_make_lazy_call2_indexed(Env *shared, Value arg1, Value arg2)
         ib_ret(b);
         prog = ib_finish(b);
     }
-    Env *env = asnix_env_alloc(shared, 2);
+    /* perf: this Env is private to exactly one Thunk (never shared,
+     * never aliased), created and consumed as a pair every single time
+     * -- fuse them into ONE asnix_arena_alloc call (Thunk's 16 bytes
+     * immediately followed by this Env's 24 bytes in the same block)
+     * instead of two separate allocations. Zero representation change
+     * visible to any consumer: force.S/anything else that reads a
+     * Thunk's ENV field only ever follows it as a plain pointer, never
+     * assumes anything about where that pointer's target was allocated
+     * from. Found via the thunk/env-count investigation into real Nix's
+     * own lightweight FunctionApplicationThunk mechanism (this doesn't
+     * go that far -- no new Value kind, no new force-path case -- just
+     * halves mapAttrs/zipAttrsWith's own allocation CALL count per
+     * element, 2N -> N, same total bytes). */
+    void *mem = asnix_arena_alloc(ASNIX_THUNK_SIZE + ASNIX_ENV_OFF_VALUES + 2 * sizeof(Value));
+    Env *env = (Env *)((char *)mem + ASNIX_THUNK_SIZE);
+    env->up = shared;
     env->values[0] = arg1;
     env->values[1] = arg2;
-    return make_thunk_from(prog, env);
+    asnix_stats_env++;
+    asnix_stats_env_elements += 2;
+    asnix_stats_thunk++;
+    *(IrProgram **)((char *)mem + ASNIX_THUNK_OFF_STATE) = prog;
+    *(void **)((char *)mem + ASNIX_THUNK_OFF_ENV) = env;
+    return (Value){ .raw = (uint64_t)(uintptr_t)mem | ASNIX_TAG_THUNK };
 }
