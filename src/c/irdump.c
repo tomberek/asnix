@@ -122,6 +122,18 @@ static int seen_find_or_add(SeenVec *s, IrProgram *p) {
     return (int)(s->len++);
 }
 
+/* Read-only lookup, for dump_program's "-> program #N" resolution once
+ * discovery (below) has already populated `seen` in full -- unlike
+ * seen_find_or_add, never inserts (every child dump_program encounters
+ * was necessarily already discovered, since discover_program walks the
+ * exact same op shapes before any printing starts). */
+static int seen_find(const SeenVec *s, IrProgram *p) {
+    for (size_t i = 0; i < s->len; i++) {
+        if (s->items[i] == p) return (int)i;
+    }
+    return -1;
+}
+
 typedef struct {
     IrProgram **items;
     size_t len, cap;
@@ -143,7 +155,32 @@ static void worklist_push(Worklist *w, IrProgram *p) {
  * buffer on a malformed/future op shape. */
 #define IRDUMP_MAX_OPS 200000
 
-static void dump_program(IrProgram *prog, int id, SeenVec *seen, Worklist *work) {
+/* First pass over a program's ops: ONLY follows OP_LAMBDA/OP_MK_THUNK
+ * pool entries to discover every reachable child IrProgram (adding each
+ * to `seen`/`work`), without printing anything -- run to completion
+ * (every program in `work` processed) BEFORE any dump_program call below,
+ * so `seen.len` is already final by the time printing starts and
+ * dump_program can correctly decide whether to show per-op firing-
+ * location markers (see its own comment: the firing log is one GLOBAL
+ * list shared across every nested program's own ib_finish() call, not
+ * disambiguated per-program -- safe to trust only when there's exactly
+ * ONE program in the whole file, which this discovery pass is what lets
+ * dump_program actually know). */
+static void discover_program(IrProgram *prog, SeenVec *seen, Worklist *work) {
+    for (int64_t i = 0; i < IRDUMP_MAX_OPS; i++) {
+        IrOp *op = &prog->ops[i];
+        int id_of = op_id_of(op->handler);
+        if (id_of < 0) break;
+        if (id_of == OP_LAMBDA || id_of == OP_MK_THUNK) {
+            IrProgram *child = (IrProgram *)(intptr_t)prog->pool[op->b];
+            int cid = seen_find_or_add(seen, child);
+            if (cid == (int)seen->len - 1) worklist_push(work, child); /* first time seen -- queue it */
+        }
+        if (id_of == OP_RET || id_of == OP_HALT) break;
+    }
+}
+
+static void dump_program(IrProgram *prog, int id, const SeenVec *seen, int suppress_location_markers) {
     printf("\n=== program #%d (ops=%p pool=%p) ===\n", id, (void *)prog->ops, (void *)prog->pool);
     for (int64_t i = 0; i < IRDUMP_MAX_OPS; i++) {
         IrOp *op = &prog->ops[i];
@@ -209,8 +246,7 @@ static void dump_program(IrProgram *prog, int id, SeenVec *seen, Worklist *work)
             case OP_LAMBDA:
             case OP_MK_THUNK: {
                 IrProgram *child = (IrProgram *)(intptr_t)prog->pool[op->b];
-                int cid = seen_find_or_add(seen, child);
-                if (cid == (int)seen->len - 1) worklist_push(work, child); /* first time seen -- queue it */
+                int cid = seen_find(seen, child); /* already discovered -- see discover_program above */
                 printf("   ; -> program #%d", cid);
                 break;
             }
@@ -228,26 +264,42 @@ static void dump_program(IrProgram *prog, int id, SeenVec *seen, Worklist *work)
          * ends up at start-1" convention -- irpass.h) is this exact op
          * index -- a direct "where did it fire" marker, not just the
          * aggregate per-pass counts asnix_irpass_print_stats gives at the
-         * end. Best-effort across nested programs (see irpass.h's own
-         * caveat) -- exact for a single flat program like this one.
-         * Counted per pass (not printed once per raw log entry): a
-         * fixpoint re-scan commonly collapses several real, distinct
-         * firings onto the same final index (e.g. folding `1+2`, then
-         * folding the result against `==3`, both land at index 0 once
-         * everything shifts down) -- legitimate, but printing the
-         * identical marker 2-3 times in a row is just noise. */
-        size_t fire_counts_here[64] = { 0 };
-        size_t npasses = asnix_irpass_num_passes();
-        if (npasses > 64) npasses = 64; /* defensive -- ASNIX_IRPASS_MAX_PASSES is currently 32 */
-        for (size_t fi = 0; fi < asnix_irpass_num_firings(); fi++) {
-            if (asnix_irpass_firing_op_index(fi) != (size_t)i) continue;
-            size_t pi = asnix_irpass_firing_pass_index(fi);
-            if (pi < npasses) fire_counts_here[pi]++;
-        }
-        for (size_t pi = 0; pi < npasses; pi++) {
-            if (fire_counts_here[pi] == 0) continue;
-            if (fire_counts_here[pi] == 1) printf("   <<< %s fired here", asnix_irpass_name(pi));
-            else printf("   <<< %s fired here (x%zu)", asnix_irpass_name(pi), fire_counts_here[pi]);
+         * end. The firing log is one GLOBAL list shared across every
+         * nested program's own ib_finish() call, not disambiguated per-
+         * program (irpass.h's own documented caveat) -- so this is only
+         * trustworthy when the WHOLE file compiles to exactly one
+         * program (no nested lambda/thunk bodies). Confirmed concretely
+         * misleading otherwise, not just imprecise: a 5-program file
+         * with 2 real firings (one in program #1, one in program #4)
+         * showed a marker on 5 different op-index-0-or-similar lines
+         * across 4 DIFFERENT programs, 3 of which never had a firing at
+         * all -- global indices happening to coincide across separately-
+         * numbered programs' own op arrays. `suppress_location_markers`
+         * (set by the caller once the full discovery pass below knows
+         * the real program count) turns this off rather than show a
+         * wrong answer; the aggregate "-- bytecode pass firing counts --"
+         * total is unaffected either way, since it's a simple global sum,
+         * not a per-location lookup. Counted per pass when shown (not
+         * printed once per raw log entry): a fixpoint re-scan commonly
+         * collapses several real, distinct firings onto the same final
+         * index (e.g. folding `1+2`, then folding the result against
+         * `==3`, both land at index 0 once everything shifts down) --
+         * legitimate, but printing the identical marker 2-3 times in a
+         * row is just noise. */
+        if (!suppress_location_markers) {
+            size_t fire_counts_here[64] = { 0 };
+            size_t npasses = asnix_irpass_num_passes();
+            if (npasses > 64) npasses = 64; /* defensive -- ASNIX_IRPASS_MAX_PASSES is currently 32 */
+            for (size_t fi = 0; fi < asnix_irpass_num_firings(); fi++) {
+                if (asnix_irpass_firing_op_index(fi) != (size_t)i) continue;
+                size_t pi = asnix_irpass_firing_pass_index(fi);
+                if (pi < npasses) fire_counts_here[pi]++;
+            }
+            for (size_t pi = 0; pi < npasses; pi++) {
+                if (fire_counts_here[pi] == 0) continue;
+                if (fire_counts_here[pi] == 1) printf("   <<< %s fired here", asnix_irpass_name(pi));
+                else printf("   <<< %s fired here (x%zu)", asnix_irpass_name(pi), fire_counts_here[pi]);
+            }
         }
         printf("\n");
         if (id_of == OP_RET || id_of == OP_HALT) break;
@@ -277,13 +329,14 @@ static void lex_parse_compile_dump(const char *src, const char *path) {
     int root_id = seen_find_or_add(&seen, root);
     worklist_push(&work, root);
     size_t cursor = 0;
-    while (cursor < work.len) {
-        IrProgram *p = work.items[cursor++];
-        int id = -1;
-        for (size_t i = 0; i < seen.len; i++) {
-            if (seen.items[i] == p) { id = (int)i; break; }
-        }
-        dump_program(p, id, &seen, &work);
+    while (cursor < work.len) discover_program(work.items[cursor++], &seen, &work);
+
+    /* Only trust per-op firing-location markers once the real program
+     * count is known -- see dump_program's own comment for why more than
+     * one program makes them actively misleading, not just imprecise. */
+    int suppress_location_markers = seen.len > 1;
+    for (size_t i = 0; i < seen.len; i++) {
+        dump_program(seen.items[i], (int)i, &seen, suppress_location_markers);
     }
     printf("\n(%zu distinct program(s), root = #%d)\n", seen.len, root_id);
     free(seen.items);
