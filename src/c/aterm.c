@@ -27,20 +27,39 @@ static void buf_puts(Buf *b, const char *s) {
     b->len += n;
 }
 
+static void buf_put_bytes(Buf *b, const char *s, size_t n) {
+    buf_reserve(b, n);
+    memcpy(b->buf + b->len, s, n);
+    b->len += n;
+}
+
 /* Nix's ATerm escaping: only \n \r \t \" \\ are ever escaped; every other
  * byte (including non-ASCII/non-UTF-8) is written verbatim. Includes the
- * surrounding quotes. */
+ * surrounding quotes.
+ *
+ * perf: scans ahead to the next byte that actually needs escaping and
+ * bulk-copies the whole safe run in one memcpy, instead of paying a
+ * buf_putc->buf_reserve call (a branch plus bookkeeping) for every
+ * single byte -- the overwhelming majority of bytes in a real path/
+ * hash/name never hit the switch below at all, so most calls now do
+ * one bulk copy of the entire string instead of N per-byte calls.
+ * Output is byte-for-byte identical to the original loop. */
 static void buf_put_escaped(Buf *b, const char *s) {
     buf_putc(b, '"');
-    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+    const unsigned char *p = (const unsigned char *)s;
+    for (;;) {
+        const unsigned char *run_start = p;
+        while (*p && *p != '\n' && *p != '\r' && *p != '\t' && *p != '"' && *p != '\\') p++;
+        if (p != run_start) buf_put_bytes(b, (const char *)run_start, (size_t)(p - run_start));
+        if (!*p) break;
         switch (*p) {
             case '\n': buf_puts(b, "\\n"); break;
             case '\r': buf_puts(b, "\\r"); break;
             case '\t': buf_puts(b, "\\t"); break;
             case '"': buf_puts(b, "\\\""); break;
             case '\\': buf_puts(b, "\\\\"); break;
-            default: buf_putc(b, (char)*p); break;
         }
+        p++;
     }
     buf_putc(b, '"');
 }

@@ -402,9 +402,27 @@ static void jb_puts(JsonBuf *b, const char *s, size_t n) {
     b->len += n;
 }
 
+/* perf: same bulk-run-copy technique as aterm.c's buf_put_escaped --
+ * scan ahead to the next byte that actually needs escaping and copy
+ * the whole safe run in one jb_puts call, instead of paying a
+ * jb_putc->jb_ensure call (a branch plus bookkeeping) for every single
+ * byte. Output is byte-for-byte identical to the original per-byte
+ * loop. */
 static void jb_escape_string(JsonBuf *out, const char *bytes, int64_t len) {
     jb_putc(out, '"');
-    for (int64_t i = 0; i < len; i++) {
+    int64_t i = 0;
+    while (i < len) {
+        int64_t run_start = i;
+        while (i < len) {
+            unsigned char rc = (unsigned char)bytes[i];
+            if (rc == '"' || rc == '\\' || rc == '\b' || rc == '\f' || rc == '\n' || rc == '\r' || rc == '\t' ||
+                rc < 0x20) {
+                break;
+            }
+            i++;
+        }
+        if (i != run_start) jb_puts(out, bytes + run_start, (size_t)(i - run_start));
+        if (i == len) break;
         unsigned char c = (unsigned char)bytes[i];
         switch (c) {
             case '"': jb_puts(out, "\\\"", 2); break;
@@ -414,15 +432,14 @@ static void jb_escape_string(JsonBuf *out, const char *bytes, int64_t len) {
             case '\n': jb_puts(out, "\\n", 2); break;
             case '\r': jb_puts(out, "\\r", 2); break;
             case '\t': jb_puts(out, "\\t", 2); break;
-            default:
-                if (c < 0x20) {
-                    char esc[8];
-                    int n = snprintf(esc, sizeof esc, "\\u%04x", c);
-                    jb_puts(out, esc, (size_t)n);
-                } else {
-                    jb_putc(out, (char)c);
-                }
+            default: {
+                char esc[8];
+                int n = snprintf(esc, sizeof esc, "\\u%04x", c);
+                jb_puts(out, esc, (size_t)n);
+                break;
+            }
         }
+        i++;
     }
     jb_putc(out, '"');
 }

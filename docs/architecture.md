@@ -109,7 +109,8 @@ what's actually implemented and the scope decisions made along the way.
 | M94 — opt-in on-disk bytecode cache (`ASNIX_BYTECODE_CACHE=1`): a new portable (de)serialization format for a compiled `IrProgram` (op-ids not handler pointers, symbols by name not process-local id, heap-pointer-shaped pool Values by content), keyed by (resolved path, source content) so `__curPos`'s baked-in file path can never leak across a content collision; plus an opt-in `ASNIX_BYTECODE_PRODUCER=1` fork()-based prefetch producer that pre-warms the cache for statically-literal `import` targets in a separate process (not a thread -- the global arena/symtab have zero synchronization) | done (see below; verified against the full real `/tmp/nix-conformance` corpus and all 74 `test-nixpkgs-hash` packages with the cache both freshly-populated and fully-hit, byte-for-byte identical to the cache-disabled baseline; three real bugs found and fixed along the way, detailed below; zero regressions; off by default) |
 | M95 — root-caused why M93's attrset-union layering showed no measurable win on the real `d.nix`/ffmpeg workload: it wasn't attrset layering at all -- `perf record` showed `cache_own_drv_closure` (derivation.c) at 43%+ of cycles, eagerly re-flattening every derivation's ENTIRE transitive closure (unioning each direct input's already-flattened closure into a brand-new hash set) for every one of ~100 derivations built, even though the only real consumer of a flattened closure is a rare `DrvDeep` context expansion. Changed to store only the direct layer at build time; added lazy, memoized materialization (`drv_closure_materialize`) triggered only by that one real consumer | done (see below; instructions on `d.nix` ~29.7B → **~12.07B**, matching real Nix's own ~12.0B; wall ~4.3s → ~2.1s; zero regressions) |
 | M96 — three more non-arena memory leaks found via an LD_PRELOAD malloc tracer: nine parser.c vector-to-AST handoff sites (`BindingVec`/`PartVec`/`AstVec`/`FormalVec`) carried permanent doubling-growth slack into AST storage (same pattern M87 fixed for `IrBuilder`, just never applied here); `btvec`'s own hash-index array (added by M88, after M87's free was written) was never freed alongside its `.items`; `ib_finish` never freed the outer `IrBuilder` struct itself (48 bytes × hundreds of thousands of calls) after pulling its `ops`/`pool` arrays out into the permanent `IrProgram` | done (see below; peak RSS on `d.nix` 853MB → **767MB** (~10%); zero regressions) |
-| M97+ | not started |
+| M97 — `aterm.c`'s `buf_put_escaped` (`.drv` ATerm string escaping) and `builtins_compare.c`'s `jb_escape_string` (`toJSON` string escaping) paid a function-call + bounds-check (`buf_putc`→`buf_reserve` / `jb_putc`→`jb_ensure`) for every single output byte, even the overwhelming majority that need no escaping at all; rewritten to scan ahead to the next byte that actually needs escaping and bulk-copy the whole safe run in one call, output byte-for-byte identical | done (see below; instructions on `d.nix` ~11.79B → **~10.89B** (-7.6%), now below real Nix's own ~12.0-12.25B; zero regressions) |
+| M98+ | not started |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
 
@@ -10895,3 +10896,55 @@ test-nixpkgs-hash`: `pass=148 fail=0`, unchanged (parser.c/irbuild.c
 are not among the project's declared hash-parity-critical files, but
 verified anyway since this touches every compiled program and every
 parsed attrset/list/string/lambda in the process).
+
+## M97: batch-copy safe byte-runs in ATerm/JSON string escaping instead of per-byte calls
+
+With the CPU gap against real Nix essentially closed by M95
+(instructions on `d.nix` already down to ~12B, matching real Nix's
+own), profiling no longer showed one dominant hotspot -- `perf record
+-g` on `./asnix d.nix` instead showed cost spread more evenly, with
+`buf_put_escaped` (`aterm.c`, `.drv` ATerm string escaping) and
+`jb_escape_string` (`builtins_compare.c`, `toJSON` string escaping)
+each in the single-digit percents. Both shared the same root
+inefficiency: the per-byte loop called `buf_putc`/`jb_putc` for every
+byte, including the overwhelming majority that never need escaping at
+all (ordinary path/hash/name characters) -- each such call pays a full
+`buf_reserve`/`jb_ensure` bounds-check-and-maybe-realloc, a real cost
+multiplied by every byte of every string this project escapes (every
+derivation output path, every input reference, every `toJSON`-encoded
+string).
+
+Rewrote both to scan ahead from the current position to the next byte
+that actually needs escaping, then copy the whole safe run in one bulk
+`memcpy`-backed call (`buf_put_bytes`/`jb_puts`), falling back to the
+original per-character escape-sequence logic only when a byte that
+needs escaping is hit. For a typical string with zero escaped bytes
+(the common case for store paths and hashes), this reduces the whole
+function to a single bulk copy instead of N per-byte calls. Output is
+byte-for-byte identical to the original loops -- verified both via the
+full test/conformance suites and via `make test-nixpkgs-hash`, which
+exercises `buf_put_escaped` on every one of the 148 checks' `.drv`
+construction.
+
+Measured on `./asnix d.nix` (`perf stat -r 2`, instruction count has
+near-zero variance (+-0.01%) making it a more reliable signal here
+than wall-clock on this shared, often-contended machine): **~11.79B ->
+~10.89B instructions (-7.6%)**, landing comfortably below real Nix's
+own ~12.0-12.25B for the identical expression.
+
+`make test`/`make test-e2e`/`make test-conformance`: unchanged, all
+green. `make test-nix-conformance`: `pass=655 fail=3 skip=148`,
+identical to the pre-existing baseline. `make test-nixpkgs-hash`:
+`pass=148 fail=0`, unchanged -- confirms the rewrite didn't alter a
+single byte of output across 148 real nixpkgs `.drv`/`outPath` checks.
+Also directly spot-checked `./asnix d.nix`/`e.nix` against their
+known-correct real-Nix hashes (`ffmpeg`'s `outPath`, `hello`'s
+`drvPath`) -- both still match exactly.
+
+Not pursued further: a prior session fork investigated SIMD (SSE2)
+opportunities for these same two functions and correctly judged them
+not yet hot enough to justify vectorizing the byte-classification scan
+itself (a true sequential/branchy scan either way, not a drop-in
+intrinsics win) -- this milestone's fix addresses the actually-
+dominant cost (per-byte call overhead), which was the right layer to
+fix first and may remove the need for SIMD here entirely.
