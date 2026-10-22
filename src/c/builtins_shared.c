@@ -279,22 +279,51 @@ int64_t asnix_bshared_attrs_find(Value attrs, uint32_t sym) {
     return -1;
 }
 
+typedef struct {
+    uint32_t sym;
+    int64_t idx;
+} MakeAttrsEntry;
+
+/* Tie-break by original index, not just `sym` -- matches the insertion
+ * sort this replaced (which stopped swapping once `syms[j-1] <=
+ * syms[j]`, so equal-sym runs kept their original relative order). Some
+ * callers rely on `asnix_bshared_make_attrs` NOT deduping duplicate
+ * syms at all (e.g. a caller that already dedupes before calling this
+ * passes a genuinely unique set, but nothing here enforces that), so
+ * preserving the old stable-sort behavior exactly, rather than letting
+ * qsort's unspecified tie order change which of two equal-sym entries
+ * ends up first, avoids silently changing behavior for any caller that
+ * does pass duplicates. */
+static int cmp_make_attrs_entry(const void *a, const void *b) {
+    const MakeAttrsEntry *ea = a, *eb = b;
+    if (ea->sym != eb->sym) return ea->sym < eb->sym ? -1 : 1;
+    if (ea->idx != eb->idx) return ea->idx < eb->idx ? -1 : 1;
+    return 0;
+}
+
+/* M89 perf: was an insertion sort (O(n^2) worst case) -- measured on a
+ * full nixpkgs evaluation (`./asnix d.nix`, ffmpeg.outPath): 52,539
+ * calls, up to 5,234 entries in a single call, ~699,000 total swaps.
+ * Switched to qsort over (sym, original-index) pairs, same "resolve
+ * once into a sortable key, sort that" approach M88 already used for
+ * `sorted_name_order` -- see docs/architecture.md's M88/M89 notes. */
 Value asnix_bshared_make_attrs(uint32_t *syms, Value *vals, int64_t count) {
-    for (int64_t i = 1; i < count; i++) {
-        int64_t j = i;
-        while (j > 0 && syms[j - 1] > syms[j]) {
-            uint32_t ts = syms[j - 1]; syms[j - 1] = syms[j]; syms[j] = ts;
-            Value tv = vals[j - 1]; vals[j - 1] = vals[j]; vals[j] = tv;
-            j--;
-        }
+    MakeAttrsEntry *entries = count > 0 ? malloc((size_t)count * sizeof(MakeAttrsEntry)) : NULL;
+    for (int64_t i = 0; i < count; i++) {
+        entries[i].sym = syms[i];
+        entries[i].idx = i;
     }
+    if (count > 1) qsort(entries, (size_t)count, sizeof(MakeAttrsEntry), cmp_make_attrs_entry);
+
     void *mem = asnix_arena_alloc(8 + (uint64_t)count * ASNIX_ATTR_SIZE);
     *(int64_t *)((char *)mem + ASNIX_ATTRS_OFF_COUNT) = count;
     for (int64_t i = 0; i < count; i++) {
         char *entry = (char *)mem + ASNIX_ATTRS_OFF_ENTRIES + i * ASNIX_ATTR_SIZE;
-        *(int64_t *)(entry + ASNIX_ATTR_OFF_SYM) = (int64_t)syms[i]; /* zero-extends */
-        *(Value *)(entry + ASNIX_ATTR_OFF_VALUE) = vals[i];
+        int64_t src = entries[i].idx;
+        *(int64_t *)(entry + ASNIX_ATTR_OFF_SYM) = (int64_t)entries[i].sym; /* zero-extends */
+        *(Value *)(entry + ASNIX_ATTR_OFF_VALUE) = vals[src];
     }
+    free(entries);
     return (Value){ .raw = (uint64_t)(uintptr_t)mem | ASNIX_TAG_ATTRS };
 }
 

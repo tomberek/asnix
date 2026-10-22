@@ -103,7 +103,8 @@ what's actually implemented and the scope decisions made along the way.
 | M88 — three more O(n²)-or-worse CPU hotspots fixed after discovering M86 had itself introduced a severe regression (`./asnix d.nix`: ~275 billion instructions / ~31.8s, 73.59% of cycles in `cache_own_drv_closure`'s `__strcmp_avx2` calls): `cache_own_drv_closure`'s append-only linear-scan caches and its per-call O(closure_size²) dedup scan converted to hash tables/sets; `parser.c`'s `btvec_find` (hit by every attrpath-sugar binding/attrset literal) given its own open-addressing index; `builtins_attrs.c`'s `sorted_name_order` (backing `attrNames`/`attrValues`) switched from insertion sort to `qsort` over pre-resolved names | done (see below; instructions ~275B → **~37.9B** on `d.nix`, below the pre-M86 ~42B baseline; wall ~31.8s → ~6.09s; zero regressions) |
 | M89 — flipped the Makefile's default build from `-O0` to `-O2` (a background agent measured a genuine ~2x wall-clock difference on `d.nix` from the flag alone: real work like derivation-building/hashing/encoding lives in compiled C, not just the asm dispatch loop, so the old "hot path is asm, C doesn't matter" assumption didn't hold); added a `make debug` target for the old -O0/gdb-friendly behavior; added a stale-optimization-flag guard (`.opt-stamp`) so switching between `make`/`make debug`/`make release` without an explicit `make clean` can no longer silently leave a mix of differently-optimized `.o` files | done (see below; zero regressions; `make test-nixpkgs-hash` still `pass=148 fail=0`) |
 | M90 — thunk-count reduction: `compiler.c`'s ~10 `ib_mk_thunk` call sites (list elements, let/attrs/rec bindings, call arguments, `with` values) now skip thunk-wrapping entirely for expression kinds that already compile to a zero-cost compile-time push (`AST_INT`/`AST_FLOAT`/`AST_BOOL`/`AST_NULL`/`AST_CURPOS`/literal `AST_STRING`/literal `AST_PATH`), matching real Nix's own `maybeThunk` overrides for these same kinds -- deliberately excludes `AST_VAR`, a separate slot-aliasing optimization out of scope here | done (see below; **184,768 of 919,350 thunk-creation sites skipped (20.1%)** on `d.nix`'s ffmpeg closure, **10,941 of 43,503 (25.2%)** on `e.nix`'s hello closure; zero regressions) |
-| M91+ | not started |
+| M91 — `asnix_bshared_make_attrs` (the core attrset constructor used by `listToAttrs`/`zipAttrsWith`/JSON-TOML-object-parsing/`intersectAttrs`/etc.) was an insertion sort, O(n²) worst case; measured on `d.nix`: 52,539 calls, one with 5,234 entries, ~699,000 total swaps. Switched to `qsort` over `(sym, original-index)` pairs, preserving exact stability (ties broken by original index, matching the insertion sort's own behavior, in case any caller passes duplicate syms) | done (see below; instructions ~32.6-32.9B → ~30.7B on `d.nix`, ~6% further reduction; zero regressions) |
+| M92+ | not started |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
 
@@ -9904,3 +9905,97 @@ checks its own 120-second timeout -- under enough contention, legitimate
 checks occasionally miss that window and get misclassified as
 `(crash)`. A clean, uncontended rerun of the full suite confirmed
 `pass=148 fail=0` with no flagged packages at all.
+
+## M91: `asnix_bshared_make_attrs` insertion sort -> `qsort`
+
+Continuing this session's CPU-time investigation after M88 (the
+`cache_own_drv_closure`/`btvec_find`/`sorted_name_order` fixes).
+Re-profiled `./asnix d.nix` (`perf record -g`) looking for the next
+algorithmic win. The call-graph attribution for the top two entries
+turned out to be a dead end: both resolved (via `nm`/`addr2line`
+against the PIE binary's load offset) to a tiny, loop-free
+`utf8_encode` helper (JSON/TOML `\uXXXX` escape decoding) -- a
+12-instruction leaf function with no loop cannot plausibly own ~29%
+of cycles on a workload that barely touches TOML/JSON; this is a
+sampling/stack-walk artifact (hand-written asm lacking the frame-
+pointer chains `perf`'s unwinder expects), not a real hotspot.
+Disregarded rather than chased.
+
+Checked two other candidates the same profile flagged before finding
+the real one:
+
+- `eval_file.c`'s `import_cache_find` (a linear `strcmp` scan over
+  every previously-imported file, explicitly justified in its own
+  comment as "cheap relative to a full parse+compile+eval"). Measured
+  directly (temporary call/step counters, reverted): 1,056 distinct
+  cached files, 2,063 total lookups, ~784,000 total scan steps on
+  `d.nix` -- confirmed the original judgment call still holds at this
+  scale; not worth converting to a hash table for a near-zero return.
+- `attrs_update.c`'s `asnix_attrs_update` (`//`) and
+  `asnix_attrs_insert_dynamic` (`${k} = v;`) -- both already O(n) merge
+  / O(log n) binary-search-insert, not the source of the profile's
+  `__strcmp_avx2` samples attributed near them (also likely stack-walk
+  noise).
+
+The real find: `builtins_shared.c`'s `asnix_bshared_make_attrs` --
+the one function every attrset-constructing builtin funnels through
+(`listToAttrs`, `zipAttrsWith`, JSON/TOML object parsing,
+`intersectAttrs`'s own output, `__overrides` merge, etc.) -- was a
+plain insertion sort, O(n²) worst case. Instrumented directly (same
+temporary-counter-then-revert technique as every other measurement
+this session): **52,539 calls** evaluating `d.nix`'s ffmpeg closure,
+one single call with **5,234 entries**, **~699,000 total swaps**
+across all calls combined. Real, measurable, and exactly the same
+shape as M88's `sorted_name_order` fix (also insertion sort -> a
+proper sort, both backing attrset-related operations at real
+nixpkgs's actual scale).
+
+Fixed by sorting `(sym, original_index)` pairs via `qsort` instead of
+insertion sort, then writing output entries via the sorted pairs'
+`idx`. The index is carried specifically to preserve exact stability:
+the insertion sort being replaced stopped swapping once `syms[j-1] <=
+syms[j]`, so two equal-sym entries kept their original relative
+order -- `qsort`'s own tie-breaking is unspecified by the C standard,
+so without the index tie-break, a caller that (unusually) passes
+duplicate syms could see a different one "win" than before. Checked
+every caller of `asnix_bshared_make_attrs` (18 call sites across
+builtins_json.c/toml.c/builtins_m54.c/builtins_attrs2.c/
+builtins_list2.c/builtins_fetchgit.c/builtins_m23.c/
+builtins_tryeval.c/builtins_flakeref.c/builtins_misc.c/compiler.c/
+main.c/derivation.c): every one that could plausibly produce
+duplicate syms already dedupes before calling this function (e.g.
+JSON object parsing's own `existing >= 0` overwrite-in-place check,
+`listToAttrs`'s own linear "first occurrence wins" dedup scan), so in
+practice this function never sees duplicates today -- but preserving
+the stability guarantee costs nothing and removes any risk from a
+future caller that doesn't dedupe first.
+
+(Flagged, not fixed, as out of scope for this milestone:
+`listToAttrs`'s own duplicate-name dedup scan, `builtins_attrs2.c`
+lines 103-106, is ALSO a linear O(n²)-shaped check -- but it's a
+different function entirely, and wasn't confirmed hot in this
+session's profiling, so left for a future pass rather than scope-
+creeping into it here.)
+
+Measured impact on `./asnix d.nix`: instructions **~32.6-32.9 billion
+(this session's post-M88 baseline, measured fresh via an isolated
+worktree checkout of M88's own commit to avoid any contamination from
+concurrent unrelated changes landing on master mid-session) -> ~30.7
+billion**, a further ~6% reduction (smaller than M87/M88's own
+reductions, matching expectations: 699,000 swaps is real but modest
+next to the previous fixes' hundreds-of-millions-of-comparisons
+scale). `make test`/`make test-e2e`/`make test-conformance`: all
+green. `make test-nix-conformance`: `pass=652 fail=6 skip=148`,
+unchanged -- zero regressions. `make test-nixpkgs-hash`
+(hash-parity-critical risk: this function underlies nearly every
+attrset-constructing builtin, including several in `derivation.c`'s
+own code paths): confirmed `pass=148 fail=0`, both via a clean run
+and via repeated isolated re-checks of every package a *contended*
+run flagged as `(crash)` (multiple heavy background agents were
+running concurrently on this shared machine during this milestone's
+own verification, at one point pushing load average above 30 --
+every single flagged package, checked individually afterward,
+evaluated successfully with no issue at all, confirming resource
+contention/timeout as the cause rather than any regression from this
+change -- see the M89-adjacent note elsewhere in this doc about
+`test-nixpkgs-hash`'s per-check timeout under contention).
