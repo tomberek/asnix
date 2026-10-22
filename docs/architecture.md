@@ -116,6 +116,7 @@ what's actually implemented and the scope decisions made along the way.
 | M101 — fixed a real bug in `bytecode.c`'s `OP_MK_THUNK`/`OP_LAMBDA` (de)serialization: M100 collapsed `ib_mk_thunk`/`ib_lambda` to push one `IrProgram*` pool slot instead of a `{ops,pool}` pair, but `write_one_op`/the `PTAG_OP_THUNK`/`PTAG_OP_LAMBDA` deserialize cases weren't updated, so the serializer read garbage for 1055 of 1056 real files' programs and silently refused to cache almost everything (`0.1%` store rate) -- both M98's and a follow-up subtask's own "1.1-1.2x speedup, 100% hit rate" measurements were taken against M98/pre-M100 code and genuinely valid at the time, but had gone stale the moment M100 landed on top | done (see below; store rate restored to 100% (1056/1056), confirmed correct output and zero regressions; real speedup re-measured post-fix: still only ~1.13x, revealing the cache's true ceiling for this workload -- lex+parse+compile of all 1056 files costs only ~200ms of `d.nix`'s ~1.66s total wall-clock, the rest being genuine evaluation work (derivation building, closure hashing, thunk forcing) bytecode caching can't touch) |
 
 | M102 — thunk-creation avoidance: `[]` (empty list literal) now skips thunk-wrapping at all 10 `ib_mk_thunk` call sites, matching real Nix's `ExprList::maybeThunk` (returns a shared singleton for the empty case specifically, falling through to an ordinary thunk for any non-empty list, since each element still captures the enclosing scope as genuine deferred work) -- found by directly enumerating ALL of real Nix's `maybeThunk` overrides (`ExprVar`/`ExprString`/`ExprInt`/`ExprFloat`/`ExprPath` already covered by M90/M92; `ExprList` was the one remaining override not yet ported) | done (see below; instructions on `d.nix`: 11.01B → 10.94B (~0.7%); zero regressions) |
+| M103 — the bytecode cache's on-disk wire format (`bytecode.c`'s `wbuf_i64`/`rcur_i64`) encoded every opcode/operand/length/symbol-id as a fixed 8-byte `int64`, making the serialized cache ~1.5x LARGER than the Nix source text it replaced (91MB vs. ~62MB on `d.nix`'s real ffmpeg closure); checked `~/gnix/iets`'s own cache format first (already plain LEB128, confirming the approach rather than inventing it) and added a zigzag step on top since asnix's fields are genuinely signed (jump deltas, `PUSH_INT` literals) where iets's are naturally unsigned; magic bumped `ASNXBC01`→`ASNXBC02` so a stale pre-change cache entry is rejected outright, never misread | done (see below; cache size **91MB → 32MB (~2.84x smaller)**, now well under the ~62MB source-text figure; new `tests/c/test_bytecode.c` round-trips `INT64_MAX`/`INT64_MIN` and LEB128/zigzag byte-boundary values explicitly, plus old-format/truncated/garbage rejection; zero regressions) |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
 
@@ -11278,3 +11279,124 @@ instructions 11.01B -> 10.94B (~0.7%, cpu_core), peak RSS unchanged
 within noise (742,452 -> 742,712 KB) -- a small, modest win, consistent
 with empty-list literals being a real but not dominant pattern in real
 nixpkgs code (e.g. `imports = [];`-shaped NixOS-module defaults).
+## M103: variable-width (zigzag+LEB128) integers in the bytecode cache wire format -- the cache was 1.5x LARGER than the source it replaced
+
+Directive: measured directly this session that `d.nix`'s real ffmpeg
+closure (1056 distinct files) produced a **91MB** on-disk bytecode cache
+against **~62MB** of total source `.nix` text for the same files -- the
+"compiled" cache was actually *larger* than the source, the opposite of
+what a cache is for. A hex dump of a real entry showed why: `bytecode.c`'s
+`wbuf_i64`/`rcur_i64` (the sole write/read primitives `write_one_op`'s
+program-serialization path and its reader use for every opcode, operand,
+string/pool length, and symbol id) stored every one of those fields as a
+fixed 8 bytes, regardless of magnitude -- an opcode value of `2` burned
+the same 8 bytes as a 64-bit jump delta would.
+
+**Prior-art check (required before implementing):** read
+`~/gnix/iets/src/compile/cache.rs`, the sibling Rust reimplementation's
+own on-disk IR-cache serializer. It already uses exactly this class of
+fix: `put_u32`/`put_u64` are plain unsigned LEB128 (7 payload bits +
+continuation bit per byte), used for literally every count/length/
+symbol-id/position field in its format. No delta-coding, no other
+exotic trick layered on top -- iets's own `word()` encoder even stores
+`Int`/`Float` constants as fixed 8 raw bytes (never varint, since those
+are opaque bit patterns, not magnitudes) and a bit-pattern `TAG_INT`/
+`TAG_IMM` constant as a *varint* via `put_u64(w.bits())` since those really
+are usually-small. Nothing beyond plain LEB128 was found to be worth
+adopting; it's independent confirmation this is the obvious right default
+for "mostly-small-integer" binary formats, not a novel scheme.
+
+**What asnix needed beyond iets's version:** every iets field is
+naturally unsigned (counts, lengths, `Pos` offsets, raw bit patterns).
+asnix's own `IrOp.a`/`.b` fields are genuinely *signed* int64 (a jump
+delta can be negative; `OP_PUSH_INT`'s operand is an arbitrary signed
+64-bit Nix integer literal, stored directly in `op->a`, not boxed into
+the pool). Plain unsigned LEB128 would need the full 10-byte worst case
+for any negative value (two's-complement small negatives have all their
+high bits set). Fixed by adding one step before the same LEB128 varint:
+zigzag encoding (the standard protobuf `sint64` trick -- maps
+`0,-1,1,-2,2,...` to `0,1,2,3,4,...`), so small-magnitude values of
+either sign cost 1 byte, at the cost of needing the full 10-byte
+worst case for the full `int64_t` range either way (unchanged vs. the
+old format's flat 8 bytes, just now the EXCEPTION instead of the rule).
+
+**Implementation:** `wbuf_i64`/`rcur_i64` are the ONLY two functions
+whose wire format changed -- every one of `write_one_op`/`read_one_tagged_op`'s
+dozens of call sites (`write_value`'s `VTAG_INT`/`VTAG_ATTRS` count,
+`wbuf_bytes_with_len`'s length prefix, every op's `a`/`b` operand,
+`OP_CHECK_FORMALS`'s `total_count` which can legitimately be `-1`, etc.)
+still call `wbuf_i64(b, int64_t)`/`rcur_i64(r) -> int64_t` completely
+unchanged. `wbuf_i64` now does `wbuf_varu64(b, zigzag_encode(v))`;
+`rcur_i64` now does `zigzag_decode(rcur_varu64(r))`. `rcur_varu64` caps
+at 10 bytes (`ceil(64/7)`) and marks the cursor failed rather than
+looping if a malformed/corrupt entry's continuation bit never clears --
+covered by the existing "any anomaly -> NULL, never a crash" contract.
+Values stored as raw fixed-width bytes elsewhere (float bits via
+`wbuf_bytes`, `VTAG_IMM`'s subtag byte) are untouched -- only fields that
+previously went through `wbuf_i64`/`rcur_i64`.
+
+**Format-version bump:** the magic number (`ASNXBC01`) is bumped to
+`ASNXBC02` in both `asnix_bytecode_serialize` and
+`asnix_bytecode_deserialize`'s check -- a stale pre-M103 entry's byte
+layout no longer lines up with the new reader at all past the first
+field, so it must never be misread as new-format data. Verified for
+real: copied a full 91MB cache directory populated by the OLD (pre-M103)
+binary, pointed the NEW binary at it via `ASNIX_BYTECODE_CACHE_DIR`, and
+ran `./asnix d.nix` -- result: `0 hits, 1056 misses, 1056 stores`, exit
+0, output byte-identical to the cache-disabled baseline, and the
+directory shrank to 32MB (every stale entry was cleanly treated as a
+miss and overwritten, never misread or crashed on).
+
+**Correctness (`tests/c/test_bytecode.c`, new):** hand-builds `IrProgram`s
+via `IrBuilder` (bypassing the compiler, same strategy `tests/ir/*.c`
+uses) and round-trips them through `asnix_bytecode_serialize`/
+`asnix_bytecode_deserialize` directly:
+- An ordinary small-value program (`5 + 37 == 42`, all operands < 64) --
+  exact op-by-op field equality (these ops are pool-free, so this is a
+  literal struct-field comparison, not just "evaluates the same") plus a
+  correct eval.
+- The large-value edge case the fixed-width format never needed to prove
+  anything about: `OP_PUSH_INT` with values at `INT64_MAX`/`INT64_MIN`
+  (and `ASNIX_INT_MAX`/`MIN`, asnix's own 61-bit representable-integer
+  window, plus assorted LEB128/zigzag byte-boundary values like
+  63/64/-64/-65/127/128) -- exact field equality for ALL of these
+  (the on-disk `int64_t` field must round-trip the full range even
+  though `asnix_make_int` itself would later reject anything outside
+  `ASNIX_INT_MIN..ASNIX_INT_MAX` as a real Nix value -- that's a
+  pre-existing, unrelated range check, not a serialization concern), plus
+  an eval-level value check for the in-range subset.
+- A string-constant + `OP_PUSH_CONST` program, to exercise the
+  length-prefixed-string varint path end to end.
+- Explicit old-format-rejection fixtures: an `ASNXBC01`-tagged buffer
+  (with plausible old-shaped trailing bytes), bare old magic with no
+  payload, bare new magic with no payload, too-short buffers, and random
+  garbage -- all must return `NULL` cleanly, never crash.
+- A genuine current-format entry still round-trips (the rejection logic
+  doesn't also reject valid data).
+
+**Measured result on the real workload this task is based on:**
+`d.nix` (ffmpeg's full closure, 1056 files), fresh cache population:
+
+| | before (M94-M101, `ASNXBC01`) | after (M103, `ASNXBC02`) |
+|---|---|---|
+| cache directory size | 91MB | **32MB** |
+| vs. ~62MB source text | 1.47x LARGER than source | **0.52x** (now genuinely smaller) |
+| hits/misses/stores (cold) | 0/1056/1056 | 0/1056/1056 |
+| hits/misses/stores (warm) | 1056/0/0 | 1056/0/0 |
+| `./asnix d.nix` output | (baseline) | byte-identical |
+
+**Verified zero regressions:** `make test` (including the new
+`test_bytecode` binary) and `make test-e2e` all green. `make
+test-nix-conformance`: `pass=655 fail=3 skip=148`, identical to the
+pre-change baseline measured at the start of this task (the 3 failures
+are the pre-existing, unrelated `getattrpos`/`inherit-attr-pos` gaps).
+`make test-nixpkgs-hash`: `pass=148 fail=0`, unchanged from baseline.
+
+**Scope held:** only `bytecode.c`'s own wire-format primitives and the
+magic-number check changed. The in-memory `IrProgram`/`IrOp` shapes,
+`ir_link`, and every other part of `bytecode_cache.c` (key hashing,
+atomic write-then-rename, the fork-based prefetch producer, hit/miss
+stats) are untouched -- this change is invisible to every caller except
+through the bytes actually written to and read from disk.
+
+**Commit:** `src/c/bytecode.c`, `tests/c/test_bytecode.c`, `docs/architecture.md`.

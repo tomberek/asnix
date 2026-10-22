@@ -43,8 +43,55 @@ static void wbuf_u8(WBuf *b, uint8_t v) {
     wbuf_bytes(b, &v, 1);
 }
 
+/* M102: variable-width (LEB128-style) integer encoding, replacing the
+ * fixed 8-byte int64 every opcode/operand/length/symbol-id field used to
+ * burn regardless of magnitude. Measured on a real nixpkgs closure
+ * (ffmpeg, 1056 files): the fixed-width cache was 91MB against ~62MB of
+ * source text for the same files -- the "compiled" cache was actually
+ * LARGER than the source, because most fields here (opcodes, small
+ * operand values, string/pool lengths, symbol ids) fit in 1-2 bytes but
+ * every one was stored as 8.
+ *
+ * Checked ~/gnix/iets/src/compile/cache.rs (a sibling Rust Nix
+ * reimplementation's own on-disk IR-cache serializer) before picking a
+ * scheme: it already uses exactly this -- unsigned LEB128 (`put_u32`/
+ * `put_u64`, 7 payload bits + continuation bit per byte) for every
+ * count/length/symbol-id/position field in its format, no delta-coding
+ * or other trick layered on top. That's independent confirmation this is
+ * the right default for "mostly-small-integer" serialization streams
+ * like this one, not a novel choice -- adopted here with one addition
+ * iets doesn't need: asnix's own `IrOp.a`/`.b` fields and `VTAG_INT`
+ * payload are genuinely signed (jump deltas can be negative; a `PUSH_INT`
+ * operand is an arbitrary signed 64-bit Nix integer), where iets's own
+ * fields (counts, lengths, bit-pattern words) are always unsigned. So
+ * this adds a zigzag step (the standard protobuf `sint64` trick: maps
+ * 0,-1,1,-2,2,... to 0,1,2,3,4,...) before the same LEB128 varint,
+ * folding "signed small magnitude" into "small unsigned", while still
+ * correctly round-tripping the full int64_t range (including
+ * INT64_MIN/INT64_MAX) at a bounded worst case of 10 bytes -- never
+ * truncating, just no longer paying 8 bytes for a value that fits in 1.
+ *
+ * Every call site below still calls plain wbuf_i64/rcur_i64 with an
+ * int64_t -- only these two functions' own wire format changed, so this
+ * is the entire diff against the fixed-width encoding. */
+static uint64_t zigzag_encode(int64_t v) {
+    return ((uint64_t)v << 1) ^ (uint64_t)(v >> 63);
+}
+
+static int64_t zigzag_decode(uint64_t v) {
+    return (int64_t)((v >> 1) ^ (~(v & 1) + 1));
+}
+
+static void wbuf_varu64(WBuf *b, uint64_t v) {
+    while (v >= 0x80) {
+        wbuf_u8(b, (uint8_t)(v & 0x7f) | 0x80);
+        v >>= 7;
+    }
+    wbuf_u8(b, (uint8_t)v);
+}
+
 static void wbuf_i64(WBuf *b, int64_t v) {
-    wbuf_bytes(b, &v, 8);
+    wbuf_varu64(b, zigzag_encode(v));
 }
 
 static void wbuf_bytes_with_len(WBuf *b, const char *p, size_t n) {
@@ -74,10 +121,27 @@ static uint8_t rcur_u8(RCur *r) {
     return v;
 }
 
+/* Bounded to 10 bytes (ceil(64/7)) -- a malformed/corrupt entry whose
+ * continuation bit never clears within that many bytes is rejected
+ * (r->failed = 1) rather than looping or reading out of bounds; the
+ * caller's existing "any anomaly -> NULL, never a crash" contract
+ * (asnix_bytecode_deserialize) covers the rest. */
+static uint64_t rcur_varu64(RCur *r) {
+    uint64_t v = 0;
+    int shift = 0;
+    for (int i = 0; i < 10; i++) {
+        uint8_t byte = rcur_u8(r);
+        if (r->failed) return 0;
+        if (shift < 64) v |= ((uint64_t)(byte & 0x7f)) << shift;
+        if ((byte & 0x80) == 0) return v;
+        shift += 7;
+    }
+    r->failed = 1;
+    return 0;
+}
+
 static int64_t rcur_i64(RCur *r) {
-    int64_t v = 0;
-    rcur_bytes(r, &v, 8);
-    return v;
+    return zigzag_decode(rcur_varu64(r));
 }
 
 /* Arena-owned (never freed -- same lifetime convention every other
@@ -504,7 +568,16 @@ static int write_one_op(WBuf *b, IrOp *op, int64_t *pool) {
 
 int asnix_bytecode_serialize(IrProgram *prog, uint8_t **out_buf, size_t *out_len) {
     WBuf b = { 0 };
-    wbuf_bytes(&b, "ASNXBC01", 8);
+    /* M102: magic bumped 01 -> 02 -- the wire format of every
+     * opcode/operand/length/symbol-id field changed from fixed 8-byte
+     * int64 to a variable-width (zigzag+LEB128) varint. A stale
+     * ASNXBC01 entry from before this change must never be misread as
+     * ASNXBC02 data (the byte layout no longer lines up at all past the
+     * first field) -- asnix_bytecode_deserialize's own magic check below
+     * rejects it outright, same as any other corrupt/foreign entry,
+     * degrading cleanly to a cache miss (recompile, overwrite) per this
+     * cache's own silent-degrade-to-miss design (bytecode_cache.c). */
+    wbuf_bytes(&b, "ASNXBC02", 8);
     if (write_program(&b, prog) != 0 || b.failed) {
         free(b.buf);
         return -1;
@@ -817,7 +890,10 @@ static int read_program_into(RCur *r, DBuilder *d) {
 }
 
 IrProgram *asnix_bytecode_deserialize(const uint8_t *buf, size_t len) {
-    if (len < 8 || memcmp(buf, "ASNXBC01", 8) != 0) return NULL;
+    /* Also rejects a pre-M102 ASNXBC01 entry (fixed-8-byte-int wire
+     * format) -- see asnix_bytecode_serialize's own comment on the magic
+     * bump. */
+    if (len < 8 || memcmp(buf, "ASNXBC02", 8) != 0) return NULL;
     RCur r = { .buf = buf, .len = len, .pos = 8, .failed = 0 };
     DBuilder d = { 0 };
     if (read_program_into(&r, &d) != 0 || r.pos != len) {

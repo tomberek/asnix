@@ -32,3 +32,4 @@ tests/c/test_abort
 tests/c/test_builtins_m18
 tests/c/test_toml
 tests/c/test_regex_engine_scratch
+tests/c/test_bytecode
