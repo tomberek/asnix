@@ -23,11 +23,17 @@ asnix_op_frame_alloc:                   // a = nslots
     movq %rsi, %rbp                     // save IP (callee-saved, survives the call below)
     movq %rdi, %r15                     // save current ENV = up-pointer for the new frame
 
-    leaq 8(, %rbx, 8), %rdi             // size = 8 + nslots*8
-    call asnix_arena_alloc
+    leaq ASNIX_ENV_OFF_VALUES(, %rbx, 8), %rdi // size = 4 (up) + nslots*8
+    call asnix_env_arena_alloc
     incq asnix_stats_env(%rip)
     addq %rbx, asnix_stats_env_elements(%rip)
-    movq %r15, ASNIX_ENV_OFF_UP(%rax)
+    // M118: compress the current ENV (%r15) into the new frame's `up`.
+    // Unconditional, no NULL-check: ENV is always a live, non-NULL Env
+    // by the time any op handler runs (asnix_eval is never invoked with
+    // a NULL root_env -- see eval_file.c).
+    movq %r15, %rcx
+    subq asnix_env_arena_base(%rip), %rcx
+    movl %ecx, ASNIX_ENV_OFF_UP(%rax)
 
     movq %rax, %rdi                     // ENV = new frame (slots left uninitialized -- every
                                          // slot is written by an OP_FRAME_SET before anything
@@ -72,7 +78,10 @@ asnix_op_frame_get:                     // a = slot index; pushes ENV.values[slo
     .globl asnix_op_frame_exit
     .type asnix_op_frame_exit, @function
 asnix_op_frame_exit:                    // no operands; ENV = ENV->up
-    movq ASNIX_ENV_OFF_UP(%rdi), %rdi
+    movl ASNIX_ENV_OFF_UP(%rdi), %edi   // M118: zero-extends into %rdi; decompress (no tag
+                                         // bit to mask -- an ordinary frame's `up` never has
+                                         // ASNIX_ENV_WITH_TAG set)
+    addq asnix_env_arena_base(%rip), %rdi
 
     addq $ASNIX_IROP_SIZE, %rsi
     movq (%rsi), %rax

@@ -16,8 +16,9 @@ asnix_op_var_ref_raw:                   // a = depth, b = slot
 .Lvar_ref_raw_walk:
     testq %rdx, %rdx
     jz .Lvar_ref_raw_done
-    movq ASNIX_ENV_OFF_UP(%rcx), %rcx
-    andq $-8, %rcx                      // mask off ASNIX_ENV_WITH_TAG in case this hop is a with-frame
+    movl ASNIX_ENV_OFF_UP(%rcx), %ecx    // M118: zero-extends into %rcx; decompress below
+    addq asnix_env_arena_base(%rip), %rcx
+    andq $-2, %rcx                      // mask off ASNIX_ENV_WITH_TAG in case this hop is a with-frame
     decq %rdx
     jmp .Lvar_ref_raw_walk
 .Lvar_ref_raw_done:

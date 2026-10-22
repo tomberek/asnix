@@ -12732,11 +12732,13 @@ landing on the identical conclusion:
 
 **Quantified payoff if the one non-zero case (`Closure`) were pushed
 through anyway**: `ASNIX_SHOW_STATS=1 ./asnix d.nix` (ffmpeg's real
-closure, this session's build) reports 362,661 closures allocated.
-`8 bytes * 362,661 = 2,901,288 bytes (~2.77 MiB)` against a measured
-peak RSS of **588,580 KB (~574.8 MiB)** on the identical run (stable
-across repeats: 588,404 / 588,684 / 588,580 KB) -- **~0.48% of peak
-RSS**. That is not worth taking on an arena rearchitecture plus a
+closure; re-measured against this repo's actual merged tip, post-M117
+`LazyApp`, not the earlier pre-rebase number this paragraph originally
+cited -- see M119's own note on why that distinction matters) reports
+360,937 closures allocated. `8 bytes * 360,937 = 2,887,496 bytes (~2.75
+MiB)` against a measured peak RSS of **~584,239 KB (~570.5 MiB)**
+(3-run average: 584,308 / 584,468 / 583,940 KB) -- **~0.48% of peak
+RSS**, essentially unchanged from the original estimate. That is not worth taking on an arena rearchitecture plus a
 separate `IrProgram`-allocator rewrite for, especially given the new
 hard constraint it would introduce: `asnix_arena.max_memory` defaults to
 0 (unlimited) today, but any cage sized to fit a 32-bit offset is
@@ -12773,3 +12775,178 @@ be a genuine miss in this first pass: see M119, which found and fixed
 the actual blind spot (a dedicated arena is free to pick ITS OWN
 rounding granularity, decoupled from the general arena's `round_up_8`)
 and landed a real `Env.up` compression on top of this research.
+
+## M119: a dedicated, bounded Env arena -- `Env.up` compressed to a 32-bit offset, fixing the blind spot M118's first pass missed
+
+**The correction, in one sentence**: M118's rounding argument against
+`Env.up` ("`4+8n` rounds right back to `8+8n`, zero bytes saved")
+silently assumed any new dedicated arena would keep reusing the general
+arena's `round_up_8` convention. It doesn't have to. `round_up_8` exists
+*only* because `Value.raw`'s 3-bit tag scheme needs every TAGGED pointer
+(String/Path/Float/Cell/Attrs/List/Closure/Thunk/PrimOp) to be 8-byte
+aligned -- `Env` is never itself a tagged `Value`, so a dedicated,
+Env-only arena can round to 4 instead, and `4+8n` really is smaller
+than `8+8n`, for every `n`, with nothing clawing it back. This was
+flagged directly, mid-session, by feedback questioning why the
+projected win looked too small for a field that's "literally halved" --
+the halved-field framing was right; what was missing was checking
+whether the SURROUNDING struct's rounding convention was actually
+fixed or just inherited by default.
+
+**Mechanism**: a brand-new `src/asm/env_arena.S`, structurally similar
+to `arena.S` but deliberately simpler and separate from it -- ONE
+upfront `mmap(ASNIX_ENV_ARENA_SIZE)` reservation (no `.Lgrow`-style
+repeated, address-unconstrained growth: a compressed 32-bit offset is
+only valid if every object it can address lives inside one bounded,
+contiguous region, which the general arena's own growth strategy
+cannot guarantee -- see M118), lazily self-initialized on first call
+(checked via the bump cursor being exactly 0) so no caller anywhere,
+production or test, needs to remember an explicit init step. Bump
+cursor starts at `base+8`, not `base+0`, so a stored offset of 0 can
+always mean NULL unambiguously. Reconstruction is additive
+(`full = base + zext32(offset)`), not V8's OR-based 4-GiB-aligned-cage
+scheme -- additive places no alignment requirement on the reservation's
+base address at all, which is also why the session's own empirical
+finding that Linux's `MAP_32BIT` only really delivers ~1 GiB (not ~2
+GiB; M118) turned out to be moot: an ordinary anywhere-`mmap` works
+identically well once you're not relying on address magnitude.
+
+`ASNIX_ENV_OFF_UP` stays conceptually offset 0 but narrows to a 4-byte
+compressed offset; `ASNIX_ENV_OFF_VALUES` drops from 8 to 4 -- every
+real access site in this codebase reads that offset through the macro
+(none hardcode a bare `8`), so the slot-access offset update was
+automatic everywhere except the handful of allocation-size computations
+that spelled "8" as a literal (`leaq 8(, %rsi, 8), %rdi`), which were
+switched to reference `ASNIX_ENV_OFF_VALUES` explicitly. `Env`'s C
+struct is now `__attribute__((packed))` with `uint32_t up` (was
+`struct Env *up`) so `values[]` genuinely sits at byte offset 4 -- an
+un-packed struct would have silently re-inserted the 4 bytes of padding
+this whole change exists to remove, to keep `Value` 8-aligned.
+
+**Compress/decompress at every touch site** (re-derived via grep, not
+assumed): allocation sites compress the new frame's `up` before storing
+it (`env.S`'s `asnix_env_alloc`, `op_frame.S`, `op_let.S`, `op_with.S`,
+and the Closure-call frame setup in `op_call.S`/`apply.S`, which copies
+a Closure's own -- still full-width, uncompressed -- `up` pointer into
+a freshly compressed child frame); depth-walk/exit sites decompress
+(`env.S`'s `asnix_env_lookup`, `op_var_ref.S`/`op_var_ref_cell.S`/
+`op_var_ref_raw.S`'s depth walks, `op_frame.S`'s `OP_FRAME_EXIT`,
+`op_with.S`'s `OP_WITH_EXIT`) -- these are exactly the sites M118
+identified as the real blast radius, confirmed unchanged by re-deriving
+them a second time independently here. `ASNIX_ENV_WITH_TAG` (the
+with-frame marker bit) survives compression intact: both the arena base
+(page-aligned, from `mmap`) and every real Env address within it
+(`round_up_4`) stay at least 4-byte aligned, so subtracting one from a
+tagged (odd) address stays odd, exactly the same way it did on the full
+64-bit pointer -- four sites that previously over-masked with `andq
+$-8` (relying on 8-byte alignment that no longer holds) were narrowed
+to `andq $-2` (bit 0 only), matching a fifth site (`op_with.S`'s
+`OP_WITH_EXIT`) that already did this correctly before this change.
+NULL-safety: `up` is unconditionally live/non-NULL at the three
+hot-path-inlined allocation sites (`op_frame.S`/`op_let.S`/`op_with.S`
+only ever compress the CURRENT, already-live ENV), but genuinely can be
+NULL at three other sites -- `env.S`'s general-purpose `asnix_env_alloc`
+entry point (called with `up=NULL` for every root Env) and the two
+Closure-call frame-setup sites (a native-wrapper Closure can have
+`up=NULL`, no captured env) -- each guarded with an explicit
+`testq`/branch so NULL compresses to 0, not a garbage subtraction.
+
+**Fallback/cap design, per this session's explicit direction**: a
+single flat, generously-sized hard cap (`ASNIX_ENV_ARENA_SIZE` = 1
+GiB) with a clean `asnix_fatal` abort on exhaustion -- the SAME
+philosophy the general arena's own `ASNIX_MAX_MEMORY` already uses, not
+the alternative (a dual-path fallback to plain 64-bit pointers from the
+general arena once the dedicated arena fills, with a marker bit
+distinguishing which kind of pointer a given `up` field holds) this
+session's own earlier message offered as an option. The flat cap was
+chosen specifically because the marker-fallback's cost lands exactly
+where it hurts most: an extra branch on EVERY depth-walk hop, the
+hottest of the sites this change touches, for a case (filling a
+1-GiB-not-yet-stressed-by-any-real-workload arena) this session has no
+evidence is a real risk. 1 GiB is ~36x the ~28 MB (978,030 envs, M117's
+own post-`LazyApp` count) this session's one real benchmark actually
+uses -- comfortably short of the hard 4 GiB ceiling a 32-bit offset
+imposes regardless of chosen cap, confirmed to abort cleanly (not
+corrupt memory) via a standalone throwaway test that forced the arena
+to fill: `asnix: Env arena exhausted (ASNIX_ENV_ARENA_SIZE), aborting`,
+exit code 1.
+
+**M113's fusion note, overtaken by events**: the plan going into this
+milestone was to unwind M113's fused single-allocation Env+Thunk
+helper in `builtins_shared.c` (`asnix_bshared_make_lazy_call2_indexed`),
+since `Env` and `Thunk` can no longer share one allocation once they
+live in different arenas. By the time this milestone's code was
+written, M117 (`LazyApp`, landed concurrently on `master` by a
+different session) had already removed that entire helper and its
+siblings outright, replacing the whole Env+Thunk-per-`mapAttrs`-element
+mechanism with a lighter-weight value kind that allocates neither --
+so there was nothing left to unwind. Discovered via a real merge
+conflict (both sessions picked the same next milestone number, M117,
+independently) rather than assumed; the rebase onto the real `master`
+tip surfaced it directly.
+
+**Measured** (fresh, against this repo's actual immediate parent commit
+-- M117/`LazyApp`, not the earlier pre-rebase baseline some of M118's
+own numbers were measured against before this merge): on `./asnix
+d.nix` (ffmpeg's real closure), output unchanged
+(`/nix/store/29iacg6h530yx7rxz4k1fhvi0kxxhsam-ffmpeg-9.0.1-bin`),
+allocation COUNTS unchanged (978,030 envs, 1,721,601 elements -- this
+is a byte-size change, not an allocation-count change):
+- `sizeof` per Env: `8+8n -> 4+8n` bytes, exactly (no rounding
+  clawback) -- e.g. a 1-slot Env: 16 -> 12 bytes (25%); average over
+  this workload's real slot distribution (1,721,601 elements /
+  978,030 envs ~= 1.76 slots/env): ~22.1 -> ~18.1 bytes/env (~18.1%).
+- peak RSS: 584,239 -> 580,408 KB (3-run averages; **-3,831 KB,
+  -0.66%**) -- matches the byte-counting prediction almost exactly
+  (978,030 envs * 4 bytes = 3,820 KB predicted vs. 3,831 KB measured).
+- instructions (`perf stat`, `cpu_core` counter, 4 runs each side on
+  this shared, concurrently-loaded machine): ~10,671.7M -> ~10,733.4M
+  average (**+61.7M, ~+0.58%**) -- within this measurement's own
+  run-to-run noise band (before-group spread ~0.84%, after-group
+  spread ~2.95%), so this is honestly reported as "roughly flat, maybe
+  a small real cost" rather than a clean win either way: the extra
+  `movl`+`addq`(+`andq`) per decompression and the `testq`+branch at
+  the three NULL-safe compression sites are real added instructions,
+  just apparently small enough to sit inside the noise floor on this
+  machine. Reported plainly rather than rounded to "no cost" or
+  oversold as a speedup.
+- `make test`/`test-e2e`/`test-conformance`: all green. `make
+  test-nix-conformance`: `pass=655 fail=3 skip=148`, exact match to
+  the pre-existing baseline (same 3 documented `getattrpos`/
+  `inherit-attr-pos` gaps). `make test-nixpkgs-hash`: `pass=148
+  fail=0`.
+
+**New hard constraint introduced**: a permanent 1 GiB cap on live Env
+memory specifically (not overall process memory -- the general arena's
+own `ASNIX_MAX_MEMORY` is untouched and still defaults to unlimited),
+with a clean `asnix_fatal` abort if a program's live Env count ever
+reaches it. Acceptable given the ~36x headroom over this session's one
+real benchmark, but a genuine new ceiling this codebase did not have
+before, and this project has no larger-than-single-package real
+workload fixture to stress-test it against.
+
+**Win #1 (freeing `Value`'s own spare tag bits), confirmed NOT
+reopened**: this change only touches a field INSIDE an already-
+allocated `Env` object -- it never touches `Value.raw`'s own tag
+scheme, which is what any real progress on the previously-blocked
+shared-descriptor/packed-index `mapAttrs` idea would need (compressing
+the `ATTRS`/`LIST`/`CLOSURE`/`THUNK`/`PRIMOP`/`PTR` tags' own payload
+pointers, an entirely different and much larger change -- see M118).
+`Thunk`/`Cell` remain unconverted for the same reasons M118 found
+(field-reuse and cross-cutting-marker blockers respectively, both
+independent of the rounding fix this milestone applied); `Closure`
+remains unconverted because its `prog` field's target (`IrProgram`,
+heap-`malloc`'d/`calloc`'d, never arena-allocated) would need its own,
+separate allocator migration first -- noted in M118, unchanged by this
+milestone.
+
+**Commit**: `include/asnix/env.h`, `src/asm/env_arena.S` (new),
+`src/asm/env.S`, `src/asm/apply.S`,
+`src/asm/ops/{op_call,op_frame,op_let,op_var_ref,op_var_ref_cell,
+op_var_ref_raw,op_with}.S`, ten hand-rolled-root-Env test fixtures
+(`tests/{ir,asm,c}/*.c`) switched to the real `asnix_env_alloc` API
+instead of a raw general-arena poke (required for correctness, not
+just style -- a hand-rolled Env outside the dedicated arena can't be
+correctly compressed if anything ever points `up` at it), plus
+`tests/asm/test_env.c`'s one direct `up`-comparison check updated for
+the new compressed representation.

@@ -56,14 +56,20 @@ asnix_op_with:
     movq %rsi, %rbp                     // save IP (callee-saved, survives the call below)
     movq %rdi, %r15                     // save current ENV = up-pointer for the new frame
 
-    movq $ASNIX_ENV_OFF_VALUES+8, %rdi  // size = 8 (up) + 1 slot * 8
-    call asnix_arena_alloc
+    movq $ASNIX_ENV_OFF_VALUES+8, %rdi  // size = 4 (up) + 1 slot * 8 = 12
+    call asnix_env_arena_alloc
     incq asnix_stats_env(%rip)
     incq asnix_stats_env_elements(%rip) // always exactly 1 slot
 
+    // M118: OR the tag bit in first, THEN compress -- subtracting the
+    // (even, page-aligned) arena base from an odd tagged address stays
+    // odd, so the tag bit survives compression intact (see env.h).
+    // Unconditional, no NULL-check: same as op_frame.S/op_let.S, ENV is
+    // always live/non-NULL here.
     movq %r15, %rcx
     orq $ASNIX_ENV_WITH_TAG, %rcx
-    movq %rcx, ASNIX_ENV_OFF_UP(%rax)
+    subq asnix_env_arena_base(%rip), %rcx
+    movl %ecx, ASNIX_ENV_OFF_UP(%rax)
 
     subq $8, %r12
     movq (%r12), %rdx
@@ -291,7 +297,8 @@ asnix_op_with_miss:
     .globl asnix_op_with_exit
     .type asnix_op_with_exit, @function
 asnix_op_with_exit:
-    movq ASNIX_ENV_OFF_UP(%rdi), %rdi
+    movl ASNIX_ENV_OFF_UP(%rdi), %edi    // M118: zero-extends into %rdi; decompress below
+    addq asnix_env_arena_base(%rip), %rdi
     andq $-2, %rdi                       // mask off ASNIX_ENV_WITH_TAG (bit 0)
 
     addq $ASNIX_IROP_SIZE, %rsi

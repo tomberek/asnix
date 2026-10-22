@@ -23,7 +23,11 @@ int main(void) {
     Env *mid = asnix_env_alloc(root, 2);
     mid->values[0] = asnix_make_int(10);
     mid->values[1] = asnix_make_int(20);
-    CHECK(mid->up == root, "env_alloc wires up the parent pointer");
+    /* M118: mid->up is now a 32-bit offset into asnix_env_arena_base's
+     * region, not a raw pointer -- compress `root` the same way
+     * asnix_env_alloc itself does before comparing. */
+    CHECK(mid->up == (uint32_t)((uintptr_t)root - (uintptr_t)asnix_env_arena_base),
+          "env_alloc wires up the parent pointer");
 
     Env *inner = asnix_env_alloc(mid, 1);
     inner->values[0] = asnix_make_int(99);

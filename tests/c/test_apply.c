@@ -29,9 +29,10 @@ static int failures = 0;
     } while (0)
 
 static Env *root_env(void) {
-    Env *e = asnix_arena_alloc(8);
-    e->up = NULL;
-    return e;
+    /* M118: Env.up is a dedicated-arena-relative compressed offset --
+     * must come from the real allocator, not a hand-rolled general-
+     * arena alloc. */
+    return asnix_env_alloc(NULL, 0);
 }
 
 /* Builds a real Closure Value for `x: x + 1` via the same IrBuilder API the

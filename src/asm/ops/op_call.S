@@ -170,12 +170,22 @@ asnix_op_call:                          // a = argc
     pushq %rdi                          // save ENV == the return_env (2 pushes, stays 16-byte aligned)
 
     movq %rbx, %rcx
-    leaq 8(, %rcx, 8), %rdi             // size = 8 + argc*8
-    call asnix_arena_alloc
+    leaq ASNIX_ENV_OFF_VALUES(, %rcx, 8), %rdi // size = 4 (up) + argc*8
+    call asnix_env_arena_alloc
     incq asnix_stats_env(%rip)
     addq %rbx, asnix_stats_env_elements(%rip)
+    // M118: Closure.up is a plain, full pointer (Closure isn't
+    // compressed in this milestone) -- but it may legitimately be NULL
+    // (a native-wrapper closure with no captured env, see
+    // builtins_misc.c/builtins_shared.c), so the compress here must be
+    // NULL-safe, unlike op_frame.S/op_let.S/op_with.S's unconditional
+    // compress of the always-live current ENV.
     movq ASNIX_CLOSURE_OFF_UP(%rbp), %rcx
-    movq %rcx, ASNIX_ENV_OFF_UP(%rax)
+    testq %rcx, %rcx
+    jz .Lop_call_up_null
+    subq asnix_env_arena_base(%rip), %rcx
+.Lop_call_up_null:
+    movl %ecx, ASNIX_ENV_OFF_UP(%rax)
 
     xorq %rcx, %rcx                     // rcx = i = 0
 .Lop_call_copy_args:

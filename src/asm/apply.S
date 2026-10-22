@@ -341,12 +341,18 @@ asnix_apply:                            // Value asnix_apply(Value fn, const Val
     // C array (%rbp), not from VALSTACK -- there is no caller IrOp that
     // already pushed them there the way an in-language OP_CALL has.
     movq %r15, %rcx
-    leaq 8(, %rcx, 8), %rdi
-    call asnix_arena_alloc
+    leaq ASNIX_ENV_OFF_VALUES(, %rcx, 8), %rdi
+    call asnix_env_arena_alloc
     incq asnix_stats_env(%rip)
     addq %r15, asnix_stats_env_elements(%rip)
+    // M118: NULL-safe compress -- see op_call.S's identical note
+    // (Closure.up may legitimately be NULL for a native-wrapper closure).
     movq ASNIX_CLOSURE_OFF_UP(%rbx), %rcx
-    movq %rcx, ASNIX_ENV_OFF_UP(%rax)
+    testq %rcx, %rcx
+    jz .Lapply_up_null
+    subq asnix_env_arena_base(%rip), %rcx
+.Lapply_up_null:
+    movl %ecx, ASNIX_ENV_OFF_UP(%rax)
 
     xorq %rcx, %rcx                     // rcx = i = 0
 .Lapply_copy_args:
