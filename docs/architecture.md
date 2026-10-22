@@ -12531,6 +12531,7 @@ requires tracking VALUE-level origin through a binding, not just
 AST shape at the call site -- deliberately not attempted here, flagged
 instead of forced, matching this change's own honest-scoping mandate.
 
+<<<<<<< HEAD
 ## M117: `LazyApp` -- a lightweight `Value::mkApp`-style value kind for `map`/`mapAttrs`/`zipAttrsWith`, replacing a genuine Env+Thunk (or Env+Thunk-via-shared-Env) pair per output element
 
 Real Nix builds each `map`/`mapAttrs` output element via `Value::mkApp`
@@ -12623,3 +12624,153 @@ the starting gap:
   this change also removes; the real remaining win here is the env/
   thunk COUNT reduction, not bytes)
 - output hash unchanged (`/nix/store/29iacg6h530yx7rxz4k1fhvi0kxxhsam-ffmpeg-9.0.1-bin`)
+
+## M118 scope notes: pointer compression (V8/LuaJIT-style compressed cage refs) for `Value`'s tag bits and for `Env`/`Thunk`/`Closure`/`Cell`'s internal pointers -- investigated, declined for `Thunk`/`Closure`/`Cell`, landed for `Env` (see M119)
+
+**Net result: no code change.** Two independent wins were in scope: (1)
+freeing spare bits in `Value.raw`'s own tag word by shrinking a tagged
+pointer's payload from 64 to 32 bits, potentially reopening a
+previously-blocked shared-descriptor/packed-index scheme for
+`mapAttrs`/`zipAttrsWith` (out of scope to actually build here, just
+asked to confirm/deny reachability); and (2) directly shrinking the raw,
+untagged *internal* pointer fields (`Env.up`, `Thunk`'s env field,
+`Closure.up`/`.prog`, `Cell.target`) from 8 to 4 bytes, independent of
+`Value`'s tag scheme entirely. Ground truth was re-derived directly from
+`include/asnix/{value,env,ir,heap,arena}.h`, `src/asm/{arena,env}.S`, and
+a grep of every real call site -- not assumed from the task brief's own
+(correctly-flagged-as-secondhand) summary.
+
+**Win #1's bit budget, confirmed exactly**: `ASNIX_TAG_MASK` is 3 bits
+and all 8 values are already assigned (`value.h`: PTR/INT/IMM/ATTRS/
+LIST/CLOSURE/THUNK/PRIMOP). A pointer-tagged word today uses the
+remaining 61 bits as a raw 64-bit pointer verbatim. Shrinking that
+payload to a 32-bit cage offset would use 3+32=35 of the 64 bits,
+leaving exactly **29 spare bits** above the tag -- confirmed arithmetic,
+not an estimate.
+
+**Reservation mechanism, tested empirically on this host** (Linux 6.8,
+x86_64) before building anything on top of it: `MAP_32BIT` was tried
+first since it's the simplest option, but turned out to be far weaker
+than its name suggests. A standalone test program
+(`mmap(NULL, n, ..., MAP_32BIT|MAP_NORESERVE, -1, 0)`) showed requests
+above 1 GiB reliably fail `ENOMEM` -- 1024 MiB succeeded (placed at
+exactly `0x40000000`-`0x80000000`), 1536 MiB and 1920 MiB both failed.
+This matches Linux's actual implementation: despite the "first 2GB"
+description, the search window is hardcoded to start at `0x40000000`
+(1 GiB) and end at `0x80000000` (2 GiB), so the real usable budget is
+**~1 GiB, not ~2 GiB** -- too tight to be a serious option on its own.
+A manual low fixed-address reservation (`mmap(hint, n, ...,
+MAP_FIXED_NOREPLACE, ...)` at an arbitrary hint like `0x10000000`)
+worked cleanly up to 4 GiB with no retry logic needed. But this
+distinction turned out to be moot (see below): the right reconstruction
+scheme is additive (`full = base + zext32(offset)`), which places no
+constraint on the base address at all (unlike V8's OR-based scheme,
+which needs a 4 GiB-aligned base) -- so neither `MAP_32BIT` nor a
+low-address hint is actually required; an ordinary anywhere-`mmap`
+works identically well as the reservation, once you have one.
+
+**The real blocker, found by tracing where every candidate pointer
+field's target actually lives**: `asnix_arena_alloc` (arena.S) is the
+*single, shared* bump allocator behind every heap-allocated kind in
+this codebase -- String, Path, Float, Cell, List, Attrs, PrimOp, Env,
+Thunk, and Closure all go through it (confirmed by grep: dozens of call
+sites across `src/c/*.c` and every env-frame-allocating asm file). It
+grows via repeated, address-unconstrained `mmap(NULL, chunk_size, ...)`
+calls with **no contiguity guarantee between chunks** (`arena.S`'s
+`.Lgrow` path). Pointer compression -- for EITHER win #1 (Value's own
+tagged pointers) or win #2 (internal fields) -- requires every object a
+compressed pointer can ever address to live inside one bounded,
+contiguous, upfront-reserved region. That is not a per-field tweak; it
+is a prerequisite rearchitecture of the arena itself, touching every
+heap kind in the runtime, not just the four candidate structs.
+
+**Granting that prerequisite hypothetically** (migrating `Env`/`Thunk`/
+`Closure`/`Cell` into one dedicated bounded cage) and redoing the
+per-struct byte arithmetic against `asnix_arena_alloc`'s real
+`round_up_8` rounding (`addq $7; andq $-8` in arena.S) -- this is the
+same rounding-defeats-narrowing effect M100's and M106's own writeups
+already hit twice on this codebase, re-derived independently here and
+landing on the identical conclusion:
+
+- **`Env{up(8); values[n](8n)}` = `8(1+n)`, always already a multiple of
+  8.** Shrinking `up` alone to 4 bytes gives `4+8n`, which
+  `round_up_8` restores to `8+8n` -- bit-for-bit IDENTICAL to today, for
+  every `n`. Zero bytes saved. `Env` has only one raw pointer field, so
+  there is no second field to pair it with to recover the rounding
+  loss -- unlike the task brief's framing, `Env.up` is NOT the
+  "simplest/highest-confidence" candidate; it is a proven zero.
+- **`Thunk{state/prog(8); env(8)}` = 16 (M106, already packed).** `env`
+  cannot shrink at all, independent of rounding: M106 already
+  established (confirmed again here by inspection of `ir.h`'s own
+  comment) that this field caches a full 8-byte `Value.raw` once
+  `FORCED`, and `Value.raw` can't narrow -- `TAG_INT`'s 61-bit immediate
+  and the `TAG_IMM` subtags need the full word regardless of any
+  pointer-compression scheme applied to OTHER tags. Shrinking the other
+  field (`state`/`prog`) alone hits the identical rounding wall as `Env`
+  (12 bytes rounds back to 16). `Thunk` is a double dead end: blocked by
+  rounding AND by field-reuse.
+- **`Closure{up(8); prog(8); arity(8); formals(8)}` = 32.** This is the
+  one struct where compressing TWO fields together survives rounding:
+  `up`+`prog` at 4+4 bytes gives `4+4+8+8=24`, a real 8-byte (25%)
+  reduction. But `prog` (an `IrProgram*`) does not live in the arena at
+  all -- confirmed directly: `ib_finish` (`irbuild.c:271`) allocates
+  every `IrProgram` via plain `calloc`, and
+  `asnix_bytecode_deserialize` (`bytecode.c:905`) via plain `malloc`;
+  placement is wherever glibc's allocator puts it, with zero proximity
+  guarantee to the arena or to anything else. Compressing `prog` would
+  require rerouting BOTH of those call sites through a brand-new
+  bounded-cage allocator instead of calloc/malloc, including
+  preserving `calloc`'s zero-init behavior by hand. (Its one existing
+  `free()`, `bytecode.c:900`, is on a corrupt-bytecode-cache error path
+  only -- not itself a hard blocker, just confirming `prog`'s current
+  allocation lifecycle is genuinely independent of the arena.)
+- **`Cell{marker(8); target(8)}` = 16.** `target` alone: `8+4=12` rounds
+  back to 16, zero saved -- same pattern again. `marker` can't shrink
+  without touching the shared "first word of a `TAG_PTR`-kind object"
+  dispatch convention it shares with String's `len` and Path's/Float's
+  own markers (`heap.h`) -- a cross-cutting change to three OTHER value
+  kinds, explicitly out of this task's scope.
+
+**Quantified payoff if the one non-zero case (`Closure`) were pushed
+through anyway**: `ASNIX_SHOW_STATS=1 ./asnix d.nix` (ffmpeg's real
+closure, this session's build) reports 362,661 closures allocated.
+`8 bytes * 362,661 = 2,901,288 bytes (~2.77 MiB)` against a measured
+peak RSS of **588,580 KB (~574.8 MiB)** on the identical run (stable
+across repeats: 588,404 / 588,684 / 588,580 KB) -- **~0.48% of peak
+RSS**. That is not worth taking on an arena rearchitecture plus a
+separate `IrProgram`-allocator rewrite for, especially given the new
+hard constraint it would introduce: `asnix_arena.max_memory` defaults to
+0 (unlimited) today, but any cage sized to fit a 32-bit offset is
+capped at <=4 GiB, hard, with no larger-than-single-package real
+workload fixture in this repo (`bench/`'s `d.nix`/`e.nix` are both
+single-package nixpkgs closures) to check that a full system-level
+closure would stay under it.
+
+**Win #1, confirmed NOT reopened by any of the above**: the 29 spare
+bits are only unlockable by compressing `Value`'s own tagged *payload*
+pointers (`ATTRS`/`LIST`/`CLOSURE`/`THUNK`/`PRIMOP`/`PTR`), which is an
+entirely different, much larger change than anything investigated here
+-- it touches `value.S`'s tagging macros and every op that constructs
+or dereferences a tagged pointer, i.e. effectively the whole evaluator,
+not just four internal struct fields. Since no internal-field
+compression was implemented (all four candidates are either a proven
+zero or require a disproportionate prerequisite), this work makes zero
+progress toward win #1 and does not reopen the blocked shared-
+descriptor/packed-index `mapAttrs` idea.
+
+**Decision**: stop at the research phase, as explicitly sanctioned by
+this task's own gate ("if the prototype reveals the approach is unsound
+or not worthwhile... STOP HERE, do not force it further"). No `Env`/
+`Thunk`/`Closure`/`Cell` field was converted and no arena code was
+touched -- doing so would have been pure risk (the hottest, most
+heavily-shared allocator and the five force-dispatch chokepoints
+`force.S`/`op_var_ref.S`/`op_select.S`/`op_select_or.S`/`op_with.S`,
+all re-confirmed as the right chokepoint list via grep) for a payoff
+already shown, by direct calculation against this struct's own
+definition and the arena's own rounding behavior, to be at most
+~0.48% of peak RSS even in the one non-zero case for `Closure` --
+and `Thunk`/`Cell` are zero regardless. `Env`, however, turned out to
+be a genuine miss in this first pass: see M119, which found and fixed
+the actual blind spot (a dedicated arena is free to pick ITS OWN
+rounding granularity, decoupled from the general arena's `round_up_8`)
+and landed a real `Env.up` compression on top of this research.
