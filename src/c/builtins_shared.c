@@ -8,6 +8,7 @@
 #include "asnix/arena.h"
 #include "asnix/env.h"
 #include "asnix/heap.h"
+#include "asnix/stats.h"
 #include "asnix/ir.h"
 #include "asnix/irbuild.h"
 #include "attrs_update.h" /* M88: asnix_attrs_eager_merge, for asnix_bshared_attrs_resolve */
@@ -16,6 +17,7 @@
 
 Value asnix_bshared_make_primop(void *fn, int64_t arity) {
     void *mem = asnix_arena_alloc(ASNIX_PRIMOP_SIZE);
+    asnix_stats_primop++;
     *(void **)((char *)mem + ASNIX_PRIMOP_OFF_FN) = fn;
     *(int64_t *)((char *)mem + ASNIX_PRIMOP_OFF_ARITY) = arity;
     /* ASNIX_PRIMOP_OFF_NOFORCE left at its fresh-arena zero (force args,
@@ -26,6 +28,7 @@ Value asnix_bshared_make_primop(void *fn, int64_t arity) {
 
 Value asnix_bshared_make_primop_noforce(void *fn, int64_t arity) {
     void *mem = asnix_arena_alloc(ASNIX_PRIMOP_SIZE);
+    asnix_stats_primop++;
     *(void **)((char *)mem + ASNIX_PRIMOP_OFF_FN) = fn;
     *(int64_t *)((char *)mem + ASNIX_PRIMOP_OFF_ARITY) = arity;
     *(int64_t *)((char *)mem + ASNIX_PRIMOP_OFF_NOFORCE) = 1;
@@ -77,6 +80,7 @@ Value asnix_bshared_make_curried_native(void *native_fn, int64_t arity) {
     }
 
     void *mem = asnix_arena_alloc(ASNIX_CLOSURE_SIZE);
+    asnix_stats_closure++;
     *(void **)((char *)mem + ASNIX_CLOSURE_OFF_UP) = NULL;
     *(IrProgram **)((char *)mem + ASNIX_CLOSURE_OFF_PROG) = prog; /* M100: one pointer, not {ops,pool} */
     *(int64_t *)((char *)mem + ASNIX_CLOSURE_OFF_ARITY) = 1;
@@ -90,6 +94,7 @@ Value asnix_bshared_make_curried_native(void *native_fn, int64_t arity) {
  * and the leaf primop is built NOFORCE (asnix_bshared_make_primop_
  * noforce) instead of force-by-default. */
 Value asnix_bshared_make_curried_native_noforce(void *native_fn, int64_t arity) {
+    asnix_stats_closure++;
     Value native_primop = asnix_bshared_make_primop_noforce(native_fn, arity);
     Value empty_formals = asnix_bshared_native_formals_marker();
 
@@ -278,6 +283,8 @@ const Value *asnix_bshared_list_elems(Value v) {
 
 Value asnix_bshared_make_list(const Value *elems, int64_t count) {
     void *mem = asnix_arena_alloc(8 + (uint64_t)count * sizeof(Value));
+    asnix_stats_list++;
+    asnix_stats_list_elements += (uint64_t)count;
     *(int64_t *)((char *)mem + ASNIX_LIST_OFF_COUNT) = count;
     if (count > 0) memcpy((char *)mem + ASNIX_LIST_OFF_ELEMS, elems, (size_t)count * sizeof(Value));
     return (Value){ .raw = (uint64_t)(uintptr_t)mem | ASNIX_TAG_LIST };
@@ -400,6 +407,8 @@ Value asnix_bshared_make_attrs(uint32_t *syms, Value *vals, int64_t count) {
     if (count > 1) qsort(entries, (size_t)count, sizeof(MakeAttrsEntry), cmp_make_attrs_entry);
 
     void *mem = asnix_arena_alloc(8 + (uint64_t)count * ASNIX_ATTR_SIZE);
+    asnix_stats_attrs++;
+    asnix_stats_attrs_entries += (uint64_t)count;
     *(int64_t *)((char *)mem + ASNIX_ATTRS_OFF_COUNT) = count;
     for (int64_t i = 0; i < count; i++) {
         char *entry = (char *)mem + ASNIX_ATTRS_OFF_ENTRIES + i * ASNIX_ATTR_SIZE;
@@ -771,6 +780,7 @@ int asnix_bshared_value_lt(Value a, Value b, const char *who) {
  * aliasing risk even though the IR body is a shared singleton). */
 static Value make_thunk_from(IrProgram *prog, Env *env) {
     void *mem = asnix_arena_alloc(ASNIX_THUNK_SIZE);
+    asnix_stats_thunk++;
     /* M103: OFF_STATE doubles as the prog pointer while UNFORCED -- prog
      * is always >=8-byte-aligned (calloc/malloc), so its low 3 bits are
      * already 0 == ASNIX_THUNK_STATE_UNFORCED; see ir.h's comment. */

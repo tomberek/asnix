@@ -18,6 +18,7 @@ asnix_op_lambda:                        // a = arity, b = pool index of {body Ir
 
     movq $ASNIX_CLOSURE_SIZE, %rdi
     call asnix_arena_alloc
+    incq asnix_stats_closure(%rip)
     movq %rbp, ASNIX_CLOSURE_OFF_PROG(%rax)
     movq %rbx, ASNIX_CLOSURE_OFF_ARITY(%rax)
 

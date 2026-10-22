@@ -14,6 +14,8 @@ asnix_op_mk_list:                       // a = count; pops `count` values (rever
 
     leaq 8(, %rbx, 8), %rdi             // size = 8 + count*8
     call asnix_arena_alloc
+    incq asnix_stats_list(%rip)
+    addq %rbx, asnix_stats_list_elements(%rip)
     movq %rbx, ASNIX_LIST_OFF_COUNT(%rax)
 
     movq %rbx, %rcx                     // rcx = remaining, counting down

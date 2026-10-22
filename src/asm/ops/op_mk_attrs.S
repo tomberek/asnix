@@ -17,6 +17,8 @@ asnix_op_mk_attrs:                      // a = count, b = pool index of `count` 
     imulq $ASNIX_ATTR_SIZE, %rdi        // rdi = count * ASNIX_ATTR_SIZE (12 -- not a power of 2)
     addq $8, %rdi                       // rdi = 8 + count*12 (header + entries)
     call asnix_arena_alloc
+    incq asnix_stats_attrs(%rip)
+    addq %rbx, asnix_stats_attrs_entries(%rip)
     movq %rbx, ASNIX_ATTRS_OFF_COUNT(%rax)
 
     // Fill entries[count-1 .. 0], matching the compiler's convention of

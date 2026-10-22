@@ -172,6 +172,8 @@ asnix_op_call:                          // a = argc
     movq %rbx, %rcx
     leaq 8(, %rcx, 8), %rdi             // size = 8 + argc*8
     call asnix_arena_alloc
+    incq asnix_stats_env(%rip)
+    addq %rbx, asnix_stats_env_elements(%rip)
     movq ASNIX_CLOSURE_OFF_UP(%rbp), %rcx
     movq %rcx, ASNIX_ENV_OFF_UP(%rax)
 

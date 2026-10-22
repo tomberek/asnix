@@ -25,6 +25,8 @@ asnix_op_frame_alloc:                   // a = nslots
 
     leaq 8(, %rbx, 8), %rdi             // size = 8 + nslots*8
     call asnix_arena_alloc
+    incq asnix_stats_env(%rip)
+    addq %rbx, asnix_stats_env_elements(%rip)
     movq %r15, ASNIX_ENV_OFF_UP(%rax)
 
     movq %rax, %rdi                     // ENV = new frame (slots left uninitialized -- every

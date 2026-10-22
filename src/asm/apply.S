@@ -343,6 +343,8 @@ asnix_apply:                            // Value asnix_apply(Value fn, const Val
     movq %r15, %rcx
     leaq 8(, %rcx, 8), %rdi
     call asnix_arena_alloc
+    incq asnix_stats_env(%rip)
+    addq %r15, asnix_stats_env_elements(%rip)
     movq ASNIX_CLOSURE_OFF_UP(%rbx), %rcx
     movq %rcx, ASNIX_ENV_OFF_UP(%rax)
 

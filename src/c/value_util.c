@@ -12,6 +12,7 @@
 #include "asnix/arena.h"
 #include "asnix/heap.h"
 #include "asnix/ir.h" /* asnix_force_for_print, asnix_apply */
+#include "asnix/stats.h"
 #include "builtins_shared.h"
 #include "nar.h"
 #include "string_context.h" /* M76 */
@@ -19,6 +20,7 @@
 
 Value asnix_make_string_value(const char *s, size_t len) {
     void *mem = asnix_arena_alloc(8 + len);
+    asnix_stats_string++;
     *(int64_t *)((char *)mem + ASNIX_STRING_OFF_LEN) = (int64_t)len;
     memcpy((char *)mem + ASNIX_STRING_OFF_BYTES, s, len);
     return (Value){ .raw = (uint64_t)(uintptr_t)mem | ASNIX_TAG_PTR };
@@ -26,6 +28,7 @@ Value asnix_make_string_value(const char *s, size_t len) {
 
 Value asnix_make_path_value(const char *abs_path, size_t len) {
     void *mem = asnix_arena_alloc(16 + len);
+    asnix_stats_path++;
     *(int64_t *)((char *)mem + ASNIX_PATH_OFF_MARKER) = ASNIX_PATH_MARKER;
     *(int64_t *)((char *)mem + ASNIX_PATH_OFF_LEN) = (int64_t)len;
     memcpy((char *)mem + ASNIX_PATH_OFF_BYTES, abs_path, len);
@@ -58,6 +61,7 @@ double asnix_float_value(Value v) {
 
 Value asnix_make_cell_value(Value *target) {
     void *mem = asnix_arena_alloc(16);
+    asnix_stats_cell++;
     *(int64_t *)((char *)mem + ASNIX_CELL_OFF_MARKER) = ASNIX_CELL_MARKER;
     *(Value **)((char *)mem + ASNIX_CELL_OFF_TARGET) = target;
     return (Value){ .raw = (uint64_t)(uintptr_t)mem | ASNIX_TAG_PTR };

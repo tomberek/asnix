@@ -11,10 +11,15 @@
 asnix_env_alloc:                        // Env *asnix_env_alloc(Env *up, int64_t nslots)
     .cfi_startproc
     pushq %rbx
+    pushq %rbp
     movq %rdi, %rbx                     // save `up` across the call (rdi becomes the size arg)
+    movq %rsi, %rbp                     // save nslots across the call, for stats accounting
     leaq 8(, %rsi, 8), %rdi             // size = 8 + nslots*8
     call asnix_arena_alloc
+    incq asnix_stats_env(%rip)
+    addq %rbp, asnix_stats_env_elements(%rip)
     movq %rbx, ASNIX_ENV_OFF_UP(%rax)
+    popq %rbp
     popq %rbx
     ret
     .cfi_endproc

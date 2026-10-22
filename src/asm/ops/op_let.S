@@ -12,6 +12,8 @@ asnix_op_let:                           // a = nslots; binds the next `nslots` p
 
     leaq 8(, %rbx, 8), %rdi             // size = 8 + nslots*8
     call asnix_arena_alloc
+    incq asnix_stats_env(%rip)
+    addq %rbx, asnix_stats_env_elements(%rip)
     movq %r15, ASNIX_ENV_OFF_UP(%rax)
 
     movq %rbx, %rcx                     // rcx = remaining slots to bind, counting down

@@ -121,6 +121,7 @@ what's actually implemented and the scope decisions made along the way.
 | M105 — `ASNIX_ATTR_SIZE` 16 → 12 bytes: dropped the permanent 4-byte alignment pad on every attrset entry (`{uint32_t sym; uint32_t pad; Value value;}` → `{uint32_t sym; Value value;}`, the pad bought nothing -- a 4-byte `movl` zero-extends for free on x86-64, same single-instruction cost as the padded 8-byte `movq` it replaced); re-derived M93's own "~40+ call sites" estimate from scratch (narrower in practice: 8 asm stride multiplies, 7 asm + 5 C sym-field accesses needed narrowing from `movq`/`int64_t*` to `movl`/`uint32_t*` since sym is no longer followed by a zero pad) | done (see below; measured 12,698,073 real attrset entries on `d.nix`'s ffmpeg closure; peak RSS 741,568 KB → 692,152 KB, ~6.7% reduction; zero regressions) |
 | M107 — the bytecode cache's own lookup path did MORE file opens than no caching at all: the cache key required hashing the entire source file's content before even checking for a hit, so a warm-cache run was "1 source open (always) + 1 cache-entry open (on a hit)" against disabled's single open. Added a cheap mtime+size fast path (reusing the `lstat()` M83's `follow_symlink_chain` already does, no extra syscall in the common case) with a content-hash fallback + atomic self-heal when mtime/size drifts but content hasn't | done (see below; `openat` count on `d.nix`'s 1056-file closure: disabled 2444 → warm-cache 3500 (pre-fix) → **2447** (post-fix, +3 fully explained: one embedded-stub file always needs the verify path); zero regressions) |
 | M106 — packed `Thunk`'s `state` field into the low tag bits of its own `prog` field instead of a separate 8-byte word: `prog` is always a plain `IrProgram*` (malloc/calloc-aligned, low 3 bits always free, written once at creation, read once more at UNFORCED→IN_PROGRESS), unlike the originally-proposed target (`env`, whose FORCED case caches a raw `Value.raw` that already saturates all 8 combinations of the low 3 bits via `ASNIX_TAG_MASK` -- a genuine dead end, confirmed before picking `prog` instead); `ASNIX_THUNK_SIZE` 24 → 16 bytes, unlike M100's earlier rejected narrowing this one is already 8-byte-aligned so the arena's rounding doesn't claw it back | done (see below; found and tagged the 4th thunk state, `ASNIX_THUNK_STATE_FAILED` from M82's `tryEval` memoization, that an earlier description had missed; peak RSS on `d.nix` 741,976 → 723,820 KB (~2.5%); zero regressions) |
+| M108 — a permanent, always-on `NIX_SHOW_STATS=1`-equivalent (`ASNIX_SHOW_STATS=1`): per-category object counters (env/thunk/closure/attrs/list/cell/string/primop/path, plus element/entry sub-counts for env/attrs/list) incremented at every real allocation site -- `asnix_env_alloc` plus the four hot-path-inlined env-frame sites (`op_frame.S`/`op_let.S`/`op_call.S`/`op_with.S`/`apply.S`) that bypass it entirely, so a first attempt at just the shared helper undercounted envs by ~3x until all five sites were found and instrumented | done (see below; env/thunk/cell counts cross-checked exactly against this session's own independent arena-tracer investigation -- 1,675,074 / 2,342,967 / 836,471 -- confirming correctness; zero regressions) |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
 
@@ -11899,4 +11900,65 @@ on top of M103's already-landed one.**
 
 **Commit:** `src/c/bytecode.c` (redundant with M103, see above),
 `src/c/bytecode_cache.c`, `src/c/bytecode_cache.h`, `src/c/eval_file.c`,
+`docs/architecture.md`.
+
+## M108: a permanent `ASNIX_SHOW_STATS=1` object-count feature, modeled on real Nix's `NIX_SHOW_STATS=1`
+
+This session's memory-gap investigations repeatedly re-derived the same
+per-category allocation counts (envs/thunks/closures/attrs/lists/cells/
+strings/primops/paths) via temporary, reverted instrumentation (an arena
+allocation-site tracer read back through `addr2line`) -- every fresh
+investigation started from zero. This milestone makes those counts a
+permanent, always-available feature instead: plain `.bss` global
+counters (`include/asnix/stats.h`/`src/c/stats.c`), incremented
+unconditionally at each category's real allocation site (a bare
+`incq`/`++` is cheap enough to always pay), with printing gated behind
+`ASNIX_SHOW_STATS=1` (silent no-op otherwise), dumped to stderr at the
+same exit point M98's `ASNIX_BYTECODE_CACHE_STATS` already uses.
+
+**The one real bug found while building this**: `asnix_env_alloc`
+(`src/asm/env.S`) looked like the one place Env frames get allocated,
+but the file's own header comment already said otherwise --
+"`op_var_ref`/`op_let`/`op_call` inline the same logic directly in the
+hot dispatch path rather than paying a `call` per use". A first pass
+instrumenting only `asnix_env_alloc` undercounted envs by ~3.1x
+(533,486 vs the true 1,675,074) on `d.nix`'s real ffmpeg closure.
+Found and instrumented the four actually-dominant inlined sites by
+grepping for `ASNIX_ENV_OFF_UP` directly instead of trusting the one
+named helper: `op_frame.S` (`let`/`rec {}`/attrset frames -- the
+largest contributor), `op_let.S`, `op_call.S` (closure-call argument
+frames), `op_with.S` (always-1-slot with-frames), and `apply.S`
+(`builtins.*`-driven calls, a separate call path from `op_call.S`'s
+in-language one).
+
+**Cross-checked against this session's own independent measurement**:
+after instrumenting all five sites, `envs=1,675,074` / `thunks=2,342,967`
+/ `cells=836,471` on `d.nix` match the arena allocation-site tracer's
+own numbers from `docs/memory-accounting-asnix-vs-nix.md` exactly --
+strong confirmation this feature counts correctly, not just
+plausibly.
+
+**Environment note for whoever reviews this**: this worktree was
+shared with (at least) one other concurrent, unrelated change in
+progress (`src/c/ast.c`/`ast.h`'s AST-arena-freeing optimization and
+`src/c/attrs_update.c`'s attrs-layering threshold retuning, plus
+`eval_file.c`'s wiring for the former) -- confirmed broken on its own
+(`asnix: undefined variable 'list'` on both `hello.drvPath` and
+`ffmpeg.outPath`, reproducible, unrelated to this milestone's own
+changes: verified by stashing those four files out, confirming this
+milestone's own changes evaluate both correctly on the clean baseline,
+then restoring them exactly as found). This commit deliberately does
+NOT touch or fix that unrelated, in-progress, currently-broken work --
+out of scope for this directive, left for whoever owns it.
+
+Verified (on the clean baseline, i.e. with the unrelated WIP above
+stashed out): `make test`/`test-e2e`/`test-conformance` all green;
+`make test-nix-conformance`: `pass=655 fail=3 skip=148`, unchanged;
+`make test-nixpkgs-hash`: `pass=148 fail=0`, unchanged; `./asnix d.nix`/
+`e.nix` still match their known-correct hashes exactly.
+
+**Commit:** `include/asnix/stats.h` (new), `src/c/stats.c` (new),
+`src/asm/env.S`, `src/asm/ops/{op_frame,op_let,op_call,op_with,
+op_mk_thunk,op_lambda,op_mk_attrs,op_mk_list}.S`, `src/asm/apply.S`,
+`src/c/builtins_shared.c`, `src/c/value_util.c`, `src/c/main.c`,
 `docs/architecture.md`.

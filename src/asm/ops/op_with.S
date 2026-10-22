@@ -58,6 +58,8 @@ asnix_op_with:
 
     movq $ASNIX_ENV_OFF_VALUES+8, %rdi  // size = 8 (up) + 1 slot * 8
     call asnix_arena_alloc
+    incq asnix_stats_env(%rip)
+    incq asnix_stats_env_elements(%rip) // always exactly 1 slot
 
     movq %r15, %rcx
     orq $ASNIX_ENV_WITH_TAG, %rcx

@@ -7,6 +7,7 @@
 #include "asnix/arena.h"
 #include "asnix/heap.h"
 #include "asnix/ir.h"
+#include "asnix/stats.h"
 #include "asnix/value.h"
 #include "builtins_shared.h" /* M57i: asnix_bshared_attrs_* / make_attrs, CLI --arg/-A support */
 #include "eval_file.h"
@@ -608,5 +609,6 @@ int main(int argc, char **argv) {
     if (n_cli_args > 0) result = auto_call(result, cli_args, n_cli_args);
     if (attrpath) result = select_attrpath(result, attrpath);
     print_value(result);
+    if (getenv("ASNIX_SHOW_STATS")) asnix_stats_print();
     return 0;
 }
