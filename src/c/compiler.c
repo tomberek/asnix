@@ -10,6 +10,9 @@
 #include "asnix/heap.h"
 #include "asnix/irbuild.h"
 #include "asnix/value.h"
+#include "builtins_list2.h"  /* M110: asnix_prim_{elem,any,all}2_impl */
+#include "builtins_m23.h"    /* M110: asnix_prim_intersectAttrs2_impl */
+#include "builtins_regex.h"  /* M110: asnix_prim_match2_impl */
 #include "builtins_shared.h"
 #include "eval_file.h" /* M80: asnix_eval_top_level_file, for AST_CURPOS's `file` field */
 #include "symtab.h"
@@ -1203,6 +1206,71 @@ static void compile_expr(IrBuilder *b, Ast *node, ScopeFrame *scope) {
                  * one always-empty, zero-cost frame wrapped around it). */
                 size_t hidden_count = 0;
                 for (size_t i = 0; i < n; i++) if (node->as.attrset.bindings[i].is_hidden) hidden_count++;
+                if (hidden_count == 0) {
+                    /* M110: the overwhelming common case -- no `inherit
+                     * (expr) a b;` clause needs a shared hidden slot, so
+                     * NOTHING here needs its own frame at all. Real Nix's
+                     * own non-recursive ExprAttrs::eval (eval.cc, ~line
+                     * 1315) never allocates an Env for a plain `{ ... }`
+                     * literal: every binding's value is bound directly
+                     * against the ENCLOSING scope, because non-`rec`
+                     * siblings never see each other -- there is no shared
+                     * scope for a frame to provide. Before this case
+                     * existed, `ib_frame_alloc(b, 0)` ran unconditionally
+                     * here, costing one real (if zero-slot) Env allocation
+                     * per plain attrset literal evaluated, for nothing
+                     * (confirmed: 189,914 of these on real nixpkgs's
+                     * ffmpeg.outPath, 20% of asnix's total env-count gap
+                     * against real Nix for the same evaluation). This
+                     * mirrors the `hidden_count > 0` branch below exactly,
+                     * minus the hidden frame itself -- every binding/
+                     * dyn-binding value compiles straight against `scope`,
+                     * and `order[i]` (not `i`) is used so values are
+                     * pushed in the SAME sorted-symbol order `sorted_syms`
+                     * is already in, matching what `ib_mk_attrs` needs
+                     * (identical to the `visible_sorted_syms` loop below,
+                     * just with `visible_count == n` so no filtering or
+                     * copy is needed). */
+                    for (size_t i = 0; i < n; i++) {
+                        AstBinding *bind = &node->as.attrset.bindings[order[i]];
+                        if (try_cell_ref(b, bind->value, scope)) {
+                            /* nothing more to do -- OP_VAR_REF_CELL already emitted */
+                        } else if (is_thunk_free_literal(bind->value)) {
+                            compile_expr(b, bind->value, scope);
+                        } else {
+                            IrBuilder *thunk_b = ib_new();
+                            compile_expr(thunk_b, bind->value, scope);
+                            ib_ret(thunk_b);
+                            ib_mk_thunk(b, ib_finish(thunk_b));
+                        }
+                    }
+                    ib_mk_attrs(b, (int64_t)n, sorted_syms);
+                    /* M67: `${expr} = value;` entries -- see the matching
+                     * comment below (the `hidden_count > 0` branch); same
+                     * reasoning applies verbatim with `scope` standing in
+                     * for `&hidden_frame` (which, with zero hidden slots,
+                     * was always mechanically identical to `scope` at
+                     * runtime anyway -- this path just stops paying for
+                     * the frame that fell through to it). */
+                    for (size_t i = 0; i < node->as.attrset.dyn_count; i++) {
+                        compile_expr(b, node->as.attrset.dyn_bindings[i].name_expr, scope);
+                        if (try_cell_ref(b, node->as.attrset.dyn_bindings[i].value, scope)) {
+                            /* nothing more to do -- OP_VAR_REF_CELL already emitted */
+                        } else if (is_thunk_free_literal(node->as.attrset.dyn_bindings[i].value)) {
+                            compile_expr(b, node->as.attrset.dyn_bindings[i].value, scope);
+                        } else {
+                            IrBuilder *thunk_b = ib_new();
+                            compile_expr(thunk_b, node->as.attrset.dyn_bindings[i].value, scope);
+                            ib_ret(thunk_b);
+                            ib_mk_thunk(b, ib_finish(thunk_b));
+                        }
+                        ib_insert_dynamic_attr(b);
+                    }
+                    free(syms);
+                    free(order);
+                    free(sorted_syms);
+                    return;
+                }
                 const char **hnames = malloc((hidden_count ? hidden_count : 1) * sizeof(char *));
                 size_t *hname_lens = malloc((hidden_count ? hidden_count : 1) * sizeof(size_t));
                 size_t hi = 0;

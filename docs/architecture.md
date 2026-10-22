@@ -12300,3 +12300,51 @@ reproduced clean immediately after, matching this session's own
 documented contention-flakiness pattern). `make test-nix-conformance`:
 `pass=655 fail=3 skip=148` unchanged. `make test-nixpkgs-hash`:
 `pass=148 fail=0` unchanged.
+
+## M114: non-rec `{ ... }` with no hidden `inherit (expr)` slots skips `ib_frame_alloc` entirely -- real Nix never allocates an Env for this case either
+
+A dedicated investigation this session (reading real Nix's `eval.cc`
+directly against `compiler.c`) found: `compiler.c`'s `AST_ATTRSET`
+non-`rec` branch unconditionally emitted `ib_frame_alloc(b, hidden_count)`
+even when `hidden_count == 0` -- the overwhelming common case (any plain
+`{ a = 1; b = foo; }` with no `inherit (expr) a b;` clause has
+`hidden_count == 0`). `op_frame.S`'s `asnix_op_frame_alloc` unconditionally
+calls `asnix_arena_alloc` and increments the env stats counter regardless
+of slot count -- 0 slots still cost a real `Env` header allocation. Real
+Nix's own non-recursive `ExprAttrs::eval` never allocates an `Env` at all
+for this case: a non-`rec` attrset literal's bindings don't need their own
+recursive scope (only `rec {}` and `let` need a frame, because only THOSE
+let sibling bindings see each other -- a plain `{ a = 1; b = foo; }` has
+`foo` resolve in the ENCLOSING scope, not against sibling `a`).
+
+M80 had added a small, always-present `hidden_frame` (with `.up = scope`)
+specifically so a multi-name `inherit (expr) a b;` clause's synthetic
+shared slot has somewhere to live -- correct and necessary when
+`hidden_count > 0`, but paid for unconditionally even when there is no
+hidden slot at all, which is the normal case for almost every attrset
+literal in real Nix code.
+
+**The fix**: when `hidden_count == 0`, skip `ib_frame_alloc`/
+`ib_frame_exit`/`hidden_frame` entirely and compile every binding's value
+(and every `${expr} = value;` dynamic binding, M67) directly against the
+ENCLOSING `scope` -- mechanically identical to real Nix's own
+`ExprAttrs::eval` for this shape. The `hidden_count > 0` path (M80's own
+fix for a real double-eval/self-reference bug, confirmed by
+`eval-okay-getattrpos.nix`) is untouched and still takes the original
+frame-allocating path exactly as before.
+
+**Measured directly against real master (M113's tip), paired same-build
+before/after, `./asnix d.nix` (real nixpkgs's `ffmpeg.outPath`)**:
+- envs: **1,684,904 -> 1,494,995 (-189,909, -11.3%)** -- matches this
+  session's own thunk/env-count investigation's predicted ~189,914-env
+  reduction (20% of asnix's total env-count gap against real Nix for this
+  evaluation) almost exactly.
+- output hash unchanged: `/nix/store/29iacg6h530yx7rxz4k1fhvi0kxxhsam-ffmpeg-9.0.1-bin`,
+  identical before and after.
+
+`make test`/`make test-e2e`/`make test-conformance`: all green, no
+regressions. `make test-nix-conformance`: `pass=655 fail=3 skip=148`,
+identical before and after -- same 3 pre-existing, unrelated failures
+(`eval-okay-getattrpos-functionargs.nix`, `eval-okay-getattrpos.nix`,
+`eval-okay-inherit-attr-pos.nix`, all pos-tracking gaps, not Env-shape
+related). `make test-nixpkgs-hash`: **`pass=148 fail=0`**, unchanged.
