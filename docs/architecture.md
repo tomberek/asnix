@@ -12531,7 +12531,6 @@ requires tracking VALUE-level origin through a binding, not just
 AST shape at the call site -- deliberately not attempted here, flagged
 instead of forced, matching this change's own honest-scoping mandate.
 
-<<<<<<< HEAD
 ## M117: `LazyApp` -- a lightweight `Value::mkApp`-style value kind for `map`/`mapAttrs`/`zipAttrsWith`, replacing a genuine Env+Thunk (or Env+Thunk-via-shared-Env) pair per output element
 
 Real Nix builds each `map`/`mapAttrs` output element via `Value::mkApp`
