@@ -111,7 +111,8 @@ what's actually implemented and the scope decisions made along the way.
 | M96 — three more non-arena memory leaks found via an LD_PRELOAD malloc tracer: nine parser.c vector-to-AST handoff sites (`BindingVec`/`PartVec`/`AstVec`/`FormalVec`) carried permanent doubling-growth slack into AST storage (same pattern M87 fixed for `IrBuilder`, just never applied here); `btvec`'s own hash-index array (added by M88, after M87's free was written) was never freed alongside its `.items`; `ib_finish` never freed the outer `IrBuilder` struct itself (48 bytes × hundreds of thousands of calls) after pulling its `ops`/`pool` arrays out into the permanent `IrProgram` | done (see below; peak RSS on `d.nix` 853MB → **767MB** (~10%); zero regressions) |
 | M97 — `aterm.c`'s `buf_put_escaped` (`.drv` ATerm string escaping) and `builtins_compare.c`'s `jb_escape_string` (`toJSON` string escaping) paid a function-call + bounds-check (`buf_putc`→`buf_reserve` / `jb_putc`→`jb_ensure`) for every single output byte, even the overwhelming majority that need no escaping at all; rewritten to scan ahead to the next byte that actually needs escaping and bulk-copy the whole safe run in one call, output byte-for-byte identical | done (see below; instructions on `d.nix` ~11.79B → **~10.89B** (-7.6%), now below real Nix's own ~12.0-12.25B; zero regressions) |
 | M98 — bytecode cache visibility + measured real speedup: `ASNIX_BYTECODE_CACHE_STATS=1` now prints a one-line hits/misses/stores summary to stderr at exit (the cache was otherwise completely silent -- a stale/corrupt entry or "never looked up" were all indistinguishable from the outside); measured in a clean, isolated worktree (not the noisy shared-contention measurements from M94's own landing): 100% hit rate on `d.nix`'s ffmpeg closure (1056/1056 files) | done (see below; `hyperfine -m 8`: **1.11x faster** (1.68s → 1.52s mean) at full cache warmth; zero regressions) |
-| M99+ | not started |
+| M99 — `irdump`, a companion tool that lexes+parses+compiles a `.nix` file through this project's own pipeline and pretty-prints the resulting `IrProgram`: one line per op (mnemonic resolved via a reverse lookup through `asnix_handler_table`, since `ir_link()` has already overwritten each op's original op-id with a real handler address by the time a program is compiled), symbol ids resolved to names, jump deltas resolved to target op indices, `OP_PUSH_CONST`'s pool entry resolved to a brief printable value, recursing into every distinct nested child program reached via `OP_LAMBDA`/`OP_MK_THUNK` (each printed once, keyed by pointer identity) | done (see below; `./irdump <file.nix>`, built on demand via `make irdump`, not part of the default build) |
+| M100+ | not started |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
 
@@ -11001,3 +11002,82 @@ hit and miss, across the full conformance corpus and all 74
 `test-nixpkgs-hash` packages); this milestone only added counters
 around existing lookup/store call sites, touching no behavior those
 exhaustive checks didn't already cover.
+
+## M99: `irdump` -- a companion tool to decode and explore the IR
+
+A `.nix` file's compiled `IrProgram` was previously only inspectable by
+adding temporary `fprintf`s and rebuilding (the pattern this entire
+session's own debugging repeatedly fell back to -- see e.g. M84's
+`ASNIX_DEBUG_DRV` hook for the same need one level down, at the
+derivation-ATerm layer instead of the IR layer). `irdump` is a small,
+standalone companion binary (`src/c/irdump.c`, built via `make irdump`,
+deliberately NOT part of the default `make`/`make release` build) that
+runs this project's own lexer/parser/compiler pipeline
+(`asnix_lex`/`asnix_parse`/`asnix_compile`) on a given file and prints
+every op in the resulting program, recursively following every
+distinct child program reached through `OP_LAMBDA`/`OP_MK_THUNK`.
+
+One real wrinkle: by the time `asnix_compile` returns a program ready
+to hand to `asnix_eval`, `ir_link()` has already rewritten every op's
+`handler` field in place from its original small op-id into a real
+function-pointer address in this process's own loaded `.text` -- the
+op-id itself is gone, overwritten, not recoverable by just reading the
+field back. `irdump` reverses this by linear-scanning
+`asnix_handler_table[OP_COUNT]` (already `extern`-declared in `ir.h`
+for exactly this kind of use) for whichever table slot's address
+matches the op's current handler -- cheap enough for a diagnostic tool
+run once per invocation, and it means `irdump` is decoding the EXACT
+same linked artifact `asnix_eval` itself runs, not a separate
+pre-link snapshot that could drift from runtime behavior.
+
+A hand-maintained `op_names[]` string array (ordered to match `ir.h`'s
+`OP_*` enum) supplies the mnemonic for each resolved op-id -- guarded
+by a `_Static_assert(sizeof(op_names)/sizeof(op_names[0]) == OP_COUNT,
+...)` so a future op added to the enum without a matching name added
+here fails the BUILD, not a silent wrong-label at runtime. This only
+catches a COUNT mismatch, not a reordering -- if `ir.h`'s enum order
+ever changes, `op_names[]` needs updating to match; noted directly in
+the file's own header comment so this doesn't need rediscovering.
+
+For readability, several ops get operand-specific decoding beyond the
+raw `a`/`b` integers: `OP_VAR_REF`/`OP_VAR_REF_CELL`/`OP_VAR_REF_RAW`
+show `depth`/`slot`; `OP_SELECT`/`OP_HAS_ATTR`/`OP_SELECT_OR`/
+`OP_WITH_TRY` resolve the symbol id to its name via the existing
+`asnix_sym_name` reverse lookup; `OP_IF`/`OP_JMP` convert the raw byte
+delta into an absolute target op index; `OP_PUSH_CONST` decodes the
+pool slot's `Value` (string/path/float/int/bool/null shown directly,
+heap-pointer kinds shown as a brief `<attrs>`/`<list>`/`<closure>`/
+etc. tag rather than recursively dumped, to keep output bounded);
+`OP_MK_ATTRS` resolves its whole sorted-symbol-id pool run to names;
+`OP_LAMBDA`/`OP_MK_THUNK` recurse into the referenced child
+`IrProgram*` (a single pointer per M97's merge, not the older
+`{ops,pool}` pair) and print which program number it got assigned,
+deduped by pointer identity so a child reused across many call sites
+(e.g. a function called from several places) is still only printed
+once.
+
+Verified against a small hand-written fixture
+(`let x = 1 + 2; f = a: a * 2; attrs = { foo = "bar"; baz = x; }; in
+if attrs.foo == "bar" then f x else 0`): output correctly shows `x`'s
+`1 + 2` genuinely thunked (`OP_MK_THUNK`), `f`'s call argument `x`
+cell-aliased instead (`OP_VAR_REF_CELL`, M92's `maybeThunk`-style
+optimization visibly in action), the attrset literal's `MK_ATTRS`
+listing both symbol names in sorted order, and the `if`/`else`
+branches' jump targets resolving to the correct absolute op indices.
+Also run against `e.nix` (`(builtins.import
+/home/tbereknyei/nixpkgs/default.nix {}).hello.drvPath`) as a
+real-file robustness check -- correctly shows only the OUTER file's
+own small compiled program (2 distinct programs: the top-level file
+and the `{}` argument's own tiny thunk body), since `irdump` only
+compiles, never evaluates -- `import`'s own target
+(`nixpkgs/default.nix`) is resolved and compiled lazily at EVAL time
+via `prim_import`, not up front at compile time, so a static
+compile-only tool correctly has no visibility into what a given
+`import` call will eventually pull in without actually running it.
+This is the right scope for a pure IR decoder, not a limitation to
+fix.
+
+`make test`/`make test-e2e` unchanged, all green (the new `irdump`
+target/source is additive and excluded from the library's own object
+list via the same `filter-out` pattern `main.c` already uses, so it
+cannot affect `asnix`'s own build or behavior at all).

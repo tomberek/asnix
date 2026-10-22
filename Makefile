@@ -26,8 +26,9 @@ MAKEFLAGS    += -j$(shell nproc 2>/dev/null || echo 4)
 
 ASM_SRCS     := $(wildcard src/asm/*.S src/asm/ops/*.S)
 C_ALL_SRCS   := $(wildcard src/c/*.c)
-C_LIB_SRCS   := $(filter-out src/c/main.c,$(C_ALL_SRCS))
+C_LIB_SRCS   := $(filter-out src/c/main.c src/c/irdump.c,$(C_ALL_SRCS))
 MAIN_SRC     := src/c/main.c
+IRDUMP_SRC   := src/c/irdump.c
 
 LIB_OBJS     := $(ASM_SRCS:.S=.o) $(C_LIB_SRCS:.c=.o)
 MAIN_OBJ     := $(MAIN_SRC:.c=.o)
@@ -68,7 +69,7 @@ endif
 OPT_STAMP := .opt-stamp
 $(shell last=$$(cat $(OPT_STAMP) 2>/dev/null); \
 	if [ "$$last" != "$(EFFECTIVE_OPT)" ]; then \
-		rm -f $(ALL_OBJS) $(DEPS) asnix libasnix.a $(TEST_ASM_BINS) $(TEST_IR_BINS) $(TEST_C_BINS); \
+		rm -f $(ALL_OBJS) $(DEPS) asnix libasnix.a $(TEST_ASM_BINS) $(TEST_IR_BINS) $(TEST_C_BINS) irdump $(IRDUMP_SRC:.c=.o); \
 		echo "$(EFFECTIVE_OPT)" > $(OPT_STAMP); \
 	fi)
 
@@ -86,6 +87,12 @@ asnix: $(MAIN_OBJ) libasnix.a
 
 libasnix.a: $(LIB_OBJS)
 	ar rcs $@ $(LIB_OBJS)
+
+# Companion tool: decodes+pretty-prints a compiled IrProgram (see
+# irdump.c's own header comment) -- not part of `all`/`make`'s default
+# build, built on demand like the test binaries below.
+irdump: $(IRDUMP_SRC:.c=.o) libasnix.a
+	$(CC) $(LDFLAGS) -o $@ $(IRDUMP_SRC:.c=.o) -L. -lasnix
 
 # .S files are cpp-preprocessed by `cc` (capital S => real #include of
 # include/asnix/*.h, shared verbatim with the C side -- zero constant drift).
@@ -281,8 +288,10 @@ clean:
 	rm -f asnix libasnix.a $(ALL_OBJS) $(DEPS) $(TEST_ASM_BINS) $(TEST_IR_BINS) $(TEST_C_BINS)
 	rm -f $(TEST_ASM_SRCS:.c=.d) $(TEST_IR_SRCS:.c=.d) $(TEST_C_SRCS:.c=.d)
 	rm -f $(OPT_STAMP)
+	rm -f irdump $(IRDUMP_SRC:.c=.o) $(IRDUMP_SRC:.c=.d)
 
 -include $(DEPS)
 -include $(TEST_ASM_SRCS:.c=.d)
 -include $(TEST_IR_SRCS:.c=.d)
 -include $(TEST_C_SRCS:.c=.d)
+-include $(IRDUMP_SRC:.c=.d)
