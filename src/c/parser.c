@@ -1458,58 +1458,12 @@ static Ast *parse_has_attr(Parser *p) {
     return e;
 }
 
-/* `++` list concatenation: binds tighter than `*`/`/` but looser than
- * `?` (has-attr) and unary `-` (negate), right-associative -- cross-
- * checked against cppnix's real grammar, `~/nix/src/libexpr/parser.y`'s
- * precedence table (`%left '+' '-'`, `%left '*' '/'`, `%right CONCAT`,
- * `%nonassoc '?'`, `%nonassoc NEGATE`, loosest to tightest in that
- * declaration order). Verified against `nix-instantiate --eval`:
- * `[1] ++ [2] ++ [3]` => `[ 1 2 3 ]` (chains), and the type error from
- * `1 ++ [2]` names the lhs ("expected a list but found an integer: 1"),
- * confirming no numeric-only interpretation competes here. */
-static Ast *parse_concat(Parser *p) {
-    Ast *lhs = parse_has_attr(p);
-    if (cur(p)->kind == TOK_PLUSPLUS) {
-        advance(p);
-        Ast *rhs = parse_concat(p); /* right-recurse: right-associative */
-        Ast *n = asnix_ast_new(AST_BINOP);
-        n->as.binop.op = 'c';
-        n->as.binop.lhs = lhs;
-        n->as.binop.rhs = rhs;
-        return n;
-    }
-    return lhs;
-}
-
-static Ast *parse_mul(Parser *p) {
-    Ast *lhs = parse_concat(p);
-    while (cur(p)->kind == TOK_STAR || cur(p)->kind == TOK_SLASH) {
-        char op = cur(p)->kind == TOK_STAR ? '*' : '/';
-        advance(p);
-        Ast *rhs = parse_concat(p);
-        Ast *n = asnix_ast_new(AST_BINOP);
-        n->as.binop.op = op;
-        n->as.binop.lhs = lhs;
-        n->as.binop.rhs = rhs;
-        lhs = n;
-    }
-    return lhs;
-}
-
-static Ast *parse_add(Parser *p) {
-    Ast *lhs = parse_mul(p);
-    while (cur(p)->kind == TOK_PLUS || cur(p)->kind == TOK_MINUS) {
-        char op = cur(p)->kind == TOK_PLUS ? '+' : '-';
-        advance(p);
-        Ast *rhs = parse_mul(p);
-        Ast *n = asnix_ast_new(AST_BINOP);
-        n->as.binop.op = op;
-        n->as.binop.lhs = lhs;
-        n->as.binop.rhs = rhs;
-        lhs = n;
-    }
-    return lhs;
-}
+/* `++`/`*`//`+`/`-` (list concat, mul/div, add/sub): folded into the
+ * table-driven `parse_binop` climbing loop below, alongside `//`/`==`/
+ * `!=`/`<`/`>`/`<=`/`>=`/`&&`/`||`/`->` -- see that function's own header
+ * comment for the precedence table and the perf rationale for collapsing
+ * these 9 levels into one. `?` (has-attr, tighter than `++`) keeps its
+ * own real grammar in `parse_has_attr` below, unchanged. */
 
 /* Operator precedence below `parse_expr`'s keyword forms (`let`/`if`/
  * lambda/`assert`), lowest to highest, verified directly against real
@@ -1522,124 +1476,199 @@ static Ast *parse_add(Parser *p) {
  * `(!true) // {}`, confirmed by the runtime error naming `false`, the
  * result of the `!`, not `true`)):
  *
- *   parse_impl  ->              right-assoc, chainable, LOWEST of all of these
- *   parse_or    ||              left-assoc, chainable
- *   parse_and   &&              left-assoc, chainable
- *   parse_eq    == !=           non-assoc (single occurrence only)
- *   parse_cmp   < > <= >=       non-assoc (single occurrence only)
- *   parse_update //             right-assoc, chainable
- *   parse_not   ! (prefix)      binds the rest of this chain down to parse_add
- *   parse_add   + -             (already existed, M4)
- *   parse_mul   * /             (already existed, M4)
- *   parse_concat ++             right-assoc, chainable -- binds TIGHTER than
- *                                * / + -, looser than ? and application (M23,
- *                                see parse_concat's own comment above parse_mul)
+ *   ->           right-assoc, chainable, LOWEST of all of these
+ *   ||           left-assoc, chainable
+ *   &&           left-assoc, chainable
+ *   == !=        non-assoc (single occurrence only)
+ *   < > <= >=    non-assoc (single occurrence only)
+ *   //           right-assoc, chainable
+ *   ! (prefix)   binds the rest of this chain down to PREC_ADD
+ *   + -          (already existed, M4)
+ *   * /          (already existed, M4)
+ *   ++           right-assoc, chainable -- binds TIGHTER than
+ *                 * / + -, looser than ? and application (M23)
  *
-
  * `->`'s precedence/associativity (lowest, right-assoc) cross-checked
  * against cppnix's real grammar (~/nix/src/libexpr/parser.y: `%right
  * IMPL`, declared before `%left OR`, i.e. binding looser).
- */
-static Ast *parse_not(Parser *p) {
+ *
+ * perf: this whole chain used to be 9 separate, mostly-non-inlined
+ * recursive-descent functions (parse_impl -> parse_or -> parse_and ->
+ * parse_eq -> parse_cmp -> parse_update -> parse_not -> parse_add ->
+ * parse_mul -> parse_concat), each a trivial "lhs = parse_NEXT(p); if/
+ * while (match(op)) {...}" with no fast path for the overwhelming
+ * majority of leaf expressions that touch NONE of these operators --
+ * every single leaf still paid all 9 call/ret pairs to find that out.
+ * Measured via `perf record -g` on a real nixpkgs closure: these 9
+ * functions showed up together at nearly identical cumulative cost (they
+ * fire in lockstep on virtually every parse), consistent with
+ * `asnix_lex`/`compile_expr`-adjacent lex+parse+compile work eating a
+ * disproportionate, not-yet-addressed share of total cycles relative to
+ * a comparable evaluator's own single-function precedence-climbing
+ * parser (iets, ~/gnix/iets/src/eval/parser*.rs's `parse_op(min_bp)`).
+ * Collapsed into ONE table-driven climbing loop (`parse_binop`) below --
+ * same exact precedence/associativity/AST-node-shape as the 9 functions
+ * it replaces, verified via the project's own full e2e + nix-conformance
+ * + nixpkgs-hash suites, just 1 call instead of up to 9 for any leaf that
+ * touches none of this chain's operators (the common case), and for any
+ * operator chain, the loop itself replaces what used to be `N` nested
+ * call frames with one frame plus `N` loop iterations / RHS recursions.
+ * `parse_has_attr` and everything tighter (`?`, unary `-`/negate,
+ * application, select, atom) keep their own real, non-table grammar as
+ * separate functions, unchanged below -- only the 9 "plain binary
+ * operator" levels collapse. */
+typedef enum { BINOP_K_BINOP, BINOP_K_AND, BINOP_K_OR, BINOP_K_IMPL } BinOpKind;
+typedef struct {
+    TokKind tok;
+    int prec;
+    int right_assoc; /* chainable via same-level RHS recursion */
+    int non_assoc;   /* exactly one occurrence allowed -- break after firing once */
+    BinOpKind kind;
+    char op; /* only meaningful when kind == BINOP_K_BINOP */
+} BinOpInfo;
+
+/* Precedence values are this table's OWN numbering (not tied to any
+ * other representation) -- only their relative ORDER matters, lowest
+ * (loosest) to highest (tightest), matching the comment block above
+ * exactly. PREC_ADD below must stay in sync with `+`/`-`'s own `prec`
+ * value -- it's `!`'s own operand boundary (see parse_binop_primary). */
+static const BinOpInfo BINOPS[] = {
+    { TOK_ARROW,      0, 1, 0, BINOP_K_IMPL,  0   },
+    { TOK_OROR,       1, 0, 0, BINOP_K_OR,    0   },
+    { TOK_ANDAND,     2, 0, 0, BINOP_K_AND,   0   },
+    { TOK_EQEQ,       3, 0, 1, BINOP_K_BINOP, 'e' },
+    { TOK_NEQ,        3, 0, 1, BINOP_K_BINOP, 'n' },
+    { TOK_LT,         4, 0, 1, BINOP_K_BINOP, 'l' },
+    { TOK_GT,         4, 0, 1, BINOP_K_BINOP, 'g' },
+    { TOK_LE,         4, 0, 1, BINOP_K_BINOP, 'L' },
+    { TOK_GE,         4, 0, 1, BINOP_K_BINOP, 'G' },
+    { TOK_SLASHSLASH, 5, 1, 0, BINOP_K_BINOP, 'u' },
+    { TOK_PLUS,       6, 0, 0, BINOP_K_BINOP, '+' },
+    { TOK_MINUS,      6, 0, 0, BINOP_K_BINOP, '-' },
+    { TOK_STAR,       7, 0, 0, BINOP_K_BINOP, '*' },
+    { TOK_SLASH,      7, 0, 0, BINOP_K_BINOP, '/' },
+    { TOK_PLUSPLUS,   8, 1, 0, BINOP_K_BINOP, 'c' },
+};
+#define BINOPS_COUNT (sizeof(BINOPS) / sizeof(BINOPS[0]))
+#define PREC_ADD 6 /* must match TOK_PLUS/TOK_MINUS's own `prec` entry above */
+
+static const BinOpInfo *lookup_binop(TokKind k) {
+    for (size_t i = 0; i < BINOPS_COUNT; i++) {
+        if (BINOPS[i].tok == k) return &BINOPS[i];
+    }
+    return NULL;
+}
+
+static Ast *make_binop_node(const BinOpInfo *info, Ast *lhs, Ast *rhs) {
+    switch (info->kind) {
+        case BINOP_K_AND: {
+            Ast *n = asnix_ast_new(AST_AND);
+            n->as.logic.lhs = lhs;
+            n->as.logic.rhs = rhs;
+            return n;
+        }
+        case BINOP_K_OR: {
+            Ast *n = asnix_ast_new(AST_OR);
+            n->as.logic.lhs = lhs;
+            n->as.logic.rhs = rhs;
+            return n;
+        }
+        case BINOP_K_IMPL: {
+            /* `a -> b` desugars directly to `(!a) || b` -- exactly real
+             * Nix's own ExprOpImpl::eval semantics (`!evalBool(e1) ||
+             * evalBool(e2)`, cppnix's eval.cc), so this gets short-
+             * circuiting (b is never evaluated when a is false) for free
+             * by reusing the already-correct AST_OR/AST_NOT compilation,
+             * no new AST node or IR op needed. */
+            Ast *not_lhs = asnix_ast_new(AST_NOT);
+            not_lhs->as.not1.operand = lhs;
+            Ast *n = asnix_ast_new(AST_OR);
+            n->as.logic.lhs = not_lhs;
+            n->as.logic.rhs = rhs;
+            return n;
+        }
+        case BINOP_K_BINOP:
+        default: {
+            Ast *n = asnix_ast_new(AST_BINOP);
+            n->as.binop.op = info->op;
+            n->as.binop.lhs = lhs;
+            n->as.binop.rhs = rhs;
+            return n;
+        }
+    }
+}
+
+static Ast *parse_binop(Parser *p, int min_prec);
+
+/* The "primary" step every climbing-loop call starts with: `!` (prefix)
+ * first -- its own operand is parsed at PREC_ADD, i.e. everything this
+ * table drives at `+`'s own precedence or tighter (+/-, * /, ++), so
+ * `!1 + 1` consumes the whole `1 + 1` as one operand (matching real Nix,
+ * see the comment above), while `!a // b` stops before `//` (prec 5 <
+ * PREC_ADD) and parses as `(!a) // b`, not `!(a // b)` -- both cross-
+ * checked against real Nix before this rewrite, same as the original
+ * parse_not/parse_update pair enforced structurally. A second `!` is
+ * caught the same way regardless of nesting depth, since this function
+ * re-checks TOK_BANG on every call, including the recursive one for the
+ * operand -- `!!x` works via that re-entry, not a dedicated loop.
+ * Falls through to `parse_has_attr` (its own real, non-table grammar:
+ * `?`'s dotted-chain desugaring, then unary negate, application, select,
+ * atom) for everything else -- unchanged, unaffected by this rewrite. */
+static Ast *parse_binop_primary(Parser *p) {
     if (cur(p)->kind == TOK_BANG) {
         advance(p);
-        Ast *operand = parse_not(p); /* right-recurse: allows `!!x` */
+        Ast *operand = parse_binop(p, PREC_ADD);
         Ast *n = asnix_ast_new(AST_NOT);
         n->as.not1.operand = operand;
         return n;
     }
-    return parse_add(p);
+    return parse_has_attr(p);
 }
 
-static Ast *parse_update(Parser *p) {
-    Ast *lhs = parse_not(p);
-    if (cur(p)->kind == TOK_SLASHSLASH) {
+/* Classic precedence climbing: parses one primary, then repeatedly
+ * consumes an infix operator whose own precedence is >= min_prec,
+ * recursing for its RHS at a bumped-up min_prec (right_assoc: SAME
+ * level, allowing further right-recursion at that level, which is what
+ * makes e.g. `a -> b -> c` associate as `a -> (b -> c)`; otherwise
+ * prec+1, forcing the RHS to bind tighter so the loop's own next
+ * iteration -- not a nested call -- picks up the next same-level
+ * operator, which is what makes e.g. `a + b + c` associate as
+ * `(a+b)+c`). `non_assoc` breaks the loop immediately after firing once
+ * -- the leftover token (e.g. the second `==` in `1==2==3`) is simply
+ * never consumed by anything in this chain, surfacing as a parse error
+ * wherever control eventually returns to (exactly matching the original
+ * separate-function design's own behavior for this case, just reached
+ * via a different code path). */
+static Ast *parse_binop(Parser *p, int min_prec) {
+    Ast *lhs = parse_binop_primary(p);
+    /* Tracks the precedence of the last NON-ASSOC operator fired in THIS
+     * loop (-1 == none yet) -- a non-assoc operator may only forbid a
+     * repeat at its OWN exact precedence (`1 < 2 < 3`, `1 == 2 == 3`:
+     * both illegal), not the whole rest of this loop: `1 == 2 && true`
+     * must still parse as `(1 == 2) && true` (&&'s own looser precedence
+     * is a perfectly valid continuation), and `1 < 2 == 3` must still
+     * parse as `(1 < 2) == 3` (== and < are DIFFERENT precedences, so
+     * neither blocks the other) -- both cross-checked against real Nix.
+     * A plain `break` here (this function's first draft) over-blocked
+     * both of those, found by the project's own test-e2e suite
+     * (ops_precedence_add_eq_and.nix) failing with a parse error on
+     * exactly the first case. */
+    int last_non_assoc_prec = -1;
+    for (;;) {
+        const BinOpInfo *info = lookup_binop(cur(p)->kind);
+        if (!info || info->prec < min_prec) break;
+        if (info->non_assoc && info->prec == last_non_assoc_prec) break;
         advance(p);
-        Ast *rhs = parse_update(p); /* right-recurse: right-associative, matching real Nix */
-        Ast *n = asnix_ast_new(AST_BINOP);
-        n->as.binop.op = 'u';
-        n->as.binop.lhs = lhs;
-        n->as.binop.rhs = rhs;
-        return n;
+        int next_min_prec = info->right_assoc ? info->prec : info->prec + 1;
+        Ast *rhs = parse_binop(p, next_min_prec);
+        lhs = make_binop_node(info, lhs, rhs);
+        if (info->non_assoc) last_non_assoc_prec = info->prec;
     }
     return lhs;
 }
 
-static Ast *parse_cmp(Parser *p) {
-    Ast *lhs = parse_update(p);
-    TokKind k = cur(p)->kind;
-    if (k == TOK_LT || k == TOK_GT || k == TOK_LE || k == TOK_GE) {
-        advance(p);
-        Ast *rhs = parse_update(p); /* no loop: non-associative, matching real Nix (`1 < 2 < 3` is a parse error there too) */
-        char op = k == TOK_LT ? 'l' : k == TOK_GT ? 'g' : k == TOK_LE ? 'L' : 'G';
-        Ast *n = asnix_ast_new(AST_BINOP);
-        n->as.binop.op = op;
-        n->as.binop.lhs = lhs;
-        n->as.binop.rhs = rhs;
-        return n;
-    }
-    return lhs;
-}
-
-static Ast *parse_eq(Parser *p) {
-    Ast *lhs = parse_cmp(p);
-    TokKind k = cur(p)->kind;
-    if (k == TOK_EQEQ || k == TOK_NEQ) {
-        advance(p);
-        Ast *rhs = parse_cmp(p); /* non-associative, same reasoning as parse_cmp */
-        Ast *n = asnix_ast_new(AST_BINOP);
-        n->as.binop.op = k == TOK_EQEQ ? 'e' : 'n';
-        n->as.binop.lhs = lhs;
-        n->as.binop.rhs = rhs;
-        return n;
-    }
-    return lhs;
-}
-
-static Ast *parse_and(Parser *p) {
-    Ast *lhs = parse_eq(p);
-    while (cur(p)->kind == TOK_ANDAND) {
-        advance(p);
-        Ast *rhs = parse_eq(p);
-        Ast *n = asnix_ast_new(AST_AND);
-        n->as.logic.lhs = lhs;
-        n->as.logic.rhs = rhs;
-        lhs = n;
-    }
-    return lhs;
-}
-
-static Ast *parse_or(Parser *p) {
-    Ast *lhs = parse_and(p);
-    while (cur(p)->kind == TOK_OROR) {
-        advance(p);
-        Ast *rhs = parse_and(p);
-        Ast *n = asnix_ast_new(AST_OR);
-        n->as.logic.lhs = lhs;
-        n->as.logic.rhs = rhs;
-        lhs = n;
-    }
-    return lhs;
-}
-
-/* `a -> b` desugars directly to `(!a) || b` -- exactly real Nix's own
- * ExprOpImpl::eval semantics (`!evalBool(e1) || evalBool(e2)`, cppnix's
- * eval.cc), so this gets short-circuiting (b is never evaluated when a is
- * false) for free by reusing the already-correct AST_OR/AST_NOT
- * compilation, no new AST node or IR op needed. */
 static Ast *parse_impl(Parser *p) {
-    Ast *lhs = parse_or(p);
-    if (cur(p)->kind == TOK_ARROW) {
-        advance(p);
-        Ast *rhs = parse_impl(p); /* right-recurse: right-associative, matching real Nix */
-        Ast *not_lhs = asnix_ast_new(AST_NOT);
-        not_lhs->as.not1.operand = lhs;
-        Ast *n = asnix_ast_new(AST_OR);
-        n->as.logic.lhs = not_lhs;
-        n->as.logic.rhs = rhs;
-        return n;
-    }
-    return lhs;
+    return parse_binop(p, 0);
 }
 
 /* Parses the bindings following `let` into one flat binding list (real Nix

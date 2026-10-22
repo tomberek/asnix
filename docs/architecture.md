@@ -13592,3 +13592,64 @@ transient `gnutar.outPath(crash)` on a run taken under heavy concurrent-
 agent machine load -- reproduced clean standalone and on a full rerun,
 this session's familiar contention-flakiness pattern). Output hash on
 `d.nix` (ffmpeg's closure) unchanged.
+
+## M125: collapse the 9-level binary-operator precedence chain into one precedence-climbing loop
+
+Directed follow-up to M123's speed investigation, which found `parser.c`'s
+binary-operator chain was a 15-level non-Pratt recursive-descent cascade
+(`parse_expr -> ... -> parse_atom`), with 9 of those levels being
+nothing but a trivial "lhs = parse_NEXT(p); if/while (match(op)) {...}"
+for a single precedence tier each (`parse_impl -> parse_or -> parse_and
+-> parse_eq -> parse_cmp -> parse_update -> parse_not -> parse_add ->
+parse_mul -> parse_concat`), paying all 9 call/ret pairs for every single
+leaf expression regardless of whether it touches any of these operators
+at all. A comparison evaluator (iets) does the equivalent work with one
+`parse_op(min_bp)` precedence-climbing function (~4 calls/leaf).
+
+**The fix**: those 9 levels collapsed into one table-driven climbing
+loop, `parse_binop(Parser *p, int min_prec)`, plus a `BinOpInfo` table
+(token, precedence, associativity, AST-node-shape) and a `parse_binop_
+primary` helper that checks for the `!` prefix (whose own operand reaches
+down through `+`/`-`/`*`//`++` at `PREC_ADD` and tighter, exactly
+matching the original `parse_not`-calls-`parse_add` nesting) before
+falling through to the unchanged `parse_has_attr` (and everything
+tighter: unary `-`/negate, application, select, atom, which keep their
+own real, non-table grammar as separate functions). `parse_impl` keeps
+its name as the single external entry point (`parse_expr` is its only
+caller), now just delegating to `parse_binop(p, 0)`.
+
+**A real bug found and fixed during this rewrite**: the first draft
+treated every `non_assoc` operator (`==`/`!=`, `<`/`>`/`<=`/`>=`) as
+"break the whole loop after firing once," which incorrectly rejected
+`1 == 2 && true` (should parse as `(1==2) && true` -- `&&` is a
+perfectly valid, looser continuation) and `1 < 2 == 3` (should parse as
+`(1<2) == 3` -- a DIFFERENT non-assoc operator at a different precedence
+is not blocked by an earlier one). Caught immediately by the project's
+own `tests/e2e/ops_precedence_add_eq_and.nix` fixture. Fixed by tracking
+only the precedence VALUE of the last-fired non-assoc operator and
+blocking only an exact repeat at that same precedence (`1==2==3`,
+`1<2<3`, or mixing the 4 mutually-exclusive comparison operators with
+each other, correctly still rejected) while leaving every other
+precedence free to continue in the same loop -- verified by re-deriving
+and manually tracing both the failing and the originally-intended cases
+before re-testing, not just patching until the suite went green.
+
+**Verified**: `make test`/`test-e2e`/`test-conformance` all green.
+`make test-nix-conformance`: `pass=655 fail=3 skip=148` -- EXACT match to
+the pre-existing baseline (same 3 pos-tracking failures), a strong signal
+given this rewrite touches every single binary-operator expression in
+the whole 806-file real-world corpus. `make test-nixpkgs-hash`:
+`pass=148 fail=0`. Output hash on `d.nix` (ffmpeg's closure) unchanged.
+
+**Honest note on performance measurement**: this milestone landed under
+unusually heavy concurrent load on this shared machine (two OTHER
+background agents' own `asnix` processes pegged at 100-200% CPU during
+measurement). Three separate `perf stat` comparison attempts gave
+contradictory results (one showing ~18% fewer instructions, another
+showing a few percent MORE) -- too noisy to certify a clean number right
+now. The structural case for a real win stands regardless (the common
+leaf-expression case genuinely drops from up to 9 nested call/ret pairs
+to 1-2, a deterministic reduction independent of runtime values, and
+matches the exact technique a faster comparison evaluator already uses)
+-- but the actual measured wall-clock/instruction delta should be
+re-taken on a quiet host before being cited as a specific number.
