@@ -41,32 +41,41 @@ asnix_op_var_ref:                       // a = depth, b = slot
     jne .Lvar_ref_check_cell
 
     andq $-8, %rax                      // rax = Thunk*
+    // M103: OFF_STATE is now tagged -- UNFORCED: this word IS the clean
+    // IrProgram* (tag bits 0); IN_PROGRESS/FORCED/FAILED: the bare state
+    // tag alone. Extract the tag into %r8 for dispatch while keeping the
+    // (possibly-a-pointer) original word in %rcx -- on the UNFORCED path
+    // below, %rcx already equals the clean prog pointer with no masking.
     movq ASNIX_THUNK_OFF_STATE(%rax), %rcx
-    cmpq $ASNIX_THUNK_STATE_FORCED, %rcx
+    movq %rcx, %r8
+    andq $ASNIX_TAG_MASK, %r8
+    cmpq $ASNIX_THUNK_STATE_FORCED, %r8
     je .Lvar_ref_forced
-    cmpq $ASNIX_THUNK_STATE_IN_PROGRESS, %rcx
+    cmpq $ASNIX_THUNK_STATE_IN_PROGRESS, %r8
     je .Lvar_ref_blackhole
-    cmpq $ASNIX_THUNK_STATE_FAILED, %rcx
+    cmpq $ASNIX_THUNK_STATE_FAILED, %r8
     je .Lvar_ref_reraise
 
     // UNFORCED: enter the thunk's body like a zero-arg call, with a
     // retframe that tells OP_RET to memoize the result back into this
-    // cell instead of just resuming (see op_call.S).
+    // cell instead of just resuming (see op_call.S). %rcx (the clean
+    // prog pointer) must survive this -- ASNIX_CHECK_RETSP below is
+    // given %r8 (dead: already consumed above) as scratch instead of
+    // %rcx.
     movq $ASNIX_THUNK_STATE_IN_PROGRESS, ASNIX_THUNK_OFF_STATE(%rax)
 
     movq %rsi, %rdx
     addq $ASNIX_IROP_SIZE, %rdx         // return_ip = one past this VAR_REF record
-    ASNIX_CHECK_RETSP %rcx              // %rcx dead since the depth-walk loop above
+    ASNIX_CHECK_RETSP %r8               // %r8 dead (already consumed into the state tag above)
     movq %rdx, ASNIX_RETFRAME_OFF_IP(%r14)
     movq %rdi, ASNIX_RETFRAME_OFF_ENV(%r14)     // ENV/POOL are unchanged by var_ref itself
     movq %r13, ASNIX_RETFRAME_OFF_POOL(%r14)
     movq %rax, ASNIX_RETFRAME_OFF_FORCE_TARGET(%r14)
     addq $ASNIX_RETFRAME_SIZE, %r14
 
-    // M100: prog (one pointer) replaces {body,pool} -- %rcx is free here
-    // (last written by the STATE check above; reused again right below
-    // for the IN_PROGRESS-stack push, after this).
-    movq ASNIX_THUNK_OFF_PROG(%rax), %rcx
+    // M103: %rcx already holds the clean prog pointer (read above, tag
+    // bits were 0) -- no second memory read needed (the old separate
+    // OFF_PROG field is gone).
     movq ASNIX_IRPROG_OFF_POOL(%rcx), %r13
     movq ASNIX_IRPROG_OFF_OPS(%rcx), %rsi       // IP = thunk body
     movq ASNIX_THUNK_OFF_ENV(%rax), %rdi         // ENV = thunk's captured scope -- last read of this
@@ -82,11 +91,21 @@ asnix_op_var_ref:                       // a = depth, b = slot
 
 .Lvar_ref_forced:
     movq ASNIX_THUNK_OFF_ENV(%rax), %rax // cached Value.raw (ENV slot repurposed once forced)
-    jmp .Lvar_ref_resolve                // M92: defensive re-check (a forced thunk's cached
-                                          // value is never actually a raw Cell by construction
-                                          // -- see heap.h's ASNIX_CELL_MARKER comment -- but
-                                          // re-resolving costs nothing extra on this
-                                          // once-per-thunk path and keeps the invariant local).
+    // perf: skip straight to the push path instead of re-entering
+    // .Lvar_ref_resolve's thunk-tag/Cell-tag checks. Safe by construction,
+    // not just "probably fine": a raw Cell (heap.h's ASNIX_CELL_MARKER) is
+    // only ever produced by OP_VAR_REF_CELL at a would-be thunk-creation
+    // site (compiler.c's try_cell_ref) -- it SUBSTITUTES for creating a
+    // Thunk there, so no Thunk object exists to force in that case at all.
+    // A real Thunk's body is always compiled via ordinary compile_expr
+    // (never try_cell_ref's short-circuit), so by the time OP_RET memoizes
+    // its result into ASNIX_THUNK_OFF_ENV, that value is guaranteed to be
+    // neither a Thunk (already fully resolved by the body's own
+    // VAR_REF/SELECT) nor a Cell (no code path ever produces one there).
+    // This was previously a defensive re-check paid on every single access
+    // to an already-forced thunk -- one of the hottest paths in the whole
+    // evaluator -- for an invariant that already held unconditionally.
+    jmp .Lvar_ref_push
 
     // M92: not a thunk -- check whether it's a Cell instead (see heap.h's
     // ASNIX_CELL_MARKER comment). %rcx still holds the tag bits from the
