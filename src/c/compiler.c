@@ -456,6 +456,43 @@ static void sort_syms(uint32_t *syms, size_t n) {
     }
 }
 
+/* perf: these expression kinds already compile to a single zero-cost
+ * compile-time push (ib_push_int/true/false/null, or ib_push_const for a
+ * pooled constant) -- no captured scope, no deferred work, no runtime
+ * op beyond the push itself. Same reasoning as real Nix's own
+ * `maybeThunk` overrides for ExprInt/ExprFloat/ExprString/ExprPath
+ * (~/nix/gc-unlock/src/libexpr/eval.cc): wrapping one of these in a
+ * Thunk (a 32-byte heap allocation plus a whole separate child
+ * IrProgram, forced through the full OP_CALL/force machinery at every
+ * point of use) is pure overhead for a value that costs nothing to
+ * produce and never benefits from being deferred. Every call site that
+ * thunks a list element / binding value / call argument already
+ * tolerates either an already-forced Value or a Thunk there (that's
+ * what `force` means), so substituting the immediate compile_expr()
+ * output for a thunk wrapping the identical value is observably
+ * identical, just cheaper -- not applicable to AST_VAR (a bare variable
+ * reference): that's a distinct optimization (real Nix's own
+ * `ExprVar::maybeThunk` slot-aliasing), out of scope here. */
+static int is_thunk_free_literal(Ast *node) {
+    switch (node->kind) {
+        case AST_INT:
+        case AST_FLOAT:
+        case AST_BOOL:
+        case AST_NULL:
+        case AST_CURPOS:
+            return 1;
+        case AST_STRING:
+            for (size_t i = 0; i < node->as.string.count; i++) {
+                if (node->as.string.parts[i].is_expr) return 0;
+            }
+            return 1;
+        case AST_PATH:
+            return !node->as.path.is_search && node->as.path.interp_count == 0;
+        default:
+            return 0;
+    }
+}
+
 static void compile_expr(IrBuilder *b, Ast *node, ScopeFrame *scope) {
     switch (node->kind) {
         case AST_INT:
@@ -580,10 +617,14 @@ static void compile_expr(IrBuilder *b, Ast *node, ScopeFrame *scope) {
             ib_frame_alloc(b, (int64_t)n);
             for (size_t i = 0; i < n; i++) {
                 ScopeFrame *value_scope = bindings[i].is_inherit ? &skip : &frame;
-                IrBuilder *thunk_b = ib_new();
-                compile_expr(thunk_b, bindings[i].value, value_scope);
-                ib_ret(thunk_b);
-                ib_mk_thunk(b, ib_finish(thunk_b));
+                if (is_thunk_free_literal(bindings[i].value)) {
+                    compile_expr(b, bindings[i].value, value_scope);
+                } else {
+                    IrBuilder *thunk_b = ib_new();
+                    compile_expr(thunk_b, bindings[i].value, value_scope);
+                    ib_ret(thunk_b);
+                    ib_mk_thunk(b, ib_finish(thunk_b));
+                }
                 ib_frame_set(b, (int64_t)i);
             }
             compile_expr(b, node->as.let1.body, &frame);
@@ -731,10 +772,14 @@ static void compile_expr(IrBuilder *b, Ast *node, ScopeFrame *scope) {
                     field_body = if_node;
                 }
 
-                IrBuilder *thunk_b = ib_new();
-                compile_expr(thunk_b, field_body, &fieldframe);
-                ib_ret(thunk_b);
-                ib_mk_thunk(body_b, ib_finish(thunk_b));
+                if (is_thunk_free_literal(field_body)) {
+                    compile_expr(body_b, field_body, &fieldframe);
+                } else {
+                    IrBuilder *thunk_b = ib_new();
+                    compile_expr(thunk_b, field_body, &fieldframe);
+                    ib_ret(thunk_b);
+                    ib_mk_thunk(body_b, ib_finish(thunk_b));
+                }
                 ib_frame_set(body_b, (int64_t)i);
             }
 
@@ -804,10 +849,14 @@ static void compile_expr(IrBuilder *b, Ast *node, ScopeFrame *scope) {
              * only if the callee's body ever actually reads the
              * parameter. */
             compile_expr(b, node->as.app.fn, scope);
-            IrBuilder *arg_b = ib_new();
-            compile_expr(arg_b, node->as.app.arg, scope);
-            ib_ret(arg_b);
-            ib_mk_thunk(b, ib_finish(arg_b));
+            if (is_thunk_free_literal(node->as.app.arg)) {
+                compile_expr(b, node->as.app.arg, scope);
+            } else {
+                IrBuilder *arg_b = ib_new();
+                compile_expr(arg_b, node->as.app.arg, scope);
+                ib_ret(arg_b);
+                ib_mk_thunk(b, ib_finish(arg_b));
+            }
             ib_call(b, 1);
             return;
         }
@@ -1005,10 +1054,14 @@ static void compile_expr(IrBuilder *b, Ast *node, ScopeFrame *scope) {
              * new element shape, just a new *producer* of the same
              * already-handled shape. */
             for (size_t i = 0; i < node->as.list.count; i++) {
-                IrBuilder *elem_b = ib_new();
-                compile_expr(elem_b, node->as.list.elems[i], scope);
-                ib_ret(elem_b);
-                ib_mk_thunk(b, ib_finish(elem_b));
+                if (is_thunk_free_literal(node->as.list.elems[i])) {
+                    compile_expr(b, node->as.list.elems[i], scope);
+                } else {
+                    IrBuilder *elem_b = ib_new();
+                    compile_expr(elem_b, node->as.list.elems[i], scope);
+                    ib_ret(elem_b);
+                    ib_mk_thunk(b, ib_finish(elem_b));
+                }
             }
             ib_mk_list(b, (int64_t)node->as.list.count);
             return;
@@ -1103,10 +1156,14 @@ static void compile_expr(IrBuilder *b, Ast *node, ScopeFrame *scope) {
                 hi = 0;
                 for (size_t i = 0; i < n; i++) {
                     if (!node->as.attrset.bindings[i].is_hidden) continue;
-                    IrBuilder *thunk_b = ib_new();
-                    compile_expr(thunk_b, node->as.attrset.bindings[i].value, &skip);
-                    ib_ret(thunk_b);
-                    ib_mk_thunk(b, ib_finish(thunk_b));
+                    if (is_thunk_free_literal(node->as.attrset.bindings[i].value)) {
+                        compile_expr(b, node->as.attrset.bindings[i].value, &skip);
+                    } else {
+                        IrBuilder *thunk_b = ib_new();
+                        compile_expr(thunk_b, node->as.attrset.bindings[i].value, &skip);
+                        ib_ret(thunk_b);
+                        ib_mk_thunk(b, ib_finish(thunk_b));
+                    }
                     ib_frame_set(b, (int64_t)hi);
                     hi++;
                 }
@@ -1115,10 +1172,14 @@ static void compile_expr(IrBuilder *b, Ast *node, ScopeFrame *scope) {
                 size_t vi = 0;
                 for (size_t i = 0; i < n; i++) {
                     if (node->as.attrset.bindings[order[i]].is_hidden) continue;
-                    IrBuilder *thunk_b = ib_new();
-                    compile_expr(thunk_b, node->as.attrset.bindings[order[i]].value, &hidden_frame);
-                    ib_ret(thunk_b);
-                    ib_mk_thunk(b, ib_finish(thunk_b));
+                    if (is_thunk_free_literal(node->as.attrset.bindings[order[i]].value)) {
+                        compile_expr(b, node->as.attrset.bindings[order[i]].value, &hidden_frame);
+                    } else {
+                        IrBuilder *thunk_b = ib_new();
+                        compile_expr(thunk_b, node->as.attrset.bindings[order[i]].value, &hidden_frame);
+                        ib_ret(thunk_b);
+                        ib_mk_thunk(b, ib_finish(thunk_b));
+                    }
                     visible_sorted_syms[vi++] = sorted_syms[i];
                 }
                 ib_mk_attrs(b, (int64_t)visible_count, visible_sorted_syms);
@@ -1137,10 +1198,14 @@ static void compile_expr(IrBuilder *b, Ast *node, ScopeFrame *scope) {
                  * `rec` sibling). */
                 for (size_t i = 0; i < node->as.attrset.dyn_count; i++) {
                     compile_expr(b, node->as.attrset.dyn_bindings[i].name_expr, &hidden_frame);
-                    IrBuilder *thunk_b = ib_new();
-                    compile_expr(thunk_b, node->as.attrset.dyn_bindings[i].value, &hidden_frame);
-                    ib_ret(thunk_b);
-                    ib_mk_thunk(b, ib_finish(thunk_b));
+                    if (is_thunk_free_literal(node->as.attrset.dyn_bindings[i].value)) {
+                        compile_expr(b, node->as.attrset.dyn_bindings[i].value, &hidden_frame);
+                    } else {
+                        IrBuilder *thunk_b = ib_new();
+                        compile_expr(thunk_b, node->as.attrset.dyn_bindings[i].value, &hidden_frame);
+                        ib_ret(thunk_b);
+                        ib_mk_thunk(b, ib_finish(thunk_b));
+                    }
                     ib_insert_dynamic_attr(b);
                 }
                 ib_frame_exit(b);
@@ -1202,10 +1267,14 @@ static void compile_expr(IrBuilder *b, Ast *node, ScopeFrame *scope) {
                 ib_frame_alloc(b, (int64_t)n);
                 for (size_t i = 0; i < n; i++) {
                     ScopeFrame *value_scope = bindings[i].is_inherit ? &skip : &frame;
-                    IrBuilder *thunk_b = ib_new();
-                    compile_expr(thunk_b, bindings[i].value, value_scope);
-                    ib_ret(thunk_b);
-                    ib_mk_thunk(b, ib_finish(thunk_b));
+                    if (is_thunk_free_literal(bindings[i].value)) {
+                        compile_expr(b, bindings[i].value, value_scope);
+                    } else {
+                        IrBuilder *thunk_b = ib_new();
+                        compile_expr(thunk_b, bindings[i].value, value_scope);
+                        ib_ret(thunk_b);
+                        ib_mk_thunk(b, ib_finish(thunk_b));
+                    }
                     ib_frame_set(b, (int64_t)i);
                 }
                 if (overrides_slot >= 0) {
@@ -1280,10 +1349,14 @@ static void compile_expr(IrBuilder *b, Ast *node, ScopeFrame *scope) {
                  * with `scope` right after ITS OWN `ib_mk_attrs`. */
                 for (size_t i = 0; i < node->as.attrset.dyn_count; i++) {
                     compile_expr(b, node->as.attrset.dyn_bindings[i].name_expr, &frame);
-                    IrBuilder *thunk_b = ib_new();
-                    compile_expr(thunk_b, node->as.attrset.dyn_bindings[i].value, &frame);
-                    ib_ret(thunk_b);
-                    ib_mk_thunk(b, ib_finish(thunk_b));
+                    if (is_thunk_free_literal(node->as.attrset.dyn_bindings[i].value)) {
+                        compile_expr(b, node->as.attrset.dyn_bindings[i].value, &frame);
+                    } else {
+                        IrBuilder *thunk_b = ib_new();
+                        compile_expr(thunk_b, node->as.attrset.dyn_bindings[i].value, &frame);
+                        ib_ret(thunk_b);
+                        ib_mk_thunk(b, ib_finish(thunk_b));
+                    }
                     ib_insert_dynamic_attr(b);
                 }
                 ib_frame_exit(b);
@@ -1399,10 +1472,14 @@ static void compile_expr(IrBuilder *b, Ast *node, ScopeFrame *scope) {
              * in `body` resolves lexically) never forces it -- matches
              * real Nix (verified: `with (builtins.trace "x" {}); 5` never
              * prints the trace). */
-            IrBuilder *thunk_b = ib_new();
-            compile_expr(thunk_b, node->as.with1.attrs, scope);
-            ib_ret(thunk_b);
-            ib_mk_thunk(b, ib_finish(thunk_b));
+            if (is_thunk_free_literal(node->as.with1.attrs)) {
+                compile_expr(b, node->as.with1.attrs, scope);
+            } else {
+                IrBuilder *thunk_b = ib_new();
+                compile_expr(thunk_b, node->as.with1.attrs, scope);
+                ib_ret(thunk_b);
+                ib_mk_thunk(b, ib_finish(thunk_b));
+            }
             ib_with(b);
             ScopeFrame frame = { .up = scope, .names = NULL, .name_lens = NULL, .count = 0, .is_with = 1 };
             compile_expr(b, node->as.with1.body, &frame);

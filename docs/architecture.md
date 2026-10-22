@@ -102,7 +102,8 @@ what's actually implemented and the scope decisions made along the way.
 | M87 — perf/memory regression triage on real nixpkgs workloads (`./asnix d.nix`, ffmpeg's closure): `builtins.intersectAttrs` was walking the LARGER attrset operand and binary-searching into the smaller one (backwards for `callPackageWith`'s own `intersectAttrs (functionArgs f) autoArgs` shape, where e1 is tiny and e2 is effectively the whole ~28,189-entry `pkgs` set); a leaked lexer token array (never freed after parsing); `IrBuilder`'s `ops`/`pool` arrays carrying permanent doubling-growth slack into every compiled program; `BTVec`'s own backing arrays never freed after `insert_attrpath`'s tree is flattened | done (see below; instructions 51.3B → 42.1B; peak RSS 1.42GB → 917MB on `d.nix`, 170MB → 134MB on `e.nix`; zero regressions) |
 | M88 — three more O(n²)-or-worse CPU hotspots fixed after discovering M86 had itself introduced a severe regression (`./asnix d.nix`: ~275 billion instructions / ~31.8s, 73.59% of cycles in `cache_own_drv_closure`'s `__strcmp_avx2` calls): `cache_own_drv_closure`'s append-only linear-scan caches and its per-call O(closure_size²) dedup scan converted to hash tables/sets; `parser.c`'s `btvec_find` (hit by every attrpath-sugar binding/attrset literal) given its own open-addressing index; `builtins_attrs.c`'s `sorted_name_order` (backing `attrNames`/`attrValues`) switched from insertion sort to `qsort` over pre-resolved names | done (see below; instructions ~275B → **~37.9B** on `d.nix`, below the pre-M86 ~42B baseline; wall ~31.8s → ~6.09s; zero regressions) |
 | M89 — flipped the Makefile's default build from `-O0` to `-O2` (a background agent measured a genuine ~2x wall-clock difference on `d.nix` from the flag alone: real work like derivation-building/hashing/encoding lives in compiled C, not just the asm dispatch loop, so the old "hot path is asm, C doesn't matter" assumption didn't hold); added a `make debug` target for the old -O0/gdb-friendly behavior; added a stale-optimization-flag guard (`.opt-stamp`) so switching between `make`/`make debug`/`make release` without an explicit `make clean` can no longer silently leave a mix of differently-optimized `.o` files | done (see below; zero regressions; `make test-nixpkgs-hash` still `pass=148 fail=0`) |
-| M90+ | not started |
+| M90 — thunk-count reduction: `compiler.c`'s ~10 `ib_mk_thunk` call sites (list elements, let/attrs/rec bindings, call arguments, `with` values) now skip thunk-wrapping entirely for expression kinds that already compile to a zero-cost compile-time push (`AST_INT`/`AST_FLOAT`/`AST_BOOL`/`AST_NULL`/`AST_CURPOS`/literal `AST_STRING`/literal `AST_PATH`), matching real Nix's own `maybeThunk` overrides for these same kinds -- deliberately excludes `AST_VAR`, a separate slot-aliasing optimization out of scope here | done (see below; **184,768 of 919,350 thunk-creation sites skipped (20.1%)** on `d.nix`'s ffmpeg closure, **10,941 of 43,503 (25.2%)** on `e.nix`'s hello closure; zero regressions) |
+| M91+ | not started |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
 
@@ -9818,3 +9819,88 @@ test-nixpkgs-hash`: unchanged, `pass=148 fail=0` (a build-system-only
 change, not touching any hash-parity-critical file directly, but
 verified anyway since it changes which optimization level every file
 compiles at).
+
+## M90: thunk-count reduction -- skip the thunk entirely for compile-time-trivial literals
+
+A separate `/subtask` fork was asked to analyze memory usage with a
+specific angle: "any ways we can reduce the number of thunks," with
+an explicit pointer to look at real Nix and `~/gnix/iets` for ideas.
+
+Real Nix's `Expr::maybeThunk` (`~/nix/gc-unlock/src/libexpr/eval.cc`)
+is the function that decides, at the point a sub-expression is about
+to become an argument/binding/list-element, whether to allocate a
+fresh thunk or hand back something cheaper. The default always
+allocates; six expression kinds override it: `ExprVar` (returns the
+existing env-slot pointer directly -- a distinct optimization, see
+the `eq-slot-elem`/`eq-slot-identity` investigation elsewhere in this
+file, deliberately NOT touched by this milestone) and five pure-
+literal kinds -- `ExprInt`/`ExprFloat`/`ExprString` (no
+interpolation)/`ExprPath` (no search/interpolation) -- whose whole
+point is that a literal costs nothing to evaluate, so deferring it in
+a thunk is pure waste.
+
+Checking `compiler.c`: `AST_INT`/`AST_FLOAT`/`AST_BOOL`/`AST_NULL`
+already compile to a single zero-allocation push (`ib_push_int`,
+`ib_push_true`/`false`/`null`, or a pooled `ib_push_const` for
+`AST_FLOAT`'s heap-boxed-but-compile-time-constant value); a fully-
+literal `AST_STRING` (no interpolated parts) already folds to one
+pooled constant; a plain literal `AST_PATH` (not a search path, not
+interpolated) resolves once at compile time the same way; `AST_CURPOS`
+is likewise a pure compile-time constant. None of these need a captured
+scope or any deferred work -- yet every one of `compiler.c`'s ~10
+`ib_mk_thunk` call sites (list elements, let/attrs/rec bindings, call
+arguments, `with` values) wrapped ALL of them anyway: a 32-byte
+`Thunk` (`ASNIX_THUNK_SIZE`, `ir.h`) plus a whole separate child
+`IrProgram` (at minimum the literal's own push op + `ib_ret`, 24 bytes
+each per `ASNIX_IROP_SIZE`), forced through the full `OP_CALL`/force
+machinery at every future point of use -- for a value that was already
+sitting there for free.
+
+Added `is_thunk_free_literal(Ast *node)`: true for
+`AST_INT`/`AST_FLOAT`/`AST_BOOL`/`AST_NULL`/`AST_CURPOS`, true for
+`AST_STRING` only when every part is non-expr (no interpolation), true
+for `AST_PATH` only when `!is_search && interp_count == 0` (a plain
+literal path -- a search path's lookup must still happen at eval time,
+and an interpolated path still needs real work); false otherwise,
+deliberately including `AST_VAR`. Gated all 10 `ib_mk_thunk` sites on
+it: when true, `compile_expr` runs directly against the *outer*
+builder (pushing the immediate/pooled value straight into the slot the
+thunk's result would have occupied) instead of building a child
+`IrBuilder`/`IrProgram` and wrapping it. Safe by construction: every
+consumer of a list-element/attrs-value/call-argument/`with`-value slot
+already has to tolerate either a `Thunk` or an already-forced `Value`
+there (that's what `force` means everywhere in this codebase), so
+substituting the immediate value for a thunk wrapping the identical
+value is observably identical, just cheaper.
+
+Measured via a temporary, since-reverted compile-time counter
+(load-independent, unlike `perf stat`/wall-clock -- the machine had
+several other background agents actively rebuilding/testing in this
+same tree at measurement time, which corrupted an initial `perf stat`
+attempt badly enough to report a nonsensical ~56B-instruction/10.7s
+result; the counter sidesteps this entirely since it just counts a
+compile-time decision, unaffected by concurrent CPU load):
+**184,768 of 919,350 thunk-creation call sites skipped (20.1%)**
+compiling `d.nix`'s real ffmpeg closure; **10,941 of 43,503 (25.2%)**
+on `e.nix`'s much smaller hello closure. Every skipped site avoids a
+32-byte `Thunk` plus its child `IrProgram` plus all future force-
+indirection at that slot.
+
+`make test`/`make test-e2e`/`make test-conformance`: unchanged, all
+green. `make test-nix-conformance`: `pass=652 fail=6 skip=148`,
+identical to the pre-existing baseline -- zero regressions.
+`make test-nixpkgs-hash`: `pass=148 fail=0`, reconfirmed twice after
+an initial run spuriously reported several `(crash)` failures
+(`nix.outPath`, then `ncurses`/`readline`/`glibc`) that direct,
+isolated re-checks (`nix-instantiate`/`./asnix` run directly on the
+same attribute, no 120s-per-check timeout racing against other
+processes) immediately proved were NOT real -- every flagged package
+matched real Nix byte-for-byte in under 2 seconds in isolation. Root
+cause: this session had multiple other background agents (and, per
+`ps aux` at the time, an entirely unrelated `nix build` from a
+different project on the same machine) competing for CPU, and
+`test-nixpkgs-hash`'s Makefile target gives each of 296 sequential
+checks its own 120-second timeout -- under enough contention, legitimate
+checks occasionally miss that window and get misclassified as
+`(crash)`. A clean, uncontended rerun of the full suite confirmed
+`pass=148 fail=0` with no flagged packages at all.
