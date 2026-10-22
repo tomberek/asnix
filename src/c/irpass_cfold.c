@@ -60,5 +60,5 @@ static int fold_constant_int_binop(IrOp *ops, size_t *len) {
 }
 
 void asnix_irpass_register_cfold(void) {
-    asnix_irpass_register(fold_constant_int_binop);
+    asnix_irpass_register("cfold", fold_constant_int_binop);
 }

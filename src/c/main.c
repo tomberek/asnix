@@ -12,6 +12,7 @@
 #include "asnix/value.h"
 #include "builtins_shared.h" /* M57i: asnix_bshared_attrs_* / make_attrs, CLI --arg/-A support */
 #include "eval_file.h"
+#include "irpass_cfold.h" /* M118: ASNIX_IR_OPT -- see this file's own hook below */
 #include "symtab.h"
 #include "value_util.h"
 
@@ -635,5 +636,11 @@ int main(int argc, char **argv) {
     if (attrpath) result = select_attrpath(result, attrpath);
     print_value(result);
     if (getenv("ASNIX_SHOW_STATS")) asnix_stats_print();
+    /* M118: report which bytecode passes actually fired, and how many
+     * times, across the whole evaluation (every nested lambda/thunk
+     * body's own ib_finish() call included) -- only when the pipeline
+     * was actually turned on; a no-op print otherwise (0 passes
+     * registered -> asnix_irpass_print_stats prints nothing at all). */
+    if (getenv("ASNIX_IR_OPT")) asnix_irpass_print_stats(stderr);
     return 0;
 }

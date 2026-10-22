@@ -13080,3 +13080,57 @@ the labeled-field style every other operand-bearing op already gets
 (`OP_VAR_REF`'s `depth=/slot=`, `OP_SELECT`'s `sym=`, etc.) instead of
 requiring the reader to know that `PUSH_INT`'s generic `a=` field happens
 to be its literal value.
+
+### irpass follow-up: named, fire-counted pass registration + per-firing location markers
+
+Two more usability layers on top of M120's framework, both prompted
+directly by using the tool (and by a separate background pass continuing
+M120's own work, which independently landed the named/fire-count half of
+this before this round reconciled and extended it):
+
+**Named, fire-counted registration**: `asnix_irpass_register` now takes a
+short name alongside the function pointer (`asnix_irpass_register("cfold",
+fold_constant_int_binop)`); `irpass_examples.c` is renamed `irpass_cfold.c`
+(+ its own `irpass_cfold.h`), establishing a one-pass-per-file convention
+so future passes don't all land in one shared file (this session's own
+standing lesson about concurrent edits to one file). New accessors
+(`asnix_irpass_num_passes`/`_name`/`_fire_count`/`_reset_stats`/
+`_print_stats`) let `main.c` (`ASNIX_IR_OPT=1`, printed to stderr after
+evaluation) and `irdump` report exactly which registered passes fired, and
+how many times, across the whole compile (root program + every nested
+lambda/thunk body's own `ib_finish()` call, same global-not-per-program
+scope the fire counts were always meant to have).
+
+**Firing-location log**: beyond "cfold fired 12 times," `irdump`'s
+`ASNIX_IR_OPT=diff`/`=1` modes now annotate the actual dump with `<<< cfold
+fired here` directly on the op line where each fold's result ended up.
+`asnix_irpass_remove` (the one shrink primitive every pass uses) logs each
+firing at `start-1` by convention (where the kept/folded op lives, per
+every current pass's own "rewrite in place, then remove the now-redundant
+tail" shape) -- and, symmetrically with its existing jump-target fixup,
+also re-shifts every PREVIOUSLY logged firing index affected by a later
+removal, so by the time a compile finishes every logged location is still
+correct against the FINAL op array irdump prints, not some intermediate
+one. Multiple real, distinct firings commonly cascade onto the same final
+index as a fixpoint re-scan collapses adjacent folds (e.g. `1 + 2` folds,
+then the result folds again against `== 3`, both landing at index 0) --
+deduped into one `(xN)` marker per pass rather than printed N times.
+Best-effort (not disambiguated) across separate nested IrPrograms sharing
+the same global log/index space -- exact for a single flat program.
+
+**A real bug hit and fixed while merging this**: renaming
+`irpass_examples.c` to `irpass_cfold.c` via `git mv` left a STALE
+`irpass_examples.o`/`.d` on disk from an earlier build; since `ar rcs`
+doesn't prune archive members no longer in its source list, `libasnix.a`
+ended up with both the old (1-arg `asnix_irpass_register`) and new (2-arg)
+object code for the same symbol, and the linker picked the stale one --
+silently corrupting the registration call (NULL function pointer,
+segfault) at runtime. Fixed by removing the stale `.o`/`.d` and a full
+`make clean && make`. Worth remembering as a general hazard any time a
+source file is renamed rather than edited in place.
+
+Verified: `make test`/`test-e2e`/`test-conformance` all green;
+`test-nix-conformance` `pass=655 fail=3 skip=148` (same 3 pre-existing
+failures); `test-nixpkgs-hash` `pass=148 fail=0`; `./asnix d.nix` output
+hash unchanged with `ASNIX_IR_OPT` unset or `=1` ("cfold: 12 firings" on
+the real nixpkgs closure).

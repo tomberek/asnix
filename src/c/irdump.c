@@ -28,6 +28,7 @@
 #include "asnix/irpass.h"
 #include "asnix/value.h"
 #include "compiler.h"
+#include "irpass_cfold.h" /* M118: ASNIX_IR_OPT -- see main() below */
 #include "lexer.h"
 #include "parser.h"
 #include "symtab.h"
@@ -217,6 +218,32 @@ static void dump_program(IrProgram *prog, int id, SeenVec *seen, Worklist *work)
             default:
                 break;
         }
+        /* M118 follow-up: annotate this line with every logged pass
+         * firing whose location (asnix_irpass_remove's "kept/folded op
+         * ends up at start-1" convention -- irpass.h) is this exact op
+         * index -- a direct "where did it fire" marker, not just the
+         * aggregate per-pass counts asnix_irpass_print_stats gives at the
+         * end. Best-effort across nested programs (see irpass.h's own
+         * caveat) -- exact for a single flat program like this one.
+         * Counted per pass (not printed once per raw log entry): a
+         * fixpoint re-scan commonly collapses several real, distinct
+         * firings onto the same final index (e.g. folding `1+2`, then
+         * folding the result against `==3`, both land at index 0 once
+         * everything shifts down) -- legitimate, but printing the
+         * identical marker 2-3 times in a row is just noise. */
+        size_t fire_counts_here[64] = { 0 };
+        size_t npasses = asnix_irpass_num_passes();
+        if (npasses > 64) npasses = 64; /* defensive -- ASNIX_IRPASS_MAX_PASSES is currently 32 */
+        for (size_t fi = 0; fi < asnix_irpass_num_firings(); fi++) {
+            if (asnix_irpass_firing_op_index(fi) != (size_t)i) continue;
+            size_t pi = asnix_irpass_firing_pass_index(fi);
+            if (pi < npasses) fire_counts_here[pi]++;
+        }
+        for (size_t pi = 0; pi < npasses; pi++) {
+            if (fire_counts_here[pi] == 0) continue;
+            if (fire_counts_here[pi] == 1) printf("   <<< %s fired here", asnix_irpass_name(pi));
+            else printf("   <<< %s fired here (x%zu)", asnix_irpass_name(pi), fire_counts_here[pi]);
+        }
         printf("\n");
         if (id_of == OP_RET || id_of == OP_HALT) break;
     }
@@ -292,14 +319,24 @@ int main(int argc, char **argv) {
         lex_parse_compile_dump(src, argv[1]);
         asnix_irpass_register_cfold();
         printf("\n===== AFTER (pass pipeline applied) =====\n");
+        /* M118 follow-up: per-op <<< markers above are drawn live from
+         * the firing log as each AFTER line prints; this final summary
+         * is the same per-pass totals ASNIX_IR_OPT=1 prints below, just
+         * also shown here so the combined view is self-contained. */
         lex_parse_compile_dump(src, argv[1]);
+        printf("\n-- bytecode pass firing counts --\n");
+        asnix_irpass_print_stats(stdout);
         asnix_irpass_clear();
     } else {
         if (mode) {
             asnix_irpass_register_cfold();
-            printf("(ASNIX_IR_OPT=1 -- showing bytecode AFTER the pass pipeline)\n");
+            printf("(ASNIX_IR_OPT=1 -- showing bytecode AFTER the pass pipeline; <<< markers show where each pass fired)\n");
         }
         lex_parse_compile_dump(src, argv[1]);
+        if (mode) {
+            printf("\n-- bytecode pass firing counts --\n");
+            asnix_irpass_print_stats(stdout);
+        }
     }
     free(src);
     return 0;
