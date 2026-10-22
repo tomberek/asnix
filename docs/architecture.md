@@ -98,7 +98,8 @@ what's actually implemented and the scope decisions made along the way.
 | M83 — 5 more nix-conformance fixes: `import`'s real `resolveExprPath` symlink-chain-following (+ per-file `__curPos.file`), `builtins.tryEval` failed-thunk memoization (a real asm-core fix: an intrusive IN_PROGRESS-thunk stack spanning 5 op_*.S/force.S sites + `op_call.S`'s `asnix_op_ret`), `fromTOML` now rejects TOML dates/times (matching the Nix version actually installed here, correcting a stale M81 claim), a regex group-repetition memory-limit approximation | done, **scoped** (see below; `make test-nix-conformance`: `pass=646 fail=12` → **pass=651 fail=7**; zero regressions in `make test`/`make test-e2e`/`make test-nixpkgs-hash`) |
 | M84 — root-caused and fixed the M82 `ffmpeg` mismatch: `asnix_collect_input_refs` blindly recursed into every field of any non-derivation attrset (correct only for genuine `__structuredAttrs` JSON blobs), so `lib.cleanSourceWith`'s `origSrc` field (the pre-filter Path, alongside the real filtered `outPath`) got NAR-copied a second time and added as a bogus extra `inputSrcs` entry real Nix never produces | done (see below; `./asnix d.nix` — `ffmpeg.outPath` — now matches real Nix byte-for-byte) |
 | M85 — `tests/nixpkgs-hash/attrs.txt` expanded from 4 packages to 74 (148 `outPath`/`drvPath` checks), spanning CLI tools, compilers/interpreters, multi-output libraries, build tooling, a GUI/graphics stack slice, fixed-output fetchers, and `nix` itself | done (see below; `make test-nixpkgs-hash`: **`pass=148 fail=0`** — no new divergence found beyond the one M84 already fixed) |
-| M86+ | not started |
+| M86 — real `DrvDeep` string-context closure propagation (`eval-okay-context-inputs.nix`'s `drvPath` case): two small in-memory caches (`g_drv_closure_cache`/`g_drv_outputs_cache`) reconstruct what real Nix's `computeFSClosure` would compute off a real store, purely from this process's own call-by-need derivation-construction order; re-investigated and declined the `eq-slot-elem`/`eq-slot-identity` function-identity gap a second time, with a new concrete counterexample confirming it's still a genuine representation gap, not a narrow fix | done (see below; `make test-nix-conformance`: `pass=651 fail=7` → **`pass=652 fail=6`**; zero regressions; `make test-nixpkgs-hash` still `pass=148 fail=0`) |
+| M87+ | not started |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
 
@@ -4231,7 +4232,9 @@ into one fix).**
   distinction at all, so this milestone's fix does NOT make
   `eval-okay-eq-slot-identity.nix` pass (its expected array mixes both
   patterns); that gap is a separate, deeper equality-semantics
-  milestone, out of scope here.
+  milestone, out of scope here (re-investigated twice more since --
+  M81, then M86 -- and still declined both times; see M86's own notes
+  for the sharpest counterexample found so far).
 - `eval-okay-delayed-with.nix` (self-referential lazy `with` through a
   `pkgs // packageOverrides pkgs` pattern) still aborts with "infinite
   recursion forcing a thunk (blackhole)", and `eval-okay-delayed-with-
@@ -7053,7 +7056,11 @@ was missing the variable).
   closures compare by CONTENT pointer identity unconditionally, which
   is MORE permissive than real Nix in some of these cases and less in
   others -- not a worse approximation than before this pass, just an
-  unchanged one.)
+  unchanged one.) Re-investigated again in M86, with a sharper
+  counterexample (`id id`'s self-returned closure: SAME pointer, real
+  Nix still says unequal) proving pointer/content identity is neither
+  necessary nor sufficient here, not just insufficiently precise --
+  see M86's own notes.
 - **`eval-okay-compare-operand-order.nix`** -- its last element,
   `let __curPos = 42; in __curPos`, needs `__curPos` to be a true
   parser-level magic identifier (rewritten to a position-literal AST
@@ -8613,9 +8620,13 @@ Six genuine fixes landed:
    `sha256` in either hex or nix32 form. New bare-URL-literal lexing
    (`http://example.com`), ported from Nix's own `lexer.l` URI regex,
    including its `x:x+1`-lexes-as-a-URL footgun.
-   **Left out of scope:** `eval-okay-context-inputs.nix`'s `drvPath`/
-   `both` cases need a real store-reference-graph + transitive-closure
-   walk (`computeFSClosure`) this codebase doesn't have.
+   **Left out of scope (at the time):** `eval-okay-context-inputs.nix`'s
+   `drvPath` case needs a real store-reference-graph + transitive-
+   closure walk (`computeFSClosure`) this codebase doesn't have --
+   **fixed in M86** via two in-memory closure/output-name caches
+   substituting for a real on-disk store walk; `both` turned out to
+   already be passing at the time M86 re-checked it, so the pairing
+   with `drvPath` here was itself stale.
 2. **`==`/`!=` own direct operands never pointer-hack-equal two
    functions** -- real Nix's `ExprOpEq::eval` always fresh-copies its
    own two operands, so two function values are never `==` at that
@@ -8623,7 +8634,9 @@ Six genuine fixes landed:
    **Left out of scope:** the `maybeThunk` slot-identity-sharing cases
    (`eval-okay-eq-slot-elem/identity.nix`) need a real identity-bearing
    allocation layer this codebase's flat `Value` representation
-   doesn't have.
+   doesn't have -- re-investigated in M86 and reconfirmed with a
+   sharper counterexample (`id id`'s own self-returned closure), see
+   that milestone's own notes.
 3. **Printer distinguishes `<PRIMOP>`/`<PRIMOP-APP>`/`<LAMBDA>`** for
    multi-arg native builtins, via one shared canonical marker `Value`
    every native-currying constructor stamps into its `Closure`'s
@@ -9162,3 +9175,233 @@ ever swept before.
 `make test`/`make test-e2e`/`make test-conformance`: unchanged, all
 green. `make test-nix-conformance`: `pass=646 fail=12 skip=148`,
 identical to the pre-existing baseline -- zero regressions.
+
+## M86: real `DrvDeep` string-context closure propagation -- `eval-okay-context-inputs.nix` now passes; `eq-slot-elem`/`eq-slot-identity` re-investigated and re-declined, with a sharper counterexample
+
+### Part 1: `eval-okay-context-inputs.nix`
+
+Re-checked this fixture from scratch rather than trusting M81's own
+scope note (which blamed BOTH the `drvPath` and `both` cases on a
+missing `computeFSClosure`/transitive-closure walk). Running it
+against the current tree first: **8 of 9 cases already matched**
+real `nix-instantiate --eval --strict`'s `.exp` output byte-for-byte
+(`out`, `dev`, `both`, `drvOnly`, `file`, `plain`,
+`substringEmpty`, `appended`) -- M74-M85's cumulative string-context
+work had already closed every gap except exactly one: `drvPath =
+show d.drvPath;` (passing a derivation's own `drvPath` string
+directly, not through string interpolation or a named output, as
+another derivation's attribute value). `both` was in fact already
+correct; M81's note was stale.
+
+Root cause, confirmed directly against
+`~/nix/src/libexpr/primops.cc`'s `derivationStrictInternal`: a
+`NixStringContextElem::DrvDeep` context element (attached to a
+derivation's own `drvPath` string value, M80) is handled completely
+differently from `Built`/`Opaque`:
+
+```cpp
+[&](const NixStringContextElem::DrvDeep & d) {
+    /* !!! This doesn't work if readOnlyMode is set. */
+    StorePathSet refs;
+    state.store->computeFSClosure(d.drvPath, refs);
+    for (auto & j : refs) {
+        drv.inputSrcs.insert(j);
+        if (j.isDerivation())
+            drv.inputDrvs.map[j].value = state.store->readDerivation(j).outputNames();
+    }
+},
+```
+
+Every member of `d.drvPath`'s FULL transitive closure (itself
+included -- `computeFSClosure` is root-inclusive) becomes an
+`inputSrcs` entry, and every member that's itself a derivation ALSO
+becomes an `inputDrvs` entry keyed by that member's COMPLETE own
+output set -- not just whichever output(s) happen to be referenced
+elsewhere. Contrast with `Built` (what `"${d}"`/`d.dev` already
+produce): that only ever adds ONE `(drvPath, outputName)` pair to
+`inputDrvs`, never touching `inputSrcs`. `asnix_collect_input_refs`
+(`derivation.c`) read `ctx->ndrvs`/`ctx->nsrcs` (Built/Opaque) but
+never consulted `ctx->ndeep` at all -- a `DrvDeep`-tagged string used
+as an attribute value silently collected zero input refs (M80's own
+comment said as much: "deliberately NOT read ... zero risk to
+M74-M79's hash-parity work" -- correct for hash-parity at the time,
+but exactly the gap this fixture exercises).
+
+asnix has no real on-disk store to run `computeFSClosure` against,
+but doesn't need one: this process's own call-by-need evaluation
+order already guarantees every derivation a `DrvDeep` element could
+ever name was fully constructed -- hence already cacheable -- before
+a string carrying that context element could exist. Exactly the same
+"read-only-mode, in-memory substitute for reading a `.drv` back off
+disk" precedent `g_masked_hash_cache` (M74) already established for
+`hashDerivationModulo`. Added two small per-drv-path linear-scan
+caches (`derivation.c`), populated once, right after each
+derivation's own `drv_path`/`output_names` are finalized
+(`cache_own_drv_closure`):
+
+- `g_drv_outputs_cache`: `drv_path` -> that derivation's own complete
+  output-name list (needed to expand a closure member into "all its
+  outputs", not just one specific referenced output).
+- `g_drv_closure_cache`: `drv_path` -> the already-flattened set of
+  every OTHER drv path and plain src path transitively reachable
+  from it (itself included), built by unioning each DIRECT input
+  drv's own closure entry (already cached, already flat, by the
+  call-by-need guarantee above) -- so no recursion is needed at
+  lookup time, only at insertion time, and only one level deep.
+
+`asnix_collect_input_refs`'s PTR-string case now additionally walks
+`ctx->deep`, resolves each entry through these two caches, and adds
+every closure member to `inputSrcs` (unconditionally) and to
+`inputDrvs` with its full output set (if it's itself a derivation) --
+replicating the real-Nix loop above exactly. A string carrying an
+unresolvable `DrvDeep` path (not built by this process -- e.g. a
+synthetic path from `addDrvOutputDependencies`) falls back to a bare
+`inputSrcs` entry, the same degenerate case real Nix's own
+`realiseContext` hits when it can't expand a `DrvDeep` element
+further.
+
+One more real, independent bug surfaced building this: `drv_type`'s
+own "text:" reference-list computation (used for a `.drv`'s OWN
+content-addressed store path, M74) concatenated `group_paths`
+(direct input-drv paths) and `refs.srcs` (direct src paths) on the
+assumption that they're always disjoint -- true before this
+milestone ("a path is either a derivation or a plain source, never
+both"). `DrvDeep` breaks that invariant ON PURPOSE: a closure member
+that's a derivation now ALSO lands in `inputSrcs` (matching real
+Nix's own unconditional `inputSrcs.insert(j)` for every closure
+member, derivation or not), so the same path can legitimately appear
+in both arrays now. Real Nix's `references` is a deduped
+`StorePathSet`; asnix's `drv_refs` concatenation wasn't deduped,
+double-counting the colliding path in the TYPE string and producing
+a wrong `drvPath` hash even after the closure/output caches
+themselves were already correct (confirmed by hand: before this
+second fix, the `drvPath` case's `outPath` already matched but its
+`drvPath` still didn't -- the `outPath` only depends on the MASKED
+pass, which never touches `drv_type`, while `drvPath` depends on the
+REAL pass's own store-path TYPE string, which does). Fixed by
+deduping `drv_refs` after sorting, immediately before building
+`drv_type`.
+
+Verified against the fixture's own `.exp`: `eval-okay-context-
+inputs.nix` now matches byte-for-byte, all 9 cases.
+`make test-nix-conformance`: `pass=651 fail=7 skip=148` ->
+**`pass=652 fail=6 skip=148`**. `make test`/`make test-e2e`: still
+fully green (no regressions, no new fixtures needed -- the existing
+conformance fixture is the verification). `make test-nixpkgs-hash`:
+confirmed **`pass=148 fail=0`**, unchanged, both immediately before
+and after this change -- `derivation.c` was touched (hash-parity-
+critical), but the new code path (a `DrvDeep` context element
+reaching `asnix_collect_input_refs`) is only ever exercised by a
+`.drvPath` value flowing directly into another derivation's
+attribute, a shape none of the 74-package real-nixpkgs corpus's
+`outPath`/`drvPath` checks happen to hit (nixpkgs itself overwhelmingly
+passes derivation OUTPUTS around, not bare `drvPath`s), and the
+dedup fix only changes behavior when a path appears in both
+`group_paths` and `refs.srcs` simultaneously -- impossible before
+this milestone's own `DrvDeep` handling made it possible in the
+first place.
+
+### Part 2: `eq-slot-elem.nix`/`eq-slot-identity.nix` -- re-investigated, still declined, with a sharper counterexample
+
+Re-traced both fixtures by hand against the actual current asnix
+binary (not just against the old write-up) to check for a narrower
+opening. Current asnix output vs. expected:
+
+```
+eq-slot-elem:     got [ true true true true ]        want [ true false false true ]
+eq-slot-identity: got [ true true true true true true true true true true false true true true true ]
+                  want [ false false false true false false true true true true false true true true true ]
+```
+
+Confirmed exactly which real-Nix mechanism produces `want`, reading
+`~/nix/gc-unlock/src/libexpr/eval.cc` directly rather than relying on
+memory: `Expr::maybeThunk` (the default, used by every expression
+kind EXCEPT the six overrides at `eval.cc:1055-1390` --
+`ExprVar`/`ExprString`/`ExprInt`/`ExprFloat`/`ExprPath`/`ExprList`)
+always allocates a genuine fresh `Thunk`, a new heap `Value` struct
+with its own address, whenever an expression is used as a list
+element / attrset-inherit value / lambda-call argument. `ExprVar`'s
+override instead returns a POINTER TO THE EXISTING Env-slot storage
+directly -- no allocation, so a bare-variable reference threaded
+through a list/attrset-literal/call-argument SHARES the exact same
+`Value` struct address as its original binding (and as every other
+bare-variable reference to the same binding). `ExprOpEq::eval` itself
+always evaluates its own two operands into two FRESH, separate local
+`Value`s (M81's own fix already covers this half), so `eqValues`'s
+`&v1 == &v2` fast path never fires for `==`'s own direct operands --
+only for values reached by first passing through a `maybeThunk`-
+aliased path (list/attrset literal, call argument) and THEN being
+compared (e.g. as list elements, where `eqValues`'s `nList` case
+recurses on `*v1.listElems()[i]`/`*v2.listElems()[i]` -- REFERENCES
+to the ACTUAL stored `Value*` pointers, not fresh copies). Critically,
+`eqValues`'s `nFunction` case is `return false` UNCONDITIONALLY --
+with NO content-based fallback of any kind -- so two function values
+are `==` in real Nix if and only if they were reached through an
+unbroken chain of `maybeThunk`-aliasing back to the literal same
+`Value` STORAGE CELL, full stop; the actual closure/environment the
+cell happens to hold is irrelevant to the comparison.
+
+asnix's flat 8-byte `Value` already gives closures pointer identity
+for free (a `TAG_CLOSURE` word's payload bits ARE the heap address of
+the closure object, and `OP_EQ` already compares those bits
+directly, per M81) -- which is why the two cases that depend ONLY on
+"was a fresh closure object allocated" already come out right by
+coincidence: a literal lambda (`x: x`) evaluated twice allocates two
+distinct closure objects (same as `ExprLambda::eval` in real Nix), so
+`[ (x: x) ] == [ (x: x) ]` is already `false` in asnix, matching real
+Nix, with no fix needed.
+
+The NEW, sharper counterexample this re-investigation found (not in
+M52/M81's write-ups): `id id` -- applying the identity function to
+itself -- evaluates to the exact SAME closure object as `id` itself
+(no new closure is ever allocated; `id`'s own body just returns its
+argument, which IS the `id` closure, unchanged). So asnix's
+pointer-identity rule for `TAG_CLOSURE` -- "same heap address ==
+equal" -- says `[ (id id) ] == [ (id id) ]` and `builtins.elem id [
+(id id) ]` should both be `true` (it genuinely is the identical
+closure object both times). But real Nix says `false` for both
+(confirmed directly in both `.exp` files: `eq-slot-elem`'s 2nd
+element, `eq-slot-identity`'s 3rd element) -- because `(id id)` is a
+call expression (`ExprCall`, no `maybeThunk` override), so each of
+its two textual occurrences gets its OWN fresh `Thunk` cell with its
+OWN address, and `eqValues`'s `nFunction` case doesn't care that both
+thunks resolve to the identical underlying closure -- cell identity,
+not referent identity, is literally the only thing being compared.
+
+This proves, independent of M52/M81's own reasoning, that "two
+Values with the same CONTENT/POINTER" (the only notion of identity
+asnix's flat `Value` can ever express for a heap kind) is NEITHER
+necessary NOR sufficient to replicate real Nix's function-equality
+rule: not sufficient (this counterexample: same pointer, real Nix
+says unequal), and not necessary (M81's own case: `f == f` for a
+bare-variable `==` operand is `false` in real Nix despite `maybeThunk`
+aliasing existing for `f` as a variable, because `ExprOpEq::eval`
+specifically bypasses `maybeThunk` for its own two operands). The
+ONLY faithful model is real Nix's own: identity attaches to the
+*storage cell an occurrence happens to borrow or get freshly
+allocated into*, completely decoupled from the cell's content --
+which requires a cell/box indirection distinct from content for
+every `Value`, not just closures, since the aliasing-vs-fresh-copy
+distinction has to be threaded through every list-literal/attrset-
+literal/call-argument/`with`-fallback/select construct a closure
+value could flow through on its way to a comparison. Scoping the fix
+to "just closures" doesn't reduce that breadth: the breadth comes
+from needing to track *how a value arrived*, not from needing to
+track every value's *type*, and every one of those "how it arrived"
+sites (list literals, attrset literals, call-argument passing,
+`with`-fallback, thunk-forcing) already exists in the compiler/asm
+core for EVERY value, closures included. Confirmed, a second time
+from an independent angle, that this remains exactly the
+"infrastructure genuinely out of proportion" scope cut M52 and M81
+already drew -- not attempted here, to avoid a partial/heuristic
+rule (e.g. "closures reached via a call are always unequal") that
+would silently produce wrong answers on cases this session didn't
+happen to check (real Nix's actual rule has nothing to do with
+"was it a call" specifically -- `with`-fallback and `select` hit the
+exact same `false`, and plenty of OTHER call shapes, like
+`(x: x: x) 1` partially applied, would need their own hand-verified
+behavior before any such heuristic could be trusted).
+
+No code changes for this part. `eq-slot-elem.nix`/`eq-slot-
+identity.nix` remain in `make test-nix-conformance`'s failing list,
+unchanged from before this investigation.

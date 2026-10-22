@@ -410,9 +410,8 @@ static void masked_hash_cache_insert(const char *drv_path, int is_fixed_output, 
  * deferred, not silently skipping it):
  *  - `DrvDeep` context (referencing a derivation's `.drvPath` itself,
  *    which in real Nix pulls in that derivation's ENTIRE transitive
- *    closure) is not handled -- not hit by any attribute shape found
- *    chasing `d.nix` so far (an attribute referencing `.drvPath`
- *    directly, rather than an output, is rare).
+ *    closure) IS handled, as of M86 -- see this function's own
+ *    PTR-string case below and cache_own_drv_closure's header comment.
  *  - A plain (non-store, e.g. a local project file) Path attribute
  *    value is not copied into a content-addressed store and tracked
  *    as an `inputSrcs` entry -- this project has no such
@@ -468,6 +467,144 @@ static void input_ref_add_src(InputRefSet *s, const char *path) {
         s->srcs = realloc(s->srcs, s->srcs_cap * sizeof(*s->srcs));
     }
     s->srcs[s->nsrcs++] = dup_cstr(path, strlen(path));
+}
+
+/* M86: real Nix's `NixStringContextElem::DrvDeep` ("this string refers to
+ * the WHOLE transitive closure of this derivation") requires, per
+ * `~/nix/src/libexpr/primops.cc`'s `derivationStrictInternal`:
+ * `state.store->computeFSClosure(d.drvPath, refs)`, then every member of
+ * `refs` becomes an `inputSrcs` entry, and every member that `isDerivation()`
+ * ALSO becomes an `inputDrvs` entry keyed by that member's OWN FULL output
+ * set (not just whichever output(s) happen to be referenced elsewhere).
+ * asnix has no real on-disk store to walk, but -- exactly like
+ * `g_masked_hash_cache` above substitutes a real Nix `--read-only-mode`
+ * in-memory cache for "read the .drv back off disk" -- this process's own
+ * call-by-need evaluation order guarantees every derivation that could ever
+ * be named by a `DrvDeep` context element was already fully constructed
+ * (hence already cached here) before the string carrying that context could
+ * exist. Two small per-drv-path caches reconstruct exactly what
+ * `computeFSClosure` would compute, purely from data this process already
+ * has in hand at the moment each derivation is built:
+ *  - `g_drv_outputs_cache`: drv_path -> that derivation's own COMPLETE
+ *    output-name list (needed to expand a closure member into "all its
+ *    outputs", not just a specific referenced one).
+ *  - `g_drv_closure_cache`: drv_path -> the flattened set of every OTHER
+ *    drv_path and plain src path transitively reachable from it (itself
+ *    included in the drv_path set, matching `computeFSClosure`'s own
+ *    root-inclusive semantics) -- built by unioning each DIRECT input
+ *    drv's own (already-cached, already-flat) closure, so no recursion is
+ *    needed at lookup time; each derivation's cache entry is already a
+ *    fully expanded flat list by the time it's inserted. */
+typedef struct {
+    char *drv_path;
+    char **output_names;
+    size_t noutputs;
+} DrvOutputsCacheEntry;
+static DrvOutputsCacheEntry *g_drv_outputs_cache = NULL;
+static size_t g_drv_outputs_cache_count = 0, g_drv_outputs_cache_cap = 0;
+
+static const DrvOutputsCacheEntry *drv_outputs_cache_find(const char *drv_path) {
+    for (size_t i = 0; i < g_drv_outputs_cache_count; i++) {
+        if (strcmp(g_drv_outputs_cache[i].drv_path, drv_path) == 0) return &g_drv_outputs_cache[i];
+    }
+    return NULL;
+}
+
+static void drv_outputs_cache_insert(const char *drv_path, const char *const *output_names, size_t noutputs) {
+    if (g_drv_outputs_cache_count == g_drv_outputs_cache_cap) {
+        g_drv_outputs_cache_cap = g_drv_outputs_cache_cap ? g_drv_outputs_cache_cap * 2 : 64;
+        g_drv_outputs_cache = realloc(g_drv_outputs_cache, g_drv_outputs_cache_cap * sizeof(*g_drv_outputs_cache));
+    }
+    char **onames = malloc(noutputs * sizeof(char *));
+    for (size_t i = 0; i < noutputs; i++) onames[i] = dup_cstr(output_names[i], strlen(output_names[i]));
+    g_drv_outputs_cache[g_drv_outputs_cache_count].drv_path = dup_cstr(drv_path, strlen(drv_path));
+    g_drv_outputs_cache[g_drv_outputs_cache_count].output_names = onames;
+    g_drv_outputs_cache[g_drv_outputs_cache_count].noutputs = noutputs;
+    g_drv_outputs_cache_count++;
+}
+
+typedef struct {
+    char *drv_path;
+    char **closure_drvs;
+    size_t nclosure_drvs;
+    char **closure_srcs;
+    size_t nclosure_srcs;
+} DrvClosureCacheEntry;
+static DrvClosureCacheEntry *g_drv_closure_cache = NULL;
+static size_t g_drv_closure_cache_count = 0, g_drv_closure_cache_cap = 0;
+
+static const DrvClosureCacheEntry *drv_closure_cache_find(const char *drv_path) {
+    for (size_t i = 0; i < g_drv_closure_cache_count; i++) {
+        if (strcmp(g_drv_closure_cache[i].drv_path, drv_path) == 0) return &g_drv_closure_cache[i];
+    }
+    return NULL;
+}
+
+/* A small growable deduped string set -- the scratch structure used only
+ * while assembling one derivation's own closure entry below, before it's
+ * handed (ownership transferred) to drv_closure_cache_insert. */
+typedef struct {
+    char **items;
+    size_t n, cap;
+} DrvClosureStrSet;
+
+static void drv_closure_strset_add(DrvClosureStrSet *s, const char *str) {
+    for (size_t i = 0; i < s->n; i++) {
+        if (strcmp(s->items[i], str) == 0) return;
+    }
+    if (s->n == s->cap) {
+        s->cap = s->cap ? s->cap * 2 : 8;
+        s->items = realloc(s->items, s->cap * sizeof(*s->items));
+    }
+    s->items[s->n++] = dup_cstr(str, strlen(str));
+}
+
+static void drv_closure_cache_insert(const char *drv_path, char **closure_drvs, size_t nclosure_drvs,
+                                      char **closure_srcs, size_t nclosure_srcs) {
+    if (g_drv_closure_cache_count == g_drv_closure_cache_cap) {
+        g_drv_closure_cache_cap = g_drv_closure_cache_cap ? g_drv_closure_cache_cap * 2 : 64;
+        g_drv_closure_cache = realloc(g_drv_closure_cache, g_drv_closure_cache_cap * sizeof(*g_drv_closure_cache));
+    }
+    g_drv_closure_cache[g_drv_closure_cache_count].drv_path = dup_cstr(drv_path, strlen(drv_path));
+    g_drv_closure_cache[g_drv_closure_cache_count].closure_drvs = closure_drvs;
+    g_drv_closure_cache[g_drv_closure_cache_count].nclosure_drvs = nclosure_drvs;
+    g_drv_closure_cache[g_drv_closure_cache_count].closure_srcs = closure_srcs;
+    g_drv_closure_cache[g_drv_closure_cache_count].nclosure_srcs = nclosure_srcs;
+    g_drv_closure_cache_count++;
+}
+
+/* Builds and caches THIS derivation's own closure entry (`drv_path`'s
+ * complete transitive membership), from its DIRECT refs (`refs`, already
+ * fully collected -- including any already-expanded `DrvDeep` members, see
+ * asnix_collect_input_refs's own PTR-string case below, which folds a
+ * nested `DrvDeep` reference's whole closure into `refs` too, so this
+ * function never needs to recurse through context kinds itself, only
+ * through the direct-input-drv cache lookups below). Called once, right
+ * after a derivation's own `drv_path`/`output_names` are finalized. */
+static void cache_own_drv_closure(const char *drv_path, const char *const *output_names, size_t noutputs,
+                                   const InputRefSet *refs) {
+    DrvClosureStrSet cdrvs;
+    memset(&cdrvs, 0, sizeof(cdrvs));
+    DrvClosureStrSet csrcs;
+    memset(&csrcs, 0, sizeof(csrcs));
+    /* real `computeFSClosure(drvPath)` includes the root path itself. */
+    drv_closure_strset_add(&cdrvs, drv_path);
+    for (size_t i = 0; i < refs->ndrvs; i++) {
+        const char *dp = refs->drvs[i].drv_path;
+        drv_closure_strset_add(&cdrvs, dp);
+        /* In a correctly-evaluated program this is always a hit: the same
+         * call-by-need invariant masked_hash_cache_find's own comment
+         * documents above -- `dp` was already fully built (hence already
+         * cached) before this derivation could reference it. */
+        const DrvClosureCacheEntry *sub = drv_closure_cache_find(dp);
+        if (sub) {
+            for (size_t j = 0; j < sub->nclosure_drvs; j++) drv_closure_strset_add(&cdrvs, sub->closure_drvs[j]);
+            for (size_t j = 0; j < sub->nclosure_srcs; j++) drv_closure_strset_add(&csrcs, sub->closure_srcs[j]);
+        }
+    }
+    for (size_t i = 0; i < refs->nsrcs; i++) drv_closure_strset_add(&csrcs, refs->srcs[i]);
+    drv_closure_cache_insert(drv_path, cdrvs.items, cdrvs.n, csrcs.items, csrcs.n);
+    drv_outputs_cache_insert(drv_path, output_names, noutputs);
 }
 
 /* M83 (chasing ffmpeg's own nixpkgs-hash mismatch): `json_mode` --
@@ -599,6 +736,41 @@ static void asnix_collect_input_refs(Value v, InputRefSet *out, int json_mode) {
         if (!ctx) return;
         for (size_t i = 0; i < ctx->ndrvs; i++) input_ref_add_built(out, ctx->drvs[i].drv_path, ctx->drvs[i].output_name);
         for (size_t i = 0; i < ctx->nsrcs; i++) input_ref_add_src(out, ctx->srcs[i]);
+        /* M86: a `DrvDeep` element (`d.drvPath` used directly, e.g.
+         * `inherit (d) drvPath;` passed on into another `derivation
+         * {...}` call) pulls in that derivation's WHOLE transitive
+         * closure -- every member (itself included) becomes an
+         * `inputSrcs` entry, and every member that's itself a derivation
+         * ALSO becomes an `inputDrvs` entry keyed by ITS OWN full output
+         * set, not just whatever output(s) happen to be referenced
+         * elsewhere. See cache_own_drv_closure's header comment above
+         * for how `g_drv_closure_cache`/`g_drv_outputs_cache` reconstruct
+         * real Nix's `computeFSClosure` purely in-memory. */
+        for (size_t i = 0; i < ctx->ndeep; i++) {
+            const char *dp = ctx->deep[i];
+            const DrvClosureCacheEntry *closure = drv_closure_cache_find(dp);
+            if (!closure) {
+                /* Not a derivation this process ever built itself (e.g. a
+                 * path synthesized by `addDrvOutputDependencies` for a
+                 * drv this run never actually constructed) -- real Nix's
+                 * own `computeFSClosure` would need a real store to walk
+                 * in that case too; fall back to treating it as an opaque
+                 * reference, the same degenerate case `realiseContext`'s
+                 * own `DrvDeep` branch (context.cc) hits when it can't
+                 * expand further. */
+                input_ref_add_src(out, dp);
+                continue;
+            }
+            for (size_t j = 0; j < closure->nclosure_drvs; j++) {
+                const char *member = closure->closure_drvs[j];
+                input_ref_add_src(out, member);
+                const DrvOutputsCacheEntry *outs = drv_outputs_cache_find(member);
+                if (outs) {
+                    for (size_t k = 0; k < outs->noutputs; k++) input_ref_add_built(out, member, outs->output_names[k]);
+                }
+            }
+            for (size_t j = 0; j < closure->nclosure_srcs; j++) input_ref_add_src(out, closure->closure_srcs[j]);
+        }
         return;
     }
     if (tag == ASNIX_TAG_PTR && asnix_value_is_path(v)) {
@@ -1350,15 +1522,28 @@ Value asnix_prim_derivation(const Value *args, int64_t argc) {
      * are, so this is a real reference-tracking requirement, not an
      * arbitrary detail). `group_paths[]` (already sorted via
      * `group_order`, the literal -- not hash-substituted -- input
-     * derivation paths) and `refs.srcs[]` (already sorted) are
-     * disjoint by construction (a path is either a derivation or a
-     * plain source, never both), so concatenating then re-sorting the
-     * union is simplest. */
+     * derivation paths) and `refs.srcs[]` (already sorted) used to be
+     * disjoint by construction (a path was either a derivation or a
+     * plain source, never both) -- M86 broke that invariant on purpose:
+     * a `DrvDeep` closure member is a derivation that ALSO becomes its
+     * own `inputSrcs` entry (matching real Nix's own `computeFSClosure`
+     * loop, which does `inputSrcs.insert(j)` unconditionally for every
+     * closure member, derivation or not), so the same path can now
+     * legitimately appear in both arrays. `references` is a real
+     * `StorePathSet` (deduped) in real Nix, so the union below must be
+     * deduped too, not just concatenated. */
     const char **drv_refs = malloc((ngroups + refs.nsrcs) * sizeof(const char *));
     size_t ndrv_refs = 0;
     for (size_t gi = 0; gi < ngroups; gi++) drv_refs[ndrv_refs++] = group_paths[group_order[gi]];
     for (size_t i = 0; i < refs.nsrcs; i++) drv_refs[ndrv_refs++] = refs.srcs[i];
     qsort(drv_refs, ndrv_refs, sizeof(const char *), strptr_cmp);
+    {
+        size_t w = 0;
+        for (size_t r = 0; r < ndrv_refs; r++) {
+            if (w == 0 || strcmp(drv_refs[w - 1], drv_refs[r]) != 0) drv_refs[w++] = drv_refs[r];
+        }
+        ndrv_refs = w;
+    }
     free(group_paths);
     free(group_order);
     free(group_nouts);
@@ -1437,6 +1622,19 @@ Value asnix_prim_derivation(const Value *args, int64_t argc) {
     free(masked_input_drvs);
     free(real_input_drvs);
     free(masked_hash_hex);
+
+    /* M86: cache THIS derivation's own transitive-closure membership
+     * (`drv_path` -> every other drv/src path reachable from it, plus its
+     * own full output-name list) right after `drv_path`/`output_names`
+     * are both finalized, eagerly, same convention as
+     * masked_hash_cache_insert just above -- so a LATER derivation
+     * referencing `drv_path` via a `DrvDeep` string-context element
+     * (`inherit (this) drvPath;`) can resolve its whole closure purely
+     * in-memory. `refs` (this derivation's own direct Built/Opaque/
+     * already-expanded-DrvDeep references, collected by the per-attribute
+     * loop above) is exactly real Nix's own starting point for
+     * `computeFSClosure` -- see cache_own_drv_closure's header comment. */
+    cache_own_drv_closure(drv_path, output_names, noutputs, &refs);
 
     /* `strict`'s own shape, matching real Nix's derivationStrict exactly
      * (~/nix/src/libexpr/primops.cc's `mkOutputString`): `drvPath` plus
