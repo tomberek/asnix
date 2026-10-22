@@ -767,6 +767,15 @@ static void asnix_collect_input_refs(Value v, InputRefSet *out, int json_mode) {
     v = asnix_force_for_print(v);
     int tag = asnix_tag_of(v);
     if (tag == ASNIX_TAG_ATTRS) {
+        /* M88: `v` may be a lazy union header (heap.h) rather than a flat
+         * Attrs -- resolve to the flat form FIRST so every raw `base`/
+         * `count`/`entry` read below (and the `idx_*`/raw re-index pattern
+         * right after) operates on one consistent flat array. This
+         * function is exactly the kind of call site M88's design doc
+         * flagged as highest-risk: it's reached directly from
+         * asnix_prim_derivation on a real mkDerivation attrset, which is
+         * precisely the shape heavy `//`-chaining produces. */
+        v = asnix_bshared_attrs_resolve(v);
         const char *base = (const char *)(v.raw & ~0x7ULL);
         int64_t count = *(const int64_t *)(base + ASNIX_ATTRS_OFF_COUNT);
         uint32_t sym_type = asnix_intern("type", 4);
@@ -967,7 +976,13 @@ Value asnix_prim_derivation(const Value *args, int64_t argc) {
         fprintf(stderr, "asnix: derivation: argument must be an attribute set\n");
         exit(1);
     }
-
+    /* M88: this is THE hash-parity-critical call site this milestone's
+     * design doc singled out as highest-risk -- `derivation {...}`'s own
+     * argument is exactly the shape heavy `//`-chaining (mkDerivation
+     * defaults merged with user overrides) produces in real nixpkgs.
+     * Resolve to the flat form once, up front, before any of the three
+     * raw scans below ever reads `base`/`count`. */
+    attrs_val = asnix_bshared_attrs_resolve(attrs_val);
     const char *base = (const char *)(attrs_val.raw & ~0x7ULL);
     int64_t count = *(const int64_t *)(base + ASNIX_ATTRS_OFF_COUNT);
 

@@ -106,6 +106,45 @@
 #define ASNIX_ATTR_OFF_VALUE    8
 #define ASNIX_ATTR_SIZE         16
 
+/* M88: lazy union-layering for `//`. `count` (offset 0 above) is read as a
+ * signed int64_t and is never negative for an ordinary flat Attrs -- that
+ * sign bit is reused as a sentinel: a NEGATIVE value there means this
+ * ASNIX_TAG_ATTRS object is actually a UnionHdr, not a flat entries array:
+ *
+ *   UnionHdr{ int64_t  neg_leaf_count;  // == -(number of leaves), 1..MAX_LEAVES
+ *             Value    flat_cache;      // raw==0 (never a legal Value -- see
+ *                                        // value.h: raw 0 decodes as a NULL
+ *                                        // ASNIX_TAG_PTR, which no live object
+ *                                        // ever is) until materialized, then
+ *                                        // the fully flattened+deduped,
+ *                                        // sym-sorted flat Attrs Value
+ *             Value    leaves[-neg_leaf_count]; }  // lowest-priority (oldest)
+ *                                                   // leaf first; each leaf is
+ *                                                   // itself an ordinary FLAT
+ *                                                   // Attrs Value, never
+ *                                                   // another UnionHdr --
+ *                                                   // asnix_attrs_update
+ *                                                   // (attrs_update.c) always
+ *                                                   // resolves a union RHS
+ *                                                   // flat before using it as
+ *                                                   // one leaf, so unions
+ *                                                   // never nest.
+ *
+ * `asnix_bshared_attrs_resolve` (builtins_shared.c) is the ONE place that
+ * knows how to turn a UnionHdr into its flat_cache (materializing +
+ * memoizing in place on first need, same "mutate an arena object once,
+ * in place" precedent op_select.S's thunk-forcing already established for
+ * ASNIX_TAG_THUNK) -- every raw-layout reader of an ATTRS object (every
+ * op_*.S binary search, builtins_shared.c's own count/sym/value/find,
+ * derivation.c, main.c's printer, builtins_attrs.c, builtins_m54.c) MUST
+ * call it first and use ITS result, never poke `count`/`entries` directly
+ * on a Value that might be a UnionHdr -- see docs/architecture.md's M88
+ * section for the full call-site enumeration this was checked against. */
+#define ASNIX_ATTRS_UNION_OFF_NLEAVES   0  /* same slot as OFF_COUNT; stores -(leaf count) */
+#define ASNIX_ATTRS_UNION_OFF_FLATCACHE 8
+#define ASNIX_ATTRS_UNION_OFF_LEAVES    16
+#define ASNIX_ATTRS_UNION_MAX_LEAVES    64
+
 /* PrimOp (M7): {void *fn; int64_t arity;} -- a native builtin function.
  * `fn` has signature `Value (*)(const Value *args, int64_t argc)`; OP_CALL
  * invokes it directly with a pointer straight into VALSTACK (the same

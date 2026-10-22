@@ -37,14 +37,23 @@ static void require_tag(Value v, int tag, const char *who, const char *what) {
  * layout -- same inline-pointer-arithmetic style builtins.c already uses
  * for String/List; factored into named helpers here since this file reads
  * Attrs/List/String structure in many more places. */
+/* M88: `v` may be a lazy union header (heap.h) rather than a flat Attrs --
+ * resolve to the flat form first (a single sign-bit check when it's
+ * already flat, the common case) before poking raw layout. Every one of
+ * this file's six builtins (attrNames/attrValues/hasAttr/getAttr/
+ * removeAttrs/mapAttrs) goes through these three helpers, so fixing them
+ * here covers the whole file. */
 static int64_t attrs_count(Value v) {
+    v = asnix_bshared_attrs_resolve(v);
     return *(const int64_t *)((const char *)(v.raw & ~0x7ULL) + ASNIX_ATTRS_OFF_COUNT);
 }
 static uint32_t attrs_entry_sym(Value v, int64_t i) {
+    v = asnix_bshared_attrs_resolve(v);
     const char *entry = (const char *)(v.raw & ~0x7ULL) + ASNIX_ATTRS_OFF_ENTRIES + i * ASNIX_ATTR_SIZE;
     return *(const uint32_t *)(entry + ASNIX_ATTR_OFF_SYM);
 }
 static Value attrs_entry_value(Value v, int64_t i) {
+    v = asnix_bshared_attrs_resolve(v);
     const char *entry = (const char *)(v.raw & ~0x7ULL) + ASNIX_ATTRS_OFF_ENTRIES + i * ASNIX_ATTR_SIZE;
     return *(const Value *)(entry + ASNIX_ATTR_OFF_VALUE);
 }

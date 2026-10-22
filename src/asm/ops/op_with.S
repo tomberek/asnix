@@ -93,10 +93,29 @@ asnix_op_with_try:
     andq $ASNIX_TAG_MASK, %rcx
     cmpq $ASNIX_TAG_ATTRS, %rcx
     jne .Lwith_try_type_error
-    andq $-8, %rax                      // rax = real Attrs*
+
+    // M88 (lazy `//` union-layering, heap.h): resolve a UnionHdr (negative
+    // `count`) to its flat form first -- see op_select.S's matching
+    // comment for the full rationale.
+    movq %rax, %r9                      // r9 = tagged value, kept across the maybe-call below
+    andq $-8, %rax                      // rax = real Attrs* (untagged)
+    movq ASNIX_ATTRS_OFF_COUNT(%rax), %r8 // r8 = count (maybe negative)
+    testq %r8, %r8
+    jns .Lwith_try_resolved
+    pushq %rsi
+    pushq %rdi
+    movq %r9, %rdi
+    call asnix_bshared_attrs_resolve
+    movq %rax, %r9
+    popq %rdi
+    popq %rsi
+    movq %r9, %rax
+    andq $-8, %rax
+    movq ASNIX_ATTRS_OFF_COUNT(%rax), %r8 // reload -- now guaranteed non-negative
+.Lwith_try_resolved:
 
     movq ASNIX_IROP_OFF_B(%rsi), %rdx   // rdx = target symbol id
-    movq ASNIX_ATTRS_OFF_COUNT(%rax), %r8 // r8 = hi = count
+    // %r8 already holds hi = count
     xorq %rcx, %rcx                     // rcx = lo = 0
 .Lwith_try_loop:
     cmpq %r8, %rcx

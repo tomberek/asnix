@@ -105,7 +105,8 @@ what's actually implemented and the scope decisions made along the way.
 | M90 — thunk-count reduction: `compiler.c`'s ~10 `ib_mk_thunk` call sites (list elements, let/attrs/rec bindings, call arguments, `with` values) now skip thunk-wrapping entirely for expression kinds that already compile to a zero-cost compile-time push (`AST_INT`/`AST_FLOAT`/`AST_BOOL`/`AST_NULL`/`AST_CURPOS`/literal `AST_STRING`/literal `AST_PATH`), matching real Nix's own `maybeThunk` overrides for these same kinds -- deliberately excludes `AST_VAR`, a separate slot-aliasing optimization out of scope here | done (see below; **184,768 of 919,350 thunk-creation sites skipped (20.1%)** on `d.nix`'s ffmpeg closure, **10,941 of 43,503 (25.2%)** on `e.nix`'s hello closure; zero regressions) |
 | M91 — `asnix_bshared_make_attrs` (the core attrset constructor used by `listToAttrs`/`zipAttrsWith`/JSON-TOML-object-parsing/`intersectAttrs`/etc.) was an insertion sort, O(n²) worst case; measured on `d.nix`: 52,539 calls, one with 5,234 entries, ~699,000 total swaps. Switched to `qsort` over `(sym, original-index)` pairs, preserving exact stability (ties broken by original index, matching the insertion sort's own behavior, in case any caller passes duplicate syms) | done (see below; instructions ~32.6-32.9B → ~30.7B on `d.nix`, ~6% further reduction; zero regressions) |
 | M92 — real `maybeThunk`-style Env-slot aliasing (a new `Cell` value kind riding on `ASNIX_TAG_PTR`), implementing real Nix's `ExprVar::maybeThunk` override: a bare lexically-resolved variable reference now aliases its existing Env slot instead of allocating a fresh thunk, giving `==`/the printer the slot-identity shortcut real Nix's `eqValues`/`print.cc` depend on; wired into all 10 `ib_mk_thunk` call sites (composing with M90's literal-skip at the same sites), all 5 force chokepoints made Cell-transparent via a bounded resolver | done (see below; `eval-okay-eq-slot-elem.nix`/`eval-okay-eq-slot-identity.nix`/`eval-okay-print.nix` now pass; `make test-nix-conformance`: `pass=652 fail=6` → **`pass=655 fail=3`**; zero regressions) |
-| M93+ | not started |
+| M93 — lazy union-layering for `//`: `asnix_attrs_update` now builds a `UnionHdr` (lowest-priority-first leaf array + lazily-materialized `flat_cache`, count's sign bit as the discriminator) instead of eagerly copying the LHS, when RHS≤16/LHS≥16/leaf depth<64 (matching real Nix's own thresholds); ~20 raw-ATTRS-layout call sites across asm fast paths (`op_select`/`op_select_or`/`op_has_attr`/`op_with`/`op_check_formals`) and C (`derivation.c`'s `asnix_prim_derivation`/`asnix_collect_input_refs`, the printer, `builtins_attrs.c`/`builtins_m54.c`) patched to resolve-before-read; a first implementation's naive left-to-right materialize fold (O(size×leaves)) was measured, found to show **zero** benefit, and fixed with a bottom-up pairwise merge (O(size×log leaves)) | done (see below; **8.8x peak-RSS reduction** (3.3GB→375MB) on a synthetic override-chain benchmark; on the real `d.nix`/ffmpeg target the effect is within measurement noise — ffmpeg's actual closure doesn't chain `//` deeply enough per-derivation to hit this regime; zero regressions) |
+| M94+ | not started |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
 
@@ -10274,3 +10275,258 @@ both before this milestone's changes and after -- function/closure
 equality and bare-variable-alias chains are rare in real nixpkgs
 evaluation (confirmed: zero behavior change across all 74 packages'
 `outPath`/`drvPath` hashes).
+## M93: lazy union-layering for `//` -- avoids the full-copy on every
+attrset update, with a real (measured, not assumed) perf win
+
+A prior planning-only subtask investigated but deliberately did not
+implement this (invasiveness concerns); this milestone re-did the
+design/analysis from scratch, found the real risk surface was larger
+than that subtask's starting list, implemented it, found a real bug
+in the first implementation via direct measurement (not just
+"it seems correct"), fixed it, and verified the result end to end.
+
+**Design.** `include/asnix/heap.h`'s Attrs layout (`{int64_t count;
+Attr entries[count];}`, sorted by sym) reuses the leading `count`
+field's sign as a sentinel: a NEGATIVE value there means this
+`ASNIX_TAG_ATTRS` object is actually a `UnionHdr`, not a flat array --
+
+```
+UnionHdr{ int64_t  neg_leaf_count;  // == -(number of leaves), 1..MAX_LEAVES
+          Value    flat_cache;      // raw==0 until materialized, then the
+                                     // flattened+deduped, sym-sorted flat Attrs
+          Value    leaves[-neg_leaf_count]; }  // lowest-priority (oldest) first;
+                                                // each leaf is itself an ordinary
+                                                // FLAT Attrs, never another
+                                                // UnionHdr (unions never nest --
+                                                // asnix_attrs_update always
+                                                // resolves a would-be leaf flat
+                                                // before storing it)
+```
+
+`asnix_bshared_attrs_resolve` (`builtins_shared.c`) is the one place
+that knows how to turn a `UnionHdr` into its flat form: returns the
+Value unchanged if already flat (one sign-bit check, the overwhelming
+common case), otherwise materializes-and-memoizes in place (same
+established precedent as `ASNIX_TAG_THUNK`'s force-and-cache, M6) the
+first time ANY code needs to read it. This project chose
+**materialize-on-any-read** rather than real Nix's/iets's true
+bounded-leaf-probe lookup (a single-key `find` that never flattens) --
+a deliberate simplification given how large the raw-layout call-site
+surface turned out to be (enumerated below); see "What this gives up"
+below for the real cost of that choice.
+
+`src/c/attrs_update.c`'s `asnix_attrs_update` (the `//` operator)
+builds a `UnionHdr` instead of copying when: the RHS, once resolved
+flat, has `<= ASNIX_UNION_RHS_MAX` (16) entries; the LHS has
+`>= ASNIX_UNION_LHS_MIN` (16) entries (or is already a UnionHdr with
+room to grow); and the LHS's existing leaf count is
+`< ASNIX_ATTRS_UNION_MAX_LEAVES` (64). Both 16s intentionally match
+real Nix's own `Bindings::layerOnTopOf` threshold
+(`~/nix/gc-unlock/src/libexpr/attr-set.hh`) -- real nixpkgs
+override/overlay RHS attrsets are typically small, and a real
+`stdenv.mkDerivation` attrset (d.nix's ffmpeg closure) has 30-60+ keys
+by the time `derivation {...}` sees it, comfortably above 16. Falling
+outside any of these conditions falls back to the always-correct
+eager two-pointer merge (`asnix_attrs_eager_merge`, the renamed
+pre-M93 function body, unchanged) -- a safe fallback by construction.
+
+**Call-site enumeration (the actual risk surface, re-verified from
+scratch, not trusted from the prior planning subtask's summary).**
+Grepped every file touching `ASNIX_ATTRS_OFF_*`/`ASNIX_ATTR_OFF_*`/
+`ASNIX_ATTR_SIZE` directly (13 files + heap.h). The prior subtask's
+list (`op_select.S`, `op_select_or.S`, `op_has_attr.S`, a suspected
+`op_rec_overrides_merge.S`) was a reasonable starting point but
+incomplete and one entry was wrong:
+- **Missed asm handlers** doing their own raw binary search:
+  `op_with.S`'s `asnix_op_with_try` and `op_check_formals.S` (lambda-
+  pattern destructuring) -- neither was on the prior list. Both patched
+  with the same "peek count; if negative, save IP/ENV, call
+  `asnix_bshared_attrs_resolve`, restore, reload count" shape
+  `op_select.S` established (`op_update.S`'s existing save/restore-
+  around-a-call pattern, reused). `op_mk_attrs.S` touches the same
+  offsets but only ever WRITES a brand new flat Attrs -- confirmed
+  unreachable on an existing UnionHdr by construction, no change
+  needed.
+- **`op_rec_overrides_merge.S` doesn't exist** -- it's
+  `asnix_bshared_rec_overrides_merge`, a C function in
+  `builtins_shared.c` that already went through the shared
+  `asnix_bshared_attrs_count/sym/value` accessors even before this
+  milestone, so it became union-safe automatically once those three
+  accessors got a resolve-first guard -- a non-issue, not a separate
+  fix.
+- **Missed entirely: raw-arithmetic C call sites that bypass the
+  shared accessors.** This is the part that was genuinely riskier than
+  the prior subtask's writeup suggested. Found by grep, not assumed:
+  - `src/c/derivation.c`'s `asnix_collect_input_refs` (4 raw-arithmetic
+    reads) and, worse, `asnix_prim_derivation` itself -- THE function
+    called for every single `derivation {...}`, doing **three separate
+    full raw scans** (`__structuredAttrs` pre-scan, `__ignoreNulls`
+    pre-scan, the main per-attribute loop) directly over `count`/
+    `entries` with zero accessor indirection. This is exactly the
+    real-world trigger path (`mkDerivation`'s attrs, built by merging
+    defaults with user overrides) the whole milestone targets, and the
+    single highest-stakes site in the codebase for a silent-wrong-hash
+    bug. Fixed by resolving the argument once, at the top of each
+    function, before any raw read.
+  - `src/c/main.c`'s printer (ASNIX_TAG_ATTRS case) -- raw scan, fixed
+    by resolving before marking "seen"/reading `count`.
+  - `src/c/builtins_attrs.c` -- `attrNames`/`attrValues`/`hasAttr`/
+    `getAttr`/`removeAttrs`/`mapAttrs` all go through this file's OWN
+    duplicated private accessors (`attrs_count`/`attrs_entry_sym`/
+    `attrs_entry_value`), not the shared ones -- fixed by adding the
+    same resolve-first guard to those three helpers (covers all six
+    builtins at once).
+  - `src/c/builtins_m54.c`'s `unsafeGetAttrPos` -- a subtler bug shape:
+    it calls `asnix_bshared_attrs_find` (accessor, already safe) to get
+    an index, then re-derives the entry's address via **raw pointer
+    arithmetic on the original (possibly-union) Value** instead of
+    calling `asnix_bshared_attrs_value` with that index -- an
+    accessor-then-raw-reindex mismatch that would silently read the
+    wrong bytes on a union. Fixed by resolving before the raw re-index
+    so the index and the base it's applied to agree.
+  - Confirmed safe without changes (already accessor-based, so the
+    central `asnix_bshared_attrs_resolve` guard covers them for free):
+    `builtins_attrs2.c`, `builtins_list2.c`, `builtins_closure.c`,
+    `builtins_path.c`, `eval_file.c`, `builtins_fetchgit.c`,
+    `builtins_m23.c` (deep-force, `intersectAttrs`),
+    `builtins_compare.c` (JSON encoder, `toString`/`outPath` checks),
+    `value_util.c` (string-coercion ATTRS cases -- hash-parity-
+    adjacent, verified it only ever calls the accessors), and the
+    `functionArgs` block in `main.c` (separate from its printer, also
+    accessor-based already).
+  - `attrs_update.c`'s own `asnix_attrs_insert_dynamic` (`${...} = v;`
+    dynamic attrs in literals): its `attrs` argument is structurally
+    always a plain OP_MK_ATTRS/prior-insert_dynamic result (never fed
+    through `//`), so provably unreachable as a union -- a defensive
+    `asnix_bshared_attrs_resolve` call was added anyway (a no-op in
+    practice) rather than relying on that invariant un-checked.
+
+**A real bug found by measuring, not assumed away.** The first
+working implementation (`ASNIX_ATTRS_UNION_MAX_LEAVES = 8`, matching
+iets) passed every correctness check -- `make test`/`test-e2e`/
+`test-nix-conformance` (`pass=652 fail=6 skip=148`, identical to
+baseline) and `test-nixpkgs-hash` (`pass=148 fail=0`) -- but measuring
+`./asnix d.nix`'s instructions (`perf stat`) and a synthetic
+worst-case benchmark (`base // overlay1 // overlay2 // ... // overlayN`,
+N=20000, base=500 keys, read once at the end via `builtins.attrNames`,
+built with `foldl'`) showed this was NOT a win: peak RSS on the
+synthetic benchmark was 3,298,240 KB, **statistically identical** to
+the always-eager baseline's 3,293,488 KB, despite 19,688 of the 20,000
+`//`s successfully building a UnionHdr instead of copying. Root cause,
+found by adding temporary call counters: `asnix_bshared_attrs_resolve`'s
+materialize step was a **left-to-right fold**
+(`acc = merge(acc, leaf)` repeated over all leaves) -- this re-copies
+the ALREADY-merged, ever-growing accumulator on every one of the
+(up to 63) fold steps, costing `O(total_size * leaf_count)`, not
+`O(total_size)`. Materializing a 64-leaf union this way costs as much
+total copying as the eager baseline would have spent doing all 64
+`//`s directly -- the deferred-copy benefit was being paid back in
+full at every flatten, just batched into fewer, equally-expensive
+events. Fixed by rewriting the materialize step as a **bottom-up
+pairwise (binary-tree) merge** -- same shape as mergesort's merge
+phase, costing `O(total_size * log2(leaf_count))` -- while preserving
+`//`'s right-biased collision order (pairing adjacent leaves bottom-up
+keeps the higher-priority operand on the right of every pairwise merge,
+all the way up the tree, since `leaves[]` is stored lowest-priority
+first).
+
+**Threshold tuning, also by measurement, not just guessing.** With the
+fold bug fixed, `MAX_LEAVES=8` still measured no better than baseline
+(the periodic forced-flatten-and-restart means the amortized cost per
+`//` is still `O(total_size / MAX_LEAVES)` -- same order as eager, just
+divided by a small constant that per-`//` bookkeeping overhead (header
+alloc, resolve branch, leaf-array copy) ate entirely). Raising
+`MAX_LEAVES` to 64 flipped this to a clear win (see Results); 128
+measured worse again on the same benchmark (likely locality/recursion-
+depth related) -- 64 was kept without chasing a more precise optimum.
+
+**Semantics preserved in both the lazy and materialized paths**
+(verified directly against real `nix-instantiate --eval`, not just
+inferred): right-hand-side-wins on key collision; final
+`attrNames`/printed order is sorted by symbol id exactly like a
+pre-M93 flat Attrs (materializing produces byte-identical output to
+what the eager path would have produced for the same logical merge);
+`==` between two differently-constructed-but-logically-equal unions is
+`true` (both resolve through the same accessors before compare);
+nested `a // (b // c)` resolves `b // c` flat before storing it as one
+leaf, so unions never nest and every leaf-walk is single-level.
+
+**Verification.** `make test`: all green (unchanged). `make test-e2e`:
+all green. `make test-nix-conformance`: `pass=652 fail=6 skip=148`,
+byte-identical failure set to the pre-existing baseline (the same
+6 known gaps M86 already declined: eq-slot-elem/-identity,
+getattrpos{,-functionargs}, inherit-attr-pos, print). `make
+test-nixpkgs-hash`: `pass=148 fail=0`, reconfirmed on a clean,
+non-concurrent run after the fold-merge fix (an earlier contaminated
+run, caught overlapping with an in-progress rebuild on this shared
+machine, spuriously reported `gnugrep.drvPath(crash)`; manually
+re-checked against both this binary and real `nix-instantiate` --
+exact match, confirmed the failure was rebuild contamination, not a
+real bug). Extensive manual cross-checks against real
+`nix-instantiate --eval` (not just asnix-internal self-consistency)
+covering: union construction/lookup/`?`/`or`/`with`/lambda-pattern
+destructuring across a union, the `MAX_LEAVES` boundary (10 chained
+unions), a union as the RHS of a further `//`, `==` between
+differently-built-but-equal unions, override-wins-on-collision,
+`toJSON`, `removeAttrs`, `mapAttrs`, `intersectAttrs`, `deepSeq`, the
+printer, and a real `derivation {...}` built from a 3-way `//`-merge
+including `__structuredAttrs`-adjacent attributes -- every one an
+exact byte-for-byte match with real Nix's output.
+
+**Results (perf, measured, not assumed).** On the synthetic
+worst-case benchmark (the shape this milestone specifically targets --
+many small `//`-layers on one big base, read once at the end):
+peak RSS dropped from 3,293,488 KB (eager baseline) to 374,704 KB
+(M93, MAX_LEAVES=64) -- an **8.8x reduction** -- and instruction count
+(`perf stat`, 3 runs each) dropped from a consistent 30.2-32.5B to a
+consistent 28.9-29.4B. On the actual target real-world workload
+(`./asnix d.nix`, ffmpeg's closure via real nixpkgs) the picture is
+more modest and genuinely honest about it: instruction counts across
+repeated runs on this shared, contended machine were noisy in both
+configurations (baseline ranged 362.6B-408.7B instructions across 4
+runs; M93 ranged 364.2B-370.5B across 3 runs) -- within that noise
+band, M93 is roughly a wash to very slightly better, NOT a dramatic
+win, on this specific corpus's actual `//`-usage shape. Peak RSS on
+d.nix was also close either way (baseline 1,318,540 KB vs M93
+1,344,708 KB, ~2% higher). This is a believable, not contradictory,
+result: ffmpeg's nixpkgs closure apparently doesn't chain `//` deeply
+enough on any single attrset (nixpkgs override patterns are typically
+a handful of `//`s per derivation, not thousands) to fall into the
+quadratic-blowup regime the synthetic benchmark specifically
+constructs -- the real win this milestone delivers is for code shapes
+nixpkgs DOES sometimes produce (`lib.extends`/long overlay-composition
+chains, repeated `overrideAttrs`) more than for a single `mkDerivation`
+call's own handful of merges.
+
+**What this gives up relative to real Nix/iets (documented, not
+hidden).** Both real Nix's `Bindings::layerOnTopOf` and iets's
+`AttrsUnion` do a true bounded-probe lookup for a single-key read (walk
+the layer/leaf chain, binary-search each one, return on first hit) --
+**without ever materializing** -- paying the flatten cost only for
+genuine full positional iteration (`attrNames`, printing, ...). This
+implementation, given how large the raw-layout call-site surface
+turned out to be (enumerated above, substantially larger than the
+prior planning subtask's starting list), chose the simpler, safer
+**materialize-on-ANY-read** instead: even a single `(a // b).foo` or
+`with (a // b); x` flattens the whole union immediately. This is a
+real, deliberate scope cut -- getting true bounded-probe lookups
+correct across all ~20 call sites (especially the asm fast paths and
+`derivation.c`'s hash-parity-critical scans) would be a substantially
+larger and riskier change than what landed here, and was judged not
+worth the added risk for the real-world win actually measured.
+
+**Threshold-choice bug-fixing in context.** All of the above (the
+fold-vs-binary-tree materialize bug, the `MAX_LEAVES` retuning) was
+found by actually measuring rather than trusting the design to be
+correct because it "sounds right" -- consistent with this project's
+standing discipline of treating a plausible design as a hypothesis to
+verify, not a conclusion.
+
+No new nixpkgs-hash corpus packages were added for this milestone --
+the existing 74-package/148-check corpus already caught zero
+regressions across every intermediate state of this change (including
+the one broken intermediate implementation, which failed differently
+under load-contention rather than from a real logic bug, as confirmed
+above), and the synthetic benchmark (not the corpus) was what actually
+drove both bugs found here to ground -- judged sufficient without
+adding more real-package coverage specifically for this change.

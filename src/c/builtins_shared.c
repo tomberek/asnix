@@ -10,6 +10,7 @@
 #include "asnix/heap.h"
 #include "asnix/ir.h"
 #include "asnix/irbuild.h"
+#include "attrs_update.h" /* M88: asnix_attrs_eager_merge, for asnix_bshared_attrs_resolve */
 #include "symtab.h"
 #include "value_util.h"
 
@@ -284,23 +285,76 @@ Value asnix_bshared_make_list(const Value *elems, int64_t count) {
     return (Value){ .raw = (uint64_t)(uintptr_t)mem | ASNIX_TAG_LIST };
 }
 
+/* M88: see builtins_shared.h's comment and heap.h's UnionHdr layout. */
+Value asnix_bshared_attrs_resolve(Value v) {
+    const char *base = (const char *)(uintptr_t)(v.raw & ~(uint64_t)ASNIX_TAG_MASK);
+    int64_t count = *(const int64_t *)(base + ASNIX_ATTRS_OFF_COUNT);
+    if (count >= 0) return v; /* already flat -- the common case */
+
+    Value cached = *(const Value *)(base + ASNIX_ATTRS_UNION_OFF_FLATCACHE);
+    if (cached.raw != 0) return cached; /* materialized by an earlier call */
+
+    int64_t nleaves = -count;
+    const Value *leaves = (const Value *)(base + ASNIX_ATTRS_UNION_OFF_LEAVES);
+    /* Leaves are guaranteed flat by construction (asnix_attrs_update,
+     * attrs_update.c, always resolves a would-be leaf before storing it).
+     *
+     * IMPORTANT: this is a bottom-up PAIRWISE (binary-tree) merge, NOT a
+     * left-to-right fold (`acc = merge(acc, leaf)` repeated) -- a fold
+     * would re-copy the ALREADY-MERGED, ever-growing accumulator on every
+     * one of the (up to ASNIX_ATTRS_UNION_MAX_LEAVES-1) merge steps,
+     * costing O(total_size * nleaves) instead of O(total_size *
+     * log2(nleaves)). That was an actual bug found measuring this
+     * milestone (see docs/architecture.md's M88 section): with the fold,
+     * repeated materialization cost as much total copying as the eager
+     * `//` path it was meant to avoid, measured via peak RSS on a
+     * synthetic many-small-leaves benchmark (nearly identical memory to
+     * the eager baseline). The pairwise merge below halves the work list
+     * each round (same shape as mergesort's merge phase), preserving
+     * `//`'s right-biased collision semantics: each pairwise
+     * asnix_attrs_eager_merge(work[i], work[i+1]) keeps `work[i+1]` (the
+     * more-recently-layered, higher-priority side, since `leaves` is
+     * stored lowest-priority-first) as the winning operand, and pairing
+     * adjacent elements bottom-up preserves that same relative priority
+     * order all the way up the tree. */
+    Value work[ASNIX_ATTRS_UNION_MAX_LEAVES];
+    for (int64_t i = 0; i < nleaves; i++) work[i] = leaves[i];
+    int64_t n = nleaves;
+    while (n > 1) {
+        int64_t out_n = 0;
+        int64_t i = 0;
+        for (; i + 1 < n; i += 2) {
+            work[out_n++] = asnix_attrs_eager_merge(work[i], work[i + 1]);
+        }
+        if (i < n) work[out_n++] = work[i]; /* odd one out, carried up unmerged */
+        n = out_n;
+    }
+    Value acc = work[0];
+    *(Value *)((char *)base + ASNIX_ATTRS_UNION_OFF_FLATCACHE) = acc;
+    return acc;
+}
+
 int64_t asnix_bshared_attrs_count(Value v) {
+    v = asnix_bshared_attrs_resolve(v);
     return *(const int64_t *)((const char *)(uintptr_t)(v.raw & ~(uint64_t)ASNIX_TAG_MASK) + ASNIX_ATTRS_OFF_COUNT);
 }
 
 uint32_t asnix_bshared_attrs_sym(Value v, int64_t i) {
+    v = asnix_bshared_attrs_resolve(v);
     const char *entry =
         (const char *)(uintptr_t)(v.raw & ~(uint64_t)ASNIX_TAG_MASK) + ASNIX_ATTRS_OFF_ENTRIES + i * ASNIX_ATTR_SIZE;
     return *(const uint32_t *)(entry + ASNIX_ATTR_OFF_SYM);
 }
 
 Value asnix_bshared_attrs_value(Value v, int64_t i) {
+    v = asnix_bshared_attrs_resolve(v);
     const char *entry =
         (const char *)(uintptr_t)(v.raw & ~(uint64_t)ASNIX_TAG_MASK) + ASNIX_ATTRS_OFF_ENTRIES + i * ASNIX_ATTR_SIZE;
     return *(const Value *)(entry + ASNIX_ATTR_OFF_VALUE);
 }
 
 int64_t asnix_bshared_attrs_find(Value attrs, uint32_t sym) {
+    attrs = asnix_bshared_attrs_resolve(attrs);
     int64_t lo = 0, hi = asnix_bshared_attrs_count(attrs);
     while (lo < hi) {
         int64_t mid = lo + (hi - lo) / 2;

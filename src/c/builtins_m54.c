@@ -1131,7 +1131,14 @@ static Value unsafeGetAttrPos2_impl(const Value *args, int64_t argc) {
      * (still `ASNIX_TAG_CLOSURE`) isn't caught here and keeps the
      * pre-existing placeholder position, same documented gap as
      * before. */
-    const char *entry = (const char *)(args[1].raw & ~0x7ULL) + ASNIX_ATTRS_OFF_ENTRIES + idx * ASNIX_ATTR_SIZE;
+    /* M88: `idx` came from asnix_bshared_attrs_find above, which already
+     * resolves a lazy union header (heap.h) to its flat form internally
+     * -- re-resolving args[1] here (idempotent, returns the same cached
+     * flat Value) keeps this raw re-index consistent with the index
+     * `find` actually computed, instead of indexing into args[1]'s own
+     * possibly-union raw bytes. */
+    Value attrs_flat = asnix_bshared_attrs_resolve(args[1]);
+    const char *entry = (const char *)(attrs_flat.raw & ~0x7ULL) + ASNIX_ATTRS_OFF_ENTRIES + idx * ASNIX_ATTR_SIZE;
     Value attr_val = asnix_force_for_print(*(const Value *)(entry + ASNIX_ATTR_OFF_VALUE));
     if (asnix_tag_of(attr_val) == ASNIX_TAG_PRIMOP) return ASNIX_NULL;
 

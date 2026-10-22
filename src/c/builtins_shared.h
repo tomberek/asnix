@@ -152,6 +152,23 @@ uint32_t asnix_bshared_attrs_sym(Value v, int64_t i);
 Value asnix_bshared_attrs_value(Value v, int64_t i);
 int64_t asnix_bshared_attrs_find(Value attrs, uint32_t sym);
 
+/* M88 (lazy `//` union-layering, heap.h's UnionHdr comment): `v` MUST
+ * already be ASNIX_TAG_ATTRS (callers check that first, same as every
+ * other attrs_* accessor here). Returns `v` unchanged if it's already an
+ * ordinary flat Attrs (the overwhelmingly common case: one sign-bit check,
+ * no branch mispredict cost beyond that). If `v` is instead a UnionHdr,
+ * materializes its fully flattened, deduped, sym-sorted equivalent on
+ * first call (merging its (at most ASNIX_ATTRS_UNION_MAX_LEAVES) leaves
+ * left to right via asnix_attrs_eager_merge, attrs_update.c) and caches
+ * the result in the UnionHdr's own `flat_cache` slot -- every later call
+ * on the SAME UnionHdr Value just returns the cached Value, no re-merge.
+ * EVERY raw-layout reader of an ATTRS object (every op_*.S binary search,
+ * this file's own count/sym/value/find below, derivation.c, main.c's
+ * printer, builtins_attrs.c, builtins_m54.c's unsafeGetAttrPos) calls
+ * this first and uses only ITS result -- see docs/architecture.md's M88
+ * section for the full enumeration this was checked against. */
+Value asnix_bshared_attrs_resolve(Value v);
+
 /* `syms`/`vals` need NOT be pre-sorted (sorted in place, ascending by sym
  * id, before building) -- unlike builtins_attrs.c's make_attrs_from_sorted
  * (which only ever inherits sortedness from an existing Attrs object),

@@ -343,6 +343,11 @@ static void print_value_concrete(Value v) {
              * printed `{ b = 1; a = 2; }` here vs. Nix's `{ a = 2; b = 1;
              * }`). Re-sort by name for display only; the stored order is
              * untouched. */
+            /* M88: `v` may be a lazy union header (heap.h) -- resolve to
+             * the flat form before marking it "seen" (dedup is keyed on
+             * the heap pointer actually walked below) or reading any raw
+             * layout. */
+            v = asnix_bshared_attrs_resolve(v);
             const char *base = (const char *)(v.raw & ~0x7ULL);
             if (!print_attrs_seen_mark(base)) { printf("«repeated»"); return; }
             int64_t count = *(const int64_t *)(base + ASNIX_ATTRS_OFF_COUNT);

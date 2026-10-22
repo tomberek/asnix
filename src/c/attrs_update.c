@@ -12,7 +12,53 @@
 #include "symtab.h"
 #include "value_util.h"
 
-Value asnix_attrs_update(Value lhs, Value rhs) {
+/* M88 threshold constants for lazy union-layering -- see heap.h's UnionHdr
+ * comment and docs/architecture.md's M88 section for the full writeup.
+ *
+ * ASNIX_UNION_RHS_MAX: the RHS of `//` only gets deferred into a leaf (never
+ * copied) when it's small. Chosen to match real Nix's own `Bindings`
+ * layering threshold (~/nix/gc-unlock/src/libexpr/attr-set.hh's
+ * `layerOnTopOf`, default 16) -- real nixpkgs overlay/override RHS attrsets
+ * (a `postInstall` override, a `meta` patch, an overlay's `self: super: {
+ * foo = ...; }`) are typically single-digit-to-low-double-digit in key
+ * count, so 16 comfortably covers the common case without deferring
+ * something big enough that the eventual materialize cost dominates.
+ *
+ * ASNIX_UNION_LHS_MIN: the LHS must be at least this big for skipping the
+ * copy to be worth the extra indirection (a flat_cache check + a handful of
+ * leaf-array words) -- below this, the eager two-pointer merge is already
+ * a handful of memcpys and not worth avoiding. Set equal to RHS_MAX for
+ * the same "matches real Nix's one documented threshold" reasoning; a real
+ * stdenv.mkDerivation attrset (d.nix's ffmpeg closure) has 30-60+ top-level
+ * keys by the time `derivation {...}` sees it, comfortably above this.
+ *
+ * ASNIX_ATTRS_UNION_MAX_LEAVES (heap.h): bounds worst-case leaf-chain depth
+ * (and thus worst-case one-time materialize cost) the same way real Nix's
+ * own layer-depth cap bounds worst-case `Bindings::get` cost -- once a
+ * union header already has this many leaves, the NEXT `//` forces a
+ * materialize-and-restart instead of growing the chain further.
+ *
+ * Empirically tuned, not just guessed: a first pass at 8 (iets's own
+ * MAX_LEAVES) measured WORSE than always-eager on a synthetic
+ * "foldl' chaining N small `//`s onto one big base, read once at the end"
+ * benchmark (peak RSS ~identical to eager, see docs/architecture.md's M88
+ * section) -- forcing a restart every 8 leaves means the amortized cost
+ * per `//` is still O(total_size / 8), same ORDER as eager, just divided
+ * by a small constant that per-call bookkeeping overhead ate entirely.
+ * 64 leaves (after also fixing asnix_bshared_attrs_resolve's materialize
+ * step to merge pairwise/bottom-up instead of left-to-right, see that
+ * function's own comment) measured an 8.8x peak-RSS reduction and a
+ * modest instruction-count win on the same benchmark, with no measured
+ * regression on the real d.nix (ffmpeg) corpus -- see M88 for the full
+ * numbers. Kept well under 128 (measured worse again at that size on the
+ * same benchmark, likely cache-locality-related: a 128-leaf header's own
+ * leaf array no longer fits as comfortably, and bottom-up-merge recursion
+ * depth grows) without chasing a perfectly-optimal constant further.
+ */
+#define ASNIX_UNION_RHS_MAX 16
+#define ASNIX_UNION_LHS_MIN 16
+
+Value asnix_attrs_eager_merge(Value lhs, Value rhs) {
     const char *abase = (const char *)(lhs.raw & ~0x7ULL);
     const char *bbase = (const char *)(rhs.raw & ~0x7ULL);
     int64_t acount = *(const int64_t *)(abase + ASNIX_ATTRS_OFF_COUNT);
@@ -61,7 +107,66 @@ Value asnix_attrs_update(Value lhs, Value rhs) {
     return (Value){ .raw = (uint64_t)(uintptr_t)mem | ASNIX_TAG_ATTRS };
 }
 
+/* M88: builds a fresh UnionHdr (heap.h) whose leaves are `base_leaves`
+ * (`n_base_leaves` of them, already flat, lowest-priority first) plus
+ * `new_leaf` (also flat) on top. `n_base_leaves + 1` must be <=
+ * ASNIX_ATTRS_UNION_MAX_LEAVES -- callers check that before calling this. */
+static Value make_union_header(const Value *base_leaves, int64_t n_base_leaves, Value new_leaf) {
+    int64_t nleaves = n_base_leaves + 1;
+    void *mem = asnix_arena_alloc(ASNIX_ATTRS_UNION_OFF_LEAVES + (uint64_t)nleaves * sizeof(Value));
+    *(int64_t *)((char *)mem + ASNIX_ATTRS_UNION_OFF_NLEAVES) = -nleaves;
+    *(Value *)((char *)mem + ASNIX_ATTRS_UNION_OFF_FLATCACHE) = (Value){ .raw = 0 }; /* not yet materialized */
+    Value *out_leaves = (Value *)((char *)mem + ASNIX_ATTRS_UNION_OFF_LEAVES);
+    if (n_base_leaves > 0) memcpy(out_leaves, base_leaves, (size_t)n_base_leaves * sizeof(Value));
+    out_leaves[n_base_leaves] = new_leaf;
+    return (Value){ .raw = (uint64_t)(uintptr_t)mem | ASNIX_TAG_ATTRS };
+}
+
+/* `a // b`: M88 adds a lazy fast path on top of the always-correct eager
+ * merge above -- when `rhs` is small and `lhs` is big (see the threshold
+ * comment above ASNIX_UNION_RHS_MAX), this builds an O(1) UnionHdr
+ * (heap.h) instead of copying the whole of `lhs`. Falls back to the
+ * eager merge whenever the fast path doesn't apply, which remains fully
+ * correct and is always a safe fallback. */
+Value asnix_attrs_update(Value lhs, Value rhs) {
+    /* rhs must be flat before it can become one leaf -- resolving an
+     * already-flat Value is a single sign-bit check (see
+     * asnix_bshared_attrs_resolve, builtins_shared.c), so this costs
+     * nothing on the common case where rhs was never itself a union
+     * (an ordinary `{ ... }` literal or any non-`//` expression). */
+    Value rhs_flat = asnix_bshared_attrs_resolve(rhs);
+    int64_t rhs_count = *(const int64_t *)((rhs_flat.raw & ~0x7ULL) + ASNIX_ATTRS_OFF_COUNT);
+
+    const char *lhs_base = (const char *)(lhs.raw & ~0x7ULL);
+    int64_t lhs_raw = *(const int64_t *)(lhs_base + ASNIX_ATTRS_OFF_COUNT);
+    int lhs_is_union = lhs_raw < 0;
+    int64_t lhs_leaves = lhs_is_union ? -lhs_raw : 1;
+
+    if (rhs_count <= ASNIX_UNION_RHS_MAX && lhs_leaves < ASNIX_ATTRS_UNION_MAX_LEAVES
+        && (lhs_is_union || lhs_raw >= ASNIX_UNION_LHS_MIN)) {
+        if (lhs_is_union) {
+            const Value *existing_leaves = (const Value *)(lhs_base + ASNIX_ATTRS_UNION_OFF_LEAVES);
+            return make_union_header(existing_leaves, lhs_leaves, rhs_flat);
+        }
+        return make_union_header(&lhs, 1, rhs_flat);
+    }
+
+    /* Fallback: both operands must be flat for the two-pointer merge --
+     * resolving lhs is the only one that can actually be a union here
+     * (rhs_flat is already resolved above). */
+    Value lhs_flat = asnix_bshared_attrs_resolve(lhs);
+    return asnix_attrs_eager_merge(lhs_flat, rhs_flat);
+}
+
 Value asnix_attrs_insert_dynamic(Value attrs, Value name_val, Value value) {
+    /* M88: `attrs` is always the direct output of a prior OP_MK_ATTRS or a
+     * prior insert_dynamic call within the SAME `{...}`/`rec {...}`
+     * literal (compiler.c's AST_ATTRS case) -- a `//` never runs in
+     * between, so this is never actually a union header in practice.
+     * Resolved anyway (a no-op sign-bit check when already flat) so this
+     * holds even if that invariant ever changes, rather than relying on
+     * an unchecked assumption. */
+    attrs = asnix_bshared_attrs_resolve(attrs);
     /* `${null} = value;` is silently omitted, not an error -- a real,
      * deliberate nixpkgs idiom for a conditionally-present key
      * (`${if cond then "key" else null} = value;`), confirmed against

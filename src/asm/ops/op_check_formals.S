@@ -26,6 +26,14 @@
 // miss paths below now `call` into C to name the specific field -- safe
 // without any IP/ENV save, same as every other fatal-only `call` in this
 // codebase, since the process exits before ever returning.)
+//
+// M88 (lazy `//` union-layering, heap.h) amends the paragraph above: the
+// given attrset's `count` can be NEGATIVE (a UnionHdr, not a flat Attrs)
+// -- resolving it needs a real, non-tail `call` into
+// asnix_bshared_attrs_resolve, so IP/ENV ARE saved/restored around THAT
+// one call (same push/pop pattern op_update.S's call to
+// asnix_attrs_update already uses). This only happens on the union path;
+// the common flat-attrs path below still makes no call at all.
 
     .section .rodata
 .Lmsg_cf_type:
@@ -43,8 +51,23 @@ asnix_op_check_formals:                 // a = required_count; b = pool_idx
     andq $ASNIX_TAG_MASK, %rcx
     cmpq $ASNIX_TAG_ATTRS, %rcx
     jne .Lcf_type_error
-    andq $-8, %rax                      // rax = Attrs*
-    movq ASNIX_ATTRS_OFF_COUNT(%rax), %rbx     // rbx = given entry count (n)
+
+    movq %rax, %r10                     // r10 = tagged value, kept across the maybe-call below
+    andq $-8, %rax                      // rax = Attrs* (untagged)
+    movq ASNIX_ATTRS_OFF_COUNT(%rax), %rbx     // rbx = given entry count (n) -- maybe negative (M88)
+    testq %rbx, %rbx
+    jns .Lcf_resolved
+    pushq %rsi
+    pushq %rdi
+    movq %r10, %rdi
+    call asnix_bshared_attrs_resolve
+    movq %rax, %r10
+    popq %rdi
+    popq %rsi
+    movq %r10, %rax
+    andq $-8, %rax
+    movq ASNIX_ATTRS_OFF_COUNT(%rax), %rbx     // reload -- now guaranteed non-negative
+.Lcf_resolved:
     leaq ASNIX_ATTRS_OFF_ENTRIES(%rax), %rbp   // rbp = given entries base
 
     movq ASNIX_IROP_OFF_A(%rsi), %r8    // r8 = required_count

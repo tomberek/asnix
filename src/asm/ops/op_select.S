@@ -22,10 +22,32 @@ asnix_op_select:                        // a = symbol id; pops an attrset, pushe
     andq $ASNIX_TAG_MASK, %rcx
     cmpq $ASNIX_TAG_ATTRS, %rcx
     jne .Lselect_type_error
-    andq $-8, %rax                      // rax = real Attrs*
+
+    // M88 (lazy `//` union-layering, heap.h): a UnionHdr has a NEGATIVE
+    // `count` at offset 0 -- resolve to the flat form before the binary
+    // search below ever reads raw layout. asnix_bshared_attrs_resolve is
+    // a single sign-bit check (no call overhead paid) on the common
+    // already-flat case, which is why this is checked inline here rather
+    // than always calling through.
+    movq %rax, %r9                      // r9 = tagged value, kept across the maybe-call below
+    andq $-8, %rax                      // rax = real Attrs* (untagged)
+    movq ASNIX_ATTRS_OFF_COUNT(%rax), %r8 // r8 = count (maybe negative -- union header)
+    testq %r8, %r8
+    jns .Lselect_resolved
+    pushq %rsi                          // save IP
+    pushq %rdi                          // save ENV (2 pushes -- stays 16-byte aligned)
+    movq %r9, %rdi                      // arg1 = tagged attrs value
+    call asnix_bshared_attrs_resolve
+    movq %rax, %r9                      // r9 = resolved (flat) tagged value
+    popq %rdi
+    popq %rsi
+    movq %r9, %rax
+    andq $-8, %rax                      // rax = real (flat) Attrs*
+    movq ASNIX_ATTRS_OFF_COUNT(%rax), %r8 // reload count -- now guaranteed non-negative
+.Lselect_resolved:
 
     movq ASNIX_IROP_OFF_A(%rsi), %rdx   // rdx = target symbol id
-    movq ASNIX_ATTRS_OFF_COUNT(%rax), %r8 // r8 = hi = count
+    // %r8 already holds hi = count (loaded above)
     xorq %rcx, %rcx                     // rcx = lo = 0
 .Lselect_loop:
     cmpq %r8, %rcx

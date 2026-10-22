@@ -12,6 +12,13 @@
  * unforced Thunk) are copied through unchanged. */
 Value asnix_attrs_update(Value lhs, Value rhs);
 
+/* M88: the pure flat-array two-pointer merge `asnix_attrs_update` used to
+ * do unconditionally -- now also reused by `asnix_bshared_attrs_resolve`
+ * (builtins_shared.c) to materialize a lazy union header's leaves. BOTH
+ * `lhs`/`rhs` MUST already be flat (non-negative `count`, heap.h) --
+ * callers that aren't sure resolve first. */
+Value asnix_attrs_eager_merge(Value lhs, Value rhs);
+
 /* `${nameExpr} = value;` inside a plain `{...}`/`rec {...}` literal
  * (`OP_INSERT_DYNAMIC_ATTR`, ir.h): inserts one dynamically-named entry
  * into `attrs` (already fully built from the literal's static bindings),
