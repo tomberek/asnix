@@ -31,6 +31,23 @@ static void bindingvec_push(BindingVec *v, AstBinding item) {
     v->items[v->len++] = item;
 }
 
+/* perf: every one of these growable vectors (AstVec/BindingVec/PartVec/
+ * FormalVec below) doubles its capacity on growth -- correct amortized-
+ * O(1) push, but whichever fill fraction a vector happens to land on
+ * when parsing finishes (e.g. 55% full right after a doubling) gets
+ * handed straight into PERMANENT Ast storage (list elements, attrset/let
+ * bindings, string/path interpolation parts, lambda formals) with that
+ * slack never trimmed -- the exact same bug M87 already found and fixed
+ * for IrBuilder's ops/pool arrays (irbuild.c's ib_finish), just never
+ * applied here. Measured via an LD_PRELOAD malloc tracer on a real
+ * nixpkgs closure: tens of MB of pure doubling slack across these four
+ * vector types combined. Safe to trim unconditionally before handoff:
+ * shrinking realloc never moves/invalidates the still-needed prefix. */
+#define VEC_TRIM(v, T)                                                                                               \
+    do {                                                                                                             \
+        if ((v).len > 0 && (v).len < (v).cap) (v).items = realloc((v).items, (v).len * sizeof(T));                   \
+    } while (0)
+
 /* `${expr} = value;` -- a dynamic attrset-literal key. Collected
  * separately from BTVec/BTNode (the static-key tree): the name isn't
  * known until runtime, so it can't participate in that tree's compile-
@@ -344,6 +361,7 @@ static AstBinding finalize_bt_node(BTNode *node) {
     for (size_t i = 0; i < node->children.len; i++) {
         bindingvec_push(&out, finalize_bt_node(&node->children.items[i]));
     }
+    VEC_TRIM(out, AstBinding);
     Ast *attrs = asnix_ast_new(AST_ATTRSET);
     attrs->as.attrset.bindings = out.items;
     attrs->as.attrset.count = out.len;
@@ -364,6 +382,11 @@ static AstBinding finalize_bt_node(BTNode *node) {
      * full nixpkgs evaluation. */
     free(node->children.items);
     free(node->children.dyn.items);
+    /* perf: `.index` (the open-addressing hash table backing btvec_find,
+     * added after this free() was originally written) is a SEPARATE
+     * malloc'd array from `.items` -- freeing only `.items` leaked it on
+     * every subtree. */
+    free(node->children.index);
     return (AstBinding){ .name = node->name, .name_len = node->name_len, .value = attrs, .is_inherit = 0 };
 }
 
@@ -372,6 +395,7 @@ static void finalize_bt_vec(BTVec *vec, BindingVec *out) {
         bindingvec_push(out, finalize_bt_node(&vec->items[i]));
     }
     free(vec->items); /* M86 perf: see finalize_bt_node's identical comment */
+    free(vec->index); /* perf: see finalize_bt_node's identical .index comment */
 }
 
 typedef struct {
@@ -1024,6 +1048,7 @@ static Ast *parse_path_literal_interp(Parser *p, Token *t) {
         }
     }
     advance(p); /* TOK_PATH_END */
+    VEC_TRIM(parts, AstStringPart);
     n->as.path.interp_parts = parts.items;
     n->as.path.interp_count = parts.len;
     return n;
@@ -1053,6 +1078,7 @@ static Ast *parse_dquote_string(Parser *p) {
         }
     }
     advance(p); /* TOK_STR_END */
+    VEC_TRIM(parts, AstStringPart);
     Ast *n = asnix_ast_new(AST_STRING);
     n->as.string.parts = parts.items;
     n->as.string.count = parts.len;
@@ -1215,6 +1241,7 @@ static Ast *parse_atom(Parser *p) {
             AstVec elems = { 0 };
             while (cur(p)->kind != TOK_RBRACKET) astvec_push(&elems, parse_select(p));
             advance(p); /* ']' */
+            VEC_TRIM(elems, Ast *);
             Ast *n = asnix_ast_new(AST_LIST);
             n->as.list.elems = elems.items;
             n->as.list.count = elems.len;
@@ -1228,6 +1255,7 @@ static Ast *parse_atom(Parser *p) {
             advance(p); /* '}' */
             BindingVec bindings = { 0 };
             finalize_bt_vec(&bt, &bindings);
+            VEC_TRIM(bindings, AstBinding);
             Ast *n = asnix_ast_new(AST_ATTRSET);
             n->as.attrset.bindings = bindings.items;
             n->as.attrset.count = bindings.len;
@@ -1246,6 +1274,7 @@ static Ast *parse_atom(Parser *p) {
             advance(p); /* '}' */
             BindingVec bindings = { 0 };
             finalize_bt_vec(&bt, &bindings);
+            VEC_TRIM(bindings, AstBinding);
             Ast *n = asnix_ast_new(AST_ATTRSET);
             n->as.attrset.bindings = bindings.items;
             n->as.attrset.count = bindings.len;
@@ -1639,6 +1668,7 @@ static Ast *parse_let_bindings(Parser *p) {
     }
     BindingVec bindings = { 0 };
     finalize_bt_vec(&bt, &bindings);
+    VEC_TRIM(bindings, AstBinding);
 
     Ast *n = asnix_ast_new(AST_LET);
     n->as.let1.bindings = bindings.items;
@@ -1713,6 +1743,7 @@ static void parse_formals(Parser *p, AstFormal **out_items, size_t *out_count, i
         break;
     }
     expect(p, TOK_RBRACE, "'}'");
+    VEC_TRIM(formals, AstFormal);
     *out_items = formals.items;
     *out_count = formals.len;
     *out_ellipsis = ellipsis;
@@ -1735,6 +1766,7 @@ static Ast *parse_expr(Parser *p) {
             advance(p); /* '}' */
             BindingVec bindings = { 0 };
             finalize_bt_vec(&bt, &bindings);
+            VEC_TRIM(bindings, AstBinding);
             Ast *attrs = asnix_ast_new(AST_ATTRSET);
             attrs->as.attrset.bindings = bindings.items;
             attrs->as.attrset.count = bindings.len;

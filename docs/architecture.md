@@ -108,7 +108,8 @@ what's actually implemented and the scope decisions made along the way.
 | M93 — lazy union-layering for `//`: `asnix_attrs_update` now builds a `UnionHdr` (lowest-priority-first leaf array + lazily-materialized `flat_cache`, count's sign bit as the discriminator) instead of eagerly copying the LHS, when RHS≤16/LHS≥16/leaf depth<64 (matching real Nix's own thresholds); ~20 raw-ATTRS-layout call sites across asm fast paths (`op_select`/`op_select_or`/`op_has_attr`/`op_with`/`op_check_formals`) and C (`derivation.c`'s `asnix_prim_derivation`/`asnix_collect_input_refs`, the printer, `builtins_attrs.c`/`builtins_m54.c`) patched to resolve-before-read; a first implementation's naive left-to-right materialize fold (O(size×leaves)) was measured, found to show **zero** benefit, and fixed with a bottom-up pairwise merge (O(size×log leaves)) | done (see below; **8.8x peak-RSS reduction** (3.3GB→375MB) on a synthetic override-chain benchmark; on the real `d.nix`/ffmpeg target the effect is within measurement noise — ffmpeg's actual closure doesn't chain `//` deeply enough per-derivation to hit this regime; zero regressions) |
 | M94 — opt-in on-disk bytecode cache (`ASNIX_BYTECODE_CACHE=1`): a new portable (de)serialization format for a compiled `IrProgram` (op-ids not handler pointers, symbols by name not process-local id, heap-pointer-shaped pool Values by content), keyed by (resolved path, source content) so `__curPos`'s baked-in file path can never leak across a content collision; plus an opt-in `ASNIX_BYTECODE_PRODUCER=1` fork()-based prefetch producer that pre-warms the cache for statically-literal `import` targets in a separate process (not a thread -- the global arena/symtab have zero synchronization) | done (see below; verified against the full real `/tmp/nix-conformance` corpus and all 74 `test-nixpkgs-hash` packages with the cache both freshly-populated and fully-hit, byte-for-byte identical to the cache-disabled baseline; three real bugs found and fixed along the way, detailed below; zero regressions; off by default) |
 | M95 — root-caused why M93's attrset-union layering showed no measurable win on the real `d.nix`/ffmpeg workload: it wasn't attrset layering at all -- `perf record` showed `cache_own_drv_closure` (derivation.c) at 43%+ of cycles, eagerly re-flattening every derivation's ENTIRE transitive closure (unioning each direct input's already-flattened closure into a brand-new hash set) for every one of ~100 derivations built, even though the only real consumer of a flattened closure is a rare `DrvDeep` context expansion. Changed to store only the direct layer at build time; added lazy, memoized materialization (`drv_closure_materialize`) triggered only by that one real consumer | done (see below; instructions on `d.nix` ~29.7B → **~12.07B**, matching real Nix's own ~12.0B; wall ~4.3s → ~2.1s; zero regressions) |
-| M96+ | not started |
+| M96 — three more non-arena memory leaks found via an LD_PRELOAD malloc tracer: nine parser.c vector-to-AST handoff sites (`BindingVec`/`PartVec`/`AstVec`/`FormalVec`) carried permanent doubling-growth slack into AST storage (same pattern M87 fixed for `IrBuilder`, just never applied here); `btvec`'s own hash-index array (added by M88, after M87's free was written) was never freed alongside its `.items`; `ib_finish` never freed the outer `IrBuilder` struct itself (48 bytes × hundreds of thousands of calls) after pulling its `ops`/`pool` arrays out into the permanent `IrProgram` | done (see below; peak RSS on `d.nix` 853MB → **767MB** (~10%); zero regressions) |
+| M97+ | not started |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
 
@@ -10805,3 +10806,92 @@ d.nix` still prints real Nix's exact `ffmpeg.outPath`
 (`/nix/store/29iacg6h530yx7rxz4k1fhvi0kxxhsam-ffmpeg-9.0.1-bin`),
 confirming the lazy/memoized closure computation produces an identical
 flattened result to the old eager version, just far less redundantly.
+
+## M96: three more non-arena memory leaks (parser.c vector slack, btvec's hash-index, the IrBuilder struct itself)
+
+The user asked why asnix uses more memory than real Nix (measured at
+the time: `./asnix d.nix`'s peak RSS at **853,488 KB** against real
+`nix-instantiate --eval --strict`'s **373,328 KB** on the identical
+`ffmpeg.outPath` expression -- a ~2.29x gap). Investigated with the
+same LD_PRELOAD malloc-tracing shim this session's earlier M87 memory
+work used (header-prefix technique recovering each block's allocation
+site/size in O(1) at `free()` time, resolved via `addr2line` against
+the PIE binary's own load offset), since several real fixes earlier
+this session (M78/M87/M89/M93) had already closed most of the gap on
+smaller workloads but clearly hadn't caught everything on a real,
+large nixpkgs closure.
+
+Found three distinct sources, all variations on "a growable buffer's
+doubling-growth slack or the buffer itself never gets freed/trimmed
+before permanent handoff" -- the exact same anti-pattern M87 already
+diagnosed and fixed for `IrBuilder`'s `ops`/`pool` arrays, just not
+caught everywhere it also applied:
+
+1. **Nine parser.c vector-to-AST handoff sites never trimmed.**
+   `BindingVec` (6 sites: `finalize_bt_vec`'s own accumulator, the
+   `inherit`-from hidden-binding case, the `rec`-attrs visible-binding
+   case, `let`, and two plain-attrset cases), `PartVec` (2 sites:
+   path-literal and double-quoted-string interpolation parts),
+   `AstVec` (1 site: list-literal elements), and `FormalVec` (1 site:
+   lambda formals) all grow by doubling (correct amortized-O(1) push)
+   but hand their raw, possibly-oversized `.items` buffer straight into
+   **permanent** `Ast` storage without ever trimming to the final
+   `.len` -- whichever fill fraction each one happened to land on
+   (e.g. 55% full right after a doubling) was carried forever. Added a
+   single `VEC_TRIM(v, T)` macro (parser.c, right after
+   `bindingvec_push`) and applied it at all nine sites just before each
+   handoff. Measured the single biggest win here: `PartVec`'s leak
+   alone dropped from 37.6MB to 4.96MB outstanding on `d.nix` (an 87%
+   reduction for that one vector type).
+
+2. **`btvec`'s own hash-index array, never freed.** M88 (the CPU-
+   hotspot milestone) added an open-addressing hash index (`BTVec`'s
+   `.index`/`.index_cap` fields) alongside `btvec_find`'s existing
+   linear-scan replacement, to fix an O(n²) pattern -- but M87's own
+   `free(node->children.items)`/`free(vec->items)` calls (which
+   correctly free the ORIGINAL `.items` array) predate M88's `.index`
+   field entirely, so they never covered it. Added `free(node->
+   children.index)`/`free(vec->index)` right alongside the existing
+   frees in `finalize_bt_node`/`finalize_bt_vec`.
+
+3. **`ib_finish` never freed the outer `IrBuilder` struct itself.**
+   M87 already fixed the SLACK inside `IrBuilder`'s `ops`/`pool` arrays
+   (trimming them to exact size before handoff to the permanent
+   `IrProgram`) -- but the 48-byte `IrBuilder` struct that OWNS those
+   two pointers was itself always `calloc`'d fresh (`ib_new`) and never
+   freed after `ib_finish` pulls `ops`/`pool` out of it. Checked every
+   one of `ib_finish`'s ~24 call sites (`compiler.c`/`builtins_misc.c`/
+   `builtins_shared.c`/`builtins_attrs.c`/`builtins_m54.c`) to confirm
+   none reference the builder variable again afterward -- every caller
+   discards its local builder immediately. Added `free(b)` at the end
+   of `ib_finish`, right after `prog->ops`/`prog->pool` are set. Alone
+   responsible for ~28MB of the total reduction measured (matches the
+   back-of-envelope estimate: 48 bytes × ~735,000 remaining `ib_finish`
+   calls after M90's own ~20% thunk-skip ≈ 35MB).
+
+Measured impact on `./asnix d.nix`: peak RSS **853,488 KB → 767,392
+KB (~10% reduction)**. The malloc tracer's own
+`sum_of_current_outstanding` dropped from ~270.8MB to ~192.6MB across
+the same run. Verified no regression on the much smaller `e.nix`
+(`hello.drvPath`) workload too (129,232 KB, essentially unchanged from
+before -- this workload's vectors were mostly too small to have
+meaningful doubling slack in the first place, so the win is
+concentrated on real, large closures like ffmpeg's).
+
+Remaining gap to real Nix's 373,328 KB (now roughly 2.06x, down from
+2.29x) was NOT chased further in this pass: the malloc tracer's
+remaining top entries (`ib_finish`'s own trimmed `ops`/`pool` data,
+`read_file`'s source buffers, the global string-context hash table)
+are all legitimate, already-minimized necessary data, not further
+slack -- closing the rest of the gap would need an architectural
+change (e.g. real garbage collection, or structural sharing of
+attrsets/lists), the same conclusion an earlier memory-analysis
+subtask this session already reached independently.
+
+`make test`/`make test-e2e`/`make test-conformance`: unchanged, all
+green. `make test-nix-conformance`: `pass=655 fail=3 skip=148`,
+identical to the pre-existing baseline -- zero regressions. `make
+test-nixpkgs-hash`: `pass=148 fail=0`, unchanged (parser.c/irbuild.c
+are not among the project's declared hash-parity-critical files, but
+verified anyway since this touches every compiled program and every
+parsed attrset/list/string/lambda in the process).

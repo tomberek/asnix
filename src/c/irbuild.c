@@ -267,5 +267,11 @@ IrProgram *ib_finish(IrBuilder *b) {
     IrProgram *prog = calloc(1, sizeof(IrProgram));
     prog->ops = b->ops;
     prog->pool = b->pool;
+    /* perf: ops/pool were just pulled out into `prog` above -- nothing
+     * else references the outer IrBuilder struct itself afterward (every
+     * caller discards its local builder variable immediately after this
+     * call), but it was never freed. 48 bytes leaked per call, hundreds
+     * of thousands of times across a full nixpkgs evaluation. */
+    free(b);
     return prog;
 }
