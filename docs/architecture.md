@@ -119,6 +119,8 @@ what's actually implemented and the scope decisions made along the way.
 | M103 — the bytecode cache's on-disk wire format (`bytecode.c`'s `wbuf_i64`/`rcur_i64`) encoded every opcode/operand/length/symbol-id as a fixed 8-byte `int64`, making the serialized cache ~1.5x LARGER than the Nix source text it replaced (91MB vs. ~62MB on `d.nix`'s real ffmpeg closure); checked `~/gnix/iets`'s own cache format first (already plain LEB128, confirming the approach rather than inventing it) and added a zigzag step on top since asnix's fields are genuinely signed (jump deltas, `PUSH_INT` literals) where iets's are naturally unsigned; magic bumped `ASNXBC01`→`ASNXBC02` so a stale pre-change cache entry is rejected outright, never misread | done (see below; cache size **91MB → 32MB (~2.84x smaller)**, now well under the ~62MB source-text figure; new `tests/c/test_bytecode.c` round-trips `INT64_MAX`/`INT64_MIN` and LEB128/zigzag byte-boundary values explicitly, plus old-format/truncated/garbage rejection; zero regressions) |
 | M104 — `OP_VAR_REF`/`OP_SELECT`/`OP_SELECT_OR`/`OP_WITH_TRY`'s `_forced` fast path (reached on every access to an already-forced thunk, one of the hottest paths in the evaluator) re-entered the full thunk-tag+Cell-tag resolve chain on every hit, even though a forced thunk's cached value can never be a Thunk or Cell by construction (M92's Cell only ever substitutes for thunk-*creation* itself, never produced as a thunk body's own result) -- jumps straight to the push path instead | done (see below; controlled back-to-back comparison on `d.nix`: 10,790,324,524 → 10,770,466,213 instructions, ~0.18%, low variance (0.08% stddev); zero regressions) |
 | M105 — `ASNIX_ATTR_SIZE` 16 → 12 bytes: dropped the permanent 4-byte alignment pad on every attrset entry (`{uint32_t sym; uint32_t pad; Value value;}` → `{uint32_t sym; Value value;}`, the pad bought nothing -- a 4-byte `movl` zero-extends for free on x86-64, same single-instruction cost as the padded 8-byte `movq` it replaced); re-derived M93's own "~40+ call sites" estimate from scratch (narrower in practice: 8 asm stride multiplies, 7 asm + 5 C sym-field accesses needed narrowing from `movq`/`int64_t*` to `movl`/`uint32_t*` since sym is no longer followed by a zero pad) | done (see below; measured 12,698,073 real attrset entries on `d.nix`'s ffmpeg closure; peak RSS 741,568 KB → 692,152 KB, ~6.7% reduction; zero regressions) |
+| M107 — the bytecode cache's own lookup path did MORE file opens than no caching at all: the cache key required hashing the entire source file's content before even checking for a hit, so a warm-cache run was "1 source open (always) + 1 cache-entry open (on a hit)" against disabled's single open. Added a cheap mtime+size fast path (reusing the `lstat()` M83's `follow_symlink_chain` already does, no extra syscall in the common case) with a content-hash fallback + atomic self-heal when mtime/size drifts but content hasn't | done (see below; `openat` count on `d.nix`'s 1056-file closure: disabled 2444 → warm-cache 3500 (pre-fix) → **2447** (post-fix, +3 fully explained: one embedded-stub file always needs the verify path); zero regressions) |
+| M106 — packed `Thunk`'s `state` field into the low tag bits of its own `prog` field instead of a separate 8-byte word: `prog` is always a plain `IrProgram*` (malloc/calloc-aligned, low 3 bits always free, written once at creation, read once more at UNFORCED→IN_PROGRESS), unlike the originally-proposed target (`env`, whose FORCED case caches a raw `Value.raw` that already saturates all 8 combinations of the low 3 bits via `ASNIX_TAG_MASK` -- a genuine dead end, confirmed before picking `prog` instead); `ASNIX_THUNK_SIZE` 24 → 16 bytes, unlike M100's earlier rejected narrowing this one is already 8-byte-aligned so the arena's rounding doesn't claw it back | done (see below; found and tagged the 4th thunk state, `ASNIX_THUNK_STATE_FAILED` from M82's `tryEval` memoization, that an earlier description had missed; peak RSS on `d.nix` 741,976 → 723,820 KB (~2.5%); zero regressions) |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
 
@@ -11597,3 +11599,304 @@ the 12,698,073-entry count almost exactly. Output unchanged
 (`/nix/store/29iacg6h530yx7rxz4k1fhvi0kxxhsam-ffmpeg-9.0.1-bin`), byte-for-
 byte identical to the pre-change run. Narrows the gap to real Nix's own
 ~374 MB peak RSS on the same workload from ~1.98x to ~1.85x.
+## M106: pack Thunk's `state` into the low tag bits of its own `prog`
+field -- 24 bytes -> 16 bytes, a genuine (8-byte-aligned) reduction
+
+A third, independent angle on the Thunk-size problem (two other
+parallel efforts this session attacked the same struct from different
+directions: widening `Value` itself to eliminate the boxed `Thunk`
+entirely, and packing `ASNIX_ATTR_SIZE` -- unrelated struct, lower
+collision risk). This one keeps `Value` at 8 bytes and the boxed
+design intact, and instead shrinks the box: `ASNIX_THUNK_OFF_STATE=0`
+(a 4-byte enum, 4-byte padded), `ASNIX_THUNK_OFF_ENV=8` (reused three
+ways depending on state), `ASNIX_THUNK_OFF_PROG=16` (an `IrProgram*`,
+M100) -- `ASNIX_THUNK_SIZE=24`.
+
+**The idea that was proposed going in** (pack the tag into `env`'s
+spare low bits, mirroring `Value.raw`'s own `ASNIX_TAG_MASK` trick)
+turned out to be the WRONG field: `env`'s FORCED case caches a raw
+`Value.raw` word directly, and `Value.raw`'s own tag already saturates
+all 8 combinations of the low 3 bits (`ASNIX_TAG_PTR=0x0` through
+`ASNIX_TAG_PRIMOP=0x7`, value.h) -- there is no spare tag value left to
+distinguish "this word is a cached Value" from "this word is a
+state-tagged pointer" without an external discriminator, which is
+exactly the field this change is trying to eliminate. Packing `env`
+is a real dead end, not just a detail to work around.
+
+**The field that IS safe: `prog`.** Unlike `env`, `prog` is NEVER
+repurposed to hold anything other than a plain `IrProgram*` (confirmed
+by an exhaustive grep of every write site: `op_mk_thunk.S`,
+`builtins_shared.c`'s `make_thunk_from`, and the two test fixtures that
+hand-build Thunk cells) -- it's written once at creation and read
+exactly once more, during the UNFORCED->IN_PROGRESS transition (the
+jump into the thunk's body), never touched again. Every `IrProgram*`
+this field can ever hold comes from either `ib_finish`'s `calloc()` or
+`bytecode.c`'s deserializer's `malloc()` -- both glibc-guaranteed at
+least 8-byte-aligned -- so its low 3 bits are always free while
+UNFORCED. `ASNIX_THUNK_STATE_UNFORCED == 0`, so the bare pointer IS
+the correctly-tagged word with no OR needed; writing it is a single
+store. Once a thunk leaves UNFORCED, the one read that mattered
+already happened, so the word can simply be overwritten with the bare
+state tag (1/2/3), discarding the pointer bits -- exactly mirroring how
+the old separate `state` field was already overwritten in place.
+
+**Also confirmed there's a fourth state, not three:** `state` isn't
+just UNFORCED/IN_PROGRESS/FORCED -- M82 added `ASNIX_THUNK_STATE_FAILED`
+for `tryEval` memoization (`eval-okay-tryeval-failed-thunk-reeval.nix`).
+All four fit trivially in the 3 spare tag bits (only 2 are needed).
+
+**Result:** merged `state`+`prog` into one tagged 8-byte word at
+offset 0 (kept the name `ASNIX_THUNK_OFF_STATE` to minimize churn --
+UNFORCED: this word IS the clean `IrProgram*`; otherwise: the bare
+state tag alone); `env` stays at offset 8, completely untouched in
+meaning or offset. `ASNIX_THUNK_SIZE`: 24 -> 16 bytes (not 20 -- unlike
+an earlier relative-offset idea this session dropped for rounding
+straight back up to 24, 16 is itself 8-byte-aligned, so this is a real
+reduction with no arena-rounding clawback).
+
+**Call sites touched** (every read/write of
+`ASNIX_THUNK_OFF_STATE`/`ASNIX_THUNK_OFF_PROG`, re-derived via grep, not
+guessed): `op_mk_thunk.S` (creation, now one store not two),
+`builtins_shared.c`'s `make_thunk_from` (ditto), the five force-dispatch
+blocks (`force.S`, `op_var_ref.S`, `op_select.S`, `op_select_or.S`,
+`op_with.S`) -- each now extracts the state tag into a scratch register
+(`%r8`/`%rdx`, chosen per site to avoid clobbering the live prog
+pointer still held in `%rcx`) while keeping the original tagged word
+around to use directly as the prog pointer on the UNFORCED path,
+eliminating the old second memory read of `ASNIX_THUNK_OFF_PROG`
+entirely; `op_call.S`'s `OP_RET` memoization (unchanged logic, bare
+tag overwrite); `tryeval.c`'s `asnix_tryeval_unwind_inprogress`
+(unchanged logic); and the two test fixtures that hand-build Thunk
+cells (`tests/ir/test_m6_fixtures.c`, `tests/asm/test_stacklimits.c`),
+updated to mask with `ASNIX_TAG_MASK` where they compare the
+just-constructed UNFORCED state to a literal 0. `force.S` needed one
+extra wrinkle: the clean prog pointer has to survive two intervening
+`call`s to `asnix_force_scratch_{valstack,retstack}` (ordinary SysV
+calls, clobber `%rcx`), so it's stashed in `%rbp` instead -- safe
+because `%rbp`'s caller-time value is already preserved on the stack
+by this function's own prologue push, leaving the register itself free
+scratch until the matching `popq %rbp` in the epilogue.
+
+Verified: `make test`/`test-e2e` all green; `test-nix-conformance`
+`pass=655 fail=3 skip=148` unchanged (the 3 failures are the
+pre-existing, documented `getattrpos`/`inherit-attr-pos` position-
+tracking gaps, unrelated to this change); `test-nixpkgs-hash` `pass=148
+fail=0` (two transient single-package timeout flakes during repeated
+runs, each reproduced instantly and successfully in isolation --
+shared-machine contention from this session's other concurrent
+background agents, not a real regression; a clean re-run confirmed
+`pass=148 fail=0`). Measured on `./asnix d.nix` (ffmpeg's real
+closure): peak RSS 741,976 -> 723,820 KB (~18.2 MB, ~2.5%), same output
+(`outPath` byte-identical) both before and after.
+
+As of this commit, the concurrent Value-widening effort (which would
+make a boxed `Thunk` moot entirely) had NOT landed on `master`
+(`git log` still showed M102 as the latest milestone, `ASNIX_THUNK_SIZE`
+still a live, referenced constant) -- this change is a genuine,
+independent, smaller-scope complement to that larger effort, not a
+duplicate or a race lost.
+
+**Commit:** `include/asnix/ir.h`, `src/asm/force.S`,
+`src/asm/ops/{op_call,op_mk_thunk,op_select,op_select_or,op_var_ref,op_with}.S`,
+`src/c/{builtins_shared,irbuild,tryeval}.c`,
+`tests/asm/test_stacklimits.c`, `tests/ir/test_m6_fixtures.c`,
+`docs/architecture.md`.
+## M107: bytecode cache does MORE file opens than no caching at all -- mtime+size fast path, content-hash fallback
+
+A background research agent this session (working from a now-stale
+local worktree branched at M101, before M102/M103 landed on the shared
+`master` -- see this section's own "collision with M103" note below for
+why that matters) found two concrete, fixable problems in the M94/M98/
+M101 bytecode cache. This milestone implements the first (the open-
+count regression); the second (the wire format being larger than the
+source it replaced) was independently found and fixed by a *different*
+parallel agent in this same session, landed as M103 -- confirmed by
+`grep`-ing the live `docs/architecture.md`/`bytecode.c` on `master`
+mid-task and finding M103 already does exactly this (zigzag+LEB128,
+`ASNXBC01` -> `ASNXBC02`) with the same design. See the end of this
+section for how that collision is handled.
+
+### Finding 1, re-verified: the cache cost MORE opens than not caching
+
+Re-measured directly via `strace -f -c` on `./asnix d.nix` (ffmpeg's
+real 1056-file closure) before touching any code:
+
+| | `openat` calls |
+|---|---|
+| cache disabled | **2444** |
+| cache enabled, warm (pre-fix) | **3500** (+1056, exactly one extra open per cached file) |
+
+Root cause confirmed exactly as the research agent described:
+`asnix_bytecode_cache_lookup`'s key was `sha256(resolved_path, source
+bytes)` -- computing that key required opening and reading the ENTIRE
+source file on every lookup, hit or miss, before a SECOND open (the
+cache entry itself) could even happen. So "caching" cost strictly more
+opens than the normal compile path, not fewer.
+
+### The fix
+
+`bytecode_cache.c`'s on-disk entry key is now `sha256(resolved_path)`
+alone (path-only, not path+content -- see `bytecode_cache.h`'s updated
+header comment for why two different paths still never collide, and
+why this is safe). Freshness against whatever currently lives at that
+path is validated by a small fixed-width header prepended to each entry
+(`CacheHeader`: `mtime_sec`/`mtime_nsec`/`size`, plus a SHA-256 content
+hash as a fallback -- 72 bytes total, `CACHE_FORMAT_MAGIC
+"ANXCACH1"`/`CACHE_FORMAT_VERSION`, independent of `bytecode.c`'s own
+body-level magic), via two explicit steps `eval_file.c`'s
+`asnix_eval_file` now calls in order:
+
+1. **`asnix_bytecode_cache_lookup_fast`** -- takes `mtime_sec`/
+   `mtime_nsec`/`size` the caller already has (see below) and does
+   ZERO source-file I/O. Opens only the cache entry, reads its header,
+   and if the recorded mtime+size match exactly, deserializes the body
+   and returns -- a single open+read, full stop. Returns NULL + sets
+   `*out_entry_exists` if an entry exists but didn't match (ambiguous:
+   could be genuinely stale, or just touched) or if there's no entry at
+   all (plain miss).
+2. **`asnix_bytecode_cache_lookup_verify`** -- only called when step 1
+   found a mismatched entry. The caller has, by this point, already
+   read the source file anyway (an ordinary cache-miss recompile would
+   have needed to regardless), so this computes a real content hash and
+   compares it against the one recorded in the SAME entry, distinguishing
+   "mtime drifted but content is byte-identical" (e.g. `touch(1)`) from
+   "genuinely different file." On a content match it also re-stores the
+   entry with the FRESH mtime/size (atomically, via the same write-temp-
+   then-rename path `asnix_bytecode_cache_store` always used) -- a
+   self-heal that restores the fast path for this path next time, at a
+   one-time cost.
+
+**Where the mtime/size come from, free:** `eval_file.c`'s own path
+resolution (`resolve_file_path`, built on M83's `follow_symlink_chain`)
+already calls `lstat()` on the final target as part of following a
+symlink chain -- `follow_symlink_chain` now returns that `struct stat`
+directly (instead of just a `is_dir` bool) so the common direct-file-
+import case reuses it with **zero additional syscalls**. The one
+exception: `import <directory>` resolves to `<directory>/default.nix`,
+whose own mtime/size the directory's stat doesn't describe -- one more
+`stat()` (not `lstat()`, matching what `fopen`/`fread` would
+transparently follow anyway) is genuinely unavoidable there. This is
+gated behind `asnix_bytecode_cache_enabled()` so it costs nothing when
+the cache is off (see the regression below).
+
+### A regression found and fixed before landing
+
+An earlier version of this fix called that one extra `stat()`
+unconditionally inside `resolve_file_path`, regardless of whether the
+cache was even enabled -- which silently violated this whole exercise's
+own non-negotiable constraint that cache-disabled behavior stay
+provably unaffected. Caught directly via the same `strace -f -c`
+discipline used to verify the fix in the first place: the disabled
+baseline's `newfstatat` count moved from 35587 to 36228 (+641, one per
+directory-style import in ffmpeg's closure) purely from code that
+should never execute when `ASNIX_BYTECODE_CACHE` isn't set. Fixed by
+gating that one `stat()` call behind `asnix_bytecode_cache_enabled()`;
+re-verified the disabled baseline is syscall-for-syscall identical
+again (`openat`=2444, `newfstatat`=35587, matching the pre-change
+numbers exactly).
+
+### One real, expected, harmless edge case found while verifying
+
+`ASNIX_BYTECODE_CACHE_STATS=1` on `d.nix`'s warm-cache run consistently
+reports `1056 hits (1055 fast-path, 1 content-verified)`, never
+`1056/0`. Tracked down to `compiler.c`'s `ASNIX_FETCHURL_TEMP_PATH`
+(`/tmp/.asnix-corepkgs-fetchurl.nix`) -- asnix's own embedded
+`<nix/fetchurl.nix>` corepkgs stub, rewritten fresh to a fixed `/tmp`
+path on every single invocation. Same content every time, but by
+construction a brand-new mtime every run -- self-heal can't fix a file
+whose mtime changes on every read. This is precisely the documented
+mtime+size-heuristic tradeoff (see `bytecode_cache.h`'s own comment:
+the same one ccache's default mode and Nix's own eval cache both
+accept) firing correctly: never a wrong answer (output stayed byte-
+identical in every verification run below), just a permanently-skipped
+fast path for this one synthetic file out of 1056.
+
+### Verification
+
+`make test`/`make test-e2e`: unchanged, all green, cache disabled.
+`make test-nix-conformance`: `pass=655 fail=3 skip=148` -- identical to
+the session's own re-verified baseline (the three failures are the
+pre-existing, unrelated `getattrpos`/`inherit-attr-pos` gaps) -- checked
+both with the cache disabled and with `ASNIX_BYTECODE_CACHE=1` pointed
+at a fresh private cache dir, cold AND warm, all four runs giving the
+identical `pass=655 fail=3 skip=148`.
+
+`make test-nixpkgs-hash` (the gating one): `pass=148 fail=0` with the
+cache disabled (the default) -- re-confirmed after one transient
+`fail=1` (`patch.outPath(crash)`) that reproduced as a clean pass on
+immediate re-run, matching M94's own documented pattern of this
+specific shared machine's heavy concurrent-agent load producing false-
+positive crashes under `make test-nixpkgs-hash`'s 120s-per-attribute
+timeout, not a real regression. Also ran the full 74-package corpus
+with `ASNIX_BYTECODE_CACHE=1` against a fresh private cache dir, both
+cold (populates it) and warm (exercises the fast+verify lookup paths):
+`pass=148 fail=0` both times, each compared against real
+`nix-instantiate --eval` output exactly like the default-path run.
+Also ran with `ASNIX_BYTECODE_PRODUCER=1` layered on top (the M92
+fork-based prefetch producer, which also calls the new
+`asnix_bytecode_cache_store` signature) -- `pass=148 fail=0` on
+re-run (one transient `python3.src.drvPath(crash)` on the first attempt,
+same shared-machine-load pattern as above), with no leftover zombie/
+orphan processes (`ps aux` clean after the run).
+
+### Measured, before/after, on `d.nix`'s real ffmpeg closure (1056 files)
+
+| | cache disabled | warm cache, **pre**-fix | warm cache, **post**-fix |
+|---|---|---|---|
+| `openat` calls (`strace -f -c`) | 2444 | 3500 (+1056) | **2447** (+3) |
+| `newfstatat` calls | 35587 | 35587 | 36228 (+641, cache-enabled-only `default.nix` re-stats) |
+| cache dir size (1056 entries) | n/a | 91MB (pre-M103 format) | 32MB (post-M103 format, this worktree already includes M103's own fix -- see collision note) |
+| `./asnix d.nix` output | baseline | byte-identical | byte-identical |
+
+The remaining +3 opens (not a strict `<=` vs. the disabled baseline)
+are fully accounted for by the one self-regenerating stub file from the
+section above: its one occurrence needs an open for the source (needed
+anyway), a first open of the cache entry (the fast-path attempt, which
+mismatches), a second open of the same cache entry (the verify-path
+re-read), and one more for the self-heal's temp-file write -- 4 opens
+for that one file against the disabled baseline's 1, i.e. +3 overall
+across all 1056 files. Judged not worth eliminating (would mean either
+dropping the self-heal, which only shifts the same file's cost from
+"every run" to "every run anyway, just 1 fewer open," or hard-coding a
+special case for a single internal temp file) -- documenting the exact,
+fully-understood cause here rather than chasing the last 3 syscalls.
+
+Wall-clock (`hyperfine`, shared machine, `--warmup 2-3`, 20-25 runs,
+`ASNIX_BYTECODE_CACHE_DIR` pointed at a private, pre-warmed cache):
+**1.16x-1.23x** across two separate measurement runs (noisy -- hyperfine
+flagged statistical outliers on this heavily loaded shared machine both
+times), consistent with or slightly better than M101's own previously-
+measured ~1.1-1.2x and close to M101's own computed ceiling (lex+parse+
+compile is only ~200ms of `d.nix`'s ~1.6-2.1s total; a bytecode cache
+structurally cannot do better than eliminating that phase alone).
+
+### Collision with M103 -- how it's handled
+
+This work was done in an isolated git worktree branched from `master`
+at M101, per this session's standard parallel-agent workflow. Partway
+through, a live check of the shared `master` checkout (required by this
+task's own "re-verify the next-free milestone number, don't guess"
+instruction) found that M102 and M103 had already landed from OTHER
+parallel agents -- and M103 is, independently, almost exactly the
+"Finding 2" wire-format fix this task also asked for (same zigzag+
+LEB128 scheme, same `ASNXBC01`->`ASNXBC02` magic bump, arrived at
+independently). This worktree's own `src/c/bytecode.c` change (done
+before that discovery) is functionally equivalent to M103's, including
+by coincidence the identical magic-number choice, and was kept rather
+than reverted since: (1) it's correct and fully verified here, (2) this
+worktree's Finding-1 fix below is written and tested against a
+`bytecode.c` that already has the M103-equivalent varint change in
+place (both fixes share the cache-format-version-bump discipline), and
+(3) de-duplicating against M103's specific diff is an integration
+concern for whoever merges this branch onto the now-current `master`,
+not something resolvable from inside an isolated worktree with no
+access to rewrite `master`'s own history. **Whoever integrates this
+branch should take only this milestone's `bytecode_cache.c`/
+`bytecode_cache.h`/`eval_file.c` changes (the actual novel content --
+the mtime+size fast path, nowhere else in the codebase as of this
+writing) and skip re-applying this branch's redundant `bytecode.c` diff
+on top of M103's already-landed one.**
+
+**Commit:** `src/c/bytecode.c` (redundant with M103, see above),
+`src/c/bytecode_cache.c`, `src/c/bytecode_cache.h`, `src/c/eval_file.c`,
+`docs/architecture.md`.

@@ -141,29 +141,32 @@ static char *resolve_import_path(const char *path) {
  * is the symlink, but `overlay.nix` itself is a plain file) is NOT a
  * symlink itself, this loop's first lstat() sees S_ISLNK false
  * immediately, and `path` comes back completely unchanged -- so this is
- * additive, not a conflict with M57h's fix. `*is_dir_out` reports whether
- * the FINAL (post-symlink-chain) path is a directory, since the caller
- * (resolve_file_path) needs that anyway and re-stat'ing would be
- * redundant. */
-static char *follow_symlink_chain(char *canon, int *is_dir_out) {
-    struct stat st;
+ * additive, not a conflict with M57h's fix. `*out_st` reports the FINAL
+ * (post-symlink-chain) path's own stat info (mode -- so the caller can
+ * tell if it's a directory -- and, since M102/Finding 1, mtime/size too):
+ * resolve_file_path needs this anyway and re-stat'ing would be
+ * redundant; M102 additionally threads mtime/size all the way out to
+ * the bytecode cache's cheap freshness check, reusing this EXACT
+ * syscall's result with zero extra stat calls in the common direct-
+ * file-import case (see resolve_file_path's own comment for the one
+ * case -- `import <directory>` -- that still needs one more). */
+static char *follow_symlink_chain(char *canon, struct stat *out_st) {
     for (int hops = 0; hops < 1024; hops++) {
-        if (lstat(canon, &st) != 0) {
+        if (lstat(canon, out_st) != 0) {
             /* Doesn't exist (or unreadable) -- let the ordinary
              * read_file()/is_directory() error paths downstream report
              * this the same way they always have; nothing more to
              * resolve. */
-            *is_dir_out = 0;
+            memset(out_st, 0, sizeof *out_st);
             return canon;
         }
-        if (!S_ISLNK(st.st_mode)) {
-            *is_dir_out = S_ISDIR(st.st_mode);
+        if (!S_ISLNK(out_st->st_mode)) {
             return canon;
         }
         char target[4096];
         ssize_t n = readlink(canon, target, sizeof(target) - 1);
         if (n < 0) {
-            *is_dir_out = 0;
+            memset(out_st, 0, sizeof *out_st);
             return canon;
         }
         target[n] = '\0';
@@ -198,18 +201,41 @@ static char *follow_symlink_chain(char *canon, int *is_dir_out) {
  * hardening above -- a real, serious memory-safety bug, not a clean
  * error) and M57h's symlink-preserving resolution above. Split out from
  * parse_file below (M65) so asnix_eval_file can check the import cache
- * BEFORE paying for a read+lex+parse+compile+eval it might not need. */
-static char *resolve_file_path(const char *path) {
+ * BEFORE paying for a read+lex+parse+compile+eval it might not need.
+ *
+ * `*out_st` (M102/Finding 1): the FINAL path's own stat info -- for the
+ * common direct-file-import case this is simply follow_symlink_chain's
+ * own last lstat() result, already paid for, no extra syscall. The
+ * `import <directory>` case is different: follow_symlink_chain's lstat
+ * describes the DIRECTORY, not the `default.nix` file actually read
+ * below it, so one more `stat()` (not `lstat()` -- matches what
+ * `fopen`/`fread` would transparently follow anyway) would be needed to
+ * get a correct mtime/size for the file whose bytes the bytecode
+ * cache's freshness check is actually about -- EXCEPT this one extra
+ * syscall is only ever useful to the bytecode cache itself, so it's
+ * gated behind `asnix_bytecode_cache_enabled()`: with the cache off
+ * (the default), `*out_st` is simply left as the directory's own stat
+ * in this branch (never consulted by anything when the cache is
+ * disabled) and this function costs exactly the same syscalls it
+ * always did pre-M102. Found the hard way via `strace -c`: an earlier
+ * version of this fix did the extra `stat()` unconditionally, which
+ * silently violated this whole milestone's own "default/cache-disabled
+ * behavior must be provably unaffected" constraint (confirmed: it
+ * measurably added ~640 extra `newfstatat` calls to the disabled
+ * baseline on ffmpeg's real closure before this guard was added). */
+static char *resolve_file_path(const char *path, struct stat *out_st) {
     char *resolved = resolve_import_path(path);
-    int is_dir;
-    resolved = follow_symlink_chain(resolved, &is_dir);
-    if (is_dir) {
+    resolved = follow_symlink_chain(resolved, out_st);
+    if (S_ISDIR(out_st->st_mode)) {
         size_t len = strlen(resolved);
         char *with_default = malloc(len + strlen("/default.nix") + 1);
         memcpy(with_default, resolved, len);
         memcpy(with_default + len, "/default.nix", strlen("/default.nix") + 1);
         free(resolved);
         resolved = with_default;
+        if (asnix_bytecode_cache_enabled()) {
+            if (stat(resolved, out_st) != 0) memset(out_st, 0, sizeof *out_st);
+        }
     }
     return resolved;
 }
@@ -242,7 +268,9 @@ static Ast *parse_resolved_file(const char *resolved, char **base_dir_out) {
  * legitimately produce a different result per call -- caching by path
  * alone would be wrong there). */
 static Ast *parse_file(const char *path, char **resolved_out, char **base_dir_out) {
-    char *resolved = resolve_file_path(path);
+    struct stat st; /* unused here -- scopedImport never consults the bytecode
+                      * cache (see this function's own comment above) */
+    char *resolved = resolve_file_path(path, &st);
     *resolved_out = resolved;
     return parse_resolved_file(resolved, base_dir_out);
 }
@@ -368,7 +396,8 @@ const char *asnix_eval_top_level_file(void) {
 }
 
 Value asnix_eval_file(const char *path) {
-    char *resolved = resolve_file_path(path);
+    struct stat st;
+    char *resolved = resolve_file_path(path, &st);
 
     if (!g_top_level_file) {
         size_t len = strlen(resolved);
@@ -388,19 +417,57 @@ Value asnix_eval_file(const char *path) {
      * producer was started for this exact path. */
     asnix_bytecode_prefetch_wait(resolved);
 
-    char *base_dir = dir_of(resolved);
-    size_t src_len;
-    char *src = read_file(resolved, &src_len);
+    /* M102 (Finding 1): try the CHEAP fast-path cache lookup first --
+     * `st` above is already resolve_file_path's own stat result, so
+     * this costs no additional syscall in the common case. On a
+     * confirmed-fresh hit this skips dir_of()/read_file() entirely: no
+     * source-file open/read at all, just the one open+read of the
+     * cache entry itself (asnix_bytecode_cache_lookup_fast's own doing). */
+    int64_t mtime_sec = (int64_t)st.st_mtim.tv_sec;
+    int64_t mtime_nsec = (int64_t)st.st_mtim.tv_nsec;
+    int64_t fsize = (int64_t)st.st_size;
+    int entry_exists = 0;
+    IrProgram *prog = asnix_bytecode_cache_lookup_fast(resolved, mtime_sec, mtime_nsec, fsize, &entry_exists);
 
-    IrProgram *prog = asnix_bytecode_cache_lookup(resolved, src, src_len);
+    char *base_dir = NULL;
     if (!prog) {
-        size_t ntoks;
-        Token *toks = asnix_lex(src, &ntoks);
-        Ast *ast = asnix_parse(toks, ntoks, src);
-        free(toks); /* M86 perf: see parse_resolved_file's identical free() comment */
-        prog = asnix_compile(ast, base_dir, resolved);
-        asnix_bytecode_cache_store(resolved, src, src_len, prog);
-        asnix_bytecode_prefetch_imports(ast, base_dir);
+        /* Either disabled/no-entry (plain miss) or mtime/size drifted
+         * (ambiguous) -- either way we now need the source bytes, the
+         * same read an ordinary cache-miss compile would always have
+         * needed, no worse than before this fix. */
+        base_dir = dir_of(resolved);
+        size_t src_len;
+        char *src = read_file(resolved, &src_len);
+
+        if (entry_exists) {
+            /* An entry exists but didn't match on mtime/size -- try the
+             * content-hash fallback before giving up and recompiling;
+             * see asnix_bytecode_cache_lookup_verify's own comment. This
+             * is expected to fire every run for exactly one file in a
+             * typical nixpkgs closure: compiler.c's embedded
+             * `<nix/fetchurl.nix>` corepkgs stub is rewritten fresh to a
+             * fixed /tmp path (ASNIX_FETCHURL_TEMP_PATH) on every asnix
+             * invocation -- same content every time, but a new mtime by
+             * construction -- confirmed directly while verifying this
+             * fix (`ASNIX_BYTECODE_CACHE_STATS=1` on ffmpeg's real
+             * 1056-file closure consistently showed "1055 fast-path, 1
+             * content-verified", never a 1056/0 split, and the one
+             * mismatching path was always this stub). A real, harmless
+             * instance of the mtime+size heuristic's documented
+             * tradeoff: never a wrong answer, just a skipped fast path
+             * for this one file, forever (self-heal can't fix a file
+             * whose mtime changes on every single read). */
+            prog = asnix_bytecode_cache_lookup_verify(resolved, src, src_len, mtime_sec, mtime_nsec, fsize);
+        }
+        if (!prog) {
+            size_t ntoks;
+            Token *toks = asnix_lex(src, &ntoks);
+            Ast *ast = asnix_parse(toks, ntoks, src);
+            free(toks); /* M86 perf: see parse_resolved_file's identical free() comment */
+            prog = asnix_compile(ast, base_dir, resolved);
+            asnix_bytecode_cache_store(resolved, src, src_len, mtime_sec, mtime_nsec, fsize, prog);
+            asnix_bytecode_prefetch_imports(ast, base_dir);
+        }
     }
     Env *root_env = make_root_env(NULL);
     Value result = asnix_eval(prog, root_env);
@@ -424,7 +491,8 @@ Value asnix_eval_file(const char *path) {
  * means this child exits having cached nothing -- identical, from the
  * parent's point of view, to never having been forked at all. */
 void asnix_prefetch_compile_and_cache(const char *path) {
-    char *resolved = resolve_file_path(path);
+    struct stat st;
+    char *resolved = resolve_file_path(path, &st);
     char *base_dir = dir_of(resolved);
     size_t src_len;
     char *src = read_file(resolved, &src_len);
@@ -433,7 +501,8 @@ void asnix_prefetch_compile_and_cache(const char *path) {
     Ast *ast = asnix_parse(toks, ntoks, src);
     free(toks);
     IrProgram *prog = asnix_compile(ast, base_dir, resolved);
-    asnix_bytecode_cache_store(resolved, src, src_len, prog);
+    asnix_bytecode_cache_store(resolved, src, src_len, (int64_t)st.st_mtim.tv_sec, (int64_t)st.st_mtim.tv_nsec,
+                                (int64_t)st.st_size, prog);
 }
 
 /* M58: the one caller that needs make_root_env_ex's cycle-breaking
