@@ -13653,3 +13653,38 @@ to 1-2, a deterministic reduction independent of runtime values, and
 matches the exact technique a faster comparison evaluator already uses)
 -- but the actual measured wall-clock/instruction delta should be
 re-taken on a quiet host before being cited as a specific number.
+
+### irpass follow-up: `jmpthread` -- generalized jump-threading, by far the highest-firing pass in the pipeline
+
+A new pass, `jmpthread` (`src/c/irpass_jmpthread.c`): when any jump-bearing
+op (`OP_IF`/`OP_JMP`/`OP_WITH_TRY`/`OP_SELECT_OR`/`OP_SELECT_DYNAMIC_OR`)
+targets an op that is ITSELF an unconditional `OP_JMP`, redirects the
+first jump's own delta to point straight at the chain's final
+destination, collapsing the jump-to-a-jump hop(s) entirely. This is
+exactly the shape `jmpnop.c`'s own header comment anticipated ("a nested
+`if` inside an outer `if`'s then-branch... could in principle after a
+future pass shrinks the else-branch" create a jump whose target is
+itself just a jump") -- `dce_if` collapsing a dead branch, or `jmpnop`/
+`dce` removing ops, routinely leaves what used to be a two-step jump as a
+jump directly to another jump.
+
+Unlike every other pass in this framework, `jmpthread` never calls
+`asnix_irpass_remove` at all -- it only rewrites an operand (the jump
+delta) on the jump-bearing op itself, which needs no incoming-jump safety
+guard (nothing else's index or target is affected, only where THIS one
+jump lands when taken). It resolves a whole chain in one call (follows
+target -> target's own target -> ... until a non-`OP_JMP` is reached)
+rather than one hop per fixpoint iteration, with a defensive `*len+1`
+hop-count cycle guard (this compiler's forward-jump-only invariant --
+see `dce.c`'s own exhaustive argument -- means a real cycle can never
+arise, but the guard costs nothing and avoids ever looping forever if
+that invariant is somehow violated in the future).
+
+**Measured on `d.nix`** (real nixpkgs's `ffmpeg.outPath`): `jmpthread:
+405 firings` -- by far the highest-volume pass of the whole pipeline
+(cfold: 12, cmpnot: 13, dce_if: 1), confirming the "chain-creation is
+exactly what other passes expose" hypothesis this pass was built around.
+Verified: `make test`/`test-e2e`/`test-conformance` all green;
+`test-nix-conformance pass=655 fail=3 skip=148` (same 3 pre-existing
+failures); `test-nixpkgs-hash pass=148 fail=0`; output hash unchanged
+with `ASNIX_IR_OPT=1`.

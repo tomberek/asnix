@@ -17,6 +17,7 @@
 #include "irpass_dce.h"
 #include "irpass_dce_if.h"
 #include "irpass_jmpnop.h"
+#include "irpass_jmpthread.h"
 #include "irpass_strconcat.h"
 #include "symtab.h"
 #include "value_util.h"
@@ -622,6 +623,7 @@ int main(int argc, char **argv) {
     if (getenv("ASNIX_IR_OPT")) asnix_irpass_register_dce();
     if (getenv("ASNIX_IR_OPT")) asnix_irpass_register_dce_if();
     if (getenv("ASNIX_IR_OPT")) asnix_irpass_register_jmpnop();
+    if (getenv("ASNIX_IR_OPT")) asnix_irpass_register_jmpthread();
     if (getenv("ASNIX_IR_OPT")) asnix_irpass_register_strconcat();
 
     const char *file_path = NULL;

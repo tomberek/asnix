@@ -33,6 +33,7 @@
 #include "irpass_dce.h"
 #include "irpass_dce_if.h"
 #include "irpass_jmpnop.h"
+#include "irpass_jmpthread.h"
 #include "irpass_strconcat.h"
 #include "lexer.h"
 #include "parser.h"
@@ -304,6 +305,7 @@ static void register_all_passes(void) {
     asnix_irpass_register_dce();
     asnix_irpass_register_dce_if();
     asnix_irpass_register_jmpnop();
+    asnix_irpass_register_jmpthread();
     asnix_irpass_register_strconcat();
 }
 
