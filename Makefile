@@ -1,14 +1,24 @@
 INC          := -Iinclude -Isrc/c
 CC           ?= cc
 
-# Debug-by-default: fastest compile, best debugging. `make release` opts into -O2
-# for bench/ runs only -- the hot path under measurement is hand-written asm,
-# not compiler-optimized C, so the everyday loop shouldn't pay -O2 compile cost.
-OPT          ?= -O0
+# -O2 by default: a background perf-focused agent measured a genuine ~2x
+# wall-clock difference on a real nixpkgs workload between -O0 and -O2
+# (`d.nix`, ffmpeg's closure: ~9.9s -> ~4.9s user) -- plenty of real work
+# (derivation building, string/JSON/ATerm encoding, hashing) lives in
+# compiled C, not just the hand-written asm dispatch loop, so the old
+# "the hot path is asm, C doesn't matter" assumption doesn't hold for
+# this project's actual real-world workloads. `make debug` opts back
+# into -O0 for the fastest compile / most gdb-friendly build when
+# actively debugging (this session's own memory-leak investigation
+# relied on breakpoint-based debugging, where -O0's lack of
+# optimization-driven variable elision/reordering genuinely helps).
+# `release` is kept as a now-redundant alias (identical to the default)
+# so any existing script/doc referencing `make release` (e.g. bench/run)
+# keeps working unchanged.
+OPT          ?= -O2
 # `=` (recursive), not `:=` -- CFLAGS must re-expand $(OPT) at each use so
-# `release`'s target-specific `OPT := -O2` (below) actually takes effect.
-# `:=` would bake in whatever OPT was at *this* line (-O0) permanently,
-# silently making `make release` build an unoptimized binary.
+# `debug`'s target-specific `OPT := -O0` (below) actually takes effect.
+# `:=` would bake in whatever OPT was at *this* line permanently.
 CFLAGS       = -std=c11 -Wall -Wextra -g $(OPT) $(INC) -MMD -MP -U_FORTIFY_SOURCE -Wa,--noexecstack
 LDFLAGS      :=
 
@@ -36,11 +46,40 @@ TEST_C_BINS   := $(TEST_C_SRCS:.c=)
 E2E_NIX         := $(wildcard tests/e2e/*.nix)
 CONFORMANCE_NIX := $(wildcard tests/conformance/*.nix)
 
-.PHONY: all release test test-e2e test-conformance test-nix-conformance test-nixpkgs-hash clean watch
+# Stale-optimization-flag guard: `make`/`make debug`/`make release` all
+# share the same .o files but compile them with different $(OPT) values,
+# and `-MMD -MP`'s header-dependency tracking has no way to know the
+# *flags* changed (only the *sources* did) -- switching between them
+# without an explicit `make clean` silently leaves a stale mix of
+# differently-optimized objects (found this session: a background agent
+# measured a confusing ~2x "slowdown" that turned out to be exactly
+# this, not a real regression). Checked once here, at parse time --
+# before any recipe/job dispatch, so this can't race with the parallel
+# (`-j`) object-compile rules below -- against whichever OPT value this
+# invocation will actually use (only `debug` currently diverges from
+# the global default; `$(MAKECMDGOALS)` is still correct even for a
+# bare `make`/`make all`, since an empty filter result just falls
+# through to $(OPT)).
+ifneq ($(filter debug,$(MAKECMDGOALS)),)
+EFFECTIVE_OPT := -O0
+else
+EFFECTIVE_OPT := $(OPT)
+endif
+OPT_STAMP := .opt-stamp
+$(shell last=$$(cat $(OPT_STAMP) 2>/dev/null); \
+	if [ "$$last" != "$(EFFECTIVE_OPT)" ]; then \
+		rm -f $(ALL_OBJS) $(DEPS) asnix libasnix.a $(TEST_ASM_BINS) $(TEST_IR_BINS) $(TEST_C_BINS); \
+		echo "$(EFFECTIVE_OPT)" > $(OPT_STAMP); \
+	fi)
+
+.PHONY: all release debug test test-e2e test-conformance test-nix-conformance test-nixpkgs-hash clean watch
 all: asnix
 
 release: OPT := -O2
 release: asnix
+
+debug: OPT := -O0
+debug: asnix
 
 asnix: $(MAIN_OBJ) libasnix.a
 	$(CC) $(LDFLAGS) -o $@ $(MAIN_OBJ) -L. -lasnix
@@ -241,6 +280,7 @@ watch:
 clean:
 	rm -f asnix libasnix.a $(ALL_OBJS) $(DEPS) $(TEST_ASM_BINS) $(TEST_IR_BINS) $(TEST_C_BINS)
 	rm -f $(TEST_ASM_SRCS:.c=.d) $(TEST_IR_SRCS:.c=.d) $(TEST_C_SRCS:.c=.d)
+	rm -f $(OPT_STAMP)
 
 -include $(DEPS)
 -include $(TEST_ASM_SRCS:.c=.d)

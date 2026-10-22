@@ -101,7 +101,8 @@ what's actually implemented and the scope decisions made along the way.
 | M86 — real `DrvDeep` string-context closure propagation (`eval-okay-context-inputs.nix`'s `drvPath` case): two small in-memory caches (`g_drv_closure_cache`/`g_drv_outputs_cache`) reconstruct what real Nix's `computeFSClosure` would compute off a real store, purely from this process's own call-by-need derivation-construction order; re-investigated and declined the `eq-slot-elem`/`eq-slot-identity` function-identity gap a second time, with a new concrete counterexample confirming it's still a genuine representation gap, not a narrow fix | done (see below; `make test-nix-conformance`: `pass=651 fail=7` → **`pass=652 fail=6`**; zero regressions; `make test-nixpkgs-hash` still `pass=148 fail=0`) |
 | M87 — perf/memory regression triage on real nixpkgs workloads (`./asnix d.nix`, ffmpeg's closure): `builtins.intersectAttrs` was walking the LARGER attrset operand and binary-searching into the smaller one (backwards for `callPackageWith`'s own `intersectAttrs (functionArgs f) autoArgs` shape, where e1 is tiny and e2 is effectively the whole ~28,189-entry `pkgs` set); a leaked lexer token array (never freed after parsing); `IrBuilder`'s `ops`/`pool` arrays carrying permanent doubling-growth slack into every compiled program; `BTVec`'s own backing arrays never freed after `insert_attrpath`'s tree is flattened | done (see below; instructions 51.3B → 42.1B; peak RSS 1.42GB → 917MB on `d.nix`, 170MB → 134MB on `e.nix`; zero regressions) |
 | M88 — three more O(n²)-or-worse CPU hotspots fixed after discovering M86 had itself introduced a severe regression (`./asnix d.nix`: ~275 billion instructions / ~31.8s, 73.59% of cycles in `cache_own_drv_closure`'s `__strcmp_avx2` calls): `cache_own_drv_closure`'s append-only linear-scan caches and its per-call O(closure_size²) dedup scan converted to hash tables/sets; `parser.c`'s `btvec_find` (hit by every attrpath-sugar binding/attrset literal) given its own open-addressing index; `builtins_attrs.c`'s `sorted_name_order` (backing `attrNames`/`attrValues`) switched from insertion sort to `qsort` over pre-resolved names | done (see below; instructions ~275B → **~37.9B** on `d.nix`, below the pre-M86 ~42B baseline; wall ~31.8s → ~6.09s; zero regressions) |
-| M89+ | not started |
+| M89 — flipped the Makefile's default build from `-O0` to `-O2` (a background agent measured a genuine ~2x wall-clock difference on `d.nix` from the flag alone: real work like derivation-building/hashing/encoding lives in compiled C, not just the asm dispatch loop, so the old "hot path is asm, C doesn't matter" assumption didn't hold); added a `make debug` target for the old -O0/gdb-friendly behavior; added a stale-optimization-flag guard (`.opt-stamp`) so switching between `make`/`make debug`/`make release` without an explicit `make clean` can no longer silently leave a mix of differently-optimized `.o` files | done (see below; zero regressions; `make test-nixpkgs-hash` still `pass=148 fail=0`) |
+| M90+ | not started |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
 
@@ -9752,3 +9753,68 @@ parity was never at risk, and this confirms it directly.
   is micro-optimization, not an algorithmic win -- left for a future
   pass if `d.nix`'s instruction count ever needs to close the
   remaining gap to real Nix's ~12 billion.
+
+## M89: Makefile defaulted to `-O0` -- flipped to `-O2`, added a stale-flag guard
+
+A background agent investigating "should we move more C into assembly
+to reduce register spill?" found the real answer was no (checked
+`-O2` codegen directly via `objdump`: GCC already keeps live values in
+callee-saved registers across calls, no pathological spill pattern to
+fix) -- but surfaced something more fundamental in the process: this
+project's Makefile defaulted to `OPT ?= -O0` (`make`/`make -s` built
+unoptimized C; only `make release` opted into `-O2`), on a documented
+but, it turns out, outdated assumption ("the hot path under measurement
+is hand-written asm, not compiler-optimized C, so the everyday loop
+shouldn't pay -O2 compile cost"). Measured directly on `./asnix d.nix`
+(real nixpkgs's `ffmpeg` closure): **`-O0`: ~9.9s user; `-O2`: ~4.9s
+user** -- a ~2x difference from the flag alone, no code changes. A
+meaningful share of this session's own earlier perf investigations ran
+plain `make -s` (i.e. `-O0`) rather than `make release`, since the
+project's own convention made that the "normal" way to build -- the
+*relative* before/after comparisons within any single investigation
+still held (same build type both sides), but several absolute
+instruction-count/wall-clock figures reported earlier this session were
+measured against an unnecessarily slow build.
+
+Root cause of the outdated assumption: the dispatch *loop* itself is
+indeed hand-written asm, but a large and growing share of real work
+this session has been chasing (derivation-building, string/JSON/ATerm
+encoding, hashing, the M86-M88 closure-cache machinery) lives in plain
+C, compiled through this same `CFLAGS`/`$(OPT)` -- unoptimized C doing
+real algorithmic work is genuinely much slower than optimized C, even
+though the surrounding asm glue code isn't affected by the flag either
+way.
+
+Changed: `OPT` now defaults to `-O2`; a new `make debug` target
+(`OPT := -O0`) restores the old fast-compile/gdb-friendly build for
+anyone actively debugging with breakpoints (this session's own memory-
+leak investigation relied on exactly that kind of debugging, where
+`-O0`'s lack of optimization-driven variable elision/reordering
+genuinely helps); `release` is kept as a now-redundant alias (identical
+to the new default) so `bench/run` and any other existing script/doc
+referencing `make release` keeps working unchanged.
+
+Also fixed a related latent footgun found in the same investigation:
+`-MMD -MP`'s header-dependency tracking has no way to know `$(OPT)`
+itself changed (only source/header *files* trigger a rebuild), so
+switching between `make`/`make debug`/`make release` without an
+explicit `make clean` could silently leave a stale MIX of differently-
+optimized `.o` files linked into one binary. Added a `.opt-stamp` file
+recording the last-used `$(OPT)` value, checked once at Makefile parse
+time (before any recipe/job dispatch, so it can't race with the
+parallel `-j` object-compile rules) against whichever `OPT` value the
+current invocation will actually use (`$(MAKECMDGOALS)` is checked for
+an explicit `debug` goal, since that's the only target that currently
+diverges from the global default) -- a mismatch triggers an automatic
+`rm` of every object/dep/binary before the normal build rules run.
+Verified by round-tripping `make debug` -> `make` twice in a row and
+confirming each switch triggers a real full rebuild with the correct
+`-O0`/`-O2` flag (checked the actual `cc` invocation lines, not just
+the exit code).
+
+`make test`/`make test-e2e`/`make test-conformance`/`make
+test-nix-conformance`: unchanged, `pass=652 fail=6 skip=148`. `make
+test-nixpkgs-hash`: unchanged, `pass=148 fail=0` (a build-system-only
+change, not touching any hash-parity-critical file directly, but
+verified anyway since it changes which optimization level every file
+compiles at).

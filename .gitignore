@@ -5,6 +5,7 @@
 *.a
 result
 result-*
+/.opt-stamp
 
 # Compiled test binaries (built alongside their .c source, no extension)
 tests/asm/test_arena
