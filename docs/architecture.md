@@ -13688,3 +13688,59 @@ Verified: `make test`/`test-e2e`/`test-conformance` all green;
 `test-nix-conformance pass=655 fail=3 skip=148` (same 3 pre-existing
 failures); `test-nixpkgs-hash pass=148 fail=0`; output hash unchanged
 with `ASNIX_IR_OPT=1`.
+
+### irpass follow-ups: `streq`, `notfold`, `deadframe` -- three more correctness-complete passes, zero yield on this workload
+
+Three more passes from the same fleet that produced `jmpthread`, landed
+together since none touch each other's code:
+
+**`streq`** (`src/c/irpass_streq.c`): extends `cfold`'s `PUSH;PUSH;binop`
+pattern to string equality -- folds `OP_PUSH_CONST idx1; OP_PUSH_CONST
+idx2; OP_EQ`/`OP_NEQ` into `OP_PUSH_TRUE`/`OP_PUSH_FALSE` when both pool
+entries are genuine Strings, reusing `strconcat.c`'s exact "genuine
+string" tag check. Confirmed via `op_cmp.S`/`asnix_bshared_value_eq`:
+string equality is a pure length-then-`memcmp`, no context lookup at all
+(unlike `strconcat`'s union-of-contexts), so this fold needs no context
+handling whatsoever.
+
+**`notfold`** (`src/c/irpass_notfold.c`): folds `OP_PUSH_TRUE;OP_NOT` ->
+`OP_PUSH_FALSE` and the mirror case. Explicitly NOT the same as a general
+"NOT;NOT elision on an arbitrary value," which a prior session correctly
+declined (`OP_NOT`'s own runtime type check on an unknown operand must
+not be silently skipped) -- this is safe specifically because
+`PUSH_TRUE`/`PUSH_FALSE` are always genuine booleans by construction, so
+the two ops being folded ARE the entire "operand computation," with
+nothing else's type check being bypassed. Confirmed via `ir.h`'s `OP_*`
+enum: there is exactly one `NOT` op and no dedicated boolean and/or
+opcodes (`&&`/`||` compile via branch-shaped `OP_IF`/`OP_JMP`), so there's
+no other `NOT`-adjacent pattern in this IR to fold.
+
+**`deadframe`** (`src/c/irpass_deadframe.c`): removes a dead `OP_FRAME_
+ALLOC a=0 ... OP_FRAME_EXIT` bracket (keeping the body between them,
+which still runs for its own effects) once nothing inside genuinely needs
+the frame. NOT a re-do of M114 (which skips emitting the bracket entirely
+at compile time for non-rec attrsets) -- the real source here is
+`AST_LET`'s own unconditional `ib_frame_alloc(b, n)`, including `n==0`
+for a bindings-free `let in body`. The one real subtlety, found and
+handled correctly: removing the bracket changes how many real `ENV->up`
+hops any `OP_VAR_REF`-family op INSIDE it that reaches PAST it to an
+enclosing frame has to walk (confirmed concretely: `let a = 1; in (let in
+a)` compiles to an inner zero-slot frame whose own body is a `VAR_REF
+depth=1`, reaching the outer frame) -- a `local_nest`-tracking scan
+classifies each crossing reference and decrements its depth by one to
+compensate, rather than naively assuming "zero slots means nothing to
+check."
+
+**Verified** (all three, combined with `jmpthread` and M125's parser
+rewrite): `make test`/`test-e2e`/`test-conformance` all green;
+`test-nix-conformance pass=655 fail=3 skip=148` (same 3 pre-existing
+failures); `test-nixpkgs-hash pass=148 fail=0`; output hash unchanged.
+**Honest firing counts on `d.nix`**: all three fired **0 times** on this
+real workload -- real nixpkgs source has no adjacent-constant string
+`==`/`!=`, no literal `!true`/`!false`, and (per `AST_LET`'s own
+compile-time behavior) presumably no bindings-free `let in body` shape
+that survives to this bytecode-level check. Each is still landed as a
+correctness-complete, zero-added-risk safety net, matching `dce.c`'s own
+precedent (also 0 firings on this benchmark, kept anyway) -- each reuses
+100% established safety patterns from the existing 6 passes and adds no
+new value-kind, op, or runtime machinery.

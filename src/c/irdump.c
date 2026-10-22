@@ -33,8 +33,11 @@
 #include "irpass_dce.h"
 #include "irpass_dce_if.h"
 #include "irpass_jmpnop.h"
+#include "irpass_deadframe.h"
 #include "irpass_jmpthread.h"
+#include "irpass_notfold.h"
 #include "irpass_strconcat.h"
+#include "irpass_streq.h"
 #include "lexer.h"
 #include "parser.h"
 #include "symtab.h"
@@ -307,6 +310,9 @@ static void register_all_passes(void) {
     asnix_irpass_register_jmpnop();
     asnix_irpass_register_jmpthread();
     asnix_irpass_register_strconcat();
+    asnix_irpass_register_streq();
+    asnix_irpass_register_notfold();
+    asnix_irpass_register_deadframe();
 }
 
 int main(int argc, char **argv) {
