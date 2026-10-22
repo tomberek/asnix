@@ -79,7 +79,9 @@ static Value make_attrs_from_sorted(const uint32_t *syms, const Value *vals, int
     *(int64_t *)((char *)mem + ASNIX_ATTRS_OFF_COUNT) = count;
     for (int64_t i = 0; i < count; i++) {
         char *entry = (char *)mem + ASNIX_ATTRS_OFF_ENTRIES + i * ASNIX_ATTR_SIZE;
-        *(int64_t *)(entry + ASNIX_ATTR_OFF_SYM) = (int64_t)syms[i]; /* zero-extends */
+        /* M103: must be a 4-byte write -- entry's value bytes now start right after sym (no pad),
+         * so an 8-byte write here would clobber them. */
+        *(uint32_t *)(entry + ASNIX_ATTR_OFF_SYM) = syms[i];
         *(Value *)(entry + ASNIX_ATTR_OFF_VALUE) = vals[i];
     }
     return (Value){ .raw = (uint64_t)(uintptr_t)mem | ASNIX_TAG_ATTRS };

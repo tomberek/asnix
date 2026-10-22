@@ -404,7 +404,9 @@ Value asnix_bshared_make_attrs(uint32_t *syms, Value *vals, int64_t count) {
     for (int64_t i = 0; i < count; i++) {
         char *entry = (char *)mem + ASNIX_ATTRS_OFF_ENTRIES + i * ASNIX_ATTR_SIZE;
         int64_t src = entries[i].idx;
-        *(int64_t *)(entry + ASNIX_ATTR_OFF_SYM) = (int64_t)entries[i].sym; /* zero-extends */
+        /* M103: must be a 4-byte write -- entry's value bytes now start right after sym (no pad),
+         * so an 8-byte write here would clobber them. */
+        *(uint32_t *)(entry + ASNIX_ATTR_OFF_SYM) = entries[i].sym;
         *(Value *)(entry + ASNIX_ATTR_OFF_VALUE) = vals[src];
     }
     free(entries);

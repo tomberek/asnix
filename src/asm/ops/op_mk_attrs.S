@@ -14,8 +14,8 @@ asnix_op_mk_attrs:                      // a = count, b = pool index of `count` 
     pushq %rdi                          // save ENV (2 pushes -- stays 16-byte aligned)
 
     movq %rbx, %rdi
-    shlq $4, %rdi                       // rdi = count * ASNIX_ATTR_SIZE
-    addq $8, %rdi                       // rdi = 8 + count*16 (header + entries)
+    imulq $ASNIX_ATTR_SIZE, %rdi        // rdi = count * ASNIX_ATTR_SIZE (12 -- not a power of 2)
+    addq $8, %rdi                       // rdi = 8 + count*12 (header + entries)
     call asnix_arena_alloc
     movq %rbx, ASNIX_ATTRS_OFF_COUNT(%rax)
 
@@ -31,10 +31,14 @@ asnix_op_mk_attrs:                      // a = count, b = pool index of `count` 
     movq (%r12), %rdx                   // rdx = value for entries[i]
     movq %rbp, %r9
     addq %rcx, %r9
-    movq (%r13, %r9, 8), %r8            // r8 = symbol id for entries[i] (zero-extended; pad is 0)
+    movq (%r13, %r9, 8), %r8            // r8 = symbol id for entries[i] (compiler constant pool
+                                         // stores it as a plain non-negative int64_t)
     movq %rcx, %r9
-    shlq $4, %r9                        // r9 = i * ASNIX_ATTR_SIZE
-    movq %r8, ASNIX_ATTRS_OFF_ENTRIES+ASNIX_ATTR_OFF_SYM(%rax, %r9, 1)
+    imulq $ASNIX_ATTR_SIZE, %r9         // r9 = i * ASNIX_ATTR_SIZE (12 -- not a power of 2)
+    movl %r8d, ASNIX_ATTRS_OFF_ENTRIES+ASNIX_ATTR_OFF_SYM(%rax, %r9, 1) // MUST be 32-bit: M103
+        // removed the pad word, so this entry's value bytes start immediately after sym -- a movq
+        // here would zero them, about to be overwritten correctly below anyway, but write the
+        // narrow form regardless rather than relying on write-order to paper over it
     movq %rdx, ASNIX_ATTRS_OFF_ENTRIES+ASNIX_ATTR_OFF_VALUE(%rax, %r9, 1)
     jmp .Lop_mk_attrs_fill
 .Lop_mk_attrs_done:

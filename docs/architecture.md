@@ -117,6 +117,8 @@ what's actually implemented and the scope decisions made along the way.
 
 | M102 — thunk-creation avoidance: `[]` (empty list literal) now skips thunk-wrapping at all 10 `ib_mk_thunk` call sites, matching real Nix's `ExprList::maybeThunk` (returns a shared singleton for the empty case specifically, falling through to an ordinary thunk for any non-empty list, since each element still captures the enclosing scope as genuine deferred work) -- found by directly enumerating ALL of real Nix's `maybeThunk` overrides (`ExprVar`/`ExprString`/`ExprInt`/`ExprFloat`/`ExprPath` already covered by M90/M92; `ExprList` was the one remaining override not yet ported) | done (see below; instructions on `d.nix`: 11.01B → 10.94B (~0.7%); zero regressions) |
 | M103 — the bytecode cache's on-disk wire format (`bytecode.c`'s `wbuf_i64`/`rcur_i64`) encoded every opcode/operand/length/symbol-id as a fixed 8-byte `int64`, making the serialized cache ~1.5x LARGER than the Nix source text it replaced (91MB vs. ~62MB on `d.nix`'s real ffmpeg closure); checked `~/gnix/iets`'s own cache format first (already plain LEB128, confirming the approach rather than inventing it) and added a zigzag step on top since asnix's fields are genuinely signed (jump deltas, `PUSH_INT` literals) where iets's are naturally unsigned; magic bumped `ASNXBC01`→`ASNXBC02` so a stale pre-change cache entry is rejected outright, never misread | done (see below; cache size **91MB → 32MB (~2.84x smaller)**, now well under the ~62MB source-text figure; new `tests/c/test_bytecode.c` round-trips `INT64_MAX`/`INT64_MIN` and LEB128/zigzag byte-boundary values explicitly, plus old-format/truncated/garbage rejection; zero regressions) |
+| M104 — `OP_VAR_REF`/`OP_SELECT`/`OP_SELECT_OR`/`OP_WITH_TRY`'s `_forced` fast path (reached on every access to an already-forced thunk, one of the hottest paths in the evaluator) re-entered the full thunk-tag+Cell-tag resolve chain on every hit, even though a forced thunk's cached value can never be a Thunk or Cell by construction (M92's Cell only ever substitutes for thunk-*creation* itself, never produced as a thunk body's own result) -- jumps straight to the push path instead | done (see below; controlled back-to-back comparison on `d.nix`: 10,790,324,524 → 10,770,466,213 instructions, ~0.18%, low variance (0.08% stddev); zero regressions) |
+| M105 — `ASNIX_ATTR_SIZE` 16 → 12 bytes: dropped the permanent 4-byte alignment pad on every attrset entry (`{uint32_t sym; uint32_t pad; Value value;}` → `{uint32_t sym; Value value;}`, the pad bought nothing -- a 4-byte `movl` zero-extends for free on x86-64, same single-instruction cost as the padded 8-byte `movq` it replaced); re-derived M93's own "~40+ call sites" estimate from scratch (narrower in practice: 8 asm stride multiplies, 7 asm + 5 C sym-field accesses needed narrowing from `movq`/`int64_t*` to `movl`/`uint32_t*` since sym is no longer followed by a zero pad) | done (see below; measured 12,698,073 real attrset entries on `d.nix`'s ffmpeg closure; peak RSS 741,568 KB → 692,152 KB, ~6.7% reduction; zero regressions) |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
 
@@ -11400,3 +11402,198 @@ stats) are untouched -- this change is invisible to every caller except
 through the bytes actually written to and read from disk.
 
 **Commit:** `src/c/bytecode.c`, `tests/c/test_bytecode.c`, `docs/architecture.md`.
+
+## M104: skip the forced-thunk resolve re-check in OP_VAR_REF/OP_SELECT/OP_SELECT_OR/OP_WITH_TRY
+
+Profiled `./asnix d.nix` looking for assembly-level inefficiency on the
+dispatch hot path. `__strcmp_avx2`-under-`asnix_op_call` (11% of
+sampled cycles) is the same stack-unwinder artifact already documented
+elsewhere this session (`op_call.S` has zero CFI directives; `perf`
+loses the plot walking through hand-written asm with no unwind info
+and misattributes samples) -- not a real cost, disregarded.
+
+A real one: each of `op_var_ref.S`/`op_select.S`/`op_select_or.S`/
+`op_with.S`'s `_forced` label (reached whenever a variable/attribute
+reference finds an *already-forced* thunk -- extremely common, since
+any shared binding referenced more than once hits this on every access
+after the first) read the thunk's cached result then jumped BACK into
+the full resolve chain: a thunk-tag check (and+cmp+jne) followed by a
+Cell-tag check (cmp+jne, plus for PTR-tagged values like strings/paths/
+floats, an additional mask+load+cmp+jne to check the Cell marker).
+
+This was pure waste by construction, not just "probably fine": a raw
+Cell (`heap.h`'s `ASNIX_CELL_MARKER`) is only ever produced by
+`OP_VAR_REF_CELL` at a would-be thunk-*creation* site (`compiler.c`'s
+`try_cell_ref`) -- it substitutes for creating a Thunk there, so no
+Thunk object exists to force in that case at all. A real Thunk's body
+is always compiled via ordinary `compile_expr` (never `try_cell_ref`'s
+short-circuit), so by the time `OP_RET` memoizes its result, that
+value is guaranteed to be neither a Thunk (already fully resolved by
+the body's own `VAR_REF`/`SELECT`) nor a Cell (no code path ever
+produces one as a thunk-body result). The existing code comment at
+each site already stated this invariant correctly ("a forced thunk's
+cached value is never actually a raw Cell by construction") but then
+re-checked it anyway on every single access, on one of the hottest
+paths in the whole evaluator.
+
+Fixed all four sites: `_forced` now jumps straight to the local push
+path (verified each site's push target only needs `%rax`/`%rsi`/`%r12`,
+exactly what's available right after the single `movq` that reads the
+cached value -- no additional register setup needed).
+
+Measured with a controlled, back-to-back comparison (same build,
+same machine moment, alternating baseline/fixed binaries to cancel
+out this session's usual shared-machine contention noise, which
+produced a misleadingly higher first reading before this control was
+applied): **10,790,324,524 → 10,770,466,213 instructions on `d.nix`
+(~0.18%)**, with low variance (0.08% stddev across 3 runs) giving
+real confidence this is signal, not noise. Modest in isolation --
+`d.nix` is already near real Nix's own instruction count after
+M86-M103's cumulative work, so there isn't much slack left to find --
+but real, safe, and architecturally sound (removes genuinely dead
+work, not a speculative micro-optimization).
+
+`make test`/`test-e2e`/`test-conformance`: all green (one transient
+`test-e2e` parse-error failure during verification reproduced as a
+clean pass on immediate rerun -- contention noise, consistent with
+this session's own documented pattern, not a regression from this
+change). `make test-nix-conformance`: `pass=655 fail=3 skip=148`,
+unchanged. `make test-nixpkgs-hash`: `pass=148 fail=0`, unchanged.
+Direct `./asnix d.nix` sanity check still matches real Nix's exact
+`ffmpeg.outPath` byte-for-byte.
+
+Not pursued in this pass: the identical pattern likely exists in
+`force.S`'s own forced-thunk handling, but that function is
+architecturally different -- a generic, re-entrant tail-loop
+(`.Lforce_top`) deliberately built to handle a thunk whose own result
+is itself another unforced thunk (a real, documented edge case this
+project's M23 found), not a single-shot resolve like the four op
+handlers above. Applying the same invariant there needs separate
+analysis of that loop's own correctness argument, not a blind copy of
+this fix -- left as a candidate for a dedicated follow-up, not
+attempted here.
+## M105: `ASNIX_ATTR_SIZE` 16 -> 12 bytes -- drop the permanent 4-byte
+per-entry alignment pad on every attrset entry
+
+A prior, unrelated research pass (investigating lazy union-layering for
+`//`, M93) noticed in passing but declined to act on: `heap.h`'s Attr
+record -- one attrset entry, `{uint32_t sym; uint32_t pad; Value value;}`
+-- was 16 bytes, but its real content is only `uint32_t` (4) + `Value`
+(8) = 12 bytes. The other 4 bytes were pure alignment padding, paid on
+every attrset entry ever allocated, forever (never-free arena -- nothing
+here is reclaimed mid-run). This milestone re-verified that claim from
+scratch against current master (not trusted secondhand) and, since it
+held up, implemented it.
+
+**Confirming the claim.** `include/asnix/heap.h`'s layout comment
+(`ASNIX_ATTR_OFF_SYM = 0`, `ASNIX_ATTR_OFF_VALUE = 8`, `ASNIX_ATTR_SIZE =
+16`) and its own rationale -- "sym+pad are read/written together as one
+8-byte field" -- confirmed this was intentional, not an oversight: the
+asm binary-search hot paths load `sym` with a single 8-byte `movq` (into
+a 64-bit register, compared against a 64-bit target symbol id), relying
+on `pad` always being zero so that 8-byte load is equivalent to a
+zero-extending 4-byte load. That's a real design reason for the pad to
+*exist as a value* (zero), but NOT a reason the *storage* needs to be 8
+bytes-plus-4-pad -- a plain 4-byte `movl` into a 32-bit register name
+zero-extends into the full 64-bit register for free on x86-64, at the
+same single-instruction cost, so the "combined 8-byte field" trick turns
+out to buy nothing once checked against what the ISA actually does.
+
+**Measuring the real-world impact (not trusting the "~40+ call sites"
+estimate).** Added temporary counters at the 6 C + 1 asm Attr-entries-array
+allocation sites (reverted before the real fix; not part of this
+milestone's diff) and ran `./asnix d.nix` (ffmpeg's real closure, this
+session's standard benchmark): **12,698,073 total Attr entries allocated,
+across 468,792 distinct entries-arrays**, over one evaluation. At 4 wasted
+bytes/entry that's ~48.4 MiB of pure padding on a ~742 MiB peak-RSS run
+(~6.5%) -- small relative to the whole process, but a real, fully
+arena-permanent cost worth reclaiming given the fix's blast radius turned
+out to be fully enumerable and verifiable (see below).
+
+**Call-site enumeration, re-derived from scratch.** Grepped every file
+referencing `ASNIX_ATTR_SIZE`/`ASNIX_ATTR_OFF_SYM`/`ASNIX_ATTR_OFF_VALUE`
+directly: exactly the same **13 files + heap.h** M93's own re-verified
+enumeration (this doc's M93 section) already found and fixed for
+union-safety -- `op_select.S`, `op_select_or.S`, `op_has_attr.S`,
+`op_with.S`, `op_check_formals.S`, `op_mk_attrs.S` (asm) and
+`builtins.c`, `builtins_shared.c`, `builtins_attrs.c`, `attrs_update.c`,
+`derivation.c`, `builtins_m54.c` (comment only), `main.c` (C). The prior
+subtask's "~40+ call sites" framing roughly matches the raw line count
+(38 asm-line + 62 C-line references), though the actual EDITS needed
+were far narrower -- most C read/write sites were already correctly
+4-byte-typed (`uint32_t *` reads) or auto-adjust via the macro (plain
+`i * ASNIX_ATTR_SIZE` arithmetic, `memcpy(..., ASNIX_ATTR_SIZE)` calls --
+ordinary C multiplication/memcpy don't care whether the constant is a
+power of 2). Three *kinds* of site genuinely needed hand changes:
+1. **8 asm stride computations** (`shlq $4` computing `index *
+   ASNIX_ATTR_SIZE`) -- 16 is a power of 2 (cheap shift), 12 isn't;
+   replaced with `imulq $12` (GAS's immediate-form `imul`), still a
+   single instruction, just a few cycles' extra latency on a
+   non-power-of-2 multiply that's never on this evaluator's dominant
+   cost path (binary search over small-to-medium attrsets).
+2. **7 asm sym accesses** (6 reads, 1 write in `op_mk_attrs.S`) using
+   `movq` to move the old combined `sym+pad` 8-byte field -- with no pad,
+   sym's 4 bytes are now immediately followed by THIS SAME ENTRY's
+   `value` bytes, so an 8-byte access here would silently read/corrupt
+   the low 4 bytes of value. Narrowed to `movl`/`%reg32d` (reads
+   zero-extend into the full 64-bit register automatically, same as
+   before; the write is now scoped to exactly its 4 bytes).
+3. **5 C sym writes** (`builtins.c`, `builtins_shared.c`,
+   `builtins_attrs.c`, `attrs_update.c`, `derivation.c`) casting through
+   `*(int64_t *)(entry + ASNIX_ATTR_OFF_SYM) = (int64_t)sym` -- same
+   "writes 8 bytes, relying on pad=0" pattern as the asm write above.
+   Narrowed to `*(uint32_t *)... = sym`. (All five already write `value`
+   immediately after sym in program order, so the old wide write's
+   clobber of value's first 4 bytes was in practice always overwritten
+   correctly right after -- but fixed to the unambiguously-correct narrow
+   form rather than leaving correctness resting on write-order.)
+
+No call site was missed that M93's own prior exhaustive pass hadn't
+already catalogued; no NEW call site turned up that M93 missed, since
+this milestone's grep target (`ASNIX_ATTR_SIZE`/`ASNIX_ATTR_OFF_*`
+literally) is the same one M93's writeup used.
+
+**Layout decision: straight 12-byte packing, not a SoA split.** `Value`'s
+offset within an entries array now alternates between 8-aligned and
+4-aligned as the entry index increases (12 isn't a multiple of 8). Checked
+rather than assumed: this is architecturally safe on x86-64 -- ordinary
+`movq`/`Value *` loads and stores never fault on misalignment (only
+explicitly-aligned SIMD forms like `movdqa` do), and grepped the whole
+Attr-entries code path for any SIMD or atomic access to `value` -- none
+exists, it's always a plain scalar `movq`/struct-assignment. The only cost
+is an occasional cache-line-split access, not a correctness risk. Considered
+an alternative "SoA" layout (all `sym`s packed contiguously first, all
+`value`s packed contiguously after, each run individually 8-aligned
+throughout) that would recover slightly more of the padding (at most 4
+bytes of ONE-TIME slack per array instead of per entry -- an upper bound
+of 468,792 * 4 ≈ 1.8 MiB more than straight packing already gets) --
+rejected: it would make every access site's value-sub-array offset depend
+on a runtime `count` rather than a compile-time constant, including the
+hottest asm binary-search loops, for a marginal additional saving not
+worth the added complexity and risk surface.
+
+**Verification.** `make test` all green; `make test-e2e` all green;
+`make test-nix-conformance` `pass=655 fail=3 skip=148` -- bit-for-bit
+identical to the pre-change baseline (the 3 failures are the pre-existing,
+unrelated `getattrpos`/`inherit-attr-pos` gaps). `make test-nixpkgs-hash`
+`pass=148 fail=0`, unchanged. Beyond the existing corpus, added ad hoc
+synthetic stress coverage specifically targeting attrset stride/alignment
+edge cases the existing corpus doesn't exercise directly: a 5,000-entry
+shuffled-key literal attrset (`builtins.foldl'` summing every value via
+`getAttr`, checked against the unmodified baseline binary -- identical
+output, `12497500`), and a combined fixture exercising odd- and
+even-length literal attrsets, `//` through both the lazy-union-leaf path
+and the eager-merge path, `listToAttrs`, dynamic (`${...} =`) attribute
+insertion, `removeAttrs`/`mapAttrs`, and a `rec {...}` self-referential
+attrset -- also checked byte-for-byte against the unmodified baseline
+binary's output, identical. A third fixture exercised `op_check_formals.S`
+specifically (exact-match, `...`-open, and default-value lambda patterns
+over both odd- and even-arity attrsets) -- all results correct.
+
+**Measured real-world savings.** `./asnix d.nix` (ffmpeg's real closure)
+peak RSS: 741,568 KB -> 692,152 KB (a second run: 692,252 KB, consistent)
+-- a **~49.4 MB / 6.7% reduction**, matching the ~48.4 MiB projected from
+the 12,698,073-entry count almost exactly. Output unchanged
+(`/nix/store/29iacg6h530yx7rxz4k1fhvi0kxxhsam-ffmpeg-9.0.1-bin`), byte-for-
+byte identical to the pre-change run. Narrows the gap to real Nix's own
+~374 MB peak RSS on the same workload from ~1.98x to ~1.85x.

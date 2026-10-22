@@ -95,16 +95,57 @@
 #define ASNIX_LIST_OFF_ELEMS 8
 
 /* Attrs: {int64_t count; Attr entries[count];}, entries sorted by sym --
- * binary-searched by OP_SELECT. Each Attr is {uint32_t sym; uint32_t pad;
- * Value value;} = 16 bytes; sym+pad are read/written together as one
- * 8-byte field (the pad is always zero, since the compiler stores symbol
- * ids as plain non-negative int64_t in the constant pool -- see
- * src/c/compiler.c and op_mk_attrs.S). */
+ * binary-searched by OP_SELECT. Each Attr is {uint32_t sym; Value value;}
+ * PACKED to 12 bytes, no padding (M103).
+ *
+ * Before M103 this was {uint32_t sym; uint32_t pad; Value value;} = 16
+ * bytes, with `pad` a permanent, pure-alignment 4-byte tax on every
+ * attrset entry ever allocated -- in a never-free arena that's a
+ * permanent cost for the process's entire lifetime, not a transient one.
+ * Measured on `./asnix d.nix` (nixpkgs's ffmpeg.outPath, M103's
+ * instrumentation pass): 12,698,073 total Attr entries ever allocated
+ * across 468,792 entries-arrays over the run -- 4 bytes/entry is ~48.4
+ * MiB reclaimed on a ~742 MiB peak-RSS run (~6.5%).
+ *
+ * sym is now read/written as a plain 4-byte field (`movl` in asm,
+ * `uint32_t *` in C) -- NOT as an 8-byte field the way the old pad trick
+ * let it be (loading/storing `sym+pad` together as one 64-bit word was
+ * only safe because `pad` was always zero AND immediately followed by
+ * nothing else that 8-byte write/read was allowed to clobber; with no pad,
+ * entries[i].sym at offset 0 is immediately followed by entries[i].value's
+ * own bytes at offset 4, so any 8-byte (`movq`) access to the sym slot
+ * would silently read/corrupt the low 4 bytes of this SAME entry's value
+ * -- every sym access in this codebase MUST use the 4-byte-wide form).
+ * `value` is unaffected: it's still accessed as a full 8-byte `Value`
+ * (`movq`/`Value *`), just at relative offset 4 instead of 8 now.
+ *
+ * Entry stride is 12, not a power of 2, so every "index * ASNIX_ATTR_SIZE"
+ * computation in hand-written asm uses `imulq $12` (one instruction, same
+ * as the old `shlq $4` it replaces) rather than a shift. C call sites are
+ * unaffected by the non-power-of-2 stride -- `i * ASNIX_ATTR_SIZE` is
+ * ordinary C multiplication and the compiler picks whatever instruction
+ * sequence it likes.
+ *
+ * Alignment: `value`'s offset within the overall arena-allocated Attrs
+ * object alternates between 8-aligned and 4-aligned (not 8-aligned) as i
+ * increases, since 12 isn't a multiple of 8. This is architecturally safe
+ * on x86-64: plain `movq`/`Value *` loads and stores never fault on
+ * misalignment (only explicitly-aligned SIMD forms like `movdqa` do, and
+ * none of those are used on Attr entries -- checked: no SIMD, no atomics,
+ * on this array anywhere in the codebase), at most a small, rare
+ * cache-line-split cost. An alternative "SoA" layout (all syms packed
+ * first, all values packed after, each run individually 8-aligned) would
+ * recover slightly more of the 4-byte tax (down to at most 4 bytes of
+ * one-time padding PER ARRAY instead of PER ENTRY) but was rejected: it
+ * would make every access site's value-offset depend on a runtime `count`
+ * (not a compile-time constant), including the hot asm binary-search
+ * loops, for a marginal (~1.8 MiB upper bound) additional saving over the
+ * straight 12-byte-packed form -- not worth the added complexity/risk. */
 #define ASNIX_ATTRS_OFF_COUNT   0
 #define ASNIX_ATTRS_OFF_ENTRIES 8
 #define ASNIX_ATTR_OFF_SYM      0
-#define ASNIX_ATTR_OFF_VALUE    8
-#define ASNIX_ATTR_SIZE         16
+#define ASNIX_ATTR_OFF_VALUE    4
+#define ASNIX_ATTR_SIZE         12
 
 /* M88: lazy union-layering for `//`. `count` (offset 0 above) is read as a
  * signed int64_t and is never negative for an ordinary flat Attrs -- that

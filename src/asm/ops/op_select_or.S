@@ -81,8 +81,9 @@ asnix_op_select_or:
     addq %r8, %r9
     shrq $1, %r9                        // r9 = mid
     movq %r9, %r10
-    shlq $4, %r10                       // r10 = mid * ASNIX_ATTR_SIZE
-    movq ASNIX_ATTRS_OFF_ENTRIES+ASNIX_ATTR_OFF_SYM(%rax, %r10, 1), %r11
+    imulq $ASNIX_ATTR_SIZE, %r10         // r10 = mid * ASNIX_ATTR_SIZE (12 -- not a power of 2)
+    movl ASNIX_ATTRS_OFF_ENTRIES+ASNIX_ATTR_OFF_SYM(%rax, %r10, 1), %r11d // zero-extends; must be
+        // 32-bit -- M103 removed the pad word (see heap.h)
     cmpq %rdx, %r11
     je .Lselect_or_found
     jl .Lselect_or_go_right
@@ -142,7 +143,10 @@ asnix_op_select_or:
 
 .Lselect_or_forced:
     movq ASNIX_THUNK_OFF_ENV(%rax), %rax
-    jmp .Lselect_or_resolve               // M92: defensive re-check, see op_var_ref.S's matching comment
+    jmp .Lselect_or_push                  // perf: skip the resolve re-check entirely, see
+                                           // op_var_ref.S's matching .Lvar_ref_forced comment for
+                                           // the invariant proof (a forced thunk's cached value can
+                                           // never be a Thunk or a Cell)
 
     // M92: not a thunk -- check whether it's a Cell instead (see heap.h's
     // ASNIX_CELL_MARKER comment). %rcx still holds the tag bits from the

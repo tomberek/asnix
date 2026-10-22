@@ -50,8 +50,9 @@ asnix_op_has_attr:                      // a = symbol id; pops a value, pushes T
     addq %r8, %r9
     shrq $1, %r9                        // r9 = mid
     movq %r9, %r10
-    shlq $4, %r10                       // r10 = mid * ASNIX_ATTR_SIZE
-    movq ASNIX_ATTRS_OFF_ENTRIES+ASNIX_ATTR_OFF_SYM(%rax, %r10, 1), %r11
+    imulq $ASNIX_ATTR_SIZE, %r10         // r10 = mid * ASNIX_ATTR_SIZE (12 -- not a power of 2)
+    movl ASNIX_ATTRS_OFF_ENTRIES+ASNIX_ATTR_OFF_SYM(%rax, %r10, 1), %r11d // zero-extends; must be
+        // 32-bit -- M103 removed the pad word (see heap.h)
     cmpq %rdx, %r11
     je .Lhas_attr_true
     jl .Lhas_attr_go_right

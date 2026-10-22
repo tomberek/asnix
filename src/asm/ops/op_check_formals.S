@@ -92,8 +92,9 @@ asnix_op_check_formals:                 // a = required_count; b = pool_idx
     leaq (%rcx, %rdx), %r11
     sarq $1, %r11                       // r11 = mid
     movq %r11, %rax
-    shlq $4, %rax                       // rax = mid * ASNIX_ATTR_SIZE
-    movq ASNIX_ATTR_OFF_SYM(%rbp, %rax, 1), %rax // rax = loaded sym at entries[mid]
+    imulq $ASNIX_ATTR_SIZE, %rax         // rax = mid * ASNIX_ATTR_SIZE (12 -- not a power of 2)
+    movl ASNIX_ATTR_OFF_SYM(%rbp, %rax, 1), %eax // rax = loaded sym at entries[mid] (zero-extends;
+        // must be 32-bit -- M103 removed the pad word, see heap.h)
     cmpq %r15, %rax
     je .Lcf_req_found
     jl .Lcf_req_right
@@ -122,8 +123,9 @@ asnix_op_check_formals:                 // a = required_count; b = pool_idx
     cmpq %rbx, %r8
     jge .Lcf_done
     movq %r8, %rax
-    shlq $4, %rax                       // rax = j * ASNIX_ATTR_SIZE
-    movq ASNIX_ATTR_OFF_SYM(%rbp, %rax, 1), %r11 // r11 = given entries[j]'s sym (persists through the search)
+    imulq $ASNIX_ATTR_SIZE, %rax         // rax = j * ASNIX_ATTR_SIZE (12 -- not a power of 2)
+    movl ASNIX_ATTR_OFF_SYM(%rbp, %rax, 1), %r11d // r11 = given entries[j]'s sym (persists through
+        // the search; zero-extends, must be 32-bit -- M103 removed the pad word, see heap.h)
 
     xorq %rcx, %rcx                     // lo = 0
     movq %r15, %rdx                     // hi = total_count

@@ -430,7 +430,9 @@ static Value asnix_make_builtins_attrs_ex(int skip_derivation_wrapper) {
     *(int64_t *)((char *)mem + ASNIX_ATTRS_OFF_COUNT) = (int64_t)n;
     for (size_t i = 0; i < n; i++) {
         char *entry = (char *)mem + ASNIX_ATTRS_OFF_ENTRIES + i * ASNIX_ATTR_SIZE;
-        *(int64_t *)(entry + ASNIX_ATTR_OFF_SYM) = (int64_t)syms[order[i]]; /* zero-extends; see heap.h */
+        /* M103: must be a 4-byte write -- entry's value bytes now start right after sym (no pad),
+         * so an 8-byte write here would clobber them. */
+        *(uint32_t *)(entry + ASNIX_ATTR_OFF_SYM) = syms[order[i]];
         *(Value *)(entry + ASNIX_ATTR_OFF_VALUE) = vals[order[i]];
     }
     free(syms);

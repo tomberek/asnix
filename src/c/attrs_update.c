@@ -224,8 +224,9 @@ Value asnix_attrs_insert_dynamic(Value attrs, Value name_val, Value value) {
     void *mem = asnix_arena_alloc(8 + (uint64_t)(acount + 1) * ASNIX_ATTR_SIZE);
     char *out_entries = (char *)mem + ASNIX_ATTRS_OFF_ENTRIES;
     if (pos > 0) memcpy(out_entries, aentries, (size_t)pos * ASNIX_ATTR_SIZE);
-    *(int64_t *)(out_entries + pos * ASNIX_ATTR_SIZE + ASNIX_ATTR_OFF_SYM) = (int64_t)sym; /* zero-extends,
-        matching builtins_shared.c's asnix_bshared_make_attrs -- the sym slot is a full 8 bytes */
+    /* M103: must be a 4-byte write -- entry's value bytes now start right after sym (no pad),
+     * so an 8-byte write here would clobber them. */
+    *(uint32_t *)(out_entries + pos * ASNIX_ATTR_SIZE + ASNIX_ATTR_OFF_SYM) = sym;
     *(Value *)(out_entries + pos * ASNIX_ATTR_SIZE + ASNIX_ATTR_OFF_VALUE) = value;
     if (pos < acount) {
         memcpy(out_entries + (pos + 1) * ASNIX_ATTR_SIZE, aentries + pos * ASNIX_ATTR_SIZE,

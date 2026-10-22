@@ -1941,7 +1941,9 @@ Value asnix_prim_derivation(const Value *args, int64_t argc) {
     *(int64_t *)((char *)mem + ASNIX_ATTRS_OFF_COUNT) = (int64_t)nkeys;
     for (size_t i = 0; i < nkeys; i++) {
         char *e = (char *)mem + ASNIX_ATTRS_OFF_ENTRIES + i * ASNIX_ATTR_SIZE;
-        *(int64_t *)(e + ASNIX_ATTR_OFF_SYM) = (int64_t)syms[i];
+        /* M103: must be a 4-byte write -- entry's value bytes now start right after sym (no pad),
+         * so an 8-byte write here would clobber them. */
+        *(uint32_t *)(e + ASNIX_ATTR_OFF_SYM) = syms[i];
         *(Value *)(e + ASNIX_ATTR_OFF_VALUE) = vals[i];
     }
     return (Value){ .raw = (uint64_t)(uintptr_t)mem | ASNIX_TAG_ATTRS };

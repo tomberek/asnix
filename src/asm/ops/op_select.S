@@ -56,8 +56,11 @@ asnix_op_select:                        // a = symbol id; pops an attrset, pushe
     addq %r8, %r9
     shrq $1, %r9                        // r9 = mid
     movq %r9, %r10
-    shlq $4, %r10                       // r10 = mid * ASNIX_ATTR_SIZE
-    movq ASNIX_ATTRS_OFF_ENTRIES+ASNIX_ATTR_OFF_SYM(%rax, %r10, 1), %r11
+    imulq $ASNIX_ATTR_SIZE, %r10         // r10 = mid * ASNIX_ATTR_SIZE (12 -- not a power of 2)
+    movl ASNIX_ATTRS_OFF_ENTRIES+ASNIX_ATTR_OFF_SYM(%rax, %r10, 1), %r11d // zero-extends into %r11;
+        // MUST be 32-bit: M103 removed the pad word, so sym (4 bytes) is
+        // immediately followed by this same entry's value bytes -- a movq
+        // here would read into them
     cmpq %rdx, %r11
     je .Lselect_found
     jl .Lselect_go_right
@@ -118,7 +121,10 @@ asnix_op_select:                        // a = symbol id; pops an attrset, pushe
 
 .Lselect_forced:
     movq ASNIX_THUNK_OFF_ENV(%rax), %rax
-    jmp .Lselect_resolve                 // M92: defensive re-check, see op_var_ref.S's matching comment
+    jmp .Lselect_push                    // perf: skip the resolve re-check entirely, see
+                                          // op_var_ref.S's matching .Lvar_ref_forced comment for
+                                          // the invariant proof (a forced thunk's cached value can
+                                          // never be a Thunk or a Cell)
 
     // M92: not a thunk -- check whether it's a Cell instead (see heap.h's
     // ASNIX_CELL_MARKER comment). %rcx still holds the tag bits from the
