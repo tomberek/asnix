@@ -125,6 +125,7 @@ what's actually implemented and the scope decisions made along the way.
 | M109 — ported real Nix's `IndexedCallDescriptor` idea (`tomberek/nix#52`) to `mapAttrs`/`zipAttrsWith`: both build N lazy `(f name) value` thunks per call that all share the same `f`, but the per-thunk Env was re-storing `f` into a fresh 3-slot Env every time. Factored `f` out into one shared 1-slot Env (allocated once per builtin call, `asnix_bshared_make_call2_shared_env`), each per-attribute thunk now uses a 2-slot Env `{arg1, arg2}` whose `up` points at the shared Env, reading `f` via depth=1 instead of depth=0 (`asnix_bshared_make_lazy_call2_indexed`) -- no new Value kind, no new asm, no new force-path case, unlike the fuller `IndexedCallThunk` design the same PR also explores (deferring the attribute-name String's construction until the thunk is actually forced), which needs a new bytecode op or a native-call escape hatch in the force path and was left as a documented follow-on, out of scope for a one-shot | done (see below; per-thunk cost Env(3)+Thunk=48B -> Env(2)+Thunk=40B (~17%); measured on `d.nix`'s real ffmpeg closure: peak RSS 674,584 KB -> 670,796 KB (~0.56%, modest since ffmpeg's own closure doesn't lean on `mapAttrs`/`zipAttrsWith` heavily -- matches real Nix's own measured -2.1% to -4.2% gain for the analogous change); `mapAttrs` laziness canary (`attrNames (mapAttrs throw {...})` must not throw) and basic `mapAttrs`/`zipAttrsWith` correctness spot-checked directly; zero regressions) |
 | M110 — Ast nodes moved from the main never-free arena into their own dedicated, resettable chunk allocator, freed right after each top-level `asnix_compile`/`asnix_compile_scoped` call returns (an Ast tree is pure compile-time scratch, fully dead once walked into an `IrProgram`); a prior attempt at this exact change crashed on the real workload (`undefined variable 'list'` on `d.nix`, several real nixpkgs packages crashing in `test-nixpkgs-hash`) despite passing the small fixture suite -- root-caused via a zero-vs-garbage A/B test (poisoning freed chunks changed nothing, ruling out simple use-after-free; switching the chunk allocator from `malloc` to `calloc` fixed it outright): the arena it replaced is backed by zero-filled `mmap`, and at least one `Ast` constructor implicitly relied on an unset union field defaulting to zero, a latent assumption the whole codebase never had to confront until this allocator stopped providing it for free | done (see below; peak RSS on `d.nix` 736,920 → 691,780 KB (~6.2%), measured as a true paired before/after in one worktree/build; `make test-nixpkgs-hash`: `pass=148 fail=0`, including the specific packages (glib/gtk3/nix) that crashed under the original broken attempt; zero regressions) |
 | M111 — `op_select.S`'s `a.b` point lookup on a lazy union (M88/M93's `UnionHdr`) used to call `asnix_bshared_attrs_resolve`, which ALWAYS fully flattens+caches every leaf before any lookup -- even for a single key, meaning M88's deferral provided essentially zero benefit the moment a `//` result was read even once. New `asnix_bshared_attrs_probe` walks leaves highest-priority-first and binary-searches each flat leaf directly, matching real Nix's own layered `Bindings::get()` (point lookups walk the layer chain, never materializing); wired into `op_select.S` only (the hottest, most common access pattern), not into `attrs_find`/`_count`/`_sym`/`_value`'s 35+ callers, which need a stable positional index a bounded probe can't provide without materializing anyway | done (see below; peak RSS on `d.nix`: 673,748 -> 665,108 KB, ~1.3% reduction; instructions essentially flat, 10.874B -> 10.938B, within measurement noise; zero regressions) |
+| M112 — `asnix_attrs_eager_merge` (the `//`-operator eager-copy path) never incremented `asnix_stats_attrs`/`asnix_stats_attrs_entries` (M108), making its real allocation cost invisible to `ASNIX_SHOW_STATS=1` -- a dedicated investigation found this was the dominant source (116.0 MB of ~142MB) of an "unattributed" arena gap a manual stats-based tally couldn't explain. Added the missing increment (using the actual post-dedup entry count `k`, not the worst-case upper bound allocated) | done (see below; `sets` count jumped 246,871 → 404,878 and `entries` 1,314,751 → 10,742,641 once this call site's real volume became visible; zero regressions) |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
 
@@ -12235,3 +12236,32 @@ touch) was real and is now fixed for the single most common access
 pattern, but the remaining materialize-on-full-iteration cost is
 inherent to needing a flat, indexable, deduped view at all, and wasn't
 and isn't attempted here.
+
+## M112: `asnix_stats_attrs` now counts `asnix_attrs_eager_merge`'s real volume
+
+A dedicated investigation into an "unattributed" ~142MB gap in the
+arena (found by manually tallying `ASNIX_SHOW_STATS=1`'s counts x
+exact struct sizes, and coming up ~42% short of
+`asnix_arena.total_allocated`) traced the gap to `attrs_eager_merge`
+(the `//`-operator eager-copy path, `attrs_update.c`): it allocates
+worst-case-sized buffers for every eager merge but never incremented
+`asnix_stats_attrs`/`asnix_stats_attrs_entries` (M108), making its
+real cost -- measured independently at 116.0 MB across 158,007 calls,
+nearly the entire gap -- completely invisible to the stats feature.
+
+Added the missing increment at the end of the function, using the
+actual post-dedup entry count (`k`, the real stored-entry count) rather
+than the worst-case `acount+bcount` upper bound that gets allocated --
+matching the convention `asnix_bshared_make_attrs` already uses
+elsewhere in this file for the same reason (the stats feature should
+report real occupancy, not allocated capacity).
+
+`ASNIX_SHOW_STATS=1 ./asnix d.nix`: `sets` 246,871 -> 404,878,
+`entries` 1,314,751 -> 10,742,641 -- this one call site alone now
+accounts for the majority of both counters, matching its already-
+established status as the single largest named allocation site in the
+whole program.
+
+`make test`/`test-e2e`/`test-conformance` unchanged, all green.
+`make test-nix-conformance`: `pass=655 fail=3 skip=148` unchanged.
+`make test-nixpkgs-hash`: `pass=148 fail=0` unchanged.

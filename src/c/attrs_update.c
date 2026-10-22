@@ -7,6 +7,7 @@
 
 #include "asnix/arena.h"
 #include "asnix/heap.h"
+#include "asnix/stats.h" /* M112: visibility into this call site's real byte cost */
 #include "builtins_shared.h" /* asnix_bshared_type_name, see M50 */
 #include "string_context.h" /* M80: dynamic attr-name context rejection */
 #include "symtab.h"
@@ -104,6 +105,8 @@ Value asnix_attrs_eager_merge(Value lhs, Value rhs) {
     }
 
     *(int64_t *)((char *)mem + ASNIX_ATTRS_OFF_COUNT) = k;
+    asnix_stats_attrs++;
+    asnix_stats_attrs_entries += (uint64_t)k;
     return (Value){ .raw = (uint64_t)(uintptr_t)mem | ASNIX_TAG_ATTRS };
 }
 
