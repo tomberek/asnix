@@ -551,6 +551,23 @@ static int is_thunk_free_literal(Ast *node) {
             return 1;
         case AST_PATH:
             return !node->as.path.is_search && node->as.path.interp_count == 0;
+        case AST_LIST:
+            /* M101-era find: real Nix's own `ExprList::maybeThunk`
+             * (~/nix/gc-unlock/src/libexpr/eval.cc) special-cases ONLY
+             * the empty list -- it returns a shared singleton Value,
+             * never allocating a Thunk for `[]` wherever it appears as a
+             * list element/binding value/call argument/etc. A NON-empty
+             * list falls through to an ordinary thunk there, because
+             * each element still captures the enclosing scope (genuine
+             * deferred work: `let x = [(abort "x")]; in 5` must not run
+             * the element's code merely by resolving `x`'s binding slot,
+             * same invariant M53's own per-element thunking already
+             * protects). The empty case has no elements to capture and
+             * compiles to a single zero-cost `ib_mk_list(b, 0)` (see the
+             * AST_LIST case in compile_expr below) -- same "no captured
+             * scope, no deferred work" criteria as every other case in
+             * this switch. */
+            return node->as.list.count == 0;
         default:
             return 0;
     }

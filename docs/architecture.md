@@ -115,6 +115,8 @@ what's actually implemented and the scope decisions made along the way.
 | M100 — merge Thunk's/Closure's separate `body`+`pool` pointers into a single `IrProgram*` (`ASNIX_THUNK_OFF_PROG`/`ASNIX_CLOSURE_OFF_PROG`): a narrower 32-bit index/offset encoding was investigated and rejected on a measured basis -- `asnix_arena_alloc` rounds every allocation up to the next multiple of 8 bytes, so a 20-byte and a 24-byte Thunk consume the identical 24 bytes from the arena, meaning a narrower field buys nothing once that rounding is accounted for | done (see below; instructions on `d.nix` unchanged (10.90B → 10.87B, within noise, as expected for a memory-only change); peak RSS **766,468 KB → 742,552 KB (~3.1%)**; zero regressions) |
 | M101 — fixed a real bug in `bytecode.c`'s `OP_MK_THUNK`/`OP_LAMBDA` (de)serialization: M100 collapsed `ib_mk_thunk`/`ib_lambda` to push one `IrProgram*` pool slot instead of a `{ops,pool}` pair, but `write_one_op`/the `PTAG_OP_THUNK`/`PTAG_OP_LAMBDA` deserialize cases weren't updated, so the serializer read garbage for 1055 of 1056 real files' programs and silently refused to cache almost everything (`0.1%` store rate) -- both M98's and a follow-up subtask's own "1.1-1.2x speedup, 100% hit rate" measurements were taken against M98/pre-M100 code and genuinely valid at the time, but had gone stale the moment M100 landed on top | done (see below; store rate restored to 100% (1056/1056), confirmed correct output and zero regressions; real speedup re-measured post-fix: still only ~1.13x, revealing the cache's true ceiling for this workload -- lex+parse+compile of all 1056 files costs only ~200ms of `d.nix`'s ~1.66s total wall-clock, the rest being genuine evaluation work (derivation building, closure hashing, thunk forcing) bytecode caching can't touch) |
 
+| M102 — thunk-creation avoidance: `[]` (empty list literal) now skips thunk-wrapping at all 10 `ib_mk_thunk` call sites, matching real Nix's `ExprList::maybeThunk` (returns a shared singleton for the empty case specifically, falling through to an ordinary thunk for any non-empty list, since each element still captures the enclosing scope as genuine deferred work) -- found by directly enumerating ALL of real Nix's `maybeThunk` overrides (`ExprVar`/`ExprString`/`ExprInt`/`ExprFloat`/`ExprPath` already covered by M90/M92; `ExprList` was the one remaining override not yet ported) | done (see below; instructions on `d.nix`: 11.01B → 10.94B (~0.7%); zero regressions) |
+
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
 
 - **Value**: 8-byte pointer-tagged word, never-free bump arena, no GC.
@@ -11230,3 +11232,49 @@ cache's own storage path) wasn't actually the reason the measured
 benefit stayed modest -- the workload's own time distribution is.
 
 **Commit:** `src/c/bytecode.c`, `docs/architecture.md`.
+
+## M102: thunk-creation avoidance for the empty list literal (`[]`)
+
+Directly enumerated every override of real Nix's `Expr::maybeThunk`
+(`~/nix/gc-unlock/src/libexpr/eval.cc`, grepped exhaustively rather
+than trusting a prior session's partial list): `ExprVar`, `ExprString`,
+`ExprInt`, `ExprFloat`, `ExprPath` (all five already ported --
+M90 covers the four literal kinds, M92 covers `ExprVar`'s slot-aliasing)
+-- and one not yet ported, `ExprList::maybeThunk`:
+
+```cpp
+Value * ExprList::maybeThunk(EvalState & state, Env & env)
+{
+    if (elems.empty()) {
+        return &Value::vEmptyList;
+    }
+    return Expr::maybeThunk(state, env);
+}
+```
+
+Only the EMPTY list gets the shortcut (a shared singleton `Value`,
+zero allocation); any non-empty list falls through to an ordinary
+thunk, because each element still captures the enclosing scope as
+genuine deferred work (`let x = [(abort "x")]; in 5` must not run the
+element's code merely by resolving `x`'s binding slot -- the same
+invariant M53 already protects via per-element thunking, confirmed
+unaffected: a direct check, `let x = [(abort "boom")]; in 5`, still
+returns `5`).
+
+Added `AST_LIST` (gated on `count == 0`) to `compiler.c`'s
+`is_thunk_free_literal`, applying at the same 10 `ib_mk_thunk` call
+sites M90/M92 already touch. The empty case already compiles to a
+single zero-cost `ib_mk_list(b, 0)` (no captured scope, no per-element
+work) -- same "no captured scope, no deferred work" criteria as every
+other case in that switch.
+
+Verified: `let x = []; in builtins.length x` -> `0`;
+`let x = [(abort "boom")]; in 5` -> `5` (non-empty list still lazy);
+`let x = []; y = [1 2]; in [x y]` -> `[ [ ] [ 1 2 ] ]`.
+`make test`/`test-e2e`/`test-conformance` all green; `test-nix-conformance`
+`pass=655 fail=3 skip=148` unchanged; `test-nixpkgs-hash` `pass=148
+fail=0` unchanged. Measured on `./asnix d.nix` (ffmpeg's real closure):
+instructions 11.01B -> 10.94B (~0.7%, cpu_core), peak RSS unchanged
+within noise (742,452 -> 742,712 KB) -- a small, modest win, consistent
+with empty-list literals being a real but not dominant pattern in real
+nixpkgs code (e.g. `imports = [];`-shaped NixOS-module defaults).
