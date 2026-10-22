@@ -397,16 +397,22 @@ static int write_one_op(WBuf *b, IrOp *op, int64_t *pool) {
             return write_value(b, v);
         }
         case OP_MK_THUNK: {
-            IrProgram child = { .ops = (IrOp *)(intptr_t)pool[op->b], .pool = (int64_t *)(intptr_t)pool[op->b + 1] };
+            /* M100: pool[op->b] is now a single IrProgram* (ib_mk_thunk
+             * pushes one pool slot, not a {ops,pool} pair) -- dereference
+             * it directly instead of reading two separate pool slots. */
+            IrProgram *child = (IrProgram *)(intptr_t)pool[op->b];
             wbuf_u8(b, PTAG_OP_THUNK);
-            return write_program(b, &child);
+            return write_program(b, child);
         }
         case OP_LAMBDA: {
-            IrProgram child = { .ops = (IrOp *)(intptr_t)pool[op->b], .pool = (int64_t *)(intptr_t)pool[op->b + 1] };
-            Value formals = { .raw = (uint64_t)pool[op->b + 2] };
+            /* M100: same single-IrProgram*-slot layout as OP_MK_THUNK
+             * above; formals moved from pool[op->b+2] to pool[op->b+1]
+             * since the child program no longer occupies two slots. */
+            IrProgram *child = (IrProgram *)(intptr_t)pool[op->b];
+            Value formals = { .raw = (uint64_t)pool[op->b + 1] };
             wbuf_u8(b, PTAG_OP_LAMBDA);
             wbuf_i64(b, op->a); /* arity */
-            if (write_program(b, &child) != 0) return -1;
+            if (write_program(b, child) != 0) return -1;
             return write_value(b, formals);
         }
         case OP_ASSERT_FAIL: {
@@ -643,8 +649,13 @@ static int read_one_tagged_op(RCur *r, DBuilder *d) {
              * gdb: "Program received signal SIGSEGV... 0x000000000000000c",
              * `0xc` being a small op-id, not a code address). */
             ir_link(child.ops, child.len);
-            int64_t idx = db_pool_add(d, (int64_t)(intptr_t)child.ops);
-            db_pool_add(d, (int64_t)(intptr_t)child.pool);
+            /* M100: Thunk/Closure's runtime consumer expects ONE pool
+             * slot holding an IrProgram*, not a {ops,pool} pair -- box
+             * the freshly-read child the same way ib_finish does. */
+            IrProgram *child_prog = malloc(sizeof(IrProgram));
+            child_prog->ops = child.ops;
+            child_prog->pool = child.pool;
+            int64_t idx = db_pool_add(d, (int64_t)(intptr_t)child_prog);
             db_emit(d, OP_MK_THUNK, 0, idx);
             return d->failed ? -1 : 0;
         }
@@ -655,8 +666,10 @@ static int read_one_tagged_op(RCur *r, DBuilder *d) {
             ir_link(child.ops, child.len); /* see PTAG_OP_THUNK's identical comment above */
             Value formals;
             if (read_value(r, &formals) != 0) return -1;
-            int64_t idx = db_pool_add(d, (int64_t)(intptr_t)child.ops);
-            db_pool_add(d, (int64_t)(intptr_t)child.pool);
+            IrProgram *child_prog = malloc(sizeof(IrProgram));
+            child_prog->ops = child.ops;
+            child_prog->pool = child.pool;
+            int64_t idx = db_pool_add(d, (int64_t)(intptr_t)child_prog);
             db_pool_add(d, (int64_t)formals.raw);
             db_emit(d, OP_LAMBDA, arity, idx);
             return d->failed ? -1 : 0;

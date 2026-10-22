@@ -113,7 +113,7 @@ what's actually implemented and the scope decisions made along the way.
 | M98 — bytecode cache visibility + measured real speedup: `ASNIX_BYTECODE_CACHE_STATS=1` now prints a one-line hits/misses/stores summary to stderr at exit (the cache was otherwise completely silent -- a stale/corrupt entry or "never looked up" were all indistinguishable from the outside); measured in a clean, isolated worktree (not the noisy shared-contention measurements from M94's own landing): 100% hit rate on `d.nix`'s ffmpeg closure (1056/1056 files) | done (see below; `hyperfine -m 8`: **1.11x faster** (1.68s → 1.52s mean) at full cache warmth; zero regressions) |
 | M99 — `irdump`, a companion tool that lexes+parses+compiles a `.nix` file through this project's own pipeline and pretty-prints the resulting `IrProgram`: one line per op (mnemonic resolved via a reverse lookup through `asnix_handler_table`, since `ir_link()` has already overwritten each op's original op-id with a real handler address by the time a program is compiled), symbol ids resolved to names, jump deltas resolved to target op indices, `OP_PUSH_CONST`'s pool entry resolved to a brief printable value, recursing into every distinct nested child program reached via `OP_LAMBDA`/`OP_MK_THUNK` (each printed once, keyed by pointer identity) | done (see below; `./irdump <file.nix>`, built on demand via `make irdump`, not part of the default build) |
 | M100 — merge Thunk's/Closure's separate `body`+`pool` pointers into a single `IrProgram*` (`ASNIX_THUNK_OFF_PROG`/`ASNIX_CLOSURE_OFF_PROG`): a narrower 32-bit index/offset encoding was investigated and rejected on a measured basis -- `asnix_arena_alloc` rounds every allocation up to the next multiple of 8 bytes, so a 20-byte and a 24-byte Thunk consume the identical 24 bytes from the arena, meaning a narrower field buys nothing once that rounding is accounted for | done (see below; instructions on `d.nix` unchanged (10.90B → 10.87B, within noise, as expected for a memory-only change); peak RSS **766,468 KB → 742,552 KB (~3.1%)**; zero regressions) |
-| M101+ | not started |
+| M101 — fixed a real bug in `bytecode.c`'s `OP_MK_THUNK`/`OP_LAMBDA` (de)serialization: M100 collapsed `ib_mk_thunk`/`ib_lambda` to push one `IrProgram*` pool slot instead of a `{ops,pool}` pair, but `write_one_op`/the `PTAG_OP_THUNK`/`PTAG_OP_LAMBDA` deserialize cases weren't updated, so the serializer read garbage for 1055 of 1056 real files' programs and silently refused to cache almost everything (`0.1%` store rate) -- both M98's and a follow-up subtask's own "1.1-1.2x speedup, 100% hit rate" measurements were taken against M98/pre-M100 code and genuinely valid at the time, but had gone stale the moment M100 landed on top | done (see below; store rate restored to 100% (1056/1056), confirmed correct output and zero regressions; real speedup re-measured post-fix: still only ~1.13x, revealing the cache's true ceiling for this workload -- lex+parse+compile of all 1056 files costs only ~200ms of `d.nix`'s ~1.66s total wall-clock, the rest being genuine evaluation work (derivation building, closure hashing, thunk forcing) bytecode caching can't touch) |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
 
@@ -11148,3 +11148,85 @@ regressions. `make test-nixpkgs-hash`: `pass=148 fail=0`, unchanged --
 verified even though this change doesn't touch `derivation.c` directly,
 since it does touch the core Thunk/Closure representation used by
 every single evaluation.
+
+## M101: real root-cause of the bytecode cache's own low "store" rate -- M100 broke the serializer, and fixing it reveals the cache's true ceiling
+
+Directive: "bytecode caching should be a bigger benefit... why is it so
+slow?" Investigated by instrumenting `ASNIX_BYTECODE_CACHE_STATS=1` on a
+*freshly emptied* cache directory and running `./asnix d.nix` (real
+nixpkgs's `ffmpeg.outPath`, 1056 distinct files) -- expected `0 hits,
+1056 misses, 1056 stores` on a cold population run; got **`0 hits, 1056
+misses, 1 stores`**. Only one file out of 1056 was ever actually written
+to the cache.
+
+Root cause: `bytecode.c`'s `write_one_op` (`OP_MK_THUNK`/`OP_LAMBDA`
+cases) and the mirror-image deserialize cases (`PTAG_OP_THUNK`/
+`PTAG_OP_LAMBDA`) were written against the PRE-M100 pool layout, where
+`ib_mk_thunk`/`ib_lambda` pushed a child program as a `{ops, pool}` PAIR
+of pool slots. M100 (landed earlier this session, `f47ec48`) collapsed
+that to a SINGLE pool slot holding one `IrProgram*` pointer -- but
+`bytecode.c` was never updated to match, since M100's own verification
+never exercised the bytecode cache at all (it's opt-in, off by default,
+and M100's test suite run didn't set `ASNIX_BYTECODE_CACHE=1`). The
+serializer kept reading `pool[op->b]`/`pool[op->b+1]` as two separate
+pointers -- now reading the single `IrProgram*` as if it were `child.ops`,
+and (for `OP_LAMBDA`) the `formals` value or out-of-bounds garbage as
+`child.pool` -- which then fails `write_program`'s own recursive
+validation almost every time (any real nixpkgs file has a thunk or
+lambda in it), silently refusing to cache it (`asnix_bytecode_serialize`
+returning -1, which `asnix_bytecode_cache_store` treats as "some
+construct this format doesn't support, just skip it" -- indistinguishable
+from a genuine unsupported-construct case without digging in).
+
+This also explains an apparent contradiction: M98's own measurement
+(`1.11x`, 100% hit rate) and a follow-up subtask's independent
+re-measurement (`1.19x`, also 100% hit rate, confirmed via stats) were
+BOTH taken at `ec69c74` (M98's own HEAD) -- genuinely correct at the
+time, before M100 existed. M100 landed on top afterward and broke the
+serializer without either measurement being re-run against the new
+code. Nothing wrong with either of those two reports; they'd simply gone
+stale by the time this investigation started.
+
+**Fix:** `write_one_op`'s `OP_MK_THUNK`/`OP_LAMBDA` cases now dereference
+`pool[op->b]` directly as an `IrProgram*` instead of reading two pool
+slots as `{ops,pool}`; `OP_LAMBDA`'s `formals` read shifted from
+`pool[op->b+2]` to `pool[op->b+1]` to match the one-slot-shorter layout.
+The deserialize side's `PTAG_OP_THUNK`/`PTAG_OP_LAMBDA` cases now
+heap-allocate a proper `IrProgram` struct for the freshly-read child
+(same shape `ib_finish` itself builds) and push ONE pool slot holding a
+pointer to it, instead of pushing `child.ops`/`child.pool` as two
+separate raw pointers.
+
+**Verified the fix is real:** fresh-cache population run now shows `0
+hits, 1056 misses, 1056 stores` (was `1 stores`); a second run against
+that now-fully-populated cache shows `1056 hits, 0 misses, 0 stores
+(100.0% hit rate)` (was effectively 0% in practice, since almost nothing
+had ever been stored to hit against); output confirmed byte-identical to
+cache-disabled (`./asnix d.nix` still prints the correct, previously-
+verified ffmpeg store path). `make test`/`test-e2e`/`test-conformance`
+unchanged, all green. `make test-nix-conformance`: `pass=655 fail=3
+skip=148`, identical to baseline. `make test-nixpkgs-hash` (cache
+disabled, the default path): `pass=148 fail=0`, unchanged -- verified
+even though this change doesn't touch `derivation.c` directly, since it
+does touch the core Thunk/Closure representation used by every single
+evaluation.
+
+**The honest answer to "why is it so slow" turned out to be a different
+finding than "the cache was broken":** fixing the serializer bug (going
+from ~0.1% effective caching to a genuine 100% hit rate) produced almost
+NO additional wall-clock improvement over the already-measured ~1.1-1.2x
+-- re-measured post-fix at **~1.13x** (1.658s -> 1.464s mean,
+`hyperfine -m 8 --warmup 2`, properly pre-warmed cache this time, not the
+partially-warming methodology either of the two earlier measurements
+used). This reveals the real ceiling: lex+parse+compile of all 1056
+distinct files in ffmpeg's closure costs only ~200ms out of `d.nix`'s
+~1.66s total wall-clock. The other ~1.3s+ is genuine evaluation work --
+derivation building, closure hashing (M95/M101... see M95's own section),
+thunk forcing -- that a BYTECODE cache, which only ever skips the
+lex/parse/compile PHASE, structurally cannot help with. The user's
+instinct that "this should be a bigger benefit" was right to question,
+but the bug it led to finding (a real, now-fixed correctness issue in the
+cache's own storage path) wasn't actually the reason the measured
+benefit stayed modest -- the workload's own time distribution is.
+
+**Commit:** `src/c/bytecode.c`, `docs/architecture.md`.
