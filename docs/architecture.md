@@ -110,7 +110,8 @@ what's actually implemented and the scope decisions made along the way.
 | M95 — root-caused why M93's attrset-union layering showed no measurable win on the real `d.nix`/ffmpeg workload: it wasn't attrset layering at all -- `perf record` showed `cache_own_drv_closure` (derivation.c) at 43%+ of cycles, eagerly re-flattening every derivation's ENTIRE transitive closure (unioning each direct input's already-flattened closure into a brand-new hash set) for every one of ~100 derivations built, even though the only real consumer of a flattened closure is a rare `DrvDeep` context expansion. Changed to store only the direct layer at build time; added lazy, memoized materialization (`drv_closure_materialize`) triggered only by that one real consumer | done (see below; instructions on `d.nix` ~29.7B → **~12.07B**, matching real Nix's own ~12.0B; wall ~4.3s → ~2.1s; zero regressions) |
 | M96 — three more non-arena memory leaks found via an LD_PRELOAD malloc tracer: nine parser.c vector-to-AST handoff sites (`BindingVec`/`PartVec`/`AstVec`/`FormalVec`) carried permanent doubling-growth slack into AST storage (same pattern M87 fixed for `IrBuilder`, just never applied here); `btvec`'s own hash-index array (added by M88, after M87's free was written) was never freed alongside its `.items`; `ib_finish` never freed the outer `IrBuilder` struct itself (48 bytes × hundreds of thousands of calls) after pulling its `ops`/`pool` arrays out into the permanent `IrProgram` | done (see below; peak RSS on `d.nix` 853MB → **767MB** (~10%); zero regressions) |
 | M97 — `aterm.c`'s `buf_put_escaped` (`.drv` ATerm string escaping) and `builtins_compare.c`'s `jb_escape_string` (`toJSON` string escaping) paid a function-call + bounds-check (`buf_putc`→`buf_reserve` / `jb_putc`→`jb_ensure`) for every single output byte, even the overwhelming majority that need no escaping at all; rewritten to scan ahead to the next byte that actually needs escaping and bulk-copy the whole safe run in one call, output byte-for-byte identical | done (see below; instructions on `d.nix` ~11.79B → **~10.89B** (-7.6%), now below real Nix's own ~12.0-12.25B; zero regressions) |
-| M98+ | not started |
+| M98 — bytecode cache visibility + measured real speedup: `ASNIX_BYTECODE_CACHE_STATS=1` now prints a one-line hits/misses/stores summary to stderr at exit (the cache was otherwise completely silent -- a stale/corrupt entry or "never looked up" were all indistinguishable from the outside); measured in a clean, isolated worktree (not the noisy shared-contention measurements from M94's own landing): 100% hit rate on `d.nix`'s ffmpeg closure (1056/1056 files) | done (see below; `hyperfine -m 8`: **1.11x faster** (1.68s → 1.52s mean) at full cache warmth; zero regressions) |
+| M99+ | not started |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
 
@@ -10948,3 +10949,55 @@ itself (a true sequential/branchy scan either way, not a drop-in
 intrinsics win) -- this milestone's fix addresses the actually-
 dominant cost (per-byte call overhead), which was the right layer to
 fix first and may remove the need for SIMD here entirely.
+
+## M98: bytecode cache hit/miss visibility, and the real speedup number M94 never got
+
+M94 implemented the opt-in on-disk bytecode cache but, by its own
+admission, never got a reliable wall-clock speedup measurement --
+this session's shared-machine contention (multiple concurrent `/subtask`
+forks hammering the same box) made any such number unreliable at the
+time. The user asked directly: measure it, or add a way to see whether
+it's even getting hits at all. Both, since the cache was previously
+silent by design (a miss, a corrupt entry, and "this path was never
+looked up" were all indistinguishable from the outside -- there was no
+way to tell a working-but-cold cache from a silently-broken one).
+
+Added `ASNIX_BYTECODE_CACHE_STATS=1` (on top of `ASNIX_BYTECODE_CACHE=1`):
+process-lifetime counters (`g_stat_hits`/`g_stat_misses`/`g_stat_stores`,
+plain globals -- no synchronization needed since the fork-based M94
+prefetch children never share them with the parent process) incremented
+at `asnix_bytecode_cache_lookup`'s three failure points plus its one
+success path, and at `asnix_bytecode_cache_store`'s one success path;
+printed via an `atexit`-registered handler, lazily registered the first
+time either function actually runs with the cache enabled.
+
+Measured properly this time: a dedicated `git worktree` at the current
+commit, confirmed quiet (`uptime` load average ~1.5, not the 30+ seen
+elsewhere this session), `hyperfine --warmup 2 -m 8` comparing
+cache-disabled against a fully-warm cache (populated by one prior run)
+on `d.nix` (ffmpeg's real closure, 1056 distinct files compiled):
+
+```
+no cache:   1.680s +/- 0.090s  [User: 1.288s, System: 0.391s]
+warm cache: 1.518s +/- 0.049s  [User: 1.115s, System: 0.402s]
+-> warm cache ran 1.11x faster than no cache
+```
+
+Confirmed `ASNIX_BYTECODE_CACHE_STATS=1` itself reports `1056 hits, 0
+misses, 0 stores (100.0% hit rate)` on that same warm run -- the cache
+is working exactly as designed, the 1.11x is the real number for this
+workload, not an artifact of a partial hit rate. A single uncontrolled
+before/after pair (not the full `hyperfine` run) initially looked like
+a wash or even a slight regression -- within the measured +/-0.05-0.09s
+noise band, a reminder that this project's own single-run perf claims
+earlier in the session needed the same `-m N` averaging discipline to
+trust, not just a one-off `time` invocation.
+
+`make test`/`make test-e2e` unchanged, all green, in the same isolated
+worktree. Not re-run against `test-nix-conformance`/`test-nixpkgs-hash`
+specifically for this milestone -- M94's own landing already verified
+the cache's correctness exhaustively (byte-for-byte identical output,
+hit and miss, across the full conformance corpus and all 74
+`test-nixpkgs-hash` packages); this milestone only added counters
+around existing lookup/store call sites, touching no behavior those
+exhaustive checks didn't already cover.

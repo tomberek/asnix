@@ -101,16 +101,59 @@ static char *cache_file_path(const char *resolved_path, const char *source, size
     return p;
 }
 
+/* Visibility: ASNIX_BYTECODE_CACHE_STATS=1 (on top of ASNIX_BYTECODE_CACHE=1)
+ * prints a one-line hit/miss/store summary to stderr at process exit --
+ * the cache is otherwise silent by design (a stale/corrupt entry
+ * degrades to an ordinary miss with no visible symptom at all, per this
+ * file's own header comment), so without this there was no way to tell
+ * whether a given run actually benefited from the cache or was quietly
+ * missing every time. Counters are plain process-lifetime globals (this
+ * file already has several, e.g. g_outstanding) -- no synchronization
+ * needed since the fork-based prefetch children never share these
+ * counters with the parent (each process gets its own copy via fork(),
+ * and a child's own counts die with it when it `_exit(0)`s, which is
+ * fine: a prefetch child's store is still reflected in the PARENT's
+ * stats the next time the parent itself looks that path up and hits). */
+static int64_t g_stat_hits = 0, g_stat_misses = 0, g_stat_stores = 0;
+static int g_stats_atexit_registered = 0;
+
+static int stats_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("ASNIX_BYTECODE_CACHE_STATS");
+        cached = (v && strcmp(v, "1") == 0) ? 1 : 0;
+    }
+    return cached;
+}
+
+static void print_stats_atexit(void) {
+    int64_t total = g_stat_hits + g_stat_misses;
+    double rate = total > 0 ? (100.0 * (double)g_stat_hits / (double)total) : 0.0;
+    fprintf(stderr, "asnix: bytecode cache: %lld hits, %lld misses, %lld stores (%.1f%% hit rate)\n",
+            (long long)g_stat_hits, (long long)g_stat_misses, (long long)g_stat_stores, rate);
+}
+
+static void ensure_stats_atexit(void) {
+    if (!stats_enabled() || g_stats_atexit_registered) return;
+    g_stats_atexit_registered = 1;
+    atexit(print_stats_atexit);
+}
+
 IrProgram *asnix_bytecode_cache_lookup(const char *resolved_path, const char *source, size_t source_len) {
     if (!asnix_bytecode_cache_enabled()) return NULL;
+    ensure_stats_atexit();
     char *path = cache_file_path(resolved_path, source, source_len);
     FILE *f = fopen(path, "rb");
     free(path);
-    if (!f) return NULL;
+    if (!f) {
+        g_stat_misses++;
+        return NULL;
+    }
     fseek(f, 0, SEEK_END);
     long sz = ftell(f);
     if (sz <= 0) {
         fclose(f);
+        g_stat_misses++;
         return NULL;
     }
     fseek(f, 0, SEEK_SET);
@@ -119,15 +162,19 @@ IrProgram *asnix_bytecode_cache_lookup(const char *resolved_path, const char *so
     fclose(f);
     if (got != (size_t)sz) {
         free(buf);
+        g_stat_misses++;
         return NULL;
     }
     IrProgram *prog = asnix_bytecode_deserialize(buf, (size_t)sz);
     free(buf);
+    if (prog) g_stat_hits++;
+    else g_stat_misses++;
     return prog; /* NULL on any anomaly -- asnix_bytecode_deserialize's own contract */
 }
 
 void asnix_bytecode_cache_store(const char *resolved_path, const char *source, size_t source_len, IrProgram *prog) {
     if (!asnix_bytecode_cache_enabled()) return;
+    ensure_stats_atexit();
     uint8_t *buf;
     size_t len;
     if (asnix_bytecode_serialize(prog, &buf, &len) != 0) return; /* refused -- some
@@ -154,8 +201,12 @@ void asnix_bytecode_cache_store(const char *resolved_path, const char *source, s
     if (f) {
         size_t wrote = fwrite(buf, 1, len, f);
         fclose(f);
-        if (wrote == len) rename(tmp, path);
-        else unlink(tmp);
+        if (wrote == len) {
+            rename(tmp, path);
+            g_stat_stores++;
+        } else {
+            unlink(tmp);
+        }
     }
     free(tmp);
     free(path);

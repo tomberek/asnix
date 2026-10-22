@@ -25,6 +25,13 @@ typedef struct Ast Ast; /* ast.h's own tag -- forward-declared so this header
  * as a plain cache miss -- never fatal, never surfaced to the caller
  * beyond "use the normal compile path instead." */
 
+/* ASNIX_BYTECODE_CACHE_STATS=1 (alongside ASNIX_BYTECODE_CACHE=1) prints
+ * a one-line "N hits, M misses, K stores (P% hit rate)" summary to
+ * stderr at process exit -- the cache is otherwise completely silent by
+ * design (a miss, a corrupt entry, and "never looked up" are all
+ * indistinguishable from the outside), so this is the only way to tell
+ * whether a given run is actually benefiting from it. */
+
 /* True iff ASNIX_BYTECODE_CACHE=1 is set. Checked once and cached. */
 int asnix_bytecode_cache_enabled(void);
 
