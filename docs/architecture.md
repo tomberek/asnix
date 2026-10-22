@@ -13326,3 +13326,64 @@ Files added: `src/c/irpass_{jmpnop,dce_if,cmpnot,strconcat,dce}.{c,h}`,
 `src/c/irpass.c` (pool-access signature widening), `src/c/irbuild.c`,
 `src/c/irpass_cfold.c` (adapted to the widened signature),
 `src/c/main.c`/`src/c/irdump.c` (registration wiring), `.gitignore`.
+
+## M122: skip zero-length literal chunks when compiling string interpolation
+
+Prompted directly by a question about `"${thing}"`: does the overwhelmingly
+common "no literal text around an interpolation" shape waste anything?
+Yes -- `lexer.c`'s own comment already documents that it unconditionally
+emits a TOK_STR_PART on both sides of every `${...}`, "possibly
+zero-length, e.g. between two adjacent `${...}${...}` interpolations" --
+so `compiler.c`'s `AST_STRING` interpolation branch was pushing a
+zero-length String CONSTANT for each of those empty chunks and counting
+them into `OP_STR_CONCAT`'s part count, for no reason: concatenating with
+an empty string never changes the result's bytes OR its string context
+(a compile-time literal constant built directly by `compiler.c` never
+goes through `asnix_string_attach_context` in the first place, confirmed
+by reading `concat_strings_impl`, `value_util.c`) -- in ANY position,
+not just leading/trailing: the `"${a}${b}"` shape has an empty chunk
+BETWEEN the two interpolations too, and dropping it is exactly as safe as
+dropping a leading/trailing one, for the identical reason.
+
+**Measured directly on `d.nix`** (real nixpkgs's `ffmpeg.outPath`) via a
+temporary instrumented build: of 4,208 interpolated `AST_STRING` nodes
+compiled across the whole closure, 1,945 (46.2%) have at least one empty
+literal part, 2,335 empty parts total -- confirming this is the common
+case, not an edge case.
+
+**The fix**: the interpolation-compiling loop now skips any part that is
+both non-expression AND zero-length entirely -- neither pushing a
+constant for it nor counting it toward `OP_STR_CONCAT`'s `a` operand.
+`concat_strings_impl` (`value_util.c`) already handles any count >= 1
+correctly with no special-casing needed (confirmed by reading it
+directly) -- a bare `"${x}"` now compiles straight to a single
+`ib_str_concat(b, 1)`, which still does the real coercion/path-existence-
+check/context-union work `x` needs, just without two no-op concatenation
+partners. The `all_literal` branch just above (handling "no interpolation
+at all") is untouched -- it already folds a wholly-literal string,
+including an all-empty one, into one compile-time constant before this
+code is ever reached, so `emit_count` here is always >= 1 (at least one
+`is_expr` part survives, by construction).
+
+**Verified**: `"${a}"`, `"${a}${b}"` (the middle-empty-chunk case),
+`"x${a}"`, `"${a}x"`, `"x${a}x"`, and both indented-string equivalents
+(`''${a}''`, `''${a}${b}''` -- `strip_indentation`, `parser.c`, shares
+the exact same `AstStringPart`/`AST_STRING` representation and compiler
+path) all produce correct output. `make test`/`test-e2e`/`test-conformance`:
+all green. `make test-nix-conformance`: `pass=655 fail=3 skip=148` (same
+3 pre-existing pos-tracking failures). `make test-nixpkgs-hash`:
+`pass=148 fail=0`. Output hash unchanged.
+
+**Measured impact on `d.nix`**: strings 194,593 -> 192,258 (**-2,335**,
+exactly the measured empty-part count -- every one of them eliminated).
+CPU/wall-clock impact is flat, within this measurement's own noise
+(`cpu_core` instructions 10,603,502,599 -> 10,594,517,002, inside the
+~0.1-0.2% run-to-run stddev) -- most of these string literals are
+evaluated only a handful of times each across the whole closure, so the
+per-evaluation savings (a couple fewer VALSTACK pushes + coerce-loop
+iterations) don't add up to a measurable fraction of 10.6 billion total
+instructions. Landed anyway: unlike several other small-win candidates
+this session (`attrs_eager_merge`'s 1.4% shrink, the arithmetic/select
+thunk-elision pass's -0.046%), this change adds ZERO new permanent
+machinery -- it's a strict simplification of existing logic, removing
+real, confirmed dead work at no complexity cost, not a tradeoff.
