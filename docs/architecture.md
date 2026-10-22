@@ -13744,3 +13744,174 @@ correctness-complete, zero-added-risk safety net, matching `dce.c`'s own
 precedent (also 0 firings on this benchmark, kept anyway) -- each reuses
 100% established safety patterns from the existing 6 passes and adds no
 new value-kind, op, or runtime machinery.
+
+## M126: `./asnix --flake DIR[#attr.path]` -- the smallest real slice of flake support, after reading how iets does the whole thing
+
+**The ask**: real Nix flake support in full -- `flake.nix`/`flake.lock`
+parsing, the `inputs`/`outputs` schema, input resolution and *locking*,
+fetching inputs from git/github/gitlab/tarball/path/registries, and
+evaluating `outputs` with the resolved inputs as its argument. Explicitly
+scoped as "research first, implement only the smallest safe slice" --
+this is one of the largest asks this project has taken on; the honest
+finding is that full parity is a multi-milestone effort on its own (see
+the scope cuts below), but a genuinely useful, genuinely verified slice
+turned out to fit in one pass.
+
+**Research: how iets (`~/gnix/iets`) does it.** Read
+`~/gnix/iets/src/flake/{mod.rs,flakeref.rs,call-flake.nix}` (774+702+105
+lines) and `~/gnix/iets/src/{source/lock.rs,builtins/fetch.rs}`
+(311+783 lines) in full before writing anything. Headline finding: iets's
+own flake support, despite shipping a working `FLAKEREF#attr` CLI (the
+thing this session's own earlier research had confirmed via `--help`),
+is ALSO a deliberately narrow slice, not full parity -- its own doc
+comments say so directly:
+- The *root* flake reference (what's on the command line / passed to
+  `builtins.getFlake`) is **only ever a local path** (`path:`, a bare
+  directory, or a git working tree pinned to an exact 40-hex-digit
+  `rev`, read straight out of the repository beside it) --
+  `parse_flake_ref`'s own comment: *"only a local path is taken"*, and
+  every `github:`/`git+https:`/registry-indirect root ref is explicitly
+  `Error::Unsupported` ("iets cannot fetch a root flake").
+- `flake.lock` must be **complete already** (`source/lock.rs`'s
+  `lockfile.cc`-derived `check()`: every node the root reaches must
+  already carry a `narHash`/be a resolved relative `path:`) or **entirely
+  absent for a flake with no declared inputs** -- iets never writes a
+  lock file, never resolves an unlocked input, never consults a flake
+  registry at all.
+- Once locked, `builtins.fetchTree` (`builtins/fetch.rs`) DOES do real
+  network fetching for `github`/`gitlab`/`git`/`tarball`/`sourcehut`/`hg`
+  node types (reusing its own `fetch/http.rs`+`source::scm` machinery) --
+  so a flake with a *fully-locked* `flake.lock` naming real remote inputs
+  genuinely works end to end. The actual evaluation glue is cppnix's own
+  `call-flake.nix`, embedded **byte-for-byte verbatim**
+  (`include_str!("call-flake.nix")`) rather than reimplemented -- the
+  recursive `self`/`result` fixed point, `follows` resolution, and
+  per-node `fetchTree` dispatch are all real Nix's own `.nix` source,
+  unchanged; iets only supplies the native `fetchTree` primop it calls
+  into and the root tree's `sourceInfo`.
+- `builtins.parseFlakeRef`/`flakeRefToString` are pure string<->attrset
+  syntax with zero resolution -- asnix already has these (M66, below).
+
+**What asnix already had (checked before writing anything new)**:
+`builtins.fetchGit` (M82, real, shells out to `git`), `builtins.
+parseFlakeRef`/`flakeRefToString` (M66, pure syntax, no resolution), the
+M75/M80 NAR-hash + content-addressed-store-copy machinery
+(`nar.c`'s `asnix_hash_path_nar_sha256`/`asnix_copy_path_to_store_ext`,
+already used by `fetchGit`, `builtins.path`, and fixed-output
+derivations) -- and, per `eval_file.c`/`builtins.h`/`builtins_toml.c`'s
+own standing comments, confirmed **zero** flake.nix/flake.lock handling,
+**zero** `fetchTarball`/`fetchTree`/`fetchMercurial`/`getFlake`, and no
+CLI flake-ref support at all.
+
+**The slice actually landed, matching iets's own narrowing one level
+further**: `./asnix --flake DIR[#attr.path]` for a flake that declares
+**no inputs at all** (or whose `flake.nix` has no non-empty `inputs`
+attribute) -- no `flake.lock` is read, consulted, or required; no
+network fetch of any kind. This is strictly narrower than even iets's
+own "root ref must be a local path" cut (iets still locks/fetches
+*declared* inputs via a real `flake.lock`; this milestone has no lock-file
+handling whatsoever) -- deliberately, since a *correct* lock-file-driven
+input resolution (`follows`, per-node `fetchTree` dispatch, "every
+reachable node needs a `narHash`") is exactly the ~1,400-line surface
+iets itself needed and is a legitimately separate, larger milestone, not
+a one-pass add-on to this one.
+
+**The fix.** New module `src/c/flake_eval.c`/`.h`
+(`asnix_eval_flake_outputs`), wired into `main.c`'s existing CLI parser
+(`--flake`, alongside `--arg`/`--argstr`/`-A`) and reusing `main.c`'s own
+`select_attrpath` (the exact same function `-A` already uses) to apply
+the `#attr.path` fragment -- selecting a flake output attribute is
+byte-for-byte the same operation as `-A` on any other evaluated file, so
+no new selection logic was needed at all. Internals, deliberately
+following the SAME "embed a `.nix` snippet rather than hand-roll its
+recursive-attrset logic in C" trick M46 already used for
+`<nix/fetchurl.nix>` (and that iets itself uses for the real
+`call-flake.nix`): a small embedded Nix expression (`CALL_FLAKE_MIN`,
+`sourceInfo: outputsFn: let outputs = outputsFn { self = result; };
+result = outputs // sourceInfo // { outPath = sourceInfo.outPath; inputs
+= {}; inherit outputs sourceInfo; _type = "flake"; }; in result`) is run
+through `asnix_eval_expr_source` and applied (two single-arg
+`asnix_apply` calls, same curry convention as every other multi-arg call
+in this codebase) to a C-built `sourceInfo` attrset and the flake's own
+`outputs` value. The `self`<->`result` mutual recursion is ordinary Nix
+`let`-recursion (exactly how `rec {}` already works) -- nothing new on
+the evaluator side. `sourceInfo` (`outPath`/`narHash`) is built by
+NAR-hashing and store-copying `DIR` under the name `"source"`, the exact
+same two `nar.c` calls `fetchGit` (M82) already makes, confirmed to be
+the right name/shape by checking `builtins.fetchTree { type = "path";
+path = ...; }` directly against `nix-instantiate --eval --extra-
+experimental-features 'flakes fetch-tree'` (which returns exactly
+`outPath`+`narHash` for a plain path input, no `lastModified` at all --
+unlike a git-tracked tree).
+
+**Verification methodology.** Since `nix eval`/`nix flake`-family
+commands were blocked by this worktree's own sandboxing (any command
+whose name is literally `eval` is refused as a potential worktree
+escape, regardless of it being `nix eval`, not a shell builtin), ground
+truth was established with `nix-instantiate --eval --strict
+--extra-experimental-features 'flakes fetch-tree'` instead, by hand-
+writing a driver expression that reproduces cppnix's own `call-flake.nix`
+logic field-for-field (`sourceInfo = builtins.fetchTree { type = "path";
+path = ...; }; outputs = flake.outputs (inputs // { self = result; });
+result = outputs // sourceInfo // { ...; _type = "flake"; };`) and
+comparing `builtins.attrNames`/individual-field reads against this
+project's `--flake` output for the same directory. Confirmed
+byte-for-byte identical for all of: the full output attrset's key list
+(`_type inputs narHash outPath outputs packages selfKeys selfOutPath
+selfType sourceInfo`), `self.outPath`/`self.narHash` (the real NAR hash +
+derived content-addressed store path), a plain string output
+(`packages.x86_64-linux.hello`), and `self._type`. Also directly
+exercised the three documented fatal paths: a non-directory/missing
+`DIR`, a directory with no `flake.nix`, and a flake declaring a
+non-empty `inputs` attribute (clear, specific error messages, exit 1
+each time, no crash).
+
+**New fixtures + Makefile target**: `tests/flake/minimal/flake.nix`
+(no declared inputs; exercises `self.outPath`, a plain string output
+under `packages.<system>.<name>`, `self._type`, and `builtins.attrNames
+self`) plus four `tests/flake/minimal.<case>.{attr,expected}` sidecar
+pairs and a new `make test-flake` target (same stdout-diff mechanics as
+`test-e2e`/`test-conformance`, just invoking `./asnix --flake
+DIR#attr` instead of `./asnix FILE`). The sidecars deliberately live
+NEXT TO the flake directory, not inside it -- `self.outPath`'s NAR hash
+covers every file the directory contains, so a sidecar living inside the
+very directory being hashed would make its own existence change the
+value it's testing (caught live: the first version of this fixture put
+the `.attr`/`.expected` files inside `tests/flake/minimal/` itself, and
+`make test-flake` immediately failed on `selfOutPath` because the
+hashed tree now also contained the sidecar files).
+
+**Deliberate, documented scope cuts -- a genuinely separate, larger
+milestone, not attempted here**:
+- **No `flake.lock` handling of any kind** -- not read, not required,
+  not validated. A flake declaring ANY non-empty `inputs` is a hard,
+  loud, specific error (`"flake '...' declares input 'X' (and N more);
+  flake inputs are not supported yet"`), never a silent wrong-result
+  approximation.
+- **No input fetching whatsoever** -- no git/github/gitlab/tarball/
+  registry/path-input resolution, no `builtins.fetchTree` entry point at
+  all (unlike iets, which has one once a lock file resolves a node).
+  This is the actual bulk of what full flake support needs (iets's own
+  `fetch/`+`source/lock.rs`+`flake/`+`builtins/fetch.rs` alone is
+  ~3,400 lines) and is exactly the "needs its own larger multi-milestone
+  effort" case flagged up front, not a surprise found mid-implementation.
+- **No `follows`, no flake registries, no `nixConfig`, no `builtins.
+  getFlake`** -- none of these are reachable at all without input
+  fetching existing first.
+- **No `.git`/working-tree-aware source for the root flake** -- `DIR` is
+  always treated as a plain, ungitted directory (every file in it is
+  NAR-hashed, no `.gitignore`/`export-ignore` filtering, no `rev`/
+  `lastModified` in the result) -- matching iets's own `path:`-only root
+  behavior (though iets ALSO supports a pinned git working tree for the
+  root; this milestone doesn't).
+- `--flake` is not validated against `--arg`/`--argstr` (real Nix's own
+  flake CLI doesn't accept these either); combining them is simply
+  harmless here (`auto_call` no-ops on a non-Closure result) rather than
+  a hard usage error -- a cheap, deliberate non-issue, not an oversight.
+
+**Verified**: `make test`/`test-e2e`/`test-conformance`/`test-flake` all
+green (new target, 4/4 fixture checks). `make test-nix-conformance`:
+`pass=655 fail=3 skip=148` (same 3 pre-existing pos-tracking failures,
+confirmed unrelated -- this change touches no existing code path, only
+adds a new CLI flag and a new, separately-linked translation unit). `make
+test-nixpkgs-hash`: `pass=148 fail=0`.

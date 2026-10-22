@@ -47,6 +47,13 @@ TEST_C_BINS   := $(TEST_C_SRCS:.c=)
 E2E_NIX         := $(wildcard tests/e2e/*.nix)
 CONFORMANCE_NIX := $(wildcard tests/conformance/*.nix)
 
+# M125: `tests/flake/<name>/` fixtures for `--flake`, one directory per
+# flake under test (each holds its own `flake.nix`) with any number of
+# `*.attr`/`*.expected` sidecar pairs (the attrpath fragment to select,
+# and the expected printed output of selecting it) -- see test-flake's
+# own recipe below.
+FLAKE_DIRS := $(wildcard tests/flake/*)
+
 # Stale-optimization-flag guard: `make`/`make debug`/`make release` all
 # share the same .o files but compile them with different $(OPT) values,
 # and `-MMD -MP`'s header-dependency tracking has no way to know the
@@ -73,7 +80,7 @@ $(shell last=$$(cat $(OPT_STAMP) 2>/dev/null); \
 		echo "$(EFFECTIVE_OPT)" > $(OPT_STAMP); \
 	fi)
 
-.PHONY: all release debug test test-e2e test-conformance test-nix-conformance test-nixpkgs-hash clean watch
+.PHONY: all release debug test test-e2e test-conformance test-flake test-nix-conformance test-nixpkgs-hash clean watch
 all: asnix
 
 release: OPT := -O2
@@ -152,6 +159,29 @@ test-conformance: asnix
 		want=$$(cat "$$exp"); \
 		if [ "$$got" = "$$want" ]; then echo "== $$f == OK"; \
 		else echo "== $$f == FAIL (got '$$got', want '$$want')"; exit 1; fi; \
+	done
+
+# M125: `--flake DIR#attr.path` fixtures -- same mechanics as test-e2e/
+# test-conformance (compare printed stdout against a sidecar), except the
+# invocation is `./asnix --flake DIR#attr` rather than `./asnix FILE`, so
+# this needed its own small loop instead of reusing E2E_NIX's. Sidecars
+# (`*.attr`/`*.expected`, holding the attrpath fragment to select and its
+# expected printed output) live NEXT TO each flake directory, named
+# `<dir>.<case>.attr`/`.expected` -- deliberately NOT inside the flake
+# directory itself, since `self.outPath`'s NAR hash covers every file the
+# directory contains; a sidecar living inside it would make its own
+# existence change the very value it's testing.
+test-flake: asnix
+	@set -e; for d in $(FLAKE_DIRS); do \
+		for attrfile in $$d.*.attr; do \
+			[ -f "$$attrfile" ] || continue; \
+			attr=$$(cat "$$attrfile"); \
+			exp="$${attrfile%.attr}.expected"; \
+			got=$$(./asnix --flake "$$d#$$attr"); \
+			want=$$(cat "$$exp"); \
+			if [ "$$got" = "$$want" ]; then echo "== $$d#$$attr == OK"; \
+			else echo "== $$d#$$attr == FAIL (got '$$got', want '$$want')"; exit 1; fi; \
+		done; \
 	done
 
 # Tier-4: sweeps the FULL numtide/nix-conformance corpus (`lang/eval-okay-

@@ -12,6 +12,7 @@
 #include "asnix/value.h"
 #include "builtins_shared.h" /* M57i: asnix_bshared_attrs_* / make_attrs, CLI --arg/-A support */
 #include "eval_file.h"
+#include "flake_eval.h" /* M126: --flake DIR[#attr.path] */
 #include "irpass_cfold.h" /* M118: ASNIX_IR_OPT -- see this file's own hook below */
 #include "irpass_cmpnot.h"
 #include "irpass_dce.h"
@@ -633,12 +634,16 @@ int main(int argc, char **argv) {
     if (getenv("ASNIX_IR_OPT")) asnix_irpass_register_deadframe();
 
     const char *file_path = NULL;
+    const char *flake_ref = NULL; /* M126: --flake DIR[#attr.path], see flake_eval.h */
     const char *attrpath = NULL;
     CliArg *cli_args = NULL;
     size_t n_cli_args = 0, cap_cli_args = 0;
 
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--arg") == 0 && i + 2 < argc) {
+        if (strcmp(argv[i], "--flake") == 0 && i + 1 < argc) {
+            flake_ref = argv[i + 1];
+            i += 1;
+        } else if (strcmp(argv[i], "--arg") == 0 && i + 2 < argc) {
             if (n_cli_args == cap_cli_args) {
                 cap_cli_args = cap_cli_args ? cap_cli_args * 2 : 4;
                 cli_args = realloc(cli_args, cap_cli_args * sizeof(CliArg));
@@ -660,7 +665,7 @@ int main(int argc, char **argv) {
             attrpath = argv[i + 1];
             i += 1;
         } else if (argv[i][0] == '-') {
-            fprintf(stderr, "asnix: unrecognized flag '%s' (only --arg/--argstr/-A are supported)\n", argv[i]);
+            fprintf(stderr, "asnix: unrecognized flag '%s' (only --arg/--argstr/-A/--flake are supported)\n", argv[i]);
             return 1;
         } else if (file_path) {
             fprintf(stderr, "usage: %s [--arg name expr] [--argstr name str] [-A attrpath] <file.nix>\n", argv[0]);
@@ -669,12 +674,46 @@ int main(int argc, char **argv) {
             file_path = argv[i];
         }
     }
-    if (!file_path) {
-        fprintf(stderr, "usage: %s [--arg name expr] [--argstr name str] [-A attrpath] <file.nix>\n", argv[0]);
+    if (flake_ref && file_path) {
+        fprintf(stderr, "asnix: --flake cannot be combined with a plain <file.nix> argument\n");
+        return 1;
+    }
+    if (!file_path && !flake_ref) {
+        fprintf(stderr,
+                "usage: %s [--arg name expr] [--argstr name str] [-A attrpath] <file.nix>\n"
+                "       %s --flake <dir>[#attr.path] [-A attrpath]\n",
+                argv[0], argv[0]);
         return 1;
     }
 
-    Value result = asnix_eval_file(file_path);
+    Value result;
+    if (flake_ref) {
+        /* M126: `DIR#attr.path` -- split at the first '#' the same way
+         * iets's own `parse_flake_ref` does (flake_eval.h/.c has no
+         * notion of a fragment at all; selecting the attrpath is exactly
+         * `select_attrpath` below, the same function `-A` already uses
+         * on a plain file). An empty fragment (`DIR#`) means "no
+         * selection", same as a bare `DIR`. */
+        const char *hash = strchr(flake_ref, '#');
+        char dir_buf[1024];
+        const char *fragment = NULL;
+        if (hash) {
+            size_t dirlen = (size_t)(hash - flake_ref);
+            if (dirlen >= sizeof(dir_buf)) {
+                fprintf(stderr, "asnix: --flake: path '%s' is too long\n", flake_ref);
+                return 1;
+            }
+            memcpy(dir_buf, flake_ref, dirlen);
+            dir_buf[dirlen] = '\0';
+            if (hash[1]) fragment = hash + 1;
+        } else {
+            snprintf(dir_buf, sizeof(dir_buf), "%s", flake_ref);
+        }
+        result = asnix_eval_flake_outputs(dir_buf);
+        if (fragment) result = select_attrpath(result, fragment);
+    } else {
+        result = asnix_eval_file(file_path);
+    }
     if (n_cli_args > 0) result = auto_call(result, cli_args, n_cli_args);
     if (attrpath) result = select_attrpath(result, attrpath);
     print_value(result);
