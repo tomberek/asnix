@@ -13,6 +13,11 @@
 #include "builtins_shared.h" /* M57i: asnix_bshared_attrs_* / make_attrs, CLI --arg/-A support */
 #include "eval_file.h"
 #include "irpass_cfold.h" /* M118: ASNIX_IR_OPT -- see this file's own hook below */
+#include "irpass_cmpnot.h"
+#include "irpass_dce.h"
+#include "irpass_dce_if.h"
+#include "irpass_jmpnop.h"
+#include "irpass_strconcat.h"
 #include "symtab.h"
 #include "value_util.h"
 
@@ -613,6 +618,11 @@ int main(int argc, char **argv) {
      * default, so this changes nothing about a normal run. See
      * asnix/irpass.h. */
     if (getenv("ASNIX_IR_OPT")) asnix_irpass_register_cfold();
+    if (getenv("ASNIX_IR_OPT")) asnix_irpass_register_cmpnot();
+    if (getenv("ASNIX_IR_OPT")) asnix_irpass_register_dce();
+    if (getenv("ASNIX_IR_OPT")) asnix_irpass_register_dce_if();
+    if (getenv("ASNIX_IR_OPT")) asnix_irpass_register_jmpnop();
+    if (getenv("ASNIX_IR_OPT")) asnix_irpass_register_strconcat();
 
     const char *file_path = NULL;
     const char *attrpath = NULL;

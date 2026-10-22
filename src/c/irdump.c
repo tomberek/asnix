@@ -29,6 +29,11 @@
 #include "asnix/value.h"
 #include "compiler.h"
 #include "irpass_cfold.h" /* M118: ASNIX_IR_OPT -- see main() below */
+#include "irpass_cmpnot.h"
+#include "irpass_dce.h"
+#include "irpass_dce_if.h"
+#include "irpass_jmpnop.h"
+#include "irpass_strconcat.h"
 #include "lexer.h"
 #include "parser.h"
 #include "symtab.h"
@@ -285,6 +290,15 @@ static void lex_parse_compile_dump(const char *src, const char *path) {
     free(work.items);
 }
 
+static void register_all_passes(void) {
+    asnix_irpass_register_cfold();
+    asnix_irpass_register_cmpnot();
+    asnix_irpass_register_dce();
+    asnix_irpass_register_dce_if();
+    asnix_irpass_register_jmpnop();
+    asnix_irpass_register_strconcat();
+}
+
 int main(int argc, char **argv) {
     if (argc != 2) {
         fprintf(stderr, "usage: %s <file.nix>\n", argv[0]);
@@ -317,7 +331,7 @@ int main(int argc, char **argv) {
     if (mode && strcmp(mode, "diff") == 0) {
         printf("===== BEFORE (no pass pipeline) =====\n");
         lex_parse_compile_dump(src, argv[1]);
-        asnix_irpass_register_cfold();
+        register_all_passes();
         printf("\n===== AFTER (pass pipeline applied) =====\n");
         /* M118 follow-up: per-op <<< markers above are drawn live from
          * the firing log as each AFTER line prints; this final summary
@@ -329,7 +343,7 @@ int main(int argc, char **argv) {
         asnix_irpass_clear();
     } else {
         if (mode) {
-            asnix_irpass_register_cfold();
+            register_all_passes();
             printf("(ASNIX_IR_OPT=1 -- showing bytecode AFTER the pass pipeline; <<< markers show where each pass fired)\n");
         }
         lex_parse_compile_dump(src, argv[1]);

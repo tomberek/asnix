@@ -258,8 +258,14 @@ size_t ib_select_or(IrBuilder *b, uint32_t sym) {
 IrProgram *ib_finish(IrBuilder *b) {
     /* M118: opt-in bytecode-to-bytecode pass pipeline (asnix/irpass.h) --
      * a no-op (0 passes registered) in every normal build/run, so this
-     * line changes nothing by default; see that header's own comment. */
-    asnix_irpass_run(b->ops, &b->len);
+     * line changes nothing by default; see that header's own comment.
+     * `&b->pool`/`&b->pool_len`/`&b->pool_cap` (strconcat-fold
+     * extension): threaded through by pointer so a registered pass can
+     * both read an existing pool entry's Value and append a freshly-built
+     * one (asnix_irpass_pool_append) -- this IS the live builder's own
+     * pool, still growable at this point (ib_finish's own pool-shrinking
+     * realloc below runs AFTER this call). */
+    asnix_irpass_run(b->ops, &b->len, &b->pool, &b->pool_len, &b->pool_cap);
     ir_link(b->ops, b->len);
     /* M86 perf: ops/pool are handed to `prog`, which lives for the rest
      * of the process (every compiled function/thunk keeps its own

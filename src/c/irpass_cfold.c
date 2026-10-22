@@ -19,7 +19,12 @@
  * (INT64_MIN, -1) -- both must still reach the runtime op (abort with
  * "division by zero", and avoid signed-overflow UB respectively), not be
  * silently folded away. */
-static int fold_constant_int_binop(IrOp *ops, size_t *len) {
+static int fold_constant_int_binop(IrOp *ops, size_t *len, int64_t **pool, size_t *pool_len, size_t *pool_cap) {
+    (void)pool;
+    (void)pool_len;
+    (void)pool_cap; /* strconcat-fold extension widened AsnixIrPass's signature for every pass
+                      * uniformly (see irpass.h) -- this pass folds only int immediates (OP_PUSH_INT's
+                      * own operand field, never a pool index), so it has no use for the pool itself. */
     for (size_t i = 0; i + 2 < *len; i++) {
         if ((int)(intptr_t)ops[i].handler != OP_PUSH_INT) continue;
         if ((int)(intptr_t)ops[i + 1].handler != OP_PUSH_INT) continue;

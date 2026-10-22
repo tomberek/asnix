@@ -13222,3 +13222,107 @@ NOT landed alongside this milestone**:
   arena-rounding RSS regression (8->16 byte granularity). Confirms the
   prior qualitative "high-risk, not recommended" call on real counts;
   no code changed.
+
+## Bytecode-pass framework: 5 more passes via a parallel agent fleet, plus pool-access extension -- and 2 real bugs the 1114-file test corpus missed
+
+Extended the M118 bytecode-to-bytecode pass framework (`include/asnix/
+irpass.h`) with 5 more passes, each authored by an independent agent in
+its own isolated worktree, each required to verify against the
+framework's established methodology (diff `ASNIX_IR_OPT=1` vs. unset
+across all 308 `tests/e2e`/`tests/conformance` fixtures + all 806
+numtide/nix-conformance `lang/` files, zero divergences required):
+
+- **`jmpnop`**: removes a redundant `OP_JMP` whose target is the next op.
+  Found and fixed its own hazard during design (a different live jump
+  landing exactly on the no-op jump's own index), before ever shipping.
+- **`dce_if`**: dead-branch elimination for a statically-known `OP_IF`
+  condition (`PUSH_TRUE/FALSE` immediately before `OP_IF`), guarded by an
+  incoming-jump pre-check so an unsafe occurrence is silently skipped
+  rather than ever reaching `asnix_irpass_remove`'s fatal safety check.
+- **`cmpnot`**: fuses `OP_EQ;OP_NOT -> OP_NEQ` and `OP_NEQ;OP_NOT ->
+  OP_EQ` only. The 4 ordering-comparison fusions it was also asked to
+  attempt (`LT;NOT->GE` etc.) were investigated and correctly DECLINED:
+  `op_cmp.S`'s slow path does direct IEEE double comparisons for floats,
+  and IEEE comparisons involving NaN are not a total order (`NOT(LT)` is
+  `true` on a NaN operand while `GE` computed directly is `false` for the
+  same inputs) -- confirmed reachable in practice (`builtins.fromJSON
+  "1e400"` produces `+inf` with no overflow guard). Also surfaced a real,
+  PRE-EXISTING, unrelated bug: `compiler.c` already compiles `>`/`<=` as
+  `LT`+`NOT` specifically to match upstream Nix's own NaN-respecting
+  desugaring, while `>=`/`<` go straight to the native (IEEE-direct,
+  NaN-divergent) ops -- so asnix's own `>=` already disagrees with
+  upstream Nix on NaN inputs, independent of this pass. Flagged, not
+  fixed (out of scope for a bytecode pass).
+- **`strconcat`**: folds `OP_PUSH_CONST (string); OP_PUSH_CONST (string);
+  OP_STR_CONCAT a=2` into one constant. Required a real, cross-cutting
+  framework extension: `AsnixIrPass`'s signature widened to
+  `(IrOp*, size_t*, int64_t**, size_t*, size_t*)` uniformly (every pass,
+  including `cfold`, now takes and may ignore the 3 new pool params), and
+  a new `asnix_irpass_pool_append` (mirrors `ib_pool_add`'s own doubling
+  policy) as the pool's grow primitive alongside `asnix_irpass_remove`'s
+  existing ops-shrink primitive.
+- **`dce`**: global reachability-based dead code elimination (BFS from
+  op 0 over fallthrough + every jump op's target). Found that removing
+  maximal dead ranges (the originally-suggested design) is unsafe
+  whenever a dead region contains its own internal jump -- fixed by
+  removing dead ops ascending, one at a time, with an inductive proof
+  (every jump this compiler emits points strictly forward, so anything
+  that could jump into a dead op must itself have a smaller,
+  already-removed index) rather than working around the safety check.
+  Added `tests/ir/test_irpass_dce.c`, a hand-assembled synthetic fixture
+  -- the only thing that exercises this pass's removal logic, since
+  today's compiler never emits literal dead code on its own.
+
+**Merging found 2 more real bugs, neither caught by the 1114-file sweep,
+both caught only by running the actual `d.nix` (real nixpkgs
+`ffmpeg.outPath`) workload** -- underscoring, yet again, that a large
+synthetic+conformance corpus and a real nixpkgs closure are not
+substitutes for each other:
+
+1. **`cmpnot`**: assumed `OP_NOT` immediately after an `OP_EQ`/`OP_NEQ`
+   is *exclusively* fed by that one comparison. False whenever the `NOT`
+   is ALSO a shared join point -- `!(if cond then true else (y != []))`
+   compiles as an ordinary if/else whose join point (the code textually
+   after the `if`, i.e. this source's own `!`) happens to be exactly that
+   `OP_NOT`: the "then" branch pushes `PUSH_TRUE` and jumps DIRECTLY to
+   the `NOT` (skipping the "else" branch's own `NEQ` entirely), while the
+   "else" branch's `NEQ` falls through into the SAME `NOT`. Fusing would
+   have rewritten the `NEQ` to `EQ` and deleted the `NOT` -- silently
+   dropping the negation the "then" branch's jump relied on.
+   `asnix_irpass_remove`'s own fatal check caught it (a live jump
+   targeted the op being removed) rather than letting it miscompile.
+   Fixed with the same incoming-jump guard `dce_if` already uses.
+2. **`strconcat`**: assumed the second `OP_PUSH_CONST` always falls
+   through from the first. False for `"${expr.attr or "default"}
+   literal"`: `expr.attr or "default"` compiles via `OP_SELECT_OR`, whose
+   FOUND path pushes the found value and jumps DIRECTLY to this
+   interpolation's next literal chunk (exactly the second
+   `OP_PUSH_CONST`'s position), bypassing the first `OP_PUSH_CONST` (the
+   MISS path's own default-value constant) entirely. Same fix.
+
+Both share one root cause: a pass assumed "two adjacent ops in the array
+execute as a strict sequential pair" without checking whether either op
+is ALSO independently reachable via a jump that skips the other --
+exactly the hazard class `dce_if`'s own author had already generalized
+against, but `cmpnot`'s and `strconcat`'s authors (parallel, unaware of
+each other) hadn't. `asnix_irpass_remove`'s unconditional fatal check is
+what made both FINDABLE at all rather than silent miscompiles.
+
+**Verification, all 6 passes active together (`cfold` + the 5 above)**:
+`make test`/`test-e2e`/`test-conformance`/`test_irpass_dce` unchanged
+with the flag off (default). With `ASNIX_IR_OPT=1`: 0 divergences across
+all 308 e2e/conformance fixtures and all 806 nix-conformance `lang/`
+files (re-run after both fixes). `./asnix d.nix` (real nixpkgs
+`ffmpeg.outPath`), run 3x for determinism: output hash unchanged
+(`/nix/store/29iacg6h530yx7rxz4k1fhvi0kxxhsam-ffmpeg-9.0.1-bin`) every
+time, with `cfold: 12 firings`, `cmpnot: 13 firings`, `dce_if: 1
+firings` (`jmpnop`/`dce`/`strconcat` found nothing to do on this
+specific closure -- remain safety nets for other passes' output rather
+than wins on today's compiler, by design). `make test-nixpkgs-hash`:
+`pass=148 fail=0` both with and without the flag.
+
+Files added: `src/c/irpass_{jmpnop,dce_if,cmpnot,strconcat,dce}.{c,h}`,
+`tests/ir/test_irpass_dce.c`. Modified: `include/asnix/irpass.h`/
+`src/c/irpass.c` (pool-access signature widening), `src/c/irbuild.c`,
+`src/c/irpass_cfold.c` (adapted to the widened signature),
+`src/c/main.c`/`src/c/irdump.c` (registration wiring), `.gitignore`.

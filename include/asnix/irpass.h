@@ -43,11 +43,27 @@
  * call is the expected/simplest style -- find one occurrence, fix it,
  * return 1, let the fixpoint driver call again from a clean state), 0 if
  * it found nothing left to do. May shrink `*len` via asnix_irpass_remove
- * below; may NOT grow it (no growable-array support here -- every pass
- * this framework ships only removes or rewrites in place; a pass that
- * needs to INSERT new ops should instead rewrite via the IrBuilder API
- * before ib_finish, outside this framework's scope). */
-typedef int (*AsnixIrPass)(IrOp *ops, size_t *len);
+ * below; may NOT grow `*len` (no growable-OPS-array support here -- every
+ * pass this framework ships only removes or rewrites ops in place; a pass
+ * that needs to INSERT new ops should instead rewrite via the IrBuilder
+ * API before ib_finish, outside this framework's scope).
+ *
+ * `pool`/`pool_len`/`pool_cap` (strconcat-fold extension): the SAME three
+ * fields `ib_finish` is about to hand off to the IrBuilder's own
+ * `IrProgram`, passed through by pointer so a pass can both READ an
+ * OP_PUSH_CONST's pool entry (`(*pool)[ops[i].b]`, a Value.raw word --
+ * needed to check the pool entry's actual runtime Value tag, e.g. "is
+ * this genuine String", NOT just something derivable from the op alone)
+ * and APPEND a freshly-built constant via asnix_irpass_pool_append below
+ * (which may realloc `*pool`, growing `*pool_cap` -- that's why this is
+ * `int64_t **pool`, not `int64_t *pool`, unlike the ops array that's
+ * never grown by this framework). Every pass, including ones that never
+ * touch the pool (e.g. cfold's own int-only fold), still takes these
+ * three in its signature -- a cross-cutting change to AsnixIrPass itself,
+ * not a per-pass opt-in, so the one `asnix_irpass_run` call site
+ * (ib_finish, irbuild.c) only ever has ONE pool to thread through to
+ * every registered pass uniformly. */
+typedef int (*AsnixIrPass)(IrOp *ops, size_t *len, int64_t **pool, size_t *pool_len, size_t *pool_cap);
 
 /* Registers `pass` under `name` (a short human-readable label, e.g.
  * "cfold" -- used by asnix_irpass_print_stats/irdump's annotated dump,
@@ -76,8 +92,11 @@ void asnix_irpass_clear(void);
  * going through the full builder API. Returns 1 if anything changed
  * across the whole run. Every successful (returns 1) call to a given
  * pass increments that pass's own fire-count (see below) by one, and
- * (via asnix_irpass_remove) may append to the firing-location log too. */
-int asnix_irpass_run(IrOp *ops, size_t *len);
+ * (via asnix_irpass_remove) may append to the firing-location log too.
+ *
+ * `pool`/`pool_len`/`pool_cap`: forwarded verbatim to every registered
+ * pass each call -- see AsnixIrPass's own comment above. */
+int asnix_irpass_run(IrOp *ops, size_t *len, int64_t **pool, size_t *pool_len, size_t *pool_cap);
 
 /* The one shrink primitive a pass should use to remove ops: deletes
  * `count` ops starting at `start` from ops[0..*len), decrementing *len,
@@ -94,6 +113,15 @@ int asnix_irpass_run(IrOp *ops, size_t *len);
  * unconditionally, not just under a debug build, since a pass bug here
  * would otherwise silently miscompile. */
 void asnix_irpass_remove(IrOp *ops, size_t *len, size_t start, size_t count);
+
+/* The sibling GROW primitive for the pool (as asnix_irpass_remove is for
+ * ops): appends `v` to *pool[0..*pool_len), doubling *pool_cap (starting
+ * from 8, same growth policy as irbuild.c's own ib_pool_add -- these ARE
+ * the live IrBuilder's own pool fields, mid-construction) via realloc
+ * when needed, and returns the new entry's index (always the previous
+ * *pool_len) for the caller to stash into some op's `b` field (e.g.
+ * OP_PUSH_CONST). Safe to call even when *pool_cap == 0. */
+size_t asnix_irpass_pool_append(int64_t **pool, size_t *pool_len, size_t *pool_cap, int64_t v);
 
 #define ASNIX_IRPASS_MAX_ITERS 64
 

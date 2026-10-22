@@ -163,13 +163,13 @@ void asnix_irpass_remove(IrOp *ops, size_t *len, size_t start, size_t count) {
     *len = new_len;
 }
 
-int asnix_irpass_run(IrOp *ops, size_t *len) {
+int asnix_irpass_run(IrOp *ops, size_t *len, int64_t **pool, size_t *pool_len, size_t *pool_cap) {
     int any_changed_ever = 0;
     for (int iter = 0; iter < ASNIX_IRPASS_MAX_ITERS; iter++) {
         int changed = 0;
         for (size_t p = 0; p < g_npasses; p++) {
             g_current_pass = p;
-            int fired = g_passes[p](ops, len);
+            int fired = g_passes[p](ops, len, pool, pool_len, pool_cap);
             g_current_pass = (size_t)-1;
             if (fired) {
                 g_fire_counts[p]++;
@@ -180,4 +180,13 @@ int asnix_irpass_run(IrOp *ops, size_t *len) {
         any_changed_ever = 1;
     }
     return any_changed_ever;
+}
+
+size_t asnix_irpass_pool_append(int64_t **pool, size_t *pool_len, size_t *pool_cap, int64_t v) {
+    if (*pool_len == *pool_cap) {
+        *pool_cap = *pool_cap ? *pool_cap * 2 : 8;
+        *pool = realloc(*pool, *pool_cap * sizeof(int64_t));
+    }
+    (*pool)[*pool_len] = v;
+    return (*pool_len)++;
 }
