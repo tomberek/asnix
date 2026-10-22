@@ -271,8 +271,16 @@ struct Ast {
     } as;
 };
 
-/* Arena-allocated (never individually freed), same as every other runtime
- * structure in this process -- see src/asm/arena.S. */
+/* perf: owns its own dedicated, resettable chunk list (ast.c) -- NOT the
+ * main never-free arena -- since an Ast tree is pure compile-time
+ * scratch, fully dead once asnix_compile()/asnix_compile_scoped() walks
+ * it into an IrProgram. */
 Ast *asnix_ast_new(AstKind kind);
+
+/* Frees every Ast node allocated since the last reset (or process
+ * start). Call right after a top-level asnix_compile()/
+ * asnix_compile_scoped() returns -- see ast.c's own header comment for
+ * why that's always safe. */
+void asnix_ast_arena_reset(void);
 
 #endif /* ASNIX_AST_H */

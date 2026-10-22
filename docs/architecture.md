@@ -123,6 +123,7 @@ what's actually implemented and the scope decisions made along the way.
 | M106 — packed `Thunk`'s `state` field into the low tag bits of its own `prog` field instead of a separate 8-byte word: `prog` is always a plain `IrProgram*` (malloc/calloc-aligned, low 3 bits always free, written once at creation, read once more at UNFORCED→IN_PROGRESS), unlike the originally-proposed target (`env`, whose FORCED case caches a raw `Value.raw` that already saturates all 8 combinations of the low 3 bits via `ASNIX_TAG_MASK` -- a genuine dead end, confirmed before picking `prog` instead); `ASNIX_THUNK_SIZE` 24 → 16 bytes, unlike M100's earlier rejected narrowing this one is already 8-byte-aligned so the arena's rounding doesn't claw it back | done (see below; found and tagged the 4th thunk state, `ASNIX_THUNK_STATE_FAILED` from M82's `tryEval` memoization, that an earlier description had missed; peak RSS on `d.nix` 741,976 → 723,820 KB (~2.5%); zero regressions) |
 | M108 — a permanent, always-on `NIX_SHOW_STATS=1`-equivalent (`ASNIX_SHOW_STATS=1`): per-category object counters (env/thunk/closure/attrs/list/cell/string/primop/path, plus element/entry sub-counts for env/attrs/list) incremented at every real allocation site -- `asnix_env_alloc` plus the four hot-path-inlined env-frame sites (`op_frame.S`/`op_let.S`/`op_call.S`/`op_with.S`/`apply.S`) that bypass it entirely, so a first attempt at just the shared helper undercounted envs by ~3x until all five sites were found and instrumented | done (see below; env/thunk/cell counts cross-checked exactly against this session's own independent arena-tracer investigation -- 1,675,074 / 2,342,967 / 836,471 -- confirming correctness; zero regressions) |
 | M109 — ported real Nix's `IndexedCallDescriptor` idea (`tomberek/nix#52`) to `mapAttrs`/`zipAttrsWith`: both build N lazy `(f name) value` thunks per call that all share the same `f`, but the per-thunk Env was re-storing `f` into a fresh 3-slot Env every time. Factored `f` out into one shared 1-slot Env (allocated once per builtin call, `asnix_bshared_make_call2_shared_env`), each per-attribute thunk now uses a 2-slot Env `{arg1, arg2}` whose `up` points at the shared Env, reading `f` via depth=1 instead of depth=0 (`asnix_bshared_make_lazy_call2_indexed`) -- no new Value kind, no new asm, no new force-path case, unlike the fuller `IndexedCallThunk` design the same PR also explores (deferring the attribute-name String's construction until the thunk is actually forced), which needs a new bytecode op or a native-call escape hatch in the force path and was left as a documented follow-on, out of scope for a one-shot | done (see below; per-thunk cost Env(3)+Thunk=48B -> Env(2)+Thunk=40B (~17%); measured on `d.nix`'s real ffmpeg closure: peak RSS 674,584 KB -> 670,796 KB (~0.56%, modest since ffmpeg's own closure doesn't lean on `mapAttrs`/`zipAttrsWith` heavily -- matches real Nix's own measured -2.1% to -4.2% gain for the analogous change); `mapAttrs` laziness canary (`attrNames (mapAttrs throw {...})` must not throw) and basic `mapAttrs`/`zipAttrsWith` correctness spot-checked directly; zero regressions) |
+| M110 — Ast nodes moved from the main never-free arena into their own dedicated, resettable chunk allocator, freed right after each top-level `asnix_compile`/`asnix_compile_scoped` call returns (an Ast tree is pure compile-time scratch, fully dead once walked into an `IrProgram`); a prior attempt at this exact change crashed on the real workload (`undefined variable 'list'` on `d.nix`, several real nixpkgs packages crashing in `test-nixpkgs-hash`) despite passing the small fixture suite -- root-caused via a zero-vs-garbage A/B test (poisoning freed chunks changed nothing, ruling out simple use-after-free; switching the chunk allocator from `malloc` to `calloc` fixed it outright): the arena it replaced is backed by zero-filled `mmap`, and at least one `Ast` constructor implicitly relied on an unset union field defaulting to zero, a latent assumption the whole codebase never had to confront until this allocator stopped providing it for free | done (see below; peak RSS on `d.nix` 736,920 → 691,780 KB (~6.2%), measured as a true paired before/after in one worktree/build; `make test-nixpkgs-hash`: `pass=148 fail=0`, including the specific packages (glib/gtk3/nix) that crashed under the original broken attempt; zero regressions) |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
 
@@ -12061,3 +12062,81 @@ whether it's ever forced) -- real correctness-sensitive work needing a
 new Value kind and force-path case, flagged for a dedicated pass if the
 `ASNIX_SHOW_STATS`-measured `mapAttrs`/`zipAttrsWith` call volume on a
 `mapAttrs`-heavy real nixpkgs evaluation ever justifies it.
+## M110: Ast nodes freed after compile -- fixing a prior attempt's real bug (malloc vs. zero-filled arena)
+
+An earlier attempt this session at freeing an Ast tree right after
+compiling it (same idea as M87's `toks` free, extended to the AST)
+passed `make test`/`test-e2e`/`test-conformance` cleanly but crashed on
+the real workload: `./asnix d.nix` (ffmpeg's closure) failed with
+`undefined variable 'list'`, and several real nixpkgs packages
+(`glib`, `gtk3`, `nix`) crashed in `test-nixpkgs-hash`. The small
+fixture suite never exercised this because the bug only manifests once
+the chunk allocator's memory gets reused enough times across many real
+files -- something the handful of tiny `tests/e2e`/`tests/conformance`
+fixtures never do.
+
+**Root-caused via a targeted A/B test, not by reading code until something
+looked wrong.** The error site (`compiler.c`'s "undefined variable"
+fprintf) fires at COMPILE time, reading `node->as.var.name` off the
+Ast node currently being compiled -- which can't be stale, since
+nothing is freed until that file's whole compile() call returns. That
+ruled out the obvious "stale Ast* read after free" theory. Poisoning
+every freed chunk with `0xAA` before `free()` (to force any genuine
+use-after-free to read obvious garbage) changed nothing -- same exact
+error, same exact variable name, every time. That ruled out use-after-free
+entirely.
+
+The actual bug: `asnix_ast_new()`'s chunk allocator used plain
+`malloc(sizeof(AstChunk))` for each fresh chunk. The arena it replaced
+is backed by `mmap(MAP_ANONYMOUS)`, which the kernel zero-fills on
+first access -- so every `Ast` node's fields that weren't explicitly
+set by whichever constructor built it happened to read back as zero,
+for the entire life of this project, with nobody ever having to notice
+or rely on that *consciously*. `asnix_ast_new()` itself only ever sets
+`n->kind`; the `as` union's node-kind-specific fields are initialized
+field-by-field by each AST_* construction site in `parser.c`, and at
+least one of those sites apparently leaves some field unset on the
+assumption that it'll read back as zero/null. Once chunk memory starts
+coming from `malloc` (uninitialized) and starts getting genuinely
+*reused* across multiple files' compiles (freed, then re-malloc'd for
+the next file, very plausibly handed back the exact same address),
+that implicit zero-initialization assumption breaks, and a later file's
+Ast node can inherit a previous file's stale field value for whichever
+field its own constructor forgot to set.
+
+**The fix**: `malloc(sizeof(AstChunk))` -> `calloc(1, sizeof(AstChunk))`.
+One word. Confirmed via the same real-workload test that caught the
+original bug: `./asnix d.nix` now produces the correct, known ffmpeg
+hash, and the previously-crashing `test-nixpkgs-hash` packages
+(`glib`/`gtk3`/`nix`) now pass.
+
+This is a general lesson worth stating plainly for any FUTURE allocator
+swap in this codebase: the main arena's `mmap`-backed zero-fill is a
+silent, free correctness property every allocation in this project has
+always had, whether or not any individual call site's author knew they
+were relying on it. Any new allocator introduced to replace a slice of
+the main arena (as this milestone and M87 both do) needs to either
+preserve that property (`calloc`, or an explicit `memset` after
+`malloc`) or audit every consumer for implicit zero-reliance -- the
+former is cheap insurance, the latter is not something a single
+investigation can realistically guarantee exhaustively.
+
+**Measured, paired, same build**: peak RSS on `./asnix d.nix`, before
+(AST living forever in the main arena) vs. after (freed per-file),
+measured back-to-back in the same worktree/build to eliminate
+machine-noise confounds: **736,920 KB -> 691,780 KB (~6.2% reduction)**.
+Smaller than the ~101-114 MB raw AST-node byte count measured earlier
+this session by independent investigations (the full theoretical
+saving), consistent with chunk-size rounding and some AST memory
+genuinely needing to outlive a single file's own compile call (e.g.
+`asnix_bytecode_prefetch_imports` reads the AST after `asnix_compile`
+returns but before the reset call, by design).
+
+`make test`/`test-e2e`/`test-conformance`: unchanged, all green (one
+transient `pass=654 fail=4` run reproduced as a clean `pass=655 fail=3`
+on immediate retry -- the same shared-machine flakiness pattern
+documented elsewhere in this file, not a real regression).
+`make test-nix-conformance`: `pass=655 fail=3 skip=148`, identical to
+the pre-existing baseline. `make test-nixpkgs-hash`: **`pass=148
+fail=0`**, including the specific packages that crashed under the
+original broken attempt.

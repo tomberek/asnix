@@ -467,6 +467,7 @@ Value asnix_eval_file(const char *path) {
             prog = asnix_compile(ast, base_dir, resolved);
             asnix_bytecode_cache_store(resolved, src, src_len, mtime_sec, mtime_nsec, fsize, prog);
             asnix_bytecode_prefetch_imports(ast, base_dir);
+            asnix_ast_arena_reset(); /* perf: ast is dead past this point -- see ast.c */
         }
     }
     Env *root_env = make_root_env(NULL);
@@ -503,6 +504,7 @@ void asnix_prefetch_compile_and_cache(const char *path) {
     IrProgram *prog = asnix_compile(ast, base_dir, resolved);
     asnix_bytecode_cache_store(resolved, src, src_len, (int64_t)st.st_mtim.tv_sec, (int64_t)st.st_mtim.tv_nsec,
                                 (int64_t)st.st_size, prog);
+    asnix_ast_arena_reset(); /* perf: ast is dead past this point -- see ast.c (also moot -- this forked child exits right after) */
 }
 
 /* M58: the one caller that needs make_root_env_ex's cycle-breaking
@@ -511,6 +513,7 @@ Value asnix_eval_file_for_derivation_bootstrap(const char *path) {
     char *resolved, *base_dir;
     Ast *ast = parse_file(path, &resolved, &base_dir);
     IrProgram *prog = asnix_compile(ast, base_dir, resolved);
+    asnix_ast_arena_reset(); /* perf: ast is dead past this point -- see ast.c */
     Env *root_env = make_root_env_ex(NULL, 1);
     Value result = asnix_eval(prog, root_env);
     free(resolved);
@@ -538,6 +541,7 @@ Value asnix_eval_file_scoped(const char *path, Value scope) {
     }
 
     IrProgram *prog = asnix_compile_scoped(ast, base_dir, resolved, names, lens, (size_t)n);
+    asnix_ast_arena_reset(); /* perf: ast is dead past this point -- see ast.c */
 
     Env *root_env = make_root_env(NULL);
     Env *scope_env = asnix_env_alloc(root_env, n);
@@ -570,6 +574,7 @@ Value asnix_eval_expr_source(const char *src) {
     Ast *ast = asnix_parse(toks, ntoks, src);
     free(toks); /* M86 perf: see parse_resolved_file's identical free() comment */
     IrProgram *prog = asnix_compile(ast, cwd, NULL);
+    asnix_ast_arena_reset(); /* perf: ast is dead past this point -- see ast.c */
     Env *root_env = make_root_env(NULL);
     return asnix_eval(prog, root_env);
 }
