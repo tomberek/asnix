@@ -118,10 +118,13 @@ asnix_op_with_try:
 .Lwith_try_found:
     movq ASNIX_ATTRS_OFF_ENTRIES+ASNIX_ATTR_OFF_VALUE(%rax, %r10, 1), %rax
 
+.Lwith_try_resolve:                     // M92: re-entered after unwrapping a Cell (see
+                                         // .Lwith_try_check_cell below) -- see op_var_ref.S's
+                                         // matching comment.
     movq %rax, %rcx
     andq $ASNIX_TAG_MASK, %rcx
     cmpq $ASNIX_TAG_THUNK, %rcx
-    jne .Lwith_try_push
+    jne .Lwith_try_check_cell
 
     andq $-8, %rax
     movq ASNIX_THUNK_OFF_STATE(%rax), %rcx
@@ -156,6 +159,29 @@ asnix_op_with_try:
 
 .Lwith_try_forced:
     movq ASNIX_THUNK_OFF_ENV(%rax), %rax
+    jmp .Lwith_try_resolve                // M92: defensive re-check, see op_var_ref.S's matching comment
+
+    // M92: not a thunk -- check whether it's a Cell instead (see heap.h's
+    // ASNIX_CELL_MARKER comment). %rcx still holds the tag bits from the
+    // check just above (the only path that reaches this label).
+.Lwith_try_check_cell:
+    cmpq $ASNIX_TAG_PTR, %rcx
+    jne .Lwith_try_push
+    movq %rax, %r8
+    andq $-8, %r8                        // r8 = masked base pointer
+    movq ASNIX_CELL_OFF_MARKER(%r8), %r9
+    cmpq $ASNIX_CELL_MARKER, %r9
+    jne .Lwith_try_push                  // PTR but not a Cell (String/Path/Float): a real value
+
+    // It's a Cell -- see op_var_ref.S's matching comment on
+    // asnix_resolve_cell_chain (value_util.c).
+    pushq %rsi                           // save IP
+    pushq %rdi                           // save ENV (2 pushes, stays 16-byte aligned)
+    movq %rax, %rdi                      // arg1 = the Cell value
+    call asnix_resolve_cell_chain
+    popq %rdi                            // restore ENV
+    popq %rsi                            // restore IP
+    jmp .Lwith_try_resolve
 .Lwith_try_push:
     movq %rax, (%r12)
     addq $8, %r12

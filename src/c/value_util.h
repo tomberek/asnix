@@ -39,6 +39,55 @@ int asnix_value_is_float(Value v);
  * asnix_int_value) -- callers must asnix_value_is_float() first. */
 double asnix_float_value(Value v);
 
+/* Cell (M92): see heap.h's ASNIX_CELL_MARKER comment for the full
+ * rationale -- a purely-internal "alias this existing Env slot instead of
+ * allocating a fresh Thunk" device, used by compiler.c's `try_cell_ref`
+ * at each of the ten `ib_mk_thunk` call sites when the expression being
+ * thunked is a bare, lexically-resolved variable reference. Arena-
+ * allocates a Cell{marker;target} heap object and returns it tagged
+ * ASNIX_TAG_PTR. `target` must be a stable (arena-allocated, never freed)
+ * Value* -- in practice always `&env->values[slot]` for some live Env
+ * (src/asm/ops/op_var_ref_cell.S is the only caller). */
+Value asnix_make_cell_value(Value *target);
+
+/* True iff `v` is an ASNIX_TAG_PTR object storing a Cell rather than a
+ * String/Path/Float (see heap.h's ASNIX_CELL_MARKER note). False for any
+ * other tag. */
+int asnix_value_is_cell(Value v);
+
+/* Unboxes a Cell Value's target pointer. Aborts if `v` isn't one (same
+ * "trust the caller already checked the tag" convention as
+ * asnix_int_value/asnix_float_value) -- callers must asnix_value_is_cell()
+ * first. */
+Value *asnix_cell_target(Value v);
+
+/* M92: the single, shared "unwrap however many Cells are chained
+ * together" loop, called from each force chokepoint (force.S,
+ * op_var_ref.S, op_select.S, op_select_or.S, op_with.S's OP_WITH_TRY)
+ * once it's already established `v` IS a Cell -- centralizing the loop
+ * here (rather than inlining an unbounded dereference-and-jump-back-to-
+ * resolve in all five places) is what makes it practical to bound it:
+ * a Cell has no IN_PROGRESS/blackhole state of its own the way a Thunk
+ * does (see heap.h's ASNIX_CELL_MARKER comment -- it's just {marker;
+ * target}, deliberately lightweight), so a PURE alias cycle with no
+ * Thunk anywhere in it at all (e.g. the legacy-`let`-syntax mutual
+ * reference `let { x = y; y = x; body = x; }`) would otherwise chase
+ * Cell->Cell->Cell forever with nothing to ever notice the cycle and
+ * stop -- found as a real regression (numtide/nix-conformance's
+ * eval-fail-blackhole.nix hanging instead of reporting its expected
+ * "blackhole" error) once Cells started being able to alias EACH
+ * OTHER, not just a ground Thunk/concrete value. Aborts with the exact
+ * same wording the Thunk-based blackhole check already uses once the
+ * chain exceeds ASNIX_CELL_CHASE_LIMIT (chosen generously above any
+ * legitimate chain depth -- a real program's own bare-variable-alias
+ * chain is never more than a few hops deep -- while still aborting in a
+ * small, bounded amount of time on a genuine cycle). Returns the first
+ * non-Cell Value found (which may still be an unforced Thunk -- the
+ * caller's own existing thunk-forcing logic handles that, by jumping
+ * back to its own resolve loop once this returns, exactly as it would
+ * for any other non-Cell value). */
+Value asnix_resolve_cell_chain(Value v);
+
 /* Returns a pointer to the raw bytes (NOT NUL-terminated either way) and
  * length of an ASNIX_TAG_PTR value, whichever of the two kinds (String or
  * Path) it actually is -- for callers (printing, hashing, ...) that just

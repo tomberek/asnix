@@ -56,6 +56,44 @@ double asnix_float_value(Value v) {
     return *(const double *)(base + ASNIX_FLOAT_OFF_VALUE);
 }
 
+Value asnix_make_cell_value(Value *target) {
+    void *mem = asnix_arena_alloc(16);
+    *(int64_t *)((char *)mem + ASNIX_CELL_OFF_MARKER) = ASNIX_CELL_MARKER;
+    *(Value **)((char *)mem + ASNIX_CELL_OFF_TARGET) = target;
+    return (Value){ .raw = (uint64_t)(uintptr_t)mem | ASNIX_TAG_PTR };
+}
+
+int asnix_value_is_cell(Value v) {
+    if (asnix_tag_of(v) != ASNIX_TAG_PTR) return 0;
+    const char *base = (const char *)(v.raw & ~0x7ULL);
+    return *(const int64_t *)(base + ASNIX_CELL_OFF_MARKER) == ASNIX_CELL_MARKER;
+}
+
+Value *asnix_cell_target(Value v) {
+    const char *base = (const char *)(v.raw & ~0x7ULL);
+    return *(Value **)(base + ASNIX_CELL_OFF_TARGET);
+}
+
+/* M92: generous above any legitimate chain of bare-variable aliases a
+ * real program could write (see this function's own declaration,
+ * value_util.h, for the full rationale) -- chosen to abort in well under
+ * a second even on a genuine cycle, not tuned against any specific
+ * fixture's depth. */
+#define ASNIX_CELL_CHASE_LIMIT 1000000
+
+Value asnix_resolve_cell_chain(Value v) {
+    int64_t i = 0;
+    while (asnix_value_is_cell(v)) {
+        if (++i > ASNIX_CELL_CHASE_LIMIT) {
+            static const char msg[] = "asnix: infinite recursion forcing a thunk (blackhole), aborting\n";
+            fwrite(msg, 1, sizeof(msg) - 1, stderr);
+            exit(1);
+        }
+        v = *asnix_cell_target(v);
+    }
+    return v;
+}
+
 /* Shared by asnix_add_values/asnix_sub_values/asnix_mul_values/
  * asnix_div_values/the four asnix_cmp_*_values functions below: real
  * Nix promotes an int operand to float whenever the OTHER operand is

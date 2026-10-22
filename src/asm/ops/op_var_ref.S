@@ -1,4 +1,5 @@
 #include "asnix/env.h"
+#include "asnix/heap.h"
 #include "asnix/ir.h"
 #include "asnix/stackcheck.h"
 #include "asnix/value.h"
@@ -29,11 +30,15 @@ asnix_op_var_ref:                       // a = depth, b = slot
     movq ASNIX_IROP_OFF_B(%rsi), %rdx   // rdx = slot
     movq ASNIX_ENV_OFF_VALUES(%rcx, %rdx, 8), %rax // rax = raw tagged value
 
+.Lvar_ref_resolve:                      // M92: re-entered after unwrapping a Cell (see
+                                         // .Lvar_ref_check_cell below) -- the Cell's target may
+                                         // itself still need forcing, or even be another Cell
+                                         // (chained bare-var aliasing, e.g. `let y=x; z=y;`).
     // M6: force if this slot holds an unforced thunk (laziness).
     movq %rax, %rcx
     andq $ASNIX_TAG_MASK, %rcx
     cmpq $ASNIX_TAG_THUNK, %rcx
-    jne .Lvar_ref_push
+    jne .Lvar_ref_check_cell
 
     andq $-8, %rax                      // rax = Thunk*
     movq ASNIX_THUNK_OFF_STATE(%rax), %rcx
@@ -73,6 +78,36 @@ asnix_op_var_ref:                       // a = depth, b = slot
 
 .Lvar_ref_forced:
     movq ASNIX_THUNK_OFF_ENV(%rax), %rax // cached Value.raw (ENV slot repurposed once forced)
+    jmp .Lvar_ref_resolve                // M92: defensive re-check (a forced thunk's cached
+                                          // value is never actually a raw Cell by construction
+                                          // -- see heap.h's ASNIX_CELL_MARKER comment -- but
+                                          // re-resolving costs nothing extra on this
+                                          // once-per-thunk path and keeps the invariant local).
+
+    // M92: not a thunk -- check whether it's a Cell instead (see heap.h's
+    // ASNIX_CELL_MARKER comment). %rcx still holds the tag bits from the
+    // check just above (the only path that reaches this label).
+.Lvar_ref_check_cell:
+    cmpq $ASNIX_TAG_PTR, %rcx
+    jne .Lvar_ref_push
+    movq %rax, %r8
+    andq $-8, %r8                        // r8 = masked base pointer
+    movq ASNIX_CELL_OFF_MARKER(%r8), %r9
+    cmpq $ASNIX_CELL_MARKER, %r9
+    jne .Lvar_ref_push                   // PTR but not a Cell (String/Path/Float): a real value
+
+    // It's a Cell -- asnix_resolve_cell_chain (value_util.c) unwraps
+    // however many are chained together (bounded -- see its own
+    // comment for why that bound matters) and hands back the first
+    // non-Cell Value, which may still be an unforced Thunk; re-enter
+    // the resolve loop above to handle that.
+    pushq %rsi                           // save IP
+    pushq %rdi                           // save ENV (2 pushes, stays 16-byte aligned)
+    movq %rax, %rdi                      // arg1 = the Cell value
+    call asnix_resolve_cell_chain
+    popq %rdi                            // restore ENV
+    popq %rsi                            // restore IP
+    jmp .Lvar_ref_resolve
 .Lvar_ref_push:
     ASNIX_CHECK_VALSTACK %rcx
     movq %rax, (%r12)

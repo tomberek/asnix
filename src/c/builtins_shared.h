@@ -51,6 +51,29 @@ Value asnix_bshared_make_primop_noforce(void *fn, int64_t arity);
  * arity>=2 builtin added in this pass. */
 Value asnix_bshared_make_curried_native(void *native_fn, int64_t arity);
 
+/* M92: same curry-chain shape as asnix_bshared_make_curried_native just
+ * above, EXCEPT the generated chain reassembles its captured arguments
+ * with OP_VAR_REF_RAW (ib_var_ref_raw) instead of plain OP_VAR_REF, and
+ * the leaf native call is built via asnix_bshared_make_primop_noforce
+ * instead of asnix_bshared_make_primop -- so NEITHER the curry chain's
+ * own reassembly NOR op_call.S's post-dispatch primop-arg-forcing loop
+ * (M25) ever forces any argument before `native_fn` runs; `native_fn`
+ * is entirely responsible for forcing whatever it needs itself. Needed
+ * by `elem` (builtins_list2.c): its first argument must reach
+ * asnix_bshared_value_eq completely raw/unforced, so that function's own
+ * slot/Cell-identity shortcut (see its M92 comment) can still fire --
+ * forcing it first (what asnix_bshared_make_curried_native's plain
+ * OP_VAR_REF reassembly does, harmlessly for every OTHER curried
+ * builtin, since op_call.S's own M25 force-loop would force it right
+ * back anyway) throws away exactly that identity information before
+ * `elem`'s own body ever sees it (confirmed via numtide/nix-
+ * conformance's eval-okay-eq-slot-elem.nix). Safe to use for OTHER
+ * arguments too (as `elem`'s own `list` argument does) as long as the
+ * native function forces every argument it actually needs the content
+ * of -- same discipline tryEval's own asnix_bshared_make_primop_noforce
+ * already requires of its one caller. */
+Value asnix_bshared_make_curried_native_noforce(void *native_fn, int64_t arity);
+
 /* M80: a single, lazily-allocated, byte-correct empty-attrset Value
  * (count=0), shared by every curry-stage Closure this file's/
  * builtins_misc.c's/builtins_m54.c's/builtins_attrs.c's native-builtin-

@@ -104,7 +104,8 @@ what's actually implemented and the scope decisions made along the way.
 | M89 — flipped the Makefile's default build from `-O0` to `-O2` (a background agent measured a genuine ~2x wall-clock difference on `d.nix` from the flag alone: real work like derivation-building/hashing/encoding lives in compiled C, not just the asm dispatch loop, so the old "hot path is asm, C doesn't matter" assumption didn't hold); added a `make debug` target for the old -O0/gdb-friendly behavior; added a stale-optimization-flag guard (`.opt-stamp`) so switching between `make`/`make debug`/`make release` without an explicit `make clean` can no longer silently leave a mix of differently-optimized `.o` files | done (see below; zero regressions; `make test-nixpkgs-hash` still `pass=148 fail=0`) |
 | M90 — thunk-count reduction: `compiler.c`'s ~10 `ib_mk_thunk` call sites (list elements, let/attrs/rec bindings, call arguments, `with` values) now skip thunk-wrapping entirely for expression kinds that already compile to a zero-cost compile-time push (`AST_INT`/`AST_FLOAT`/`AST_BOOL`/`AST_NULL`/`AST_CURPOS`/literal `AST_STRING`/literal `AST_PATH`), matching real Nix's own `maybeThunk` overrides for these same kinds -- deliberately excludes `AST_VAR`, a separate slot-aliasing optimization out of scope here | done (see below; **184,768 of 919,350 thunk-creation sites skipped (20.1%)** on `d.nix`'s ffmpeg closure, **10,941 of 43,503 (25.2%)** on `e.nix`'s hello closure; zero regressions) |
 | M91 — `asnix_bshared_make_attrs` (the core attrset constructor used by `listToAttrs`/`zipAttrsWith`/JSON-TOML-object-parsing/`intersectAttrs`/etc.) was an insertion sort, O(n²) worst case; measured on `d.nix`: 52,539 calls, one with 5,234 entries, ~699,000 total swaps. Switched to `qsort` over `(sym, original-index)` pairs, preserving exact stability (ties broken by original index, matching the insertion sort's own behavior, in case any caller passes duplicate syms) | done (see below; instructions ~32.6-32.9B → ~30.7B on `d.nix`, ~6% further reduction; zero regressions) |
-| M92+ | not started |
+| M92 — real `maybeThunk`-style Env-slot aliasing (a new `Cell` value kind riding on `ASNIX_TAG_PTR`), implementing real Nix's `ExprVar::maybeThunk` override: a bare lexically-resolved variable reference now aliases its existing Env slot instead of allocating a fresh thunk, giving `==`/the printer the slot-identity shortcut real Nix's `eqValues`/`print.cc` depend on; wired into all 10 `ib_mk_thunk` call sites (composing with M90's literal-skip at the same sites), all 5 force chokepoints made Cell-transparent via a bounded resolver | done (see below; `eval-okay-eq-slot-elem.nix`/`eval-okay-eq-slot-identity.nix`/`eval-okay-print.nix` now pass; `make test-nix-conformance`: `pass=652 fail=6` → **`pass=655 fail=3`**; zero regressions) |
+| M93+ | not started |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
 
@@ -9999,3 +10000,277 @@ evaluated successfully with no issue at all, confirming resource
 contention/timeout as the cause rather than any regression from this
 change -- see the M89-adjacent note elsewhere in this doc about
 `test-nixpkgs-hash`'s per-check timeout under contention).
+## M92: real `maybeThunk`-style Env-slot aliasing (a new `Cell` value kind) -- `eq-slot-elem`/`eq-slot-identity`/`print` all now pass, after M52/M81/M86 each independently declined the underlying gap as out of proportion
+
+(Numbered M92, not M88, despite being planned/implemented against an M87 baseline: master had already gained M88-M91 -- all unrelated CPU/perf work, from other parallel agents -- by the time this was ready to commit. This milestone's own diff is based on the pre-M88 tree and has NOT been rebased onto M88-M91; whoever merges this should check M90 ("skip thunk-wrapping for compile-time-trivial literals") in particular, since it very likely touches the same ten `ib_mk_thunk` call sites in `compiler.c` this milestone's own `try_cell_ref` wires into -- a real semantic interaction (two independent thunk-elision optimizations at the same sites), not just textual overlap, that needs a human/agent to reconcile by hand rather than a blind rebase.)
+
+Implemented the exact infrastructure M86's Part 2 (`eq-slot-elem.nix`/
+`eq-slot-identity.nix`, re-investigated and re-declined a SECOND time)
+concluded was needed and scoped out: real Nix's `Expr::maybeThunk`
+slot-aliasing optimization (`~/nix/gc-unlock/src/libexpr/eval.cc`,
+`ExprVar::maybeThunk`'s override of the universal "always allocate a
+fresh `Value`" default), which is what lets `eqValues`'s `if (&v1 ==
+&v2) return true` (eval.cc ~line 2919) and the printer's matching
+`seen->insert(&v)` (print.cc ~line 412) recover genuine Value-slot
+identity for a bare variable threaded through a list/attrset literal,
+a call argument, or a `with`-expression -- something asnix's flat,
+copied-everywhere 8-byte `Value` word had no way to express at all
+before this milestone (see docs/value-encoding.md).
+
+### The representation: `Cell`, a fourth `ASNIX_TAG_PTR` kind
+
+`include/asnix/heap.h`: `Cell{int64_t marker == ASNIX_CELL_MARKER
+(-3); Value *target;}`, riding on the exact same "reserved negative
+marker in the leading word" scheme Path (`-1`)/Float (`-2`) already
+established -- no new tag bit (all 8 are spent, see value.h), no
+storage-layout change anywhere (every Env/List/Attrs slot already
+holds one 8-byte `Value` regardless of kind). `target` is always
+`&env->values[slot]` for some live (arena-allocated, never freed) Env
+-- stable for the program's entire lifetime. `src/c/value_util.c`
+adds `asnix_make_cell_value`/`asnix_value_is_cell`/
+`asnix_cell_target`, mirroring Path/Float's own helpers exactly.
+
+### Compiler: `try_cell_ref`, wired into all 10 `ib_mk_thunk` call sites
+
+`src/c/compiler.c` adds two helpers:
+
+- `scope_find_lexical`: factored out of `AST_VAR`'s own scope walk --
+  scans `scope` outward for a lexical match, returning `(depth,
+  slot)`. Returns 0 (not found) exactly when the name only resolves
+  via a `with` fallback (or is genuinely undefined) -- `with`-sourced
+  names are excluded from aliasing NOT by a special case, but simply
+  because they have no fixed compile-time slot to alias in the first
+  place (which `with`, if any, actually has the key is a runtime
+  fact). `AST_VAR` itself was left using its own original, unchanged
+  scan (not refactored to call this) to avoid touching a subtle,
+  already-correct piece of code for zero behavioral gain -- both scans
+  are provably equivalent (same loop shape, verified by hand against
+  the real-Nix `maybeThunk`/`eval` distinction below).
+- `try_cell_ref(b, node, scope)`: returns 1 (having emitted
+  `OP_VAR_REF_CELL`) iff `node` is a bare `AST_VAR` that
+  `scope_find_lexical` resolves; 0 otherwise (caller falls back to the
+  ordinary `ib_mk_thunk` path unchanged).
+
+Enumerated and patched every `ib_mk_thunk` call site by hand (ten,
+matching the planning agent's own count): `AST_LET` binding values,
+`AST_LAMBDA`-pattern field bodies (never actually fires here --
+each field's body is always a synthetic `AST_SELECT`/`AST_IF`, never
+a bare `AST_VAR` -- but wired for uniformity/future-proofing anyway,
+at the cost of one cheap tag check), `AST_APP` call arguments, list
+elements, non-`rec` attrset hidden/visible/dynamic bindings, `rec`
+attrset bindings and dynamic bindings, and the `with`-expression
+itself -- cross-checked against real Nix's own override list
+(`eval.cc:1055-1390`: `ExprVar`/`ExprString`/`ExprInt`/`ExprFloat`/
+`ExprPath`/`ExprList` -- asnix only needed the `ExprVar` one, since
+string/int/float/path literals are already immediate/interned
+constants with no allocation to elide, and list literals aren't a
+single `ib_mk_thunk` site at all in asnix's IR, each ELEMENT is).
+
+### Force chokepoints: Cell-transparency, five sites plus one shared helper
+
+Enumerated every place a Thunk is force-resolved (grepped
+`ASNIX_TAG_THUNK` across `src/asm`): `op_var_ref.S`, `op_select.S`,
+`op_select_or.S`, `op_with.S`'s `OP_WITH_TRY`, and `force.S`'s
+`asnix_force_for_print` -- five sites, not the three M78-found
+scratch-buffer-cache sites (`asnix_force_for_print`/`asnix_apply`/
+`asnix_eval`) the task brief's own recollection suggested; those three
+are about per-recursion-depth buffer caching (a reentrant-dispatch-
+context concern) and are almost entirely orthogonal to WHERE a Thunk
+tag is actually interpreted. `asnix_apply`'s own entry dispatch and
+`asnix_eval`'s dispatch loop never inspect a raw Thunk/Cell tag
+directly -- they rely on the same five chokepoints above having
+already resolved whatever they're about to read (confirmed by
+tracing every caller).
+
+Each of the five got the identical new "check Cell, not just Thunk"
+block, added right where the existing code already falls through on
+"not a Thunk": if the tag is `ASNIX_TAG_PTR` with the Cell marker,
+call a new shared C helper, `asnix_resolve_cell_chain` (`value_util.c`),
+and loop back to re-examine the result (which may still be an
+unforced Thunk, or even another Cell -- chained bare-variable aliasing,
+e.g. `let y = x; z = y;`, lands a raw Cell directly in `z`'s own Env
+slot). Centralizing the chain-walk in ONE C function (rather than
+inlining an unbounded dereference in all five .S files) is what made
+it practical to bound it -- see the blackhole-regression entry below
+for why that bound turned out to be load-bearing, not just tidy.
+
+### The harder-than-expected parts (three real correctness traps, all found and fixed)
+
+Iterating `make test`/`make test-e2e`/`make test-nix-conformance`
+after the representation+compiler+force-chokepoint work above
+(implemented together, then verified) surfaced three genuine
+regressions/gaps the plan's own "FLAGGED OPEN RISK" section didn't
+fully anticipate -- each is a real correctness issue, not a design
+flaw in the overall approach, and each is now fixed:
+
+1. **`builtins.elem`'s own primop-argument-forcing convention
+   destroyed the Cell before equality ever saw it.** `elem x list`
+   is arity-2, so asnix curries it into a Closure chain
+   (`asnix_bshared_make_curried_native`) -- and that chain's OWN
+   bytecode re-reads each captured argument via a plain `OP_VAR_REF`
+   when reassembling the final native call, which (correctly, by
+   design) FORCES through any Cell. By the time `elem`'s native C
+   function ever ran, `x` had already been silently resolved to a
+   concrete value, regardless of whether the primop itself was
+   force-mode or not. Real Nix's own `prim_elem` (primops.cc)
+   deliberately does NOT force its first argument before calling
+   `eqValues` for exactly this reason. Fixed with a new op,
+   `OP_VAR_REF_RAW` (`op_var_ref_raw.S` -- same depth/slot walk as
+   `OP_VAR_REF`, zero forcing, the `OP_FRAME_GET` of depth-relative
+   reads), and a new curry-chain builder,
+   `asnix_bshared_make_curried_native_noforce`, that uses it instead
+   of `OP_VAR_REF` for reassembly AND builds the leaf primop NOFORCE
+   (skipping op_call.S's own M25 post-dispatch force-loop too) --
+   used only by `elem` (`builtins_list2.c`), which now forces `list`
+   manually itself but leaves `x` completely raw.
+2. **The naive "Cell-identity shortcut" first draft broke
+   `eval-okay-equal-function-direct-identical.nix`.** `let f = x: x;
+   in f == f`'s two operands are always evaluated via the ordinary,
+   always-forcing `OP_VAR_REF` (never `OP_VAR_REF_CELL` -- that's only
+   emitted at `ib_mk_thunk` sites, never for an operand used directly)
+   -- so by the time they reach `asnix_bshared_value_eq_op`, they're
+   ALREADY the same concrete closure pointer. A blanket `a.raw ==
+   b.raw` pre-force check (the first thing tried) wrongly fired on
+   that bare content-identity, resurrecting exactly the bug M80 had
+   already fixed. Fixed by restricting the shortcut
+   (`asnix_bshared_slot_identical`, `builtins_shared.c`) to ONLY two
+   cases that genuinely correspond to "same storage slot": two Cells
+   with equal `target`, or two values that are literally the same raw
+   THUNK (not yet forced at all) -- never a blanket check on already-
+   concrete content.
+3. **A pure Cell-to-Cell alias cycle has no blackhole detection,
+   because Cells have no IN_PROGRESS state the way Thunks do.**
+   `eval-fail-blackhole.nix` (`let { body = x; x = y; y = x; }`) used
+   to abort immediately via Thunk IN_PROGRESS detection; once `x`/`y`
+   became pure Cell aliases of each other (no Thunk anywhere in the
+   cycle at all), the naive "dereference and loop" force-chokepoint
+   logic chased Cell->Cell->Cell forever with nothing to ever notice
+   the cycle -- a real hang, not a crash. This is exactly why
+   `asnix_resolve_cell_chain` was centralized into one C function
+   rather than inlined five times: it bounds the chase at
+   `ASNIX_CELL_CHASE_LIMIT` (1,000,000 -- generous above any
+   legitimate bare-variable-alias chain depth a real program would
+   write, while still aborting in well under a second on a genuine
+   cycle) and reports the exact same "blackhole" wording the Thunk
+   path already used.
+
+A fourth issue was a genuine, narrower regression found on the SAME
+re-verification pass, not a design gap: `builtins.lessThan`'s own
+list-ordering comparison (`asnix_bshared_value_lt`,
+`builtins_shared.c`) force-resolved each pair of list elements BEFORE
+calling `asnix_bshared_value_eq` to decide "equal, keep comparing the
+next element" -- the exact same forcing-before-equality-check mistake
+`elem` had, just in a different function. Found via
+`eval-okay-eq-slot-sort.nix` (`lessThan [id 2] [id 1]`, where the
+shared `id` element needs the Cell shortcut to avoid incorrectly
+falling through to "cannot compare these two values", since the
+closure-vs-closure default comparison is now unconditionally `false`,
+not a pointer-identity check -- see item 2 above). Fixed by swapping
+the equality check to run on the raw, pre-force elements, forcing only
+if they turn out NOT equal (needed for the actual ordering
+comparison).
+
+### Equality (`src/c/builtins_shared.c`)
+
+`asnix_bshared_slot_identical(a, b)` (see item 2 above for exactly
+what it does and doesn't check) is consulted at the top of BOTH
+`asnix_bshared_value_eq` (covers list/attrs-element recursion,
+`elem`, `genericClosure`, `lessThan`'s ordering -- every RAW,
+pre-force call site) and `asnix_bshared_value_eq_op` (covers `==`/`!=`
+own direct operands, before EITHER of that function's two
+`force_for_print` calls -- in practice a Cell basically never reaches
+this one directly, since direct operands are always pre-resolved by
+an ordinary `OP_VAR_REF`/`OP_SELECT`, but checking is cheap and keeps
+the two functions symmetric). `asnix_bshared_value_eq`'s `default:`
+case (closures/primops, the only tags left once Thunk is impossible
+and INT/IMM/PTR/LIST/ATTRS are handled above) now unconditionally
+returns false, matching real Nix's `case nFunction: return false` --
+previously `a.raw == b.raw` (forced-object pointer identity), which
+happened to coincide with the right answer whenever the SAME
+Thunk/Cell was read from two places (no other way to express "same
+slot" existed before this milestone) but gave the WRONG answer
+whenever two INDEPENDENTLY-computed closures just happened to
+evaluate to the literal same heap object (`[(id id)] == [(id id)]`,
+`eval-okay-eq-slot-elem.nix`'s `elem foo.bar [foo.bar]`).
+
+**Resolving the planning agent's flagged open risk**: does
+`asnix_bshared_value_eq`'s list/attrs-element recursion force before
+comparing? Yes, unconditionally, at the very top of the function --
+confirmed by reading it directly, not inferred. This was already true
+before this milestone and is NOT a latent bug on its own (the generic
+equality rules for INT/IMM/PTR/LIST/ATTRS are all content-based and
+correct either way) -- the actual problem this milestone had to solve
+was narrower and different: the slot-identity SHORTCUT has to run
+*before* that existing forcing, in every caller, which is exactly what
+`asnix_bshared_slot_identical`'s placement (checked first, in both
+`asnix_bshared_value_eq` and `asnix_bshared_value_eq_op`, plus the two
+additional call sites `elem`/`lessThan` needed fixing at) accomplishes.
+
+### Printer (`src/c/main.c`)
+
+Restructured `print_value_inner` into a new `print_peel_wrappers` (new)
++ `print_value_concrete` (the old tag-dispatch switch, renamed,
+unchanged except as noted below). `print_peel_wrappers` peels off
+Cell/Thunk wrappers one at a time -- NOT via one opaque
+`asnix_force_for_print` call -- pushing each wrapper's OWN identity (a
+Cell's `target` address, or a Thunk's own heap address) onto the
+existing ancestor stack (`g_print_active`) individually, exactly
+mirroring real Nix's `seen->insert(&v)` (keyed by the Value SLOT's own
+address, not whatever it forces to). This distinction is invisible for
+every ORDINARY value, but matters for a genuinely self-referential one
+built through a Cell (`let x = [x]; in x`): real Nix's `V_outer`
+(the enclosing list-element's own copied Value, printed first) and
+`V_x` (`x`'s own binding slot, reached one level deeper by following
+the shared `elems` array back to its one pointer) are two DIFFERENT
+Value-struct addresses that happen to share identical list CONTENT --
+only the second, deeper encounter of `&V_x` is the actual repeat.
+`ASNIX_TAG_LIST`'s own `print_value_concrete` case had its
+`print_active_push`/`pop` on the forced List object's OWN address
+REMOVED entirely (not just left alongside the new wrapper-level
+tracking) -- keeping both caused the wrong, one-bracket-too-few
+collapse, because the SAME heap List object is reachable through two
+DIFFERENT wrapper chains in this exact structure, and object-address
+tracking matches one level too early. List cycles are structurally
+only ever reachable through a Cell or Thunk in the first place (a
+plain `OP_MK_LIST` can never embed a not-yet-built list inside itself),
+so the wrapper-level tracking alone is sufficient for cycle-safety,
+with no loss of the PASSING `repeated-empty-list.nix`-style "siblings
+aren't collapsed" behavior (lists use ancestor-only, popped semantics,
+unchanged). `ASNIX_TAG_ATTRS`'s own, separate, whole-print-call
+`print_attrs_seen_mark` (object-address-keyed, deliberately never
+popped, for the DIFFERENT "non-ancestor sibling reuse IS collapsed"
+rule attrsets need) is completely unchanged -- confirmed by hand-
+tracing `let a = {x=1;}; in {p=a; q=a;}` through the new code (still
+`{ p = { x = 1; }; q = «repeated»; }`) and `eval-okay-eq-slot-attrs.nix`
+(all 5 cases, still `true`) that it keeps working correctly alongside
+the new Cell/Thunk-level ancestor tracking, not instead of it.
+
+### Verification
+
+`make test-nix-conformance`: baseline (re-verified at the START of
+this session, not trusted from any prior write-up) `pass=652 fail=6
+skip=148` -> **`pass=655 fail=3 skip=148`** -- all three target
+fixtures (`eval-okay-eq-slot-elem.nix`, `eval-okay-eq-slot-identity.nix`,
+`eval-okay-print.nix`) now pass, plus `eval-okay-equal-function-direct-
+identical.nix` and `eval-fail-blackhole.nix` (both briefly regressed
+mid-pass by the two bugs above, confirmed fixed) and
+`eval-okay-eq-slot-sort.nix` (the `lessThan` bug above, also fixed).
+The remaining 3 failures (`eval-okay-getattrpos-functionargs.nix`,
+`eval-okay-getattrpos.nix`, `eval-okay-inherit-attr-pos.nix`) are the
+SAME pre-existing, unrelated failures present in the baseline,
+untouched by this milestone. Re-ran the full suite three times in a
+row to confirm `655/3/148` is stable -- an EARLIER re-run under heavy
+concurrent machine load (other agents' background jobs, load average
+30+ on 22 cores) spuriously showed unrelated fixtures
+(`eval-okay-string.nix`, `eval-okay-attrs4.nix`, regex fixtures)
+failing due to the harness's 10-second-per-fixture timeout, NOT a real
+regression -- confirmed by re-running those specific fixtures directly
+(sub-50ms each, byte-exact match) and by the full suite settling back
+to the same stable `655/3/148` on every subsequent run.
+
+`make test`/`make test-e2e`: fully green, no regressions (289/289 e2e
+fixtures). `make test-nixpkgs-hash`: reconfirmed **`pass=148 fail=0`**
+both before this milestone's changes and after -- function/closure
+equality and bare-variable-alias chains are rare in real nixpkgs
+evaluation (confirmed: zero behavior change across all 74 packages'
+`outPath`/`drvPath` hashes).

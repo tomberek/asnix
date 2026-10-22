@@ -75,12 +75,15 @@ asnix_op_select_or:
 .Lselect_or_found:
     movq ASNIX_ATTRS_OFF_ENTRIES+ASNIX_ATTR_OFF_VALUE(%rax, %r10, 1), %rax
 
+.Lselect_or_resolve:                    // M92: re-entered after unwrapping a Cell (see
+                                         // .Lselect_or_check_cell below) -- see op_var_ref.S's
+                                         // matching comment.
     // M6: force if the selected entry holds an unforced thunk, same as
     // OP_SELECT.
     movq %rax, %rcx
     andq $ASNIX_TAG_MASK, %rcx
     cmpq $ASNIX_TAG_THUNK, %rcx
-    jne .Lselect_or_push
+    jne .Lselect_or_check_cell
 
     andq $-8, %rax
     movq ASNIX_THUNK_OFF_STATE(%rax), %rcx
@@ -116,6 +119,29 @@ asnix_op_select_or:
 
 .Lselect_or_forced:
     movq ASNIX_THUNK_OFF_ENV(%rax), %rax
+    jmp .Lselect_or_resolve               // M92: defensive re-check, see op_var_ref.S's matching comment
+
+    // M92: not a thunk -- check whether it's a Cell instead (see heap.h's
+    // ASNIX_CELL_MARKER comment). %rcx still holds the tag bits from the
+    // check just above (the only path that reaches this label).
+.Lselect_or_check_cell:
+    cmpq $ASNIX_TAG_PTR, %rcx
+    jne .Lselect_or_push
+    movq %rax, %r8
+    andq $-8, %r8                        // r8 = masked base pointer
+    movq ASNIX_CELL_OFF_MARKER(%r8), %r9
+    cmpq $ASNIX_CELL_MARKER, %r9
+    jne .Lselect_or_push                 // PTR but not a Cell (String/Path/Float): a real value
+
+    // It's a Cell -- see op_var_ref.S's matching comment on
+    // asnix_resolve_cell_chain (value_util.c).
+    pushq %rsi                           // save IP
+    pushq %rdi                           // save ENV (2 pushes, stays 16-byte aligned)
+    movq %rax, %rdi                      // arg1 = the Cell value
+    call asnix_resolve_cell_chain
+    popq %rdi                            // restore ENV
+    popq %rsi                            // restore IP
+    jmp .Lselect_or_resolve
 .Lselect_or_push:
     ASNIX_CHECK_VALSTACK %rcx
     movq %rax, (%r12)

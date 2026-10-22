@@ -38,10 +38,25 @@ static Value check_bool(Value v, const char *who) {
  * (real content equality for int/string/bool/null, pointer identity for
  * aggregates -- see builtins_shared.h), not real Nix's deep structural
  * eqValues; a documented, narrow divergence, not an oversight.
- * --------------------------------------------------------------------- */
+ *
+ * M92: `x` (args[0]) is deliberately left completely unforced -- built
+ * via asnix_bshared_make_curried_native_noforce (NOT the ordinary
+ * asnix_bshared_make_curried_native every other curried builtin here
+ * uses), specifically so asnix_bshared_value_eq's own slot/Cell-identity
+ * shortcut (see that function's M92 comment) still has something to
+ * check: forcing `x` before this function ever sees it -- which is
+ * exactly what the FORCE-mode curry builder's OP_VAR_REF reassembly
+ * (plus op_call.S's own M25 post-dispatch force-loop) would otherwise
+ * do, completely incidentally, to every curried argument -- throws away
+ * the very slot-identity information `elem x [x]` depends on being
+ * `true`. Matches real Nix's own `prim_elem` (primops.cc), which passes
+ * `*args[0]` to `eqValues` with no forcing of its own either, for the
+ * identical reason. `list` (args[1]) must still be forced explicitly
+ * here, since NOFORCE means NEITHER argument arrives pre-forced. */
 static Value elem2_impl(const Value *args, int64_t argc) {
     (void)argc;
-    Value x = args[0], list = args[1];
+    Value x = args[0];
+    Value list = asnix_force_for_print(args[1]);
     ASNIX_REQUIRE_LIST(list, "elem");
     int64_t n = asnix_bshared_list_count(list);
     const Value *elems = asnix_bshared_list_elems(list);
@@ -50,7 +65,7 @@ static Value elem2_impl(const Value *args, int64_t argc) {
     }
     return ASNIX_FALSE;
 }
-static Value build_elem(void) { return asnix_bshared_make_curried_native((void *)elem2_impl, 2); }
+static Value build_elem(void) { return asnix_bshared_make_curried_native_noforce((void *)elem2_impl, 2); }
 
 /* ---------------------------------------------------------------------
  * any pred list / all pred list -- verified:

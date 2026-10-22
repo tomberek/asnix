@@ -124,6 +124,18 @@ enum {
     OP_PUSH_FALSE,
     OP_PUSH_NULL,
     OP_VAR_REF,
+    OP_VAR_REF_CELL, /* M92: a = depth, b = slot -- same De Bruijn depth/slot addressing as
+                     * OP_VAR_REF, but instead of forcing and pushing the slot's VALUE, this
+                     * pushes a Cell wrapping a pointer straight at the slot itself (see
+                     * heap.h's ASNIX_CELL_MARKER comment). Emitted ONLY by compiler.c's
+                     * `try_cell_ref`, at each of the ten `ib_mk_thunk` call sites, when the
+                     * expression about to be thunked is a bare variable reference that
+                     * resolves LEXICALLY (never for a `with`-fallback name, which has no
+                     * fixed compile-time slot to alias) -- mirrors real Nix's
+                     * `ExprVar::maybeThunk` override (eval.cc) of the otherwise-universal
+                     * "always allocate a fresh Value" `Expr::maybeThunk` default every OTHER
+                     * expression kind still uses (OP_MK_THUNK, unchanged). See
+                     * op_var_ref_cell.S. */
     OP_ADD,
     OP_SUB,
     OP_MUL,
@@ -311,6 +323,23 @@ enum {
                      * and OP_FRAME_EXIT that normally follow it don't need to know which
                      * path ran. See asnix_bshared_rec_overrides_merge,
                      * builtins_shared.c. */
+    OP_VAR_REF_RAW, /* M92: a = depth, b = slot -- same De Bruijn depth/slot addressing as
+                     * OP_VAR_REF, but pushes the slot's raw content verbatim, with NO
+                     * forcing at all (not even thunk-forcing) -- the OP_FRAME_GET of depth-
+                     * relative reads, needed for the identical reason OP_FRAME_GET itself
+                     * was (ir.h's own OP_FRAME_GET comment): OP_VAR_REF's force-on-read is
+                     * sometimes wrong. Specifically used by
+                     * asnix_bshared_make_curried_native_noforce (builtins_shared.c) to
+                     * reassemble a curried multi-arg native builtin's captured arguments
+                     * before the final native call -- OP_VAR_REF there would silently force
+                     * (and Cell-resolve) each argument on the way back out of the curry
+                     * chain's own Env slots, defeating the whole point of a NOFORCE primop
+                     * like `elem` wanting its raw, unforced first argument (see that
+                     * builtin's own comment, builtins_list2.c, and heap.h's
+                     * ASNIX_CELL_MARKER comment for why forcing loses slot-identity). Not
+                     * used anywhere a Nix-source-level thunk needs its usual laziness
+                     * semantics preserved -- ordinary `let`/list/attrs bindings still go
+                     * through OP_MK_THUNK/OP_VAR_REF_CELL/OP_VAR_REF exactly as before. */
     OP_PATH_CONCAT, /* M59: `~`/path-literal interpolation (`./${foo}`, `~/${foo}`, ...):
                      * a = count; pops `count` values (same reverse-push-order convention
                      * as OP_STR_CONCAT), coerces each to a string and concatenates them in

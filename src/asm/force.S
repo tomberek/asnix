@@ -8,6 +8,7 @@
 // own self-contained mini dispatch context (mirroring asnix_eval's own
 // prologue) to run one thunk's body to completion and return the result.
 #include "asnix/force_scratch.h" // ASNIX_FORCE_{VALSTACK,RETSTACK}_BYTES, per-depth cache (perf)
+#include "asnix/heap.h"
 #include "asnix/ir.h"
 #include "asnix/stackcheck.h"
 #include "asnix/value.h"
@@ -182,9 +183,40 @@ asnix_force_epilogue:
     movq %rax, %rcx
     andq $ASNIX_TAG_MASK, %rcx
     cmpq $ASNIX_TAG_THUNK, %rcx
-    jne .Lforce_ret
+    jne .Lforce_check_cell
     movq %rax, %rdi                     // %rdi may be stale here (e.g. the .Lforce_cached
     jmp .Lforce_top                     // path never touches it) -- always resync from %rax
+
+    // M92: not a thunk -- check whether it's a Cell instead (see heap.h's
+    // ASNIX_CELL_MARKER comment): the Cell's own target may itself still
+    // need forcing (another Thunk), or even be another Cell (chained
+    // bare-var aliasing, e.g. `let y=x; z=y;`) -- loop back through
+    // .Lforce_top either way. %rcx still holds the tag bits from the
+    // check just above.
+.Lforce_check_cell:
+    cmpq $ASNIX_TAG_PTR, %rcx
+    jne .Lforce_ret
+    movq %rax, %rdx
+    andq $-8, %rdx                       // rdx = masked base pointer
+    movq ASNIX_CELL_OFF_MARKER(%rdx), %rcx
+    cmpq $ASNIX_CELL_MARKER, %rcx
+    jne .Lforce_ret                      // PTR but not a Cell (String/Path/Float): a real value
+
+    // It's a Cell -- see op_var_ref.S's matching comment on
+    // asnix_resolve_cell_chain (value_util.c). asnix_force_for_print is
+    // a plain C-callable function (not a dispatch-loop op handler), so
+    // its entry rsp parity is the ordinary post-`call` one (8 mod 16)
+    // rather than the dispatch loop's always-16-aligned invariant --
+    // .Lforce_check_cell is always reached on that same fast,
+    // nothing-pushed-yet path (.Lforce_top's own entry, or
+    // asnix_force_epilogue's "already fully unwound" tail-loop), so a
+    // single 8-byte pad is enough to make this call ABI-compliant.
+    movq %rax, %rdi                      // arg1 = the Cell value
+    subq $8, %rsp
+    call asnix_resolve_cell_chain
+    addq $8, %rsp
+    movq %rax, %rdi
+    jmp .Lforce_top
 .Lforce_ret:
     ret
 

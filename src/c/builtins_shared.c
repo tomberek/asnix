@@ -84,6 +84,38 @@ Value asnix_bshared_make_curried_native(void *native_fn, int64_t arity) {
     return (Value){ .raw = (uint64_t)(uintptr_t)mem | ASNIX_TAG_CLOSURE };
 }
 
+/* M92: see builtins_shared.h's own long comment -- identical to
+ * asnix_bshared_make_curried_native just above, except the reassembly
+ * loop uses ib_var_ref_raw (no forcing at all) instead of ib_var_ref,
+ * and the leaf primop is built NOFORCE (asnix_bshared_make_primop_
+ * noforce) instead of force-by-default. */
+Value asnix_bshared_make_curried_native_noforce(void *native_fn, int64_t arity) {
+    Value native_primop = asnix_bshared_make_primop_noforce(native_fn, arity);
+    Value empty_formals = asnix_bshared_native_formals_marker();
+
+    IrBuilder *b = ib_new();
+    ib_push_const(b, (int64_t)native_primop.raw);
+    for (int64_t depth = arity - 1; depth >= 0; depth--) ib_var_ref_raw(b, depth, 0);
+    ib_call(b, arity);
+    ib_ret(b);
+    IrProgram *prog = ib_finish(b);
+
+    for (int64_t i = arity - 1; i >= 1; i--) {
+        IrBuilder *wrap_b = ib_new();
+        ib_lambda(wrap_b, 1, prog, (int64_t)empty_formals.raw);
+        ib_ret(wrap_b);
+        prog = ib_finish(wrap_b);
+    }
+
+    void *mem = asnix_arena_alloc(ASNIX_CLOSURE_SIZE);
+    *(void **)((char *)mem + ASNIX_CLOSURE_OFF_UP) = NULL;
+    *(void **)((char *)mem + ASNIX_CLOSURE_OFF_BODY) = prog->ops;
+    *(int64_t *)((char *)mem + ASNIX_CLOSURE_OFF_ARITY) = 1;
+    *(void **)((char *)mem + ASNIX_CLOSURE_OFF_POOL) = prog->pool;
+    *(uint64_t *)((char *)mem + ASNIX_CLOSURE_OFF_FORMALS) = empty_formals.raw;
+    return (Value){ .raw = (uint64_t)(uintptr_t)mem | ASNIX_TAG_CLOSURE };
+}
+
 Value asnix_bshared_apply2(Value fn, Value a, Value b) {
     Value step1 = asnix_apply(fn, &a, 1);
     return asnix_apply(step1, &b, 1);
@@ -407,7 +439,46 @@ static int value_is_derivation(Value v) {
     return len == 10 && memcmp(bytes, "derivation", 10) == 0;
 }
 
+/* M92: real Nix's `eqValues` (eval.cc ~line 2919) starts with `if (&v1 ==
+ * &v2) return true` -- comparing the ADDRESS of the Value slot/cell
+ * itself, BEFORE forcing either side, not the heap payload either one
+ * eventually forces to. asnix has no single uniform "every Value lives in
+ * an addressable cell" model the way real Nix does (see heap.h's
+ * ASNIX_CELL_MARKER comment) -- the closest equivalents are (a) two Cells
+ * (possibly different Cell objects, from two independent OP_VAR_REF_CELL
+ * executions) whose `target` fields point at the exact same Env slot, and
+ * (b) two Values that are the literal same raw THUNK -- genuinely shared
+ * memoization storage, e.g. the same already-forced attrset's entry read
+ * twice (`builtins.attrValues x == builtins.attrValues x`). Must run on
+ * the RAW, pre-force operands -- forcing loses exactly the identity
+ * information being checked (confirmed via numtide/nix-conformance's
+ * eval-okay-eq-slot-elem.nix/-identity.nix).
+ *
+ * Deliberately does NOT do a blanket `a.raw == b.raw` on any already-
+ * concrete tag (INT/IMM/PTR/LIST/ATTRS/CLOSURE/PRIMOP): `==`'s own two
+ * direct operands (asnix_bshared_value_eq_op) are ALWAYS already fully
+ * forced by the ordinary (always-forcing) OP_VAR_REF/OP_SELECT/etc.
+ * chokepoint that produced them -- a bare variable used directly as an
+ * operand is never Cell-ified (compiler.c's try_cell_ref only fires at
+ * `ib_mk_thunk` call sites, never for an ordinary compile_expr(AST_VAR)
+ * read) -- so two closures that happen to be bit-identical CONTENT
+ * (e.g. `let f = x: x; in f == f`, both reads forced down to the same
+ * underlying closure object) are NOT "the same slot" in real Nix's
+ * sense (ExprOpEq::eval always copies into a fresh local Value first --
+ * see builtins_shared.h's own M80 comment) and must still compare
+ * `false` (eval-okay-equal-function-direct-identical.nix) -- exactly
+ * the case a blanket raw-equality check would have wrongly short-
+ * circuited to `true`. List/Attrs pointer-equality is still handled,
+ * correctly, by asnix_bshared_value_eq's own LIST/ATTRS cases below
+ * (content equality there IS genuine equality, unlike for a function). */
+static int asnix_bshared_slot_identical(Value a, Value b) {
+    if (asnix_value_is_cell(a) && asnix_value_is_cell(b)) return asnix_cell_target(a) == asnix_cell_target(b);
+    if (asnix_tag_of(a) == ASNIX_TAG_THUNK && asnix_tag_of(b) == ASNIX_TAG_THUNK) return a.raw == b.raw;
+    return 0;
+}
+
 int asnix_bshared_value_eq(Value a, Value b) {
+    if (asnix_bshared_slot_identical(a, b)) return 1;
     a = asnix_force_for_print(a);
     b = asnix_force_for_print(b);
     int ta = asnix_tag_of(a), tb = asnix_tag_of(b);
@@ -469,12 +540,47 @@ int asnix_bshared_value_eq(Value a, Value b) {
             }
             return 1;
         }
-        default: return a.raw == b.raw; /* pointer identity: closures/primops/thunks */
+        /* M92: closures/primops (the only tags that can still reach here --
+         * INT/IMM/PTR/LIST/ATTRS are all handled above, and THUNK is
+         * impossible: force_for_print already fully resolved both sides)
+         * are NEVER equal at this point, matching real Nix's `case
+         * nFunction: return false` (eval.cc), which runs unconditionally
+         * once the `&v1==&v2` slot-identity shortcut hasn't already
+         * fired -- and it HAS already been checked, above, on the raw
+         * pre-force operands (asnix_bshared_slot_identical). Previously
+         * this fell back to `a.raw == b.raw` (forced-object pointer
+         * identity), which happened to coincide with real Nix's answer
+         * whenever the SAME Thunk/Cell happened to be read from two
+         * places (there was no other way for asnix to express "same
+         * slot") but gave the WRONG answer (true) whenever two
+         * INDEPENDENTLY-computed closures just happened to evaluate to
+         * the literal same heap object -- e.g. `[(id id)] == [(id id)]`:
+         * each `(id id)` is a fresh, unaliased Thunk that both happen to
+         * evaluate to the very same `id` closure; real Nix says `false`
+         * (confirmed via numtide/nix-conformance's
+         * eval-okay-eq-slot-elem.nix/-identity.nix, which this fixes).
+         * `asnix_bshared_slot_identical` above is what keeps the cases
+         * that DO need `true` (eval-okay-eq-slot-attrs.nix's `g = x: x;`
+         * field, reached twice through the literal same shared Thunk; a
+         * bare-variable aliased pair via a Cell) working. */
+        default: return 0;
     }
 }
 
-/* See builtins_shared.h's long M80 comment. */
+/* See builtins_shared.h's long M80 comment. M92: also checks the Cell
+ * slot-identity shortcut (asnix_bshared_slot_identical) on the RAW,
+ * PRE-FORCE `a`/`b` -- before EITHER of this function's own two
+ * `force_for_print` calls, which would otherwise discard exactly the
+ * aliasing information being checked. In practice `==`'s own two direct
+ * operands are compiled via the ordinary (always-forcing) OP_VAR_REF/
+ * OP_SELECT/etc. chokepoints, never OP_VAR_REF_CELL (that's only ever
+ * emitted at the ten `ib_mk_thunk` call sites, see compiler.c's
+ * `try_cell_ref`) -- so a raw Cell basically never reaches here directly
+ * -- but checking costs one cheap tag test and keeps this function
+ * exactly as correct as `asnix_bshared_value_eq`'s own recursive check,
+ * with no special-case asymmetry between the two. */
 int asnix_bshared_value_eq_op(Value a, Value b) {
+    if (asnix_bshared_slot_identical(a, b)) return 1;
     Value fa = asnix_force_for_print(a);
     Value fb = asnix_force_for_print(b);
     int ta = asnix_tag_of(fa), tb = asnix_tag_of(fb);
@@ -576,9 +682,27 @@ int asnix_bshared_value_lt(Value a, Value b, const char *who) {
         const Value *ea = asnix_bshared_list_elems(a), *eb = asnix_bshared_list_elems(b);
         int64_t n = na < nb ? na : nb;
         for (int64_t i = 0; i < n; i++) {
+            /* M92: asnix_bshared_value_eq on the RAW (pre-force) elements
+             * -- NOT force_for_print'd first, same reasoning as `elem`'s
+             * own fix (builtins_list2.c): forcing here would strip
+             * exactly the slot/Cell identity asnix_bshared_value_eq's
+             * own shortcut needs to tell "two bare-var-aliased elements
+             * (e.g. both lists' shared `id`)" apart from "two
+             * independently-equal-content-but-unrelated closures" --
+             * the former must short-circuit "equal, compare the next
+             * element" without ever reaching the fatal "cannot compare
+             * these two values" fallback below, the latter correctly
+             * falls all the way through to it. Found via
+             * numtide/nix-conformance's eval-okay-eq-slot-sort.nix:
+             * `lessThan [id 2] [id 1]`, its shared `id` element, used to
+             * rely on asnix_bshared_value_eq's old default "pointer-
+             * identity" fallback for closures/primops (removed this
+             * same milestone, see that function's own comment) --
+             * forcing first here would have made `id == id` wrongly
+             * fall all the way to "cannot compare". */
+            if (asnix_bshared_value_eq(ea[i], eb[i])) continue;
             Value ea_i = asnix_force_for_print(ea[i]);
             Value eb_i = asnix_force_for_print(eb[i]);
-            if (asnix_bshared_value_eq(ea_i, eb_i)) continue;
             return asnix_bshared_value_lt(ea_i, eb_i, who);
         }
         return na < nb;

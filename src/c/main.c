@@ -188,8 +188,90 @@ static int print_attrs_seen_mark(const void *base) {
     return 1;
 }
 
+static void print_value_concrete(Value v); /* forward decl -- see print_peel_wrappers/print_value_inner below */
+
+/* M92: peels off Cell/Thunk wrappers one at a time -- rather than a
+ * single opaque `asnix_force_for_print` call -- so each wrapper's OWN
+ * identity (a Cell's `target` address, or a Thunk's own heap address)
+ * can be pushed onto the ancestor stack individually, same as real Nix's
+ * printer keys its `seen` set by `&v` (the Value SLOT's own address,
+ * print.cc ~line 412) rather than by whatever heap payload that slot
+ * forces to. This distinction only matters for a genuinely self-
+ * referential structure built through a Cell (e.g. `let x = [x]; in x`)
+ * -- see this function's own long comment below for why collapsing
+ * Cell/Thunk layers through one opaque force call would print one fewer
+ * level of `[`/`]` nesting than real Nix does (confirmed via
+ * numtide/nix-conformance's eval-okay-print.nix). Returns the fully-
+ * peeled (never Thunk, never Cell) value and writes `*pushed_out` with
+ * how many ancestor-stack entries it pushed -- the caller must pop
+ * exactly that many, AFTER it's done printing the peeled value, in
+ * exact-reverse order doesn't matter (print_active_pop is a plain LIFO
+ * counter, not keyed by WHICH entry). If a repeat is found mid-peel,
+ * this already prints "«repeated»" itself and returns with
+ * `*pushed_out` left at the count the caller must still pop (everything
+ * pushed so far, by this same call, before the repeat was found) -- the
+ * caller must NOT print anything more for this value in that case. */
+static int print_peel_wrappers(Value *v_out, int *pushed_out) {
+    Value v = *v_out;
+    int pushed = 0;
+    for (;;) {
+        if (asnix_value_is_cell(v)) {
+            Value *target = asnix_cell_target(v);
+            if (!print_active_push((const void *)target)) {
+                for (int i = 0; i < pushed; i++) print_active_pop();
+                printf("«repeated»");
+                *pushed_out = 0;
+                return 0;
+            }
+            pushed++;
+            v = *target;
+            continue;
+        }
+        if (asnix_tag_of(v) == ASNIX_TAG_THUNK) {
+            const void *thunk_addr = (const void *)(v.raw & ~0x7ULL);
+            if (!print_active_push(thunk_addr)) {
+                for (int i = 0; i < pushed; i++) print_active_pop();
+                printf("«repeated»");
+                *pushed_out = 0;
+                return 0;
+            }
+            pushed++;
+            v = asnix_force_for_print(v); /* M6: forces exactly this one Thunk -- Cell-
+                                            * transparent (force.S) so it can never itself
+                                            * return a raw Cell, only another Thunk (the M23
+                                            * lazy-passthrough case, looped by the `for`
+                                            * here) or a genuinely concrete value. */
+            continue;
+        }
+        break;
+    }
+    *v_out = v;
+    *pushed_out = pushed;
+    return 1;
+}
+
 static void print_value_inner(Value v) {
-    v = asnix_force_for_print(v); /* list elements and attrset values are lazy (M6) */
+    int pushed;
+    if (!print_peel_wrappers(&v, &pushed)) return; /* already printed "«repeated»" */
+    print_value_concrete(v);
+    for (int i = 0; i < pushed; i++) print_active_pop();
+}
+
+/* M92: the actual tag-dispatch switch, unchanged from before this
+ * milestone EXCEPT that ASNIX_TAG_LIST no longer pushes/pops its own
+ * forced-heap-object address onto the ancestor stack (see
+ * print_peel_wrappers above, which now owns ALL of the ancestor-stack
+ * bookkeeping, keyed by Cell-target/Thunk addresses one layer at a time
+ * -- not by "whatever concrete object we eventually forced to", which
+ * would be the SAME heap List object reached through two DIFFERENT
+ * wrapper chains in a self-referential structure like `let x = [x]; in
+ * x`, collapsing the cycle one bracket-level too early. ASNIX_TAG_ATTRS
+ * keeps its own SEPARATE, unchanged `print_attrs_seen_mark` -- see that
+ * function's own comment for why ATTRS genuinely needs whole-print-call,
+ * object-address-keyed dedup (collapsing non-ancestor SIBLING reuse too,
+ * e.g. `{p=a;q=a;}`), unlike LIST's ancestor-only semantics. `v` arriving
+ * here is always already fully peeled (never Thunk, never Cell). */
+static void print_value_concrete(Value v) {
     switch (asnix_tag_of(v)) {
         case ASNIX_TAG_INT:
             printf("%lld", (long long)asnix_int_value(v));
@@ -232,8 +314,16 @@ static void print_value_inner(Value v) {
             return;
         }
         case ASNIX_TAG_LIST: {
+            /* M92: no print_active_push/pop here anymore -- see this
+             * function's own header comment. Cycle protection against a
+             * genuine self-referential list (only reachable through a
+             * Cell -- see heap.h's ASNIX_CELL_MARKER comment, a plain
+             * OP_MK_LIST can never embed a not-yet-built list inside
+             * itself) is now entirely print_peel_wrappers's job, keyed
+             * by each Cell/Thunk wrapper's own address on the way here,
+             * not by this List's own (possibly-shared-with-a-different-
+             * wrapper-chain) heap address. */
             const char *base = (const char *)(v.raw & ~0x7ULL);
-            if (!print_active_push(base)) { printf("«repeated»"); return; }
             int64_t count = *(const int64_t *)(base + ASNIX_LIST_OFF_COUNT);
             const Value *elems = (const Value *)(base + ASNIX_LIST_OFF_ELEMS);
             printf("[ ");
@@ -242,7 +332,6 @@ static void print_value_inner(Value v) {
                 printf(" ");
             }
             printf("]");
-            print_active_pop();
             return;
         }
         case ASNIX_TAG_ATTRS: {

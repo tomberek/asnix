@@ -442,6 +442,69 @@ static int name_eq(const char *a, size_t alen, const char *b, size_t blen) {
     return a != NULL && alen == blen && memcmp(a, b, alen) == 0;
 }
 
+/* M92: factored out of AST_VAR's own scope walk below -- scans `scope`
+ * outward for a LEXICAL match of `name`/`name_len` (ignoring `with`
+ * fallback entirely: a lexical binding always wins over any enclosing
+ * `with`, even one introduced further out than the match, so finding one
+ * here is the WHOLE answer regardless of how many with-frames were
+ * crossed on the way -- see AST_VAR's own comment for why that's
+ * correct). Returns 1 and writes `*out_depth`/`*out_slot` on a match, 0
+ * (leaving them untouched) if `name` isn't bound lexically anywhere in
+ * `scope` -- the caller is then on its own for a `with`-fallback chain or
+ * an "undefined variable" error, exactly as AST_VAR already was before
+ * this refactor. Also the engine behind `try_cell_ref` below: a name that
+ * resolves lexically has a fixed, stable compile-time (depth, slot) --
+ * exactly what a Cell needs to alias a single Env slot forever; a name
+ * that only resolves via `with` does not (which `with`, if any, actually
+ * has the key is a runtime fact), so `try_cell_ref` simply never fires
+ * for one -- the "with-sourced names never alias" exclusion the M92
+ * design calls for falls out of this function returning 0, with no extra
+ * special-casing needed. */
+static int scope_find_lexical(ScopeFrame *scope, const char *name, size_t name_len, int *out_depth,
+                               int64_t *out_slot) {
+    int depth = 0;
+    for (ScopeFrame *f = scope; f; f = f->up, depth++) {
+        for (size_t slot = 0; slot < f->count; slot++) {
+            if (name_eq(f->names[slot], f->name_lens[slot], name, name_len)) {
+                *out_depth = depth;
+                *out_slot = (int64_t)slot;
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+/* M92: the `maybeThunk`-optimization check -- called at each of the ten
+ * `ib_mk_thunk` call sites (list elements, call arguments, let/attrs
+ * bindings, the with-expr itself) in place of the default "wrap it in a
+ * fresh OP_MK_THUNK" path. Mirrors real Nix's ONE `Expr::maybeThunk`
+ * override, `ExprVar::maybeThunk` (~/nix/gc-unlock/src/libexpr/eval.cc,
+ * ~line 1048-1065): a bare variable reference that resolves lexically
+ * skips allocating a fresh deferred-computation cell entirely and instead
+ * emits OP_VAR_REF_CELL, aliasing the EXISTING Env slot that variable
+ * already lives in (see heap.h's ASNIX_CELL_MARKER comment for why this
+ * matters -- it's what lets `==`/the printer recover real Nix's
+ * `&v1==&v2` slot-identity shortcut). Returns 1 if it emitted the Cell op
+ * (the caller must NOT also emit the ordinary thunk in that case), 0
+ * otherwise -- which happens for any non-AST_VAR expression, AND for a
+ * bare AST_VAR that only resolves via a `with` fallback (no fixed slot to
+ * alias; see scope_find_lexical's own comment) -- the caller falls back
+ * to the `is_thunk_free_literal`/ordinary-`ib_mk_thunk` path unchanged in
+ * either case. Checked BEFORE `is_thunk_free_literal` at every call site:
+ * the two predicates are mutually exclusive by AST kind (this one only
+ * ever fires for AST_VAR; that one explicitly excludes it, by its own
+ * header comment), so the check order doesn't change behavior, but
+ * `try_cell_ref` is the cheaper/more specific test. */
+static int try_cell_ref(IrBuilder *b, Ast *node, ScopeFrame *scope) {
+    if (node->kind != AST_VAR) return 0;
+    int depth;
+    int64_t slot;
+    if (!scope_find_lexical(scope, node->as.var.name, node->as.var.name_len, &depth, &slot)) return 0;
+    ib_var_ref_cell(b, depth, slot);
+    return 1;
+}
+
 /* Insertion sort by symbol id -- every call site sorts a source-level
  * formal/binding count, always tiny. */
 static void sort_syms(uint32_t *syms, size_t n) {
@@ -617,7 +680,9 @@ static void compile_expr(IrBuilder *b, Ast *node, ScopeFrame *scope) {
             ib_frame_alloc(b, (int64_t)n);
             for (size_t i = 0; i < n; i++) {
                 ScopeFrame *value_scope = bindings[i].is_inherit ? &skip : &frame;
-                if (is_thunk_free_literal(bindings[i].value)) {
+                if (try_cell_ref(b, bindings[i].value, value_scope)) {
+                    /* nothing more to do -- OP_VAR_REF_CELL already emitted */
+                } else if (is_thunk_free_literal(bindings[i].value)) {
                     compile_expr(b, bindings[i].value, value_scope);
                 } else {
                     IrBuilder *thunk_b = ib_new();
@@ -772,7 +837,9 @@ static void compile_expr(IrBuilder *b, Ast *node, ScopeFrame *scope) {
                     field_body = if_node;
                 }
 
-                if (is_thunk_free_literal(field_body)) {
+                if (try_cell_ref(body_b, field_body, &fieldframe)) {
+                    /* nothing more to do -- OP_VAR_REF_CELL already emitted */
+                } else if (is_thunk_free_literal(field_body)) {
                     compile_expr(body_b, field_body, &fieldframe);
                 } else {
                     IrBuilder *thunk_b = ib_new();
@@ -849,7 +916,9 @@ static void compile_expr(IrBuilder *b, Ast *node, ScopeFrame *scope) {
              * only if the callee's body ever actually reads the
              * parameter. */
             compile_expr(b, node->as.app.fn, scope);
-            if (is_thunk_free_literal(node->as.app.arg)) {
+            if (try_cell_ref(b, node->as.app.arg, scope)) {
+                /* nothing more to do -- OP_VAR_REF_CELL already emitted */
+            } else if (is_thunk_free_literal(node->as.app.arg)) {
                 compile_expr(b, node->as.app.arg, scope);
             } else {
                 IrBuilder *arg_b = ib_new();
@@ -1054,7 +1123,9 @@ static void compile_expr(IrBuilder *b, Ast *node, ScopeFrame *scope) {
              * new element shape, just a new *producer* of the same
              * already-handled shape. */
             for (size_t i = 0; i < node->as.list.count; i++) {
-                if (is_thunk_free_literal(node->as.list.elems[i])) {
+                if (try_cell_ref(b, node->as.list.elems[i], scope)) {
+                    /* nothing more to do -- OP_VAR_REF_CELL already emitted */
+                } else if (is_thunk_free_literal(node->as.list.elems[i])) {
                     compile_expr(b, node->as.list.elems[i], scope);
                 } else {
                     IrBuilder *elem_b = ib_new();
@@ -1156,7 +1227,9 @@ static void compile_expr(IrBuilder *b, Ast *node, ScopeFrame *scope) {
                 hi = 0;
                 for (size_t i = 0; i < n; i++) {
                     if (!node->as.attrset.bindings[i].is_hidden) continue;
-                    if (is_thunk_free_literal(node->as.attrset.bindings[i].value)) {
+                    if (try_cell_ref(b, node->as.attrset.bindings[i].value, &skip)) {
+                        /* nothing more to do -- OP_VAR_REF_CELL already emitted */
+                    } else if (is_thunk_free_literal(node->as.attrset.bindings[i].value)) {
                         compile_expr(b, node->as.attrset.bindings[i].value, &skip);
                     } else {
                         IrBuilder *thunk_b = ib_new();
@@ -1172,7 +1245,9 @@ static void compile_expr(IrBuilder *b, Ast *node, ScopeFrame *scope) {
                 size_t vi = 0;
                 for (size_t i = 0; i < n; i++) {
                     if (node->as.attrset.bindings[order[i]].is_hidden) continue;
-                    if (is_thunk_free_literal(node->as.attrset.bindings[order[i]].value)) {
+                    if (try_cell_ref(b, node->as.attrset.bindings[order[i]].value, &hidden_frame)) {
+                        /* nothing more to do -- OP_VAR_REF_CELL already emitted */
+                    } else if (is_thunk_free_literal(node->as.attrset.bindings[order[i]].value)) {
                         compile_expr(b, node->as.attrset.bindings[order[i]].value, &hidden_frame);
                     } else {
                         IrBuilder *thunk_b = ib_new();
@@ -1198,7 +1273,9 @@ static void compile_expr(IrBuilder *b, Ast *node, ScopeFrame *scope) {
                  * `rec` sibling). */
                 for (size_t i = 0; i < node->as.attrset.dyn_count; i++) {
                     compile_expr(b, node->as.attrset.dyn_bindings[i].name_expr, &hidden_frame);
-                    if (is_thunk_free_literal(node->as.attrset.dyn_bindings[i].value)) {
+                    if (try_cell_ref(b, node->as.attrset.dyn_bindings[i].value, &hidden_frame)) {
+                        /* nothing more to do -- OP_VAR_REF_CELL already emitted */
+                    } else if (is_thunk_free_literal(node->as.attrset.dyn_bindings[i].value)) {
                         compile_expr(b, node->as.attrset.dyn_bindings[i].value, &hidden_frame);
                     } else {
                         IrBuilder *thunk_b = ib_new();
@@ -1267,7 +1344,9 @@ static void compile_expr(IrBuilder *b, Ast *node, ScopeFrame *scope) {
                 ib_frame_alloc(b, (int64_t)n);
                 for (size_t i = 0; i < n; i++) {
                     ScopeFrame *value_scope = bindings[i].is_inherit ? &skip : &frame;
-                    if (is_thunk_free_literal(bindings[i].value)) {
+                    if (try_cell_ref(b, bindings[i].value, value_scope)) {
+                        /* nothing more to do -- OP_VAR_REF_CELL already emitted */
+                    } else if (is_thunk_free_literal(bindings[i].value)) {
                         compile_expr(b, bindings[i].value, value_scope);
                     } else {
                         IrBuilder *thunk_b = ib_new();
@@ -1349,7 +1428,9 @@ static void compile_expr(IrBuilder *b, Ast *node, ScopeFrame *scope) {
                  * with `scope` right after ITS OWN `ib_mk_attrs`. */
                 for (size_t i = 0; i < node->as.attrset.dyn_count; i++) {
                     compile_expr(b, node->as.attrset.dyn_bindings[i].name_expr, &frame);
-                    if (is_thunk_free_literal(node->as.attrset.dyn_bindings[i].value)) {
+                    if (try_cell_ref(b, node->as.attrset.dyn_bindings[i].value, &frame)) {
+                        /* nothing more to do -- OP_VAR_REF_CELL already emitted */
+                    } else if (is_thunk_free_literal(node->as.attrset.dyn_bindings[i].value)) {
                         compile_expr(b, node->as.attrset.dyn_bindings[i].value, &frame);
                     } else {
                         IrBuilder *thunk_b = ib_new();
@@ -1472,7 +1553,9 @@ static void compile_expr(IrBuilder *b, Ast *node, ScopeFrame *scope) {
              * in `body` resolves lexically) never forces it -- matches
              * real Nix (verified: `with (builtins.trace "x" {}); 5` never
              * prints the trace). */
-            if (is_thunk_free_literal(node->as.with1.attrs)) {
+            if (try_cell_ref(b, node->as.with1.attrs, scope)) {
+                /* nothing more to do -- OP_VAR_REF_CELL already emitted */
+            } else if (is_thunk_free_literal(node->as.with1.attrs)) {
                 compile_expr(b, node->as.with1.attrs, scope);
             } else {
                 IrBuilder *thunk_b = ib_new();

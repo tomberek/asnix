@@ -24,6 +24,14 @@ size_t ib_push_true(IrBuilder *b);
 size_t ib_push_false(IrBuilder *b);
 size_t ib_push_null(IrBuilder *b);
 size_t ib_var_ref(IrBuilder *b, int64_t depth, int64_t slot);
+/* M92: see OP_VAR_REF_CELL's own comment (ir.h) -- same depth/slot
+ * addressing as ib_var_ref, but pushes a Cell aliasing the slot instead
+ * of forcing+pushing its value. */
+size_t ib_var_ref_cell(IrBuilder *b, int64_t depth, int64_t slot);
+/* M92: see OP_VAR_REF_RAW's own comment (ir.h) -- same depth/slot
+ * addressing as ib_var_ref, but pushes the slot's raw content with NO
+ * forcing at all. */
+size_t ib_var_ref_raw(IrBuilder *b, int64_t depth, int64_t slot);
 size_t ib_add(IrBuilder *b);
 size_t ib_sub(IrBuilder *b);
 size_t ib_mul(IrBuilder *b);

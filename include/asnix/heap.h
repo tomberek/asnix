@@ -55,6 +55,41 @@
 #define ASNIX_FLOAT_OFF_MARKER 0
 #define ASNIX_FLOAT_OFF_VALUE  8
 
+/* Cell (M92): a FOURTH `ASNIX_TAG_PTR` kind, alongside String/Path/Float
+ * above -- same "reserved negative marker in the leading word" precedent,
+ * one word further along:
+ *   Cell{int64_t marker == ASNIX_CELL_MARKER (-3); Value *target;}
+ * A Cell is NOT a Nix-visible value kind (unlike Path/Float, which are
+ * both genuine Nix types) -- it's a purely internal evaluator device
+ * mirroring real Nix's `maybeThunk` slot-aliasing optimization
+ * (~/nix/gc-unlock/src/libexpr/eval.cc, ExprVar::maybeThunk): instead of
+ * allocating a fresh Thunk for a bare-variable sub-expression about to be
+ * stored somewhere lazily (a list element, a call argument, a let/attrs
+ * binding value -- see compiler.c's `try_cell_ref`), a Cell just wraps a
+ * pointer STRAIGHT AT the existing Env slot that variable already lives
+ * in, so two independent occurrences of the same bare variable end up
+ * *aliasing the same underlying storage* instead of each getting its own,
+ * separately-forced copy. This is what lets `==`/the printer recover
+ * real Nix's `if (&v1 == &v2) return true` slot-identity shortcut
+ * (eval.cc ~line 2919) despite asnix's Values normally being copied
+ * in-line everywhere (see docs/value-encoding.md) rather than referenced
+ * through a stable address the way real Nix's `Value*` is.
+ *
+ * `target` points into an Env's `values[]` array (see env.h) -- always
+ * arena-allocated, never freed, so the pointer stays valid for the
+ * program's entire lifetime; dereferencing it yields another raw
+ * (possibly still-unforced-Thunk, or even another Cell, see compiler.c's
+ * chained-bare-var case) Value, which every force chokepoint (force.S,
+ * op_var_ref.S, op_select.S, op_select_or.S, op_with.S's OP_WITH_TRY) must
+ * now treat as "not yet a usable value" exactly like a Thunk, recursively
+ * resolving through it -- see each of those files' own Cell-handling
+ * comment. Use asnix_make_cell_value()/asnix_value_is_cell()/
+ * asnix_cell_target() (src/c/value_util.c) -- never poke these offsets
+ * directly. */
+#define ASNIX_CELL_MARKER     (-3)
+#define ASNIX_CELL_OFF_MARKER 0
+#define ASNIX_CELL_OFF_TARGET 8
+
 /* List: {int64_t count; Value elems[count];} */
 #define ASNIX_LIST_OFF_COUNT 0
 #define ASNIX_LIST_OFF_ELEMS 8

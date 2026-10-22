@@ -37,6 +37,12 @@ size_t ib_push_null(IrBuilder *b) {
 size_t ib_var_ref(IrBuilder *b, int64_t depth, int64_t slot) {
     return ib_emit(b, OP_VAR_REF, depth, slot);
 }
+size_t ib_var_ref_cell(IrBuilder *b, int64_t depth, int64_t slot) {
+    return ib_emit(b, OP_VAR_REF_CELL, depth, slot);
+}
+size_t ib_var_ref_raw(IrBuilder *b, int64_t depth, int64_t slot) {
+    return ib_emit(b, OP_VAR_REF_RAW, depth, slot);
+}
 size_t ib_add(IrBuilder *b) {
     return ib_emit(b, OP_ADD, 0, 0);
 }

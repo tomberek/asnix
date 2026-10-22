@@ -13,6 +13,8 @@ extern void asnix_op_push_true(void);
 extern void asnix_op_push_false(void);
 extern void asnix_op_push_null(void);
 extern void asnix_op_var_ref(void);
+extern void asnix_op_var_ref_cell(void);
+extern void asnix_op_var_ref_raw(void);
 extern void asnix_op_add(void);
 extern void asnix_op_sub(void);
 extern void asnix_op_mul(void);
@@ -65,6 +67,8 @@ void *asnix_handler_table[OP_COUNT] = {
     [OP_PUSH_FALSE] = (void *)asnix_op_push_false,
     [OP_PUSH_NULL] = (void *)asnix_op_push_null,
     [OP_VAR_REF] = (void *)asnix_op_var_ref,
+    [OP_VAR_REF_CELL] = (void *)asnix_op_var_ref_cell,
+    [OP_VAR_REF_RAW] = (void *)asnix_op_var_ref_raw,
     [OP_ADD] = (void *)asnix_op_add,
     [OP_SUB] = (void *)asnix_op_sub,
     [OP_MUL] = (void *)asnix_op_mul,
