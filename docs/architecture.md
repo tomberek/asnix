@@ -13060,3 +13060,23 @@ whose payoff isn't yet measured).
 Files: `include/asnix/irpass.h`, `src/c/irpass.c`, `src/c/irpass_
 examples.c`, `src/c/irbuild.c` (one line in `ib_finish`), `src/c/main.c`
 (`ASNIX_IR_OPT` flag), `src/c/irdump.c` (same flag).
+
+### irdump follow-up: `ASNIX_IR_OPT=diff` combined view, and `OP_PUSH_INT`'s literal value shown explicitly
+
+Usability follow-up to M120, prompted directly by using the tool: the
+documented `before.txt`/`after.txt`/`diff` workflow needed two separate
+invocations for what's usually a quick one-off check. `irdump` now also
+accepts `ASNIX_IR_OPT=diff`, which compiles the SAME source twice in one
+process -- once before `asnix_irpass_register_cfold()`, once after --
+printing both under clearly labeled `===== BEFORE =====`/
+`===== AFTER =====` headers (`asnix_irpass_clear()`, already exported by
+M120's own irpass.h specifically for this "paired before/after in one
+process" use case, resets state between the two). The original
+`ASNIX_IR_OPT` unset/`=1` behavior (before-only/after-only, for the
+file-diff workflow) is unchanged.
+
+Also: `OP_PUSH_INT`'s dump line now shows `; value=N` explicitly, matching
+the labeled-field style every other operand-bearing op already gets
+(`OP_VAR_REF`'s `depth=/slot=`, `OP_SELECT`'s `sym=`, etc.) instead of
+requiring the reader to know that `PUSH_INT`'s generic `a=` field happens
+to be its literal value.

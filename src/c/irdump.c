@@ -150,6 +150,9 @@ static void dump_program(IrProgram *prog, int id, SeenVec *seen, Worklist *work)
         printf("  [%4lld] %-20s a=%-8lld b=%-8lld", (long long)i, op_names[id_of], (long long)op->a, (long long)op->b);
 
         switch (id_of) {
+            case OP_PUSH_INT:
+                printf("   ; value=%lld", (long long)op->a);
+                break;
             case OP_VAR_REF:
             case OP_VAR_REF_CELL:
             case OP_VAR_REF_RAW:
@@ -219,38 +222,14 @@ static void dump_program(IrProgram *prog, int id, SeenVec *seen, Worklist *work)
     }
 }
 
-int main(int argc, char **argv) {
-    if (argc != 2) {
-        fprintf(stderr, "usage: %s <file.nix>\n", argv[0]);
-        return 1;
-    }
-    asnix_arena_init(0);
-    /* M118: same opt-in flag as main.c/ASNIX_SHOW_STATS -- set it to dump
-     * the bytecode AFTER the pass pipeline instead of before (compiler.c's
-     * asnix_compile ultimately goes through ib_finish() either way, so
-     * this one flag affects every nested lambda/thunk body too, exactly
-     * like it does for the real interpreter). Compare the two:
-     *   ./irdump file.nix > before.txt
-     *   ASNIX_IR_OPT=1 ./irdump file.nix > after.txt
-     *   diff before.txt after.txt */
-    if (getenv("ASNIX_IR_OPT")) {
-        asnix_irpass_register_cfold();
-        printf("(ASNIX_IR_OPT=1 -- showing bytecode AFTER the pass pipeline)\n");
-    }
-
-    FILE *f = fopen(argv[1], "rb");
-    if (!f) {
-        fprintf(stderr, "irdump: cannot open '%s'\n", argv[1]);
-        return 1;
-    }
-    fseek(f, 0, SEEK_END);
-    long size = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    char *src = malloc((size_t)size + 1);
-    fread(src, 1, (size_t)size, f);
-    src[size] = '\0';
-    fclose(f);
-
+/* Re-lexes+re-parses+re-compiles `src` from scratch and dumps the result
+ * -- called once (ASNIX_IR_OPT unset/1) or twice (ASNIX_IR_OPT=diff,
+ * once per side of asnix_irpass_register_cfold/asnix_irpass_clear) from
+ * main() below. Re-running the whole pipeline rather than snapshotting
+ * ops mid-compile keeps this tool exercising the exact same path
+ * ib_finish() takes for a real build, same rationale as this file's own
+ * top-of-file comment about decoding the real compiled artifact. */
+static void lex_parse_compile_dump(const char *src, const char *path) {
     size_t ntoks;
     Token *toks = asnix_lex(src, &ntoks);
     Ast *ast = asnix_parse(toks, ntoks, src);
@@ -259,7 +238,7 @@ int main(int argc, char **argv) {
     /* base_dir only affects relative-import resolution inside the
      * compiled program, not this dump's own op-level output -- "." is
      * fine for a standalone decode. */
-    IrProgram *root = asnix_compile(ast, ".", argv[1]);
+    IrProgram *root = asnix_compile(ast, ".", path);
 
     SeenVec seen = { 0 };
     Worklist work = { 0 };
@@ -275,5 +254,53 @@ int main(int argc, char **argv) {
         dump_program(p, id, &seen, &work);
     }
     printf("\n(%zu distinct program(s), root = #%d)\n", seen.len, root_id);
+    free(seen.items);
+    free(work.items);
+}
+
+int main(int argc, char **argv) {
+    if (argc != 2) {
+        fprintf(stderr, "usage: %s <file.nix>\n", argv[0]);
+        return 1;
+    }
+    asnix_arena_init(0);
+
+    FILE *f = fopen(argv[1], "rb");
+    if (!f) {
+        fprintf(stderr, "irdump: cannot open '%s'\n", argv[1]);
+        return 1;
+    }
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    char *src = malloc((size_t)size + 1);
+    fread(src, 1, (size_t)size, f);
+    src[size] = '\0';
+    fclose(f);
+
+    /* M118's original flag kept exactly as documented (before.txt/
+     * after.txt via two separate invocations), plus a new combined mode
+     * for a single-command before/after view -- asnix_irpass_clear()
+     * (irpass.h) exists specifically to let one process compile the SAME
+     * source both with and without the pipeline for a paired comparison:
+     *   ./irdump file.nix                 -- before only (unset, unchanged default)
+     *   ASNIX_IR_OPT=1 ./irdump file.nix   -- after only (unchanged)
+     *   ASNIX_IR_OPT=diff ./irdump file.nix -- both, one invocation (new) */
+    const char *mode = getenv("ASNIX_IR_OPT");
+    if (mode && strcmp(mode, "diff") == 0) {
+        printf("===== BEFORE (no pass pipeline) =====\n");
+        lex_parse_compile_dump(src, argv[1]);
+        asnix_irpass_register_cfold();
+        printf("\n===== AFTER (pass pipeline applied) =====\n");
+        lex_parse_compile_dump(src, argv[1]);
+        asnix_irpass_clear();
+    } else {
+        if (mode) {
+            asnix_irpass_register_cfold();
+            printf("(ASNIX_IR_OPT=1 -- showing bytecode AFTER the pass pipeline)\n");
+        }
+        lex_parse_compile_dump(src, argv[1]);
+    }
+    free(src);
     return 0;
 }
