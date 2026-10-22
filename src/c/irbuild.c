@@ -264,7 +264,14 @@ IrProgram *ib_finish(IrBuilder *b) {
      * both read an existing pool entry's Value and append a freshly-built
      * one (asnix_irpass_pool_append) -- this IS the live builder's own
      * pool, still growable at this point (ib_finish's own pool-shrinking
-     * realloc below runs AFTER this call). */
+     * realloc below runs AFTER this call).
+     *
+     * asnix_irpass_begin_program() brackets this call so the framework's
+     * own firing-location log can tell THIS program's firings apart from
+     * every other program's (irpass.h's own comment) -- a no-op write to
+     * one static size_t either way, cheap enough to leave unconditional
+     * rather than gating it behind "any passes registered" here too. */
+    asnix_irpass_begin_program();
     asnix_irpass_run(b->ops, &b->len, &b->pool, &b->pool_len, &b->pool_cap);
     ir_link(b->ops, b->len);
     /* M86 perf: ops/pool are handed to `prog`, which lives for the rest
@@ -283,6 +290,7 @@ IrProgram *ib_finish(IrBuilder *b) {
     IrProgram *prog = calloc(1, sizeof(IrProgram));
     prog->ops = b->ops;
     prog->pool = b->pool;
+    asnix_irpass_mark_program(prog); /* tags this program's own slice of the firing log -- see irpass.h */
     /* perf: ops/pool were just pulled out into `prog` above -- nothing
      * else references the outer IrBuilder struct itself afterward (every
      * caller discards its local builder variable immediately after this

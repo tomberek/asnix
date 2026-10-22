@@ -15,6 +15,32 @@ static size_t g_npasses = 0;
  * g_passes[p], valid only during that call. */
 static size_t g_current_pass = (size_t)-1;
 
+/* The firing-log index at which the CURRENTLY-COMPILING program's own
+ * asnix_irpass_run call started -- see asnix_irpass_begin_program below.
+ * Bounds asnix_irpass_remove's shift-fixup loop so a later program's own
+ * removal never touches an earlier, already-finished program's entries
+ * (each program's ops array independently starts its own indexing at 0,
+ * so without this bound two different programs' op-index ranges
+ * routinely overlap, and the naive "shift every logged firing" loop
+ * would silently corrupt the earlier one's already-correct locations). */
+static size_t g_program_firing_base = 0;
+
+/* Per-program firing ranges: {prog, [start,end)} into g_firings, recorded
+ * by asnix_irpass_mark_program once a program's own asnix_irpass_run call
+ * (bounded by g_program_firing_base above) is done. Growable cap is
+ * generous but finite -- this is an irdump/debug-only feature, never
+ * consulted by a real production eval (which registers zero passes, so
+ * asnix_irpass_mark_program below is a guaranteed no-op there). Declared
+ * up here (not next to the functions that use it, further down) so
+ * asnix_irpass_reset_stats can clear it without a forward-declaration. */
+#define ASNIX_IRPASS_MAX_PROGRAM_RANGES 65536
+typedef struct {
+    const void *prog;
+    size_t start, end;
+} AsnixIrProgramRange;
+static AsnixIrProgramRange g_program_ranges[ASNIX_IRPASS_MAX_PROGRAM_RANGES];
+static size_t g_nprogram_ranges = 0;
+
 void asnix_irpass_register(const char *name, AsnixIrPass pass) {
     if (g_npasses >= ASNIX_IRPASS_MAX_PASSES) {
         fprintf(stderr, "asnix_irpass_register: too many passes registered\n");
@@ -72,6 +98,8 @@ static size_t g_nfirings = 0;
 void asnix_irpass_reset_stats(void) {
     for (size_t i = 0; i < g_npasses; i++) g_fire_counts[i] = 0;
     g_nfirings = 0;
+    g_nprogram_ranges = 0;
+    g_program_firing_base = 0;
 }
 
 void asnix_irpass_print_stats(FILE *out) {
@@ -99,6 +127,28 @@ size_t asnix_irpass_firing_pass_index(size_t i) {
 
 size_t asnix_irpass_firing_op_index(size_t i) {
     return g_firings[i].op_index;
+}
+
+void asnix_irpass_begin_program(void) {
+    g_program_firing_base = g_nfirings;
+}
+
+void asnix_irpass_mark_program(const void *prog) {
+    if (g_npasses == 0) return; /* no-op by default, same guarantee as the rest of this framework */
+    if (g_nfirings == g_program_firing_base) return; /* this program logged nothing -- no range needed */
+    if (g_nprogram_ranges >= ASNIX_IRPASS_MAX_PROGRAM_RANGES) return; /* defensive cap */
+    g_program_ranges[g_nprogram_ranges].prog = prog;
+    g_program_ranges[g_nprogram_ranges].start = g_program_firing_base;
+    g_program_ranges[g_nprogram_ranges].end = g_nfirings;
+    g_nprogram_ranges++;
+}
+
+int asnix_irpass_firing_belongs_to_program(size_t i, const void *prog) {
+    for (size_t r = 0; r < g_nprogram_ranges; r++) {
+        if (g_program_ranges[r].prog == prog && i >= g_program_ranges[r].start && i < g_program_ranges[r].end)
+            return 1;
+    }
+    return 0;
 }
 
 /* Which op-ids carry a byte-delta-to-target in field `a` -- see ir.h's own
@@ -146,8 +196,14 @@ void asnix_irpass_remove(IrOp *ops, size_t *len, size_t start, size_t count) {
     /* Keep every already-logged firing location valid against the new,
      * shorter array -- same shift rule as jump targets just above (an
      * index at/after the removed range moves back by `count`; one before
-     * it is untouched). */
-    for (size_t i = 0; i < g_nfirings; i++) {
+     * it is untouched). Bounded to >= g_program_firing_base: an earlier
+     * program's own already-finished entries must never be touched here
+     * -- `ops`/`start`/`count` are all relative to the CURRENT program's
+     * own array, which has nothing to do with an earlier program's
+     * unrelated op-index space, even though the raw integers can
+     * coincide (every program's own indexing independently starts at
+     * 0). */
+    for (size_t i = g_program_firing_base; i < g_nfirings; i++) {
         size_t idx = g_firings[i].op_index;
         if (idx >= start + count) g_firings[i].op_index = idx - count;
         else if (idx >= start) g_firings[i].op_index = start > 0 ? start - 1 : 0; /* was inside the removed range itself */

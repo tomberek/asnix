@@ -13387,3 +13387,54 @@ this session (`attrs_eager_merge`'s 1.4% shrink, the arithmetic/select
 thunk-elision pass's -0.046%), this change adds ZERO new permanent
 machinery -- it's a strict simplification of existing logic, removing
 real, confirmed dead work at no complexity cost, not a tradeoff.
+
+### irpass follow-up #2: fix cross-program corruption in the firing-location log, not just its display
+
+A follow-up to the previous "suppress misleading per-op firing markers for
+multi-program files" fix -- that commit only gated the DISPLAY symptom.
+Digging further (prompted directly by a question about whether location
+info had been lost entirely for real files, which overwhelmingly compile
+to more than one program) found a deeper, real bug in the underlying log
+itself, not just how it's shown.
+
+**The bug**: `asnix_irpass_remove`'s shift-fixup loop ("keep every
+already-logged firing location valid against the new, shorter array")
+iterated the ENTIRE global `g_firings` list, unconditionally, on every
+call -- but that list accumulates entries from EVERY program's own
+`ib_finish()`-triggered `asnix_irpass_run` call, and different programs'
+op arrays independently start their own indexing at 0. So a LATER
+program's own removal could silently decrement an EARLIER, already-
+finished program's already-correct `op_index` whenever the raw integers
+happened to fall in its shift range -- not just a display artifact, a
+real logged-location corruption that the previous fix's blanket
+suppression merely hid from view rather than preventing.
+
+**The fix**: `asnix_irpass_begin_program()` (new) is called by
+`ib_finish()` immediately BEFORE its own `asnix_irpass_run` call, snapshotting
+the firing-log length into `g_program_firing_base`. The shift-fixup loop
+now only touches `g_firings[g_program_firing_base .. g_nfirings)` --
+exactly this program's own slice, never an earlier program's. Once that
+call returns and `prog` is allocated, `asnix_irpass_mark_program(prog)`
+(new) records `{prog, g_program_firing_base, g_nfirings}` into a small
+side table, and `asnix_irpass_firing_belongs_to_program(i, prog)` (new)
+lets a caller with a specific `IrProgram*` in hand -- irdump, dumping one
+program at a time -- filter the global log down to exactly that program's
+own entries. Both new calls are unconditional in `ib_finish()` (cheap
+bookkeeping either way) but true no-ops whenever zero passes are
+registered, preserving the framework's "byte-for-byte identical by
+default" guarantee for every real production run.
+
+`irdump`'s per-op `<<< fired here` markers now filter through
+`asnix_irpass_firing_belongs_to_program` instead of the blanket per-file
+suppression -- correct for every program, not just files that happen to
+compile to exactly one. Verified directly on the 5-program file that
+exposed the original issue: the two real firings now show up on exactly
+the two op lines that have them (programs #1 and #4), with zero markers
+on the three programs that never fired, and the single-program regression
+case (6 passes all firing on one flat program) still shows every marker
+correctly. Verified the shift-fixup fix doesn't affect the REAL
+interpreter (not just irdump) either: `ASNIX_IR_OPT=1 make
+test-nix-conformance` across the full 806-file corpus with the whole
+6-pass pipeline active gives the identical `pass=655 fail=3 skip=148`
+baseline, and `ASNIX_IR_OPT=1 ./asnix d.nix` on real nixpkgs's
+`ffmpeg.outPath` still produces the byte-identical output hash.

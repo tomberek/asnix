@@ -158,14 +158,43 @@ void asnix_irpass_print_stats(FILE *out);
  * ops array looks like at any point -- every later asnix_irpass_remove
  * call also shifts already-logged indices, so by the time a compile
  * finishes, every logged index is still correct for the FINAL array
- * irdump actually prints. Not disambiguated across separate IrPrograms
- * (root vs. a nested lambda/thunk body each get their own ib_finish()
- * call but share this one global log/index space) -- exact for a single
- * flat program, best-effort ("approximately where") for nested ones.
- * Reset by asnix_irpass_reset_stats(), same as fire counts. */
+ * irdump actually prints.
+ *
+ * Disambiguated across separate IrPrograms (root vs. every nested lambda/
+ * thunk body, each its own ib_finish() call) via asnix_irpass_begin_
+ * program/asnix_irpass_mark_program below, bracketing ib_finish()'s own
+ * asnix_irpass_run call -- without that, two different programs' op
+ * arrays routinely have OVERLAPPING index ranges (each starts its own
+ * indexing at 0), so a later program's own asnix_irpass_remove shift-
+ * fixup would otherwise silently corrupt an earlier, already-finished
+ * program's already-correct locations, not just display them
+ * imprecisely -- found concretely on a real file where this produced
+ * firing markers on lines in programs that never fired at all. Reset by
+ * asnix_irpass_reset_stats(), same as fire counts. */
 size_t asnix_irpass_num_firings(void);
 const char *asnix_irpass_firing_pass_name(size_t i);
 size_t asnix_irpass_firing_pass_index(size_t i);
 size_t asnix_irpass_firing_op_index(size_t i);
+
+/* Call once per ib_finish(), immediately BEFORE its own asnix_irpass_run
+ * call, to mark where THIS program's own slice of the firing log begins
+ * -- bounds asnix_irpass_remove's shift-fixup to [that point, now) so it
+ * never touches an earlier, already-finished program's entries. */
+void asnix_irpass_begin_program(void);
+/* Call once per ib_finish(), immediately AFTER `prog` is allocated (right
+ * after the asnix_irpass_run call asnix_irpass_begin_program bracketed),
+ * to tag every firing-log entry logged since that begin call as
+ * belonging to `prog`. A no-op when zero passes are registered (same
+ * "byte-for-byte identical by default" guarantee as the rest of this
+ * framework) or when this program logged nothing. */
+void asnix_irpass_mark_program(const void *prog);
+/* True iff firing-log entry `i` was tagged (via asnix_irpass_mark_program)
+ * as belonging to `prog`. False if asnix_irpass_mark_program was never
+ * called for `prog` (e.g. zero passes were registered when it compiled,
+ * or it simply logged nothing). Lets a caller with its own `prog` pointer
+ * in hand (e.g. irdump, dumping one specific IrProgram) filter
+ * asnix_irpass_firing_op_index(i) to just the entries that are actually
+ * its own, instead of the whole global log. */
+int asnix_irpass_firing_belongs_to_program(size_t i, const void *prog);
 
 #endif /* ASNIX_IRPASS_H */
