@@ -77,8 +77,7 @@ static void fixture_memoization(void) {
     void *thunk_mem = asnix_arena_alloc(ASNIX_THUNK_SIZE);
     *(int64_t *)((char *)thunk_mem + ASNIX_THUNK_OFF_STATE) = ASNIX_THUNK_STATE_UNFORCED;
     *(void **)((char *)thunk_mem + ASNIX_THUNK_OFF_ENV) = root_env();
-    *(void **)((char *)thunk_mem + ASNIX_THUNK_OFF_BODY) = body_prog->ops;
-    *(void **)((char *)thunk_mem + ASNIX_THUNK_OFF_POOL) = body_prog->pool;
+    *(IrProgram **)((char *)thunk_mem + ASNIX_THUNK_OFF_PROG) = body_prog; /* M100: one pointer, not {ops,pool} */
     CHECK(*(int64_t *)((char *)thunk_mem + ASNIX_THUNK_OFF_STATE) == ASNIX_THUNK_STATE_UNFORCED,
           "memoization: starts UNFORCED");
 
@@ -119,8 +118,7 @@ static void fixture_blackhole_aborts(void) {
         void *thunk_mem = asnix_arena_alloc(ASNIX_THUNK_SIZE);
         *(int64_t *)((char *)thunk_mem + ASNIX_THUNK_OFF_STATE) = ASNIX_THUNK_STATE_UNFORCED;
         *(void **)((char *)thunk_mem + ASNIX_THUNK_OFF_ENV) = frame; /* captures its own frame */
-        *(void **)((char *)thunk_mem + ASNIX_THUNK_OFF_BODY) = body_prog->ops;
-        *(void **)((char *)thunk_mem + ASNIX_THUNK_OFF_POOL) = body_prog->pool;
+        *(IrProgram **)((char *)thunk_mem + ASNIX_THUNK_OFF_PROG) = body_prog; /* M100: one pointer, not {ops,pool} */
         Value thunk_val = { .raw = (uint64_t)(uintptr_t)thunk_mem | ASNIX_TAG_THUNK };
         frame->values[0] = thunk_val; /* ...at the very slot that references it */
 

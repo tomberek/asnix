@@ -143,8 +143,12 @@ asnix_force_for_print:                  // Value asnix_force_for_print(Value v)
     movq %rbx, ASNIX_RETFRAME_OFF_FORCE_TARGET(%r14)
     addq $ASNIX_RETFRAME_SIZE, %r14
 
-    movq ASNIX_THUNK_OFF_BODY(%rbx), %rsi
-    movq ASNIX_THUNK_OFF_POOL(%rbx), %r13
+    // M100: prog (one pointer) replaces {body,pool} -- %rax is free here
+    // (last held .Lforce_sentinel_ir's address, already written above;
+    // not read again until the dispatch jump further down).
+    movq ASNIX_THUNK_OFF_PROG(%rbx), %rax
+    movq ASNIX_IRPROG_OFF_POOL(%rax), %r13
+    movq ASNIX_IRPROG_OFF_OPS(%rax), %rsi
     movq ASNIX_THUNK_OFF_ENV(%rbx), %rdi // last read of ENV's original meaning -- safe to repurpose below
     // M82: push onto the intrusive IN_PROGRESS stack -- see
     // stacklimits.S's asnix_inprogress_head comment. %rcx is dead here

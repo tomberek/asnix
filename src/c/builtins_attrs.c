@@ -182,9 +182,8 @@ static Value make_curried2(Value captured, IrProgram *inner_prog) {
     env->values[0] = captured;
     void *mem = asnix_arena_alloc(ASNIX_CLOSURE_SIZE);
     *(void **)((char *)mem + ASNIX_CLOSURE_OFF_UP) = env;
-    *(void **)((char *)mem + ASNIX_CLOSURE_OFF_BODY) = inner_prog->ops;
+    *(IrProgram **)((char *)mem + ASNIX_CLOSURE_OFF_PROG) = inner_prog; /* M100: one pointer, not {ops,pool} */
     *(int64_t *)((char *)mem + ASNIX_CLOSURE_OFF_ARITY) = 1;
-    *(void **)((char *)mem + ASNIX_CLOSURE_OFF_POOL) = inner_prog->pool;
     /* Never a lambda-pattern -- `builtins.functionArgs` on any of these
      * closures is `{}`, same as real Nix (M37). M80: the shared canonical
      * marker, not a fresh allocation -- see builtins_shared.h's

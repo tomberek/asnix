@@ -124,12 +124,16 @@ asnix_op_select_or:
     movq %rax, ASNIX_RETFRAME_OFF_FORCE_TARGET(%r14)
     addq $ASNIX_RETFRAME_SIZE, %r14
 
-    movq ASNIX_THUNK_OFF_BODY(%rax), %rsi
-    movq ASNIX_THUNK_OFF_POOL(%rax), %r13
+    // M100: prog (one pointer) replaces {body,pool} -- %rcx is free here
+    // (last written by the STATE check above; reused again right below
+    // for the IN_PROGRESS-stack push, after this).
+    movq ASNIX_THUNK_OFF_PROG(%rax), %rcx
+    movq ASNIX_IRPROG_OFF_POOL(%rcx), %r13
+    movq ASNIX_IRPROG_OFF_OPS(%rcx), %rsi
     movq ASNIX_THUNK_OFF_ENV(%rax), %rdi // last read of ENV's original meaning -- safe to repurpose below
     // M82: push onto the intrusive IN_PROGRESS stack -- see
     // stacklimits.S's asnix_inprogress_head comment. %rcx is dead here
-    // (last written by the STATE check above).
+    // (overwritten immediately below, same as before this M100 change).
     movq asnix_inprogress_head(%rip), %rcx
     movq %rcx, ASNIX_THUNK_OFF_ENV(%rax)
     movq %rax, asnix_inprogress_head(%rip)

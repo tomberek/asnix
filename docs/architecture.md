@@ -112,7 +112,8 @@ what's actually implemented and the scope decisions made along the way.
 | M97 — `aterm.c`'s `buf_put_escaped` (`.drv` ATerm string escaping) and `builtins_compare.c`'s `jb_escape_string` (`toJSON` string escaping) paid a function-call + bounds-check (`buf_putc`→`buf_reserve` / `jb_putc`→`jb_ensure`) for every single output byte, even the overwhelming majority that need no escaping at all; rewritten to scan ahead to the next byte that actually needs escaping and bulk-copy the whole safe run in one call, output byte-for-byte identical | done (see below; instructions on `d.nix` ~11.79B → **~10.89B** (-7.6%), now below real Nix's own ~12.0-12.25B; zero regressions) |
 | M98 — bytecode cache visibility + measured real speedup: `ASNIX_BYTECODE_CACHE_STATS=1` now prints a one-line hits/misses/stores summary to stderr at exit (the cache was otherwise completely silent -- a stale/corrupt entry or "never looked up" were all indistinguishable from the outside); measured in a clean, isolated worktree (not the noisy shared-contention measurements from M94's own landing): 100% hit rate on `d.nix`'s ffmpeg closure (1056/1056 files) | done (see below; `hyperfine -m 8`: **1.11x faster** (1.68s → 1.52s mean) at full cache warmth; zero regressions) |
 | M99 — `irdump`, a companion tool that lexes+parses+compiles a `.nix` file through this project's own pipeline and pretty-prints the resulting `IrProgram`: one line per op (mnemonic resolved via a reverse lookup through `asnix_handler_table`, since `ir_link()` has already overwritten each op's original op-id with a real handler address by the time a program is compiled), symbol ids resolved to names, jump deltas resolved to target op indices, `OP_PUSH_CONST`'s pool entry resolved to a brief printable value, recursing into every distinct nested child program reached via `OP_LAMBDA`/`OP_MK_THUNK` (each printed once, keyed by pointer identity) | done (see below; `./irdump <file.nix>`, built on demand via `make irdump`, not part of the default build) |
-| M100+ | not started |
+| M100 — merge Thunk's/Closure's separate `body`+`pool` pointers into a single `IrProgram*` (`ASNIX_THUNK_OFF_PROG`/`ASNIX_CLOSURE_OFF_PROG`): a narrower 32-bit index/offset encoding was investigated and rejected on a measured basis -- `asnix_arena_alloc` rounds every allocation up to the next multiple of 8 bytes, so a 20-byte and a 24-byte Thunk consume the identical 24 bytes from the arena, meaning a narrower field buys nothing once that rounding is accounted for | done (see below; instructions on `d.nix` unchanged (10.90B → 10.87B, within noise, as expected for a memory-only change); peak RSS **766,468 KB → 742,552 KB (~3.1%)**; zero regressions) |
+| M101+ | not started |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
 
@@ -11081,3 +11082,69 @@ fix.
 target/source is additive and excluded from the library's own object
 list via the same `filter-out` pattern `main.c` already uses, so it
 cannot affect `asnix`'s own build or behavior at all).
+
+## M100: merge Thunk's/Closure's separate body+pool pointers into one IrProgram*
+
+Every `Thunk` (32 bytes) and `Closure` (40 bytes) carried TWO separate
+8-byte fields, `body` (the child program's `IrOp*`) and `pool` (that
+same child program's `int64_t*` constant pool) -- even though every
+`IrProgram` (ir.h) already bundles exactly those two pointers together
+as a single, pre-existing 16-byte record. Storing one pointer to that
+record instead of copying both fields out saves 8 bytes per Thunk/
+Closure -- the single most common allocation kind by count across a
+real nixpkgs evaluation (M87/M96's own malloc-tracer measurements).
+
+Two narrower encodings were proposed and seriously investigated before
+landing on the plain pointer-merge: a 32-bit index into a global table
+of distinct programs, and a 32-bit offset into a dedicated contiguous
+bytecode region (iets-style). Both were rejected on a concrete,
+measured basis, not a vague "too risky" excuse: `asnix_arena_alloc`
+(arena.S) rounds every allocation up to the next multiple of 8 bytes.
+A 20-byte Thunk (state 8 + env 8 + a 4-byte index/offset) and a 24-byte
+Thunk (state 8 + env 8 + an 8-byte pointer) consume the IDENTICAL 24
+bytes from the arena once that rounding is applied -- the narrower
+encoding's real implementation cost (a second allocator or a global
+growable table, a header-encoding scheme for the region variant, more
+touched asm call sites) would have bought literally nothing beyond
+what the plain pointer already gets, so the simpler design was kept.
+
+Changed `ASNIX_THUNK_OFF_BODY`/`ASNIX_THUNK_OFF_POOL` (16/24) to a
+single `ASNIX_THUNK_OFF_PROG` (16; `ASNIX_THUNK_SIZE` 32->24) and
+`ASNIX_CLOSURE_OFF_BODY`/`ASNIX_CLOSURE_OFF_POOL` to
+`ASNIX_CLOSURE_OFF_PROG` (8; `ASNIX_CLOSURE_SIZE` 40->32), compacting
+`ASNIX_CLOSURE_OFF_ARITY`/`OFF_FORMALS` down to fill the gap. At compile
+time, `ib_lambda`/`ib_mk_thunk` (irbuild.c) now push ONE pool entry (the
+child `IrProgram*` itself) instead of two raw pointers unpacked out of
+it -- `ib_lambda`'s formals-marker entry correspondingly shifts from
+pool_idx+2 to pool_idx+1. At runtime, every consumer that used to read
+`body`/`pool` as two direct fields now reads the single `prog` pointer
+first, then `prog->ops`/`prog->pool` through it (one extra pointer-
+chase, into an already-tiny 16-byte record): `op_lambda.S`,
+`op_mk_thunk.S` (construction sites), and `force.S`/`op_var_ref.S`/
+`op_select.S`/`op_select_or.S`/`op_with.S` (Thunk-forcing sites) plus
+`apply.S`/`op_call.S` (Closure-calling sites) -- enumerated by grepping
+every reference to the old offset constants, not assumed complete.
+Five C-side sites that hand-construct a Closure/Thunk directly (bypassing
+compiled bytecode -- `builtins_shared.c`/`builtins_attrs.c`/
+`builtins_m54.c`/`builtins_misc.c`'s curried-native-wrapping helpers)
+and three test fixtures (`tests/ir/test_m6_fixtures.c`,
+`tests/asm/test_stacklimits.c`) updated the same way. `irdump` (M99,
+built/landed concurrently) already read the pool entry as a direct
+`IrProgram*` -- already compatible with this change with no fix needed,
+confirmed by rebuilding it and dumping a lambda+thunk-containing fixture
+by hand.
+
+Measured on `./asnix d.nix` (ffmpeg's closure), via a side-by-side
+worktree built at the pre-M100 commit for a clean before/after
+comparison: instructions **10,902,265,823 -> 10,865,768,431** (within
+noise, as expected -- this is a memory change, not an algorithmic one);
+peak RSS **766,468 KB -> 742,552 KB (~23.9 MB, ~3.1%)**.
+
+`make test`/`make test-e2e`/`make test-conformance`: all green,
+including both hand-built-Thunk test fixtures that directly poke the
+changed struct layout. `make test-nix-conformance`: `pass=655 fail=3
+skip=148`, byte-for-byte identical to the pre-change baseline -- zero
+regressions. `make test-nixpkgs-hash`: `pass=148 fail=0`, unchanged --
+verified even though this change doesn't touch `derivation.c` directly,
+since it does touch the core Thunk/Closure representation used by
+every single evaluation.

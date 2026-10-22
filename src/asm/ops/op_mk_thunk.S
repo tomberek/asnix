@@ -6,10 +6,10 @@
 
     .globl asnix_op_mk_thunk
     .type asnix_op_mk_thunk, @function
-asnix_op_mk_thunk:                      // b = pool index of {body IrOp*, body pool}
+asnix_op_mk_thunk:                      // b = pool index of {body IrProgram*} (M100: a single
+                                         // pointer, not a {body IrOp*, body pool} pair)
     movq ASNIX_IROP_OFF_B(%rsi), %rcx
-    movq (%r13, %rcx, 8), %rbp          // rbp = body pointer (callee-saved, survives the call below)
-    movq 8(%r13, %rcx, 8), %r15         // r15 = body's own constant pool (ditto)
+    movq (%r13, %rcx, 8), %rbp          // rbp = body IrProgram* (callee-saved, survives the call below)
 
     pushq %rsi                          // save IP
     pushq %rdi                          // save ENV -- this thunk's captured scope (2 pushes, aligned)
@@ -17,8 +17,7 @@ asnix_op_mk_thunk:                      // b = pool index of {body IrOp*, body p
     movq $ASNIX_THUNK_SIZE, %rdi
     call asnix_arena_alloc
     movq $ASNIX_THUNK_STATE_UNFORCED, ASNIX_THUNK_OFF_STATE(%rax)
-    movq %rbp, ASNIX_THUNK_OFF_BODY(%rax)
-    movq %r15, ASNIX_THUNK_OFF_POOL(%rax)
+    movq %rbp, ASNIX_THUNK_OFF_PROG(%rax)
 
     popq %rdi                           // restore ENV (pushed last, popped first) -- see the
                                          // comment in op_lambda.S's matching fix for why this

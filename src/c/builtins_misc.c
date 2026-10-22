@@ -128,9 +128,8 @@ static Value make_curried_native(void *native_fn, int64_t arity) {
      * as any other root-scope value) since nothing has been bound yet. */
     void *mem = asnix_arena_alloc(ASNIX_CLOSURE_SIZE);
     *(void **)((char *)mem + ASNIX_CLOSURE_OFF_UP) = NULL;
-    *(void **)((char *)mem + ASNIX_CLOSURE_OFF_BODY) = prog->ops;
+    *(IrProgram **)((char *)mem + ASNIX_CLOSURE_OFF_PROG) = prog; /* M100: one pointer, not {ops,pool} */
     *(int64_t *)((char *)mem + ASNIX_CLOSURE_OFF_ARITY) = 1;
-    *(void **)((char *)mem + ASNIX_CLOSURE_OFF_POOL) = prog->pool;
     *(uint64_t *)((char *)mem + ASNIX_CLOSURE_OFF_FORMALS) = empty_formals.raw;
     return (Value){ .raw = (uint64_t)(uintptr_t)mem | ASNIX_TAG_CLOSURE };
 }

@@ -40,9 +40,10 @@ size_t ib_jmp(IrBuilder *b);  /* ditto */
 void ib_patch_delta(IrBuilder *b, size_t site, size_t target_idx);
 size_t ib_let(IrBuilder *b, int64_t nslots);
 /* body_prog must come from this same translation's ib_finish() -- its
- * `pool` travels with the resulting closure (see ASNIX_CLOSURE_OFF_POOL in
- * ir.h) so a lambda body containing its own nested OP_LAMBDA resolves
- * against the right constant pool at call time, not the caller's.
+ * `pool` travels with the resulting closure (M100: via ASNIX_CLOSURE_OFF_PROG
+ * in ir.h, a single IrProgram* rather than separate body/pool fields) so a
+ * lambda body containing its own nested OP_LAMBDA resolves against the
+ * right constant pool at call time, not the caller's.
  * `formals_raw`: this closure's pre-built `builtins.functionArgs` result
  * Value.raw (M37) -- the caller must build it (a real `{name:
  * hasDefault}` attrset for a lambda-pattern, or any empty-attrset Value

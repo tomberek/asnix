@@ -77,9 +77,10 @@ static size_t ib_pool_add(IrBuilder *b, int64_t v) {
 }
 
 size_t ib_lambda(IrBuilder *b, int64_t arity, IrProgram *body_prog, int64_t formals_raw) {
-    size_t pool_idx = ib_pool_add(b, (int64_t)(intptr_t)body_prog->ops);
-    ib_pool_add(b, (int64_t)(intptr_t)body_prog->pool); /* always pool_idx+1, see op_lambda.S */
-    ib_pool_add(b, formals_raw); /* always pool_idx+2, see op_lambda.S */
+    /* M100: a single IrProgram* pool entry, not a {ops, pool} pair -- see
+     * ir.h's ASNIX_CLOSURE_OFF_PROG comment. */
+    size_t pool_idx = ib_pool_add(b, (int64_t)(intptr_t)body_prog);
+    ib_pool_add(b, formals_raw); /* always pool_idx+1, see op_lambda.S */
     return ib_emit(b, OP_LAMBDA, arity, (int64_t)pool_idx);
 }
 
@@ -121,8 +122,9 @@ size_t ib_select_dynamic(IrBuilder *b) {
 }
 
 size_t ib_mk_thunk(IrBuilder *b, IrProgram *body_prog) {
-    size_t pool_idx = ib_pool_add(b, (int64_t)(intptr_t)body_prog->ops);
-    ib_pool_add(b, (int64_t)(intptr_t)body_prog->pool); /* always pool_idx+1, see op_mk_thunk.S */
+    /* M100: a single IrProgram* pool entry, not a {ops, pool} pair -- see
+     * ir.h's ASNIX_THUNK_OFF_PROG comment. */
+    size_t pool_idx = ib_pool_add(b, (int64_t)(intptr_t)body_prog);
     return ib_emit(b, OP_MK_THUNK, 0, (int64_t)pool_idx);
 }
 

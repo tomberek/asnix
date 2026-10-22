@@ -199,8 +199,11 @@ asnix_op_call:                          // a = argc
     addq $ASNIX_RETFRAME_SIZE, %r14
 
     movq %rax, %rdi                     // ENV = new frame
-    movq ASNIX_CLOSURE_OFF_POOL(%rbp), %r13 // POOL = the callee's own pool, not the caller's
-    movq ASNIX_CLOSURE_OFF_BODY(%rbp), %rsi // IP = closure body
+    // M100: prog (one pointer) replaces {body,pool} -- %rcx is free here
+    // (held return_ip, already written into the retframe above).
+    movq ASNIX_CLOSURE_OFF_PROG(%rbp), %rcx
+    movq ASNIX_IRPROG_OFF_POOL(%rcx), %r13 // POOL = the callee's own pool, not the caller's
+    movq ASNIX_IRPROG_OFF_OPS(%rcx), %rsi  // IP = closure body
     movq (%rsi), %rax
     jmp *%rax
 

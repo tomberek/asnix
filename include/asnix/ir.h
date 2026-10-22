@@ -17,22 +17,45 @@
 #define ASNIX_IRPROG_OFF_OPS  0
 #define ASNIX_IRPROG_OFF_POOL 8
 
-/* Closure heap object: {up; body; arity; pool}. In this minimal model a
+/* Closure heap object: {up; prog; arity; formals}. In this minimal model a
  * lambda's frame has exactly `arity` slots (one per parameter, no extra
  * pre-sized local slots) -- any nested `let` inside the body introduces its
  * own separate frame via OP_LET, so a distinct nslots field isn't needed.
  *
- * `pool` is each closure's OWN constant pool (every IrBuilder/IrProgram has
- * one, e.g. for ITS OWN nested lambda literals) -- it must travel with the
- * closure and get reinstalled in %r13 on call / restored on return,
- * otherwise a lambda body containing another `OP_LAMBDA` would resolve that
- * inner lambda's body pointer against the *caller's* pool instead of its
- * own (the bug M4's curried lambdas first exposed: M3's single-level
- * fixture never had a lambda body containing another OP_LAMBDA). */
+ * `prog` (an IrProgram*, M100) replaces what were two separate fields
+ * (`body`/`pool`) -- every IrProgram already bundles its own `ops`+`pool`
+ * pointers (ir.h's own struct, just below) as a pre-existing 16-byte
+ * record, so storing ONE pointer to that record here instead of copying
+ * both fields out into the Closure saves 8 bytes per closure (closures/
+ * thunks are the dominant allocation kind by count across a real nixpkgs
+ * evaluation, per this session's own M87/M96 malloc-tracer measurements)
+ * at the cost of one extra pointer-chase (prog->ops / prog->pool, both
+ * already in L1 alongside `prog` itself at only 16 bytes) wherever a call
+ * site needs the body IP or the pool base.
+ *
+ * A narrower encoding was considered (a 32-bit index into a table of
+ * distinct programs, or a 32-bit offset into a dedicated contiguous
+ * region) and measured to buy NOTHING further here specifically:
+ * `asnix_arena_alloc` (arena.S) rounds every allocation up to the next
+ * multiple of 8 bytes, so a 20-byte Closure (up 8 + a 4-byte field +
+ * arity 8) and a 24-byte Closure (up 8 + an 8-byte pointer + arity 8)
+ * consume the IDENTICAL 24 bytes from the arena -- the narrower
+ * encoding's real cost (a second allocator, a header-encoding scheme,
+ * more touched asm call sites across op_call.S/force.S/op_lambda.S/
+ * op_mk_thunk.S/op_var_ref*.S/op_select*.S/op_with.S) buys literally
+ * nothing once that rounding is accounted for, so the plain pointer is
+ * both simpler and loses nothing.
+ *
+ * `prog` still travels with the closure and gets its `ops` installed as
+ * the jump target / its `pool` reinstalled in %r13 on call, restored on
+ * return, otherwise a lambda body containing another `OP_LAMBDA` would
+ * resolve that inner lambda's body pointer against the *caller's* pool
+ * instead of its own (the bug M4's curried lambdas first exposed: M3's
+ * single-level fixture never had a lambda body containing another
+ * OP_LAMBDA). */
 #define ASNIX_CLOSURE_OFF_UP    0
-#define ASNIX_CLOSURE_OFF_BODY  8
+#define ASNIX_CLOSURE_OFF_PROG  8
 #define ASNIX_CLOSURE_OFF_ARITY 16
-#define ASNIX_CLOSURE_OFF_POOL  24
 /* `builtins.functionArgs`'s pre-built result Value for this closure (M37)
  * -- a plain attrset {name: hasDefault} for a lambda-pattern (`{a, b ?
  * d, ...}: ...`), or the shared empty-attrset Value for every other
@@ -42,9 +65,9 @@
  * freeing it) and stashed in the closure's own pool, same mechanism
  * OP_PUSH_CONST uses for any other constant Value -- not computed at
  * OP_LAMBDA-execution time, since it never varies per-call the way the
- * `up`/`pool` fields (capturing the *current* call's environment) do. */
-#define ASNIX_CLOSURE_OFF_FORMALS 32
-#define ASNIX_CLOSURE_SIZE      40
+ * `up`/`prog` fields (capturing the *current* call's environment) do. */
+#define ASNIX_CLOSURE_OFF_FORMALS 24
+#define ASNIX_CLOSURE_SIZE      32
 
 /* Call-frame record on the explicit RETSP stack (kept off the native
  * machine stack, so the jmp-chain dispatch loop never grows it): where to
@@ -63,7 +86,7 @@
 
 /* Thunk heap object (M6): a deferred, memoized computation -- the
  * mechanism behind Nix's laziness. `state` distinguishes:
- *   UNFORCED:     env/body/pool are valid (the deferred computation)
+ *   UNFORCED:     env/prog are valid (the deferred computation)
  *   IN_PROGRESS:  currently being forced -- re-entering (e.g. `let x = x;
  *                 in x`) is a cycle, caught and aborted (blackholing).
  *                 While IN_PROGRESS, `env` is repurposed (see M82 below)
@@ -74,7 +97,7 @@
  *                 each of the five op_*.S/force.S sites that set
  *                 IN_PROGRESS for the exact insertion point.
  *   FORCED:       `env`'s slot has been overwritten with the cached
- *                 Value.raw instead; body/pool are no longer meaningful
+ *                 Value.raw instead; `prog` is no longer meaningful
  *   FAILED (M82): this thunk's body previously ran to a `throw`/failed
  *                 `assert` that unwound (via `builtins.tryEval`'s
  *                 setjmp/longjmp, see tryeval.c) past this cell's own
@@ -88,17 +111,22 @@
  *                 "mark FORCED" epilogue) -- instead it re-raises
  *                 (`asnix_tryeval_raise_or_fatal`, tryeval.c/.h),
  *                 catchable by an enclosing `tryEval` same as the
- *                 original failure was. `env`/`body`/`pool` are no
+ *                 original failure was. `env`/`prog` are no
  *                 longer meaningful once FAILED (same as FORCED).
  * Forcing overwrites the cell in place (single-threaded, so no CAS claim
  * protocol is needed the way a parallel evaluator like ~/gnix/iets
  * requires) -- every tagged pointer to this same cell sees the memoized
- * value after the first force, exactly once computed. */
+ * value after the first force, exactly once computed.
+ *
+ * `prog` (an IrProgram*, M100) replaces what were two separate fields
+ * (`body`/`pool`) through M96 -- see ASNIX_CLOSURE_OFF_PROG's identical
+ * comment just above for the full rationale (8 bytes saved per thunk,
+ * the single most common allocation kind, at the cost of one extra
+ * pointer-chase through the already-tiny 16-byte IrProgram record). */
 #define ASNIX_THUNK_OFF_STATE 0
 #define ASNIX_THUNK_OFF_ENV   8  /* UNFORCED: Env*; IN_PROGRESS: intrusive "prev" link (M82); FORCED: cached Value.raw */
-#define ASNIX_THUNK_OFF_BODY  16
-#define ASNIX_THUNK_OFF_POOL  24
-#define ASNIX_THUNK_SIZE      32
+#define ASNIX_THUNK_OFF_PROG  16
+#define ASNIX_THUNK_SIZE      24
 
 #define ASNIX_THUNK_STATE_UNFORCED    0
 #define ASNIX_THUNK_STATE_IN_PROGRESS 1
@@ -150,7 +178,8 @@ enum {
     OP_MK_LIST,    /* M5: a = count; pops `count` values, builds a List */
     OP_MK_ATTRS,   /* M5: a = count, b = pool index of `count` sorted symbol ids */
     OP_SELECT,     /* M5: a = symbol id; pops an Attrs, pushes the matching value or aborts */
-    OP_MK_THUNK,   /* M6: b = pool index of {body IrOp*, body pool} -- see OP_LAMBDA's note */
+    OP_MK_THUNK,   /* M6: b = pool index of {body IrProgram*} (M100: a single pointer, not a
+                     * {body IrOp*, body pool} pair) -- see OP_LAMBDA's note */
     OP_FRAME_ALLOC, /* a = nslots; allocates a new Env{up=current ENV, nslots} and installs
                       * it as the current ENV (no popping) -- the recursive-scope building
                       * block: thunks constructed afterward (OP_MK_THUNK) naturally capture

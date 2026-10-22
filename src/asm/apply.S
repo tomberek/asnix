@@ -368,8 +368,11 @@ asnix_apply:                            // Value asnix_apply(Value fn, const Val
     addq $ASNIX_RETFRAME_SIZE, %r14
 
     movq %rax, %rdi                     // ENV = new frame
-    movq ASNIX_CLOSURE_OFF_POOL(%rbx), %r13 // POOL = the callee's own pool, not any caller's
-    movq ASNIX_CLOSURE_OFF_BODY(%rbx), %rsi // IP = closure body
+    // M100: prog (one pointer) replaces {body,pool} -- %rcx is free here
+    // (last held .Lapply_sentinel_ir's address, already written above).
+    movq ASNIX_CLOSURE_OFF_PROG(%rbx), %rcx
+    movq ASNIX_IRPROG_OFF_POOL(%rcx), %r13 // POOL = the callee's own pool, not any caller's
+    movq ASNIX_IRPROG_OFF_OPS(%rcx), %rsi  // IP = closure body
     movq (%rsi), %rax
     jmp *%rax
 
