@@ -265,6 +265,31 @@ static int print_peel_wrappers(Value *v_out, int *pushed_out) {
                                             * Thunk/Cell/LazyApp, looped by the `for` here. */
             continue;
         }
+        if (asnix_value_is_thunkmap(v)) {
+            /* M118: same ancestor-tracking shape as Cell/LazyApp above,
+             * but keyed by asnix_thunkmap_slot(v) -- the SPECIFIC output
+             * attrset entry this element's result will be memoized into
+             * -- rather than by v's own masked pointer. That masked
+             * pointer names the shared ThunkMapDesc, identical across
+             * EVERY element one mapAttrs/zipAttrsWith call produced; using
+             * it here would make unrelated sibling elements (e.g.
+             * printing `mapAttrs (n: v: v) { a = 1; b = 2; }`) falsely
+             * detect each other as "«repeated»" the first time a second
+             * element of the same call gets peeled. See heap.h's
+             * ASNIX_THUNKMAP_MARKER comment. */
+            const void *slot_addr = (const void *)asnix_thunkmap_slot(v);
+            if (!print_active_push(slot_addr)) {
+                for (int i = 0; i < pushed; i++) print_active_pop();
+                printf("«repeated»");
+                *pushed_out = 0;
+                return 0;
+            }
+            pushed++;
+            v = asnix_resolve_thunkmap(v); /* one step -- may itself still be an unforced
+                                             * Thunk/Cell/LazyApp/ThunkMap, looped by the
+                                             * `for` here. */
+            continue;
+        }
         break;
     }
     *v_out = v;

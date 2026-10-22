@@ -214,7 +214,12 @@ asnix_force_epilogue:
     cmpq $ASNIX_TAG_PTR, %rcx
     jne .Lforce_ret
     movq %rax, %rdx
-    andq $-8, %rdx                       // rdx = masked base pointer
+    andq $-8, %rdx                       // clear the low 3 tag bits...
+    shlq $16, %rdx                       // ...and the high 16 bits a packed M118 ThunkMap
+    shrq $16, %rdx                       // word's index occupies (a no-op for every OTHER PTR
+                                          // kind -- String/Path/Float/Cell/LazyApp -- whose own
+                                          // pointers always have zero there already; see heap.h's
+                                          // ASNIX_THUNKMAP_MARKER comment) -- rdx = masked base ptr
     movq ASNIX_CELL_OFF_MARKER(%rdx), %rcx
     cmpq $ASNIX_CELL_MARKER, %rcx
     jne .Lforce_check_lazyapp            // PTR but not a Cell -- maybe a LazyApp instead
@@ -244,11 +249,30 @@ asnix_force_epilogue:
     cmpq $ASNIX_LAZYAPP_MARKER, %rcx
     je .Lforce_lazyapp
     cmpq $ASNIX_LAZYAPP_FORCED_MARKER, %rcx
-    jne .Lforce_ret                      // PTR but not Cell/LazyApp (String/Path/Float): a real value
+    je .Lforce_lazyapp
+    jmp .Lforce_check_thunkmap           // PTR but not Cell/LazyApp -- maybe a ThunkMap instead
 .Lforce_lazyapp:
     movq %rax, %rdi                      // arg1 = the LazyApp value
     subq $8, %rsp
     call asnix_resolve_lazyapp
+    addq $8, %rsp
+    movq %rax, %rdi
+    jmp .Lforce_top
+
+    // M118: not a Cell/LazyApp either -- maybe a ThunkMap (heap.h's
+    // ASNIX_THUNKMAP_MARKER comment). %rcx already holds the marker value
+    // from the Cell check above (%rdx, computed there, is ALSO still the
+    // fully-masked base pointer -- cleared of both the tag bits and a
+    // ThunkMap word's packed index -- needed here since this is the
+    // first check that might actually be looking at one).
+.Lforce_check_thunkmap:
+    cmpq $ASNIX_THUNKMAP_MARKER, %rcx
+    jne .Lforce_ret                      // PTR but not Cell/LazyApp/ThunkMap (String/Path/Float):
+                                          // a real value
+    movq %rax, %rdi                      // arg1 = the ThunkMap value (original, unmasked -- the
+                                          // resolver re-derives desc/idx from the full raw bits)
+    subq $8, %rsp
+    call asnix_resolve_thunkmap
     addq $8, %rsp
     movq %rax, %rdi
     jmp .Lforce_top

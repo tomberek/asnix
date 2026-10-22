@@ -189,6 +189,160 @@
 #define ASNIX_LAZYAPP_OFF_ARG2      24 /* raw == 0 means "no second argument" (map's 1-arg case) */
 #define ASNIX_LAZYAPP_SIZE          32
 
+/* ThunkMap (M118): a SIXTH `ASNIX_TAG_PTR` kind, replacing LazyApp
+ * specifically for `mapAttrs`/`zipAttrsWith` (plain `map` over a list keeps
+ * using LazyApp -- see below for why this doesn't extend there). Where
+ * LazyApp (M113, above) pays one 32-byte heap object PER OUTPUT ELEMENT,
+ * ThunkMap pays one ~32-byte ThunkMapDesc heap object PER CALL (shared by
+ * every element that call produces) plus, in the best case, ZERO
+ * additional bytes per element -- the per-element "thunk" IS the Value
+ * already sitting in the output attrset's own entry slot (a slot that has
+ * to exist regardless of how that entry's laziness is represented), not a
+ * separate allocation at all.
+ *
+ * Ported from iets's (~/gnix/iets, a sibling Rust evaluator over the same
+ * tagged-8-byte-word bump-arena shape) `mk_map_attrs`/`TAG_THUNK_MAP`
+ * (src/runtime/value.rs/word.rs): the entry's own 8-byte Value slot is
+ * itself the "thunk", packed as
+ *     (desc_ptr) | (idx << 48) | ASNIX_TAG_PTR
+ * rather than pointing at a separate object. This is sound ONLY because
+ * real x86-64 Linux user-space pointers are canonical 48-bit addresses --
+ * bits 48-63 of any pointer this evaluator ever hands out are ALWAYS zero
+ * (TASK_SIZE for x86-64 Linux is 0x7ffffffff000, well under 2^47) --
+ * confirmed directly for THIS evaluator's own allocations, not just
+ * assumed from general x86-64 lore: asnix_arena_alloc (src/asm/arena.S)
+ * grows via `mmap(NULL, ..., MAP_PRIVATE|MAP_ANONYMOUS, ...)` with no
+ * address hint, and a standalone probe of that exact mmap call on this
+ * machine (20 consecutive calls) returned addresses in the 0x7ffff5xxxxxx-
+ * 0x7ffff7xxxxxx range every time -- `addr >> 48 == 0` for all of them. So
+ * bits 48-63 are free real estate on any genuine heap pointer, with NO
+ * conflict with the existing low-3-bits tag scheme (value.h's 8 tags are
+ * fully saturated, which is exactly why Path/Float/Cell/LazyApp above all
+ * had to reuse ASNIX_TAG_PTR plus an in-object marker rather than getting
+ * their own tag; ThunkMap reuses that SAME precedent for its outer tag,
+ * and separately spends the pointer's own otherwise-always-zero high bits
+ * on the index -- two independent tricks stacked on the same word, not a
+ * new exception to the "8 tags, fully saturated" rule). This is NOT the
+ * same idea as an earlier-rejected "steal low bits above an aligned
+ * pointer" scheme (unsound -- ordinary bump pointers have no guaranteed-
+ * free LOW bits beyond the 3 already spent on the tag); this steals HIGH
+ * bits that are free for an entirely different, verified reason (x86-64
+ * canonical addressing), the standard "high-bit pointer tagging" technique
+ * V8/LuaJIT also use.
+ *
+ *   ThunkMapDesc:
+ *     { int64_t marker == ASNIX_THUNKMAP_MARKER (-6);
+ *       Value   f;            // callback: `f name value`
+ *       void   *src_entries;  // raw `Attr*`-shaped array (heap.h's packed
+ *                              // {uint32_t sym; Value value;}, stride
+ *                              // ASNIX_ATTR_SIZE) -- see below for what
+ *                              // this points at for each caller
+ *       Value   out; }         // the output Attrs Value this call built
+ *                              // (always flat, never a union -- see below)
+ *   packed element word (lives in `out`'s OWN entries[idx].value slot):
+ *     desc_ptr | (idx << 48) | ASNIX_TAG_PTR
+ *
+ * `src_entries`/`idx` together give "name" (src_entries[idx]'s sym,
+ * resolved to a string lazily, only when this specific element is
+ * actually forced -- unlike the old LazyApp path, which had to build the
+ * name String eagerly for EVERY element up front) and "value"
+ * (src_entries[idx]'s own Value, forwarded to `f` unforced, same
+ * laziness-of-the-callback's-own-argument M23 already established).
+ *   - `mapAttrs f attrs`: `src_entries` points DIRECTLY at `attrs`'s own
+ *     (already-resolved-to-flat) entries array -- no copy, no allocation
+ *     at all beyond ThunkMapDesc itself, since `out`'s entries are built
+ *     in the exact same sym order as `attrs`'s (prim_mapAttrs_apply2,
+ *     builtins_attrs.c, copies `attrs`'s syms straight across with no
+ *     reordering), so `out`'s index `idx` and `attrs`'s index `idx`
+ *     always name the same key.
+ *   - `zipAttrsWith f listOfAttrsets`: there is no existing object shaped
+ *     like `out` to reuse as `src_entries` -- each key's `value` is a
+ *     freshly-collected list of every input attrset's value under that
+ *     key, a genuinely new per-key computation with no pre-existing home.
+ *     zipAttrsWith2_impl (builtins_m54.c) builds one small `src_entries`
+ *     buffer per call (same packed `{sym;value}` shape, `distinct_n *
+ *     ASNIX_ATTR_SIZE` bytes, no header word needed since `idx` is always
+ *     `< out`'s own count) holding each key's already-collected value
+ *     list -- this part is NOT deferred (the grouping itself is
+ *     inherently eager, see that function's own comment), only the call
+ *     to `f` is.
+ *
+ * Memoization WITHOUT a separate per-element state cell (a deliberate
+ * difference from iets's own `MapDesc`, which spends an *additional* 8
+ * bytes per element on a dedicated state `Cell` specifically so a forced-
+ * in-progress element's blackhole marker never has to touch the output
+ * set's own entry slot -- see iets's MapDesc doc comment). asnix skips
+ * that and self-mutates `out`'s own entries[idx].value slot in place
+ * instead, the exact same "mutate an arena object once, in place, on
+ * first successful resolution" precedent LazyApp (M113, above) and Thunk
+ * itself already establish:
+ *   1. Unforced: out's entries[idx].value slot holds EXACTLY the packed
+ *      `desc_ptr|(idx<<48)|ASNIX_TAG_PTR` word asnix_resolve_thunkmap was
+ *      itself just called with (bit-identical -- not just "an equivalent
+ *      ThunkMap", literally the same bits, which matters: see point 3).
+ *   2. asnix_resolve_thunkmap computes `f name value`, then overwrites
+ *      THAT SAME slot with the result -- after which EVERY copy of the
+ *      original packed word anywhere else in the program (list elements,
+ *      Env slots, `let`-bound names, ... -- copies of an 8-byte Value are
+ *      ordinary value copies everywhere in this codebase, see
+ *      docs/value-encoding.md) resolves to the cached result on its next
+ *      force: asnix_resolve_thunkmap always re-derives the SAME slot
+ *      address from `desc_ptr`/`idx` (never from `self`), so it doesn't
+ *      matter which copy of the packed word is the one being forced.
+ *   3. The check "already forced?" is exactly "does the slot still hold
+ *      THIS bit-identical packed word" -- provably never a false
+ *      positive: the only way a computed RESULT could coincide bit-for-
+ *      bit with `desc_ptr|(idx<<48)|ASNIX_TAG_PTR` is if `f` returned a
+ *      value whose own backing object lives at EXACTLY `desc_ptr` -- but
+ *      that address already holds a live, distinctly-marked
+ *      ThunkMapDesc, and the arena never reuses an address for a second
+ *      object, so no OTHER value can ever be allocated there.
+ *
+ * Same two accepted, documented LazyApp consequences apply here (see
+ * LazyApp's own comment above for the full reasoning, not repeated): no
+ * bespoke blackhole detection for a self-referential ThunkMap cycle
+ * (caught by apply.S's ordinary RETSP-overflow guard instead, like any
+ * other unbounded Nix-level recursion) and no memoized-failure state
+ * (a later force of a ThunkMap element whose first attempt threw and was
+ * caught by an enclosing `tryEval` re-runs `f` from scratch).
+ *
+ * Deliberately scoped OUT of plain `map` over a list: a list has no
+ * existing per-element slot shaped like an Attrs entry to pack a
+ * descriptor pointer + index into the way an attrset's own `entries[idx].
+ * value` already does double duty here -- a list element's slot IS just a
+ * bare `Value` with nowhere to also stash which index it is without an
+ * extra word (iets pays 16 bytes/element for plain `map`, via a different
+ * mechanism, for exactly this reason). `map` keeps using LazyApp
+ * (asnix_make_lazyapp1) unchanged.
+ *
+ * Bounded by `idx` fitting in the packed word's top 16 bits (`idx <=
+ * ASNIX_THUNKMAP_MAX_IDX`, 65535 -- matching iets's own `MAP_MAX_IDX`): a
+ * `mapAttrs`/`zipAttrsWith` call producing MORE than 65536 output entries
+ * falls back to the old per-element LazyApp path instead (checked by each
+ * caller before choosing this scheme) -- never silently truncates an
+ * index.
+ *
+ * Use asnix_thunkmap_make_desc()/asnix_thunkmap_pack()/
+ * asnix_thunkmap_set_out()/asnix_value_is_thunkmap()/
+ * asnix_resolve_thunkmap() (src/c/value_util.c) -- never poke these
+ * offsets or the packing scheme directly. Every force chokepoint that
+ * already special-cases Cell/LazyApp (force.S, op_var_ref.S, op_select.S,
+ * op_select_or.S, op_with.S's OP_WITH_TRY) gained an identical sibling
+ * check for ThunkMap, and main.c's printer (print_peel_wrappers) gained
+ * one too, keyed for ancestor-cycle-detection purposes by the per-element
+ * `out` slot address (asnix_thunkmap_slot) -- NOT by the shared
+ * descriptor's own address, which is deliberately the SAME for every
+ * element of one call and would otherwise make unrelated sibling elements
+ * (e.g. printing `mapAttrs (n: v: v) { a = 1; b = 2; }`) falsely detect
+ * each other as "«repeated»". */
+#define ASNIX_THUNKMAP_MARKER         (-6)
+#define ASNIX_THUNKMAP_OFF_MARKER     0
+#define ASNIX_THUNKMAP_OFF_F          8
+#define ASNIX_THUNKMAP_OFF_SRC_ENTRIES 16
+#define ASNIX_THUNKMAP_OFF_OUT        24
+#define ASNIX_THUNKMAP_SIZE           32
+#define ASNIX_THUNKMAP_MAX_IDX        0xFFFF /* idx must fit in the packed word's top 16 bits */
+
 /* List: {int64_t count; Value elems[count];} */
 #define ASNIX_LIST_OFF_COUNT 0
 #define ASNIX_LIST_OFF_ELEMS 8

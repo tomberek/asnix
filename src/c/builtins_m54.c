@@ -233,11 +233,17 @@ static Value build_trace(void) { return make_curried_native_noforce((void *)trac
  *   zipAttrsWith (n: v: v) [{a=1;b=2;} {a=3;c=4;}]
  *     == { a = [ 1 3 ]; b = [ 2 ]; c = [ 4 ]; }
  *   zipAttrsWith (n: v: v) [] == {}
- * Each output value is a genuine lazy call (asnix_bshared_make_lazy_
- * call2, same M23 laziness fix every other map-shaped builtin in this
- * codebase already uses for its callback), not an eagerly-invoked one --
- * `f` must not run just from zipAttrsWith being called, only once a
- * given key's result is actually forced. */
+ * Each output value is a genuine lazy call (M118: a ThunkMap,
+ * asnix_thunkmap_make_desc/_pack -- value_util.c -- one shared descriptor
+ * for the whole call rather than a separate heap object per key; see
+ * heap.h's ASNIX_THUNKMAP_MARKER comment, same M23 laziness fix every
+ * other map-shaped builtin in this codebase already uses for its
+ * callback), not an eagerly-invoked one -- `f` must not run just from
+ * zipAttrsWith being called, only once a given key's result is actually
+ * forced. The per-key GROUPING (which values go under which key) stays
+ * eager regardless -- that's the whole point of zipAttrsWith, and there's
+ * no way to defer it -- only the call to `f` on top of that grouping is
+ * deferred. */
 static Value zipAttrsWith2_impl(const Value *args, int64_t argc) {
     (void)argc;
     Value f = args[0];
@@ -280,6 +286,7 @@ static Value zipAttrsWith2_impl(const Value *args, int64_t argc) {
     }
 
     Value *out_vals = distinct_n > 0 ? asnix_arena_alloc((uint64_t)distinct_n * sizeof(Value)) : NULL;
+    Value *value_lists = distinct_n > 0 ? asnix_arena_alloc((uint64_t)distinct_n * sizeof(Value)) : NULL;
     for (int64_t k = 0; k < distinct_n; k++) {
         uint32_t sym = distinct[k];
         Value *per_key = n > 0 ? asnix_arena_alloc((uint64_t)n * sizeof(Value)) : NULL;
@@ -288,11 +295,39 @@ static Value zipAttrsWith2_impl(const Value *args, int64_t argc) {
             int64_t idx = asnix_bshared_attrs_find(sets[i], sym);
             if (idx >= 0) per_key[cnt++] = asnix_bshared_attrs_value(sets[i], idx);
         }
-        Value value_list = asnix_bshared_make_list(per_key, cnt);
+        value_lists[k] = asnix_bshared_make_list(per_key, cnt);
+    }
+
+    if (distinct_n > 0 && distinct_n <= ASNIX_THUNKMAP_MAX_IDX + 1) {
+        /* M118: pack each key's {sym, already-collected value list} into a
+         * small `Attr`-shaped `src_entries` buffer (heap.h's packed
+         * {uint32_t sym; Value value;}, no header word needed -- `idx` is
+         * always < distinct_n) and share ONE ThunkMapDesc across every
+         * key, instead of M117's one 32-byte LazyApp PER key -- see
+         * heap.h's ASNIX_THUNKMAP_MARKER comment. */
+        char *src_entries = asnix_arena_alloc((uint64_t)distinct_n * ASNIX_ATTR_SIZE);
+        for (int64_t k = 0; k < distinct_n; k++) {
+            char *entry = src_entries + k * ASNIX_ATTR_SIZE;
+            *(uint32_t *)(entry + ASNIX_ATTR_OFF_SYM) = distinct[k];
+            *(Value *)(entry + ASNIX_ATTR_OFF_VALUE) = value_lists[k];
+        }
+        void *desc = asnix_thunkmap_make_desc(f, src_entries);
+        for (int64_t k = 0; k < distinct_n; k++) out_vals[k] = asnix_thunkmap_pack(desc, k);
+        Value out = asnix_bshared_make_attrs(distinct, out_vals, distinct_n);
+        asnix_thunkmap_set_out(desc, out);
+        return out;
+    }
+
+    /* Pathological (distinct_n > ASNIX_THUNKMAP_MAX_IDX + 1) or empty:
+     * fall back to the old per-element LazyApp path rather than silently
+     * truncating a packed index -- see heap.h's ASNIX_THUNKMAP_MARKER
+     * comment. distinct_n == 0 also lands here but the loop below is then
+     * simply a no-op, matching this function's pre-M118 behavior exactly. */
+    for (int64_t k = 0; k < distinct_n; k++) {
         size_t namelen;
-        const char *name = asnix_sym_name(sym, &namelen);
+        const char *name = asnix_sym_name(distinct[k], &namelen);
         Value name_val = asnix_make_string_value(name, namelen);
-        out_vals[k] = asnix_make_lazyapp2(f, name_val, value_list);
+        out_vals[k] = asnix_make_lazyapp2(f, name_val, value_lists[k]);
     }
     return asnix_bshared_make_attrs(distinct, out_vals, distinct_n);
 }

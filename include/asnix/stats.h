@@ -26,6 +26,11 @@ extern uint64_t asnix_stats_list;
 extern uint64_t asnix_stats_list_elements;
 extern uint64_t asnix_stats_cell;
 extern uint64_t asnix_stats_lazyapp;
+extern uint64_t asnix_stats_thunkmap_desc;  /* M118: one per mapAttrs/zipAttrsWith CALL */
+extern uint64_t asnix_stats_thunkmap_elem;  /* M118: one per output ELEMENT (no heap object of its
+                                              * own -- packed straight into the output attrset's
+                                              * own entry slot, see heap.h's ASNIX_THUNKMAP_MARKER
+                                              * comment) */
 extern uint64_t asnix_stats_string;
 extern uint64_t asnix_stats_primop;
 extern uint64_t asnix_stats_path;

@@ -13,6 +13,8 @@ uint64_t asnix_stats_list = 0;
 uint64_t asnix_stats_list_elements = 0;
 uint64_t asnix_stats_cell = 0;
 uint64_t asnix_stats_lazyapp = 0;
+uint64_t asnix_stats_thunkmap_desc = 0;
+uint64_t asnix_stats_thunkmap_elem = 0;
 uint64_t asnix_stats_string = 0;
 uint64_t asnix_stats_primop = 0;
 uint64_t asnix_stats_path = 0;
@@ -28,6 +30,7 @@ void asnix_stats_print(void) {
             "  closures: %lu\n"
             "  cells:    %lu\n"
             "  lazyapps: %lu\n"
+            "  thunkmap: %lu descs, %lu elements\n"
             "  strings:  %lu\n"
             "  primops:  %lu\n"
             "  paths:    %lu\n",
@@ -36,6 +39,7 @@ void asnix_stats_print(void) {
             (unsigned long)asnix_stats_list, (unsigned long)asnix_stats_list_elements,
             (unsigned long)asnix_stats_thunk, (unsigned long)asnix_stats_closure,
             (unsigned long)asnix_stats_cell, (unsigned long)asnix_stats_lazyapp,
+            (unsigned long)asnix_stats_thunkmap_desc, (unsigned long)asnix_stats_thunkmap_elem,
             (unsigned long)asnix_stats_string,
             (unsigned long)asnix_stats_primop, (unsigned long)asnix_stats_path);
 }

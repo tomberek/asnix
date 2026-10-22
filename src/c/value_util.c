@@ -18,6 +18,24 @@
 #include "string_context.h" /* M76 */
 #include "symtab.h"
 
+/* M118: clears both the low 3 tag bits AND the high 16 index bits a packed
+ * ThunkMap word (heap.h's ASNIX_THUNKMAP_MARKER comment) carries in its
+ * OWN 8-byte Value -- a no-op on every other ASNIX_TAG_PTR kind (String/
+ * Path/Float/Cell/LazyApp), whose own pointers always have zero there
+ * already (confirmed for this evaluator's actual arena allocations -- see
+ * heap.h's comment), so EVERY function below that derives a dereferenceable
+ * base pointer from an ASNIX_TAG_PTR Value uses this mask unconditionally,
+ * not just the ones that already know `v` is specifically a ThunkMap --
+ * using the narrower `~0x7ULL` mask anywhere one of these functions might
+ * be handed an unresolved ThunkMap word (e.g. asnix_value_is_cell probing
+ * a value that turns out to be a ThunkMap, main.c's printer walking
+ * through is_cell/is_lazyapp/is_thunkmap in sequence) would leave the
+ * packed index bits in the computed "base" pointer and crash dereferencing
+ * it -- caught directly: an early version of this milestone that only
+ * widened the mask at the force-chokepoint Cell/LazyApp checks (not here)
+ * segfaulted in asnix_value_is_cell on the very first `mapAttrs` print. */
+#define ASNIX_PTR_BASE_MASK 0x0000FFFFFFFFFFF8ULL
+
 Value asnix_make_string_value(const char *s, size_t len) {
     void *mem = asnix_arena_alloc(8 + len);
     asnix_stats_string++;
@@ -37,7 +55,7 @@ Value asnix_make_path_value(const char *abs_path, size_t len) {
 
 int asnix_value_is_path(Value v) {
     if (asnix_tag_of(v) != ASNIX_TAG_PTR) return 0;
-    const char *base = (const char *)(v.raw & ~0x7ULL);
+    const char *base = (const char *)(v.raw & ASNIX_PTR_BASE_MASK);
     return *(const int64_t *)(base + ASNIX_PATH_OFF_MARKER) == ASNIX_PATH_MARKER;
 }
 
@@ -50,12 +68,12 @@ Value asnix_make_float_value(double d) {
 
 int asnix_value_is_float(Value v) {
     if (asnix_tag_of(v) != ASNIX_TAG_PTR) return 0;
-    const char *base = (const char *)(v.raw & ~0x7ULL);
+    const char *base = (const char *)(v.raw & ASNIX_PTR_BASE_MASK);
     return *(const int64_t *)(base + ASNIX_FLOAT_OFF_MARKER) == ASNIX_FLOAT_MARKER;
 }
 
 double asnix_float_value(Value v) {
-    const char *base = (const char *)(v.raw & ~0x7ULL);
+    const char *base = (const char *)(v.raw & ASNIX_PTR_BASE_MASK);
     return *(const double *)(base + ASNIX_FLOAT_OFF_VALUE);
 }
 
@@ -69,12 +87,12 @@ Value asnix_make_cell_value(Value *target) {
 
 int asnix_value_is_cell(Value v) {
     if (asnix_tag_of(v) != ASNIX_TAG_PTR) return 0;
-    const char *base = (const char *)(v.raw & ~0x7ULL);
+    const char *base = (const char *)(v.raw & ASNIX_PTR_BASE_MASK);
     return *(const int64_t *)(base + ASNIX_CELL_OFF_MARKER) == ASNIX_CELL_MARKER;
 }
 
 Value *asnix_cell_target(Value v) {
-    const char *base = (const char *)(v.raw & ~0x7ULL);
+    const char *base = (const char *)(v.raw & ASNIX_PTR_BASE_MASK);
     return *(Value **)(base + ASNIX_CELL_OFF_TARGET);
 }
 
@@ -122,13 +140,13 @@ Value asnix_make_lazyapp2(Value fn, Value arg1, Value arg2) {
 
 int asnix_value_is_lazyapp(Value v) {
     if (asnix_tag_of(v) != ASNIX_TAG_PTR) return 0;
-    const char *base = (const char *)(v.raw & ~0x7ULL);
+    const char *base = (const char *)(v.raw & ASNIX_PTR_BASE_MASK);
     int64_t marker = *(const int64_t *)(base + ASNIX_LAZYAPP_OFF_MARKER);
     return marker == ASNIX_LAZYAPP_MARKER || marker == ASNIX_LAZYAPP_FORCED_MARKER;
 }
 
 Value asnix_resolve_lazyapp(Value v) {
-    char *base = (char *)(v.raw & ~0x7ULL);
+    char *base = (char *)(v.raw & ASNIX_PTR_BASE_MASK);
     int64_t marker = *(int64_t *)(base + ASNIX_LAZYAPP_OFF_MARKER);
     if (marker == ASNIX_LAZYAPP_FORCED_MARKER) {
         return *(Value *)(base + ASNIX_LAZYAPP_OFF_RESULT);
@@ -144,6 +162,79 @@ Value asnix_resolve_lazyapp(Value v) {
      * to clean up). */
     *(int64_t *)(base + ASNIX_LAZYAPP_OFF_MARKER) = ASNIX_LAZYAPP_FORCED_MARKER;
     *(Value *)(base + ASNIX_LAZYAPP_OFF_RESULT) = result;
+    return result;
+}
+
+/* M118: see heap.h's ASNIX_THUNKMAP_MARKER comment for the full
+ * rationale/layout -- uses the same ASNIX_PTR_BASE_MASK defined near the
+ * top of this file. */
+static void *thunkmap_desc_of(Value v) {
+    return (void *)(uintptr_t)(v.raw & ASNIX_PTR_BASE_MASK);
+}
+
+static int64_t thunkmap_idx_of(Value v) {
+    return (int64_t)(v.raw >> 48);
+}
+
+void *asnix_thunkmap_make_desc(Value f, const void *src_entries) {
+    void *mem = asnix_arena_alloc(ASNIX_THUNKMAP_SIZE);
+    asnix_stats_thunkmap_desc++;
+    *(int64_t *)((char *)mem + ASNIX_THUNKMAP_OFF_MARKER) = ASNIX_THUNKMAP_MARKER;
+    *(Value *)((char *)mem + ASNIX_THUNKMAP_OFF_F) = f;
+    *(const void **)((char *)mem + ASNIX_THUNKMAP_OFF_SRC_ENTRIES) = src_entries;
+    *(Value *)((char *)mem + ASNIX_THUNKMAP_OFF_OUT) = (Value){ .raw = 0 }; /* patched by
+        asnix_thunkmap_set_out once the caller has built `out` -- see value_util.h's comment */
+    return mem;
+}
+
+Value asnix_thunkmap_pack(void *desc, int64_t idx) {
+    asnix_stats_thunkmap_elem++;
+    uint64_t p = (uint64_t)(uintptr_t)desc;
+    return (Value){ .raw = p | ((uint64_t)idx << 48) | ASNIX_TAG_PTR };
+}
+
+void asnix_thunkmap_set_out(void *desc, Value out) {
+    *(Value *)((char *)desc + ASNIX_THUNKMAP_OFF_OUT) = out;
+}
+
+int asnix_value_is_thunkmap(Value v) {
+    if (asnix_tag_of(v) != ASNIX_TAG_PTR) return 0;
+    const void *base = thunkmap_desc_of(v);
+    return *(const int64_t *)((const char *)base + ASNIX_THUNKMAP_OFF_MARKER) == ASNIX_THUNKMAP_MARKER;
+}
+
+Value *asnix_thunkmap_slot(Value v) {
+    void *desc = thunkmap_desc_of(v);
+    int64_t idx = thunkmap_idx_of(v);
+    Value out = *(Value *)((char *)desc + ASNIX_THUNKMAP_OFF_OUT);
+    char *entries = (char *)(uintptr_t)(out.raw & ~0x7ULL) + ASNIX_ATTRS_OFF_ENTRIES;
+    return (Value *)(entries + idx * ASNIX_ATTR_SIZE + ASNIX_ATTR_OFF_VALUE);
+}
+
+Value asnix_resolve_thunkmap(Value v) {
+    Value *slot = asnix_thunkmap_slot(v);
+    if (slot->raw != v.raw) {
+        /* Already forced by some earlier reference to this same element --
+         * see heap.h's comment for the "bit-identical" memoization proof. */
+        return *slot;
+    }
+    void *desc = thunkmap_desc_of(v);
+    int64_t idx = thunkmap_idx_of(v);
+    Value f = *(Value *)((char *)desc + ASNIX_THUNKMAP_OFF_F);
+    const char *src_entries = *(const char **)((char *)desc + ASNIX_THUNKMAP_OFF_SRC_ENTRIES);
+    const char *src_entry = src_entries + idx * ASNIX_ATTR_SIZE;
+    uint32_t sym = *(const uint32_t *)(src_entry + ASNIX_ATTR_OFF_SYM);
+    Value value = *(const Value *)(src_entry + ASNIX_ATTR_OFF_VALUE);
+    size_t len;
+    const char *name = asnix_sym_name(sym, &len);
+    Value name_val = asnix_make_string_value(name, len);
+    Value result = asnix_bshared_apply2(f, name_val, value);
+    /* Memoize in place -- see heap.h's comment for why this is safe to do
+     * unconditionally here (only ever reached after `f` has already
+     * returned successfully; an exception unwinding past the call above
+     * never reaches this line at all, so there is no partial state to
+     * clean up -- same reasoning as asnix_resolve_lazyapp above). */
+    *slot = result;
     return result;
 }
 

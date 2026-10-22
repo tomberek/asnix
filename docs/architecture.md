@@ -13134,3 +13134,91 @@ Verified: `make test`/`test-e2e`/`test-conformance` all green;
 failures); `test-nixpkgs-hash` `pass=148 fail=0`; `./asnix d.nix` output
 hash unchanged with `ASNIX_IR_OPT` unset or `=1` ("cfold: 12 firings" on
 the real nixpkgs closure).
+
+## M121: ThunkMap -- a shared-descriptor encoding for mapAttrs/zipAttrsWith, replacing M117's one-LazyApp-per-element scheme
+
+A research pass comparing asnix against a sibling evaluator, `iets`
+(Rust, `~/gnix/iets`), found iets's `mapAttrs`-equivalent allocates ONE
+shared descriptor per call plus a single tagged 8-byte word per output
+element (riding in the output attrset's own existing per-entry value
+slot), where asnix's M117 `LazyApp` still pays a full 32-byte heap object
+per element. This milestone ports that design, adapted to asnix's own
+saturated tag space.
+
+**Design**: one `ThunkMapDesc{marker; f; src_entries; out}` (32 bytes,
+`ASNIX_THUNKMAP_MARKER = -6`, the same reserved-marker family as
+Path/Float/Cell/LazyApp) is allocated per `mapAttrs`/`zipAttrsWith` CALL.
+Each output element is packed as `desc_ptr | (idx << 48) | ASNIX_TAG_PTR`
+directly into the output attrset's own existing `entries[idx].value` slot
+-- stacking two independent tricks on one word: the outer `ASNIX_TAG_PTR`
++ marker scheme (same precedent as Cell/LazyApp) plus, separately,
+high-bit pointer tagging inside that word's own payload. Sound because
+x86-64 Linux user-space addresses never set bits 48-63 (confirmed
+directly against this evaluator's actual `mmap`-backed arena
+allocations) -- NOT the same thing as the previously-declined
+"descriptor_base | small_index" idea, which tried to steal LOW bits above
+an allocator's alignment guarantee and ran straight into asnix's fully
+saturated 3-bit tag space; this packs into bits that are always zero on
+a real canonical pointer regardless of alignment, at a layer entirely
+internal to this one PTR-tagged word's payload.
+
+Goes one step further than iets: self-mutates the output attrset's own
+entry slot in place for memoization (a shared element forced twice runs
+`f` only once) instead of iets's own extra 8-byte-per-element state cell,
+so `mapAttrs` costs ZERO marginal heap bytes per element beyond the one
+shared descriptor (reusing the input attrset's own entries array as
+`src_entries`); `zipAttrsWith` costs roughly 12 bytes/element.
+
+**A real correctness issue found and fixed**: every PTR-marker-dispatch
+site's base-pointer mask had to widen from clearing just the 3 tag bits
+to also clearing the packed index's high 16 bits -- caught via an actual
+segfault in `asnix_value_is_cell` (the printer's `is_cell`-before-
+`is_thunkmap` check reading a bogus address), fixed via one shared
+`ASNIX_PTR_BASE_MASK` used everywhere a PTR-tagged word's base pointer is
+recovered.
+
+**Verified**: laziness canaries, memoization (a trace-counting test
+confirms a shared, twice-forced element runs its callback exactly once),
+`zipAttrsWith` output correctness, equality, and the 65,536-element
+per-descriptor index-field bound (falls back cleanly past that size).
+`make test`/`test-e2e`/`test-conformance`: all green. `make
+test-nix-conformance`: `pass=655 fail=3 skip=148` (same 3 pre-existing
+pos-tracking failures). `make test-nixpkgs-hash`: `pass=148 fail=0`.
+
+**Measured on `d.nix`** (real nixpkgs's `ffmpeg.outPath`), paired against
+master's M117 baseline:
+- lazyapps: 502,964 -> 45,348 (**-91.0%**), exactly conserved into 6,445
+  new `ThunkMapDesc`s covering 457,616 elements
+- strings: 640,304 -> 194,593 (**-69.6%**) -- deferred element
+  name-string construction, only built on actual force now
+- peak RSS: ~584,000 -> ~556,300 KB (**~-4.7%**, 3-run average)
+- all other categories (envs/sets/list/thunks/closures/cells)
+  unchanged, as expected -- this milestone only touches mapAttrs/
+  zipAttrsWith's own per-element representation
+- output hash unchanged: `/nix/store/29iacg6h530yx7rxz4k1fhvi0kxxhsam-ffmpeg-9.0.1-bin`
+
+**Scope notes on sibling work from the same research pass, evaluated and
+NOT landed alongside this milestone**:
+- A companion fix porting iets's `forced_int` arithmetic-folding and
+  `shared_select` thunk-elision techniques landed a real but far smaller
+  win (-845 thunks, -0.046%) for a proportionally larger amount of new
+  permanent machinery (2 new bytecode ops, a new scope-frame "peekable"
+  concept, bytecode-cache format special-casing) -- declined as not
+  clearing this project's own bar for landing added permanent complexity,
+  same discipline as M112's `attrs_eager_merge` investigation.
+- A companion fix eliding the intermediate partial-application `Closure`
+  for statically-saturated curried 2-arg user calls (`f a b`) cut
+  closures by -35.6% but reproducibly INCREASED peak RSS by +1.2% (the
+  fixed per-call-site bytecode cost of the eligibility check, paid at
+  every syntactic `f a b` site in nixpkgs/lib unconditionally, outweighed
+  the bytes saved from fewer `Closure` objects on this workload) --
+  declined as a net loss on this project's actual target metric.
+- A companion measurement pass quantified the real cost of asnix's
+  branch-per-force-chokepoint Cell/LazyApp/ThunkMap dispatch (riding
+  `ASNIX_TAG_PTR`): well under 1% of total branch mispredicts, ~0.16% of
+  total instructions -- not a measurable bottleneck -- and found
+  reclaiming a 4th `Value` tag bit has no safe candidate among the
+  existing 8 kinds and would cost 88+ touched call sites plus a real
+  arena-rounding RSS regression (8->16 byte granularity). Confirms the
+  prior qualitative "high-risk, not recommended" call on real counts;
+  no code changed.

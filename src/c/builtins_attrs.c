@@ -349,28 +349,58 @@ Value asnix_make_removeAttrs_primop(void) {
  * (builtins.mapAttrs throw { a = 1; })` aborted here but => `[ "a" ]` on
  * real Nix). Fixed the same way M23 also fixed plain `map`'s identical
  * bug (builtins_list.c's prim_map_stage2): each value is now a genuine
- * lazy value wrapping the curried `(f name) origvalue` call -- M117: a
- * LazyApp (asnix_make_lazyapp2, value_util.c), not a Thunk+Env pair the
- * way asnix_bshared_make_lazy_call2 (removed) used to build -- not an
- * already-computed Value. */
+ * lazy value wrapping the curried `(f name) origvalue` call -- M118: a
+ * ThunkMap (asnix_thunkmap_make_desc/_pack, value_util.c), one shared
+ * descriptor for the whole call rather than M117's LazyApp (one 32-byte
+ * heap object PER ELEMENT) -- see heap.h's ASNIX_THUNKMAP_MARKER comment
+ * for the full rationale. `flat`'s own entries array is reused directly
+ * as the descriptor's `src_entries` (no copy): `out`'s syms are copied
+ * straight across from `flat`'s in the same order below, so `out`'s index
+ * `i` and `flat`'s index `i` always name the same key, and the name
+ * string itself is no longer built eagerly for every element up front --
+ * only once a given element is actually forced (asnix_resolve_thunkmap). */
 static Value prim_mapAttrs_apply2(const Value *args, int64_t argc) {
     (void)argc;
     Value f = args[0];
     Value attrs = args[1];
     require_attrs(attrs, "mapAttrs");
-    int64_t n = attrs_count(attrs);
+    Value flat = asnix_bshared_attrs_resolve(attrs); /* M88: resolve a lazy union ONCE here,
+        rather than per-entry the way attrs_count/attrs_entry_sym/_value (used by this file's
+        other builtins) each do independently -- src_entries below is only valid once flat. */
+    const char *flat_base = (const char *)(flat.raw & ~0x7ULL);
+    int64_t n = *(const int64_t *)(flat_base + ASNIX_ATTRS_OFF_COUNT);
+    const char *src_entries = flat_base + ASNIX_ATTRS_OFF_ENTRIES;
+    if (n == 0) return make_attrs_from_sorted(NULL, NULL, 0);
+
     uint32_t *syms = asnix_arena_alloc((uint64_t)n * sizeof(uint32_t));
     Value *vals = asnix_arena_alloc((uint64_t)n * sizeof(Value));
-    for (int64_t i = 0; i < n; i++) {
-        uint32_t sym = attrs_entry_sym(attrs, i);
-        size_t len;
-        const char *name = asnix_sym_name(sym, &len);
-        Value name_val = asnix_make_string_value(name, len);
-        Value orig = attrs_entry_value(attrs, i);
-        syms[i] = sym;
-        vals[i] = asnix_make_lazyapp2(f, name_val, orig);
+
+    if (n > ASNIX_THUNKMAP_MAX_IDX + 1) {
+        /* Pathological: more entries than a packed ThunkMap index (16
+         * bits) can address -- fall back to the old per-element LazyApp
+         * path rather than silently truncating an index (see heap.h's
+         * ASNIX_THUNKMAP_MARKER comment). */
+        for (int64_t i = 0; i < n; i++) {
+            const char *entry = src_entries + i * ASNIX_ATTR_SIZE;
+            uint32_t sym = *(const uint32_t *)(entry + ASNIX_ATTR_OFF_SYM);
+            Value orig = *(const Value *)(entry + ASNIX_ATTR_OFF_VALUE);
+            size_t len;
+            const char *name = asnix_sym_name(sym, &len);
+            Value name_val = asnix_make_string_value(name, len);
+            syms[i] = sym;
+            vals[i] = asnix_make_lazyapp2(f, name_val, orig);
+        }
+        return make_attrs_from_sorted(syms, vals, n);
     }
-    return make_attrs_from_sorted(syms, vals, n);
+
+    void *desc = asnix_thunkmap_make_desc(f, src_entries);
+    for (int64_t i = 0; i < n; i++) {
+        syms[i] = *(const uint32_t *)(src_entries + i * ASNIX_ATTR_SIZE + ASNIX_ATTR_OFF_SYM);
+        vals[i] = asnix_thunkmap_pack(desc, i);
+    }
+    Value out = make_attrs_from_sorted(syms, vals, n);
+    asnix_thunkmap_set_out(desc, out);
+    return out;
 }
 
 static Value prim_mapAttrs(const Value *args, int64_t argc) {

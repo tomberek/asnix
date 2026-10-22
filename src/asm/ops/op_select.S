@@ -175,7 +175,11 @@ asnix_op_select:                        // a = symbol id; pops an attrset, pushe
     cmpq $ASNIX_TAG_PTR, %rcx
     jne .Lselect_push
     movq %rax, %r8
-    andq $-8, %r8                        // r8 = masked base pointer
+    andq $-8, %r8                        // clear the low 3 tag bits...
+    shlq $16, %r8                        // ...and the high 16 bits a packed M118 ThunkMap word's
+    shrq $16, %r8                        // index occupies (a no-op for every other PTR kind --
+                                          // see heap.h's ASNIX_THUNKMAP_MARKER comment) --
+                                          // r8 = masked base pointer
     movq ASNIX_CELL_OFF_MARKER(%r8), %r9
     cmpq $ASNIX_CELL_MARKER, %r9
     jne .Lselect_check_lazyapp           // PTR but not a Cell -- maybe a LazyApp instead
@@ -198,12 +202,27 @@ asnix_op_select:                        // a = symbol id; pops an attrset, pushe
     cmpq $ASNIX_LAZYAPP_MARKER, %r9
     je .Lselect_lazyapp
     cmpq $ASNIX_LAZYAPP_FORCED_MARKER, %r9
-    jne .Lselect_push                    // PTR but not Cell/LazyApp (String/Path/Float): a real value
+    je .Lselect_lazyapp
+    jmp .Lselect_check_thunkmap          // PTR but not Cell/LazyApp -- maybe a ThunkMap instead
 .Lselect_lazyapp:
     pushq %rsi
     pushq %rdi
     movq %rax, %rdi                      // arg1 = the LazyApp value
     call asnix_resolve_lazyapp
+    popq %rdi
+    popq %rsi
+    jmp .Lselect_resolve
+
+    // M118: not a Cell/LazyApp either -- maybe a ThunkMap (heap.h's
+    // ASNIX_THUNKMAP_MARKER comment) -- see op_var_ref.S's matching
+    // comment.
+.Lselect_check_thunkmap:
+    cmpq $ASNIX_THUNKMAP_MARKER, %r9
+    jne .Lselect_push                    // PTR but not Cell/LazyApp/ThunkMap: a real value
+    pushq %rsi
+    pushq %rdi
+    movq %rax, %rdi                      // arg1 = the ThunkMap value (original, unmasked)
+    call asnix_resolve_thunkmap
     popq %rdi
     popq %rsi
     jmp .Lselect_resolve

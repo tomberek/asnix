@@ -121,6 +121,57 @@ int asnix_value_is_lazyapp(Value v);
  * four-state machine does. */
 Value asnix_resolve_lazyapp(Value v);
 
+/* ThunkMap (M118): see heap.h's ASNIX_THUNKMAP_MARKER comment for the full
+ * rationale/layout -- replaces LazyApp specifically for `mapAttrs`
+ * (builtins_attrs.c)/`zipAttrsWith` (builtins_m54.c), one shared
+ * descriptor per CALL instead of one heap object per output element.
+ *
+ * asnix_thunkmap_make_desc allocates and partially initializes the
+ * descriptor (marker/f/src_entries); `out` is left as the "never a legal
+ * Value" raw-0 sentinel until asnix_thunkmap_set_out patches it in, since
+ * the caller can only build `out` itself (make_attrs_from_sorted/
+ * asnix_bshared_make_attrs) AFTER every element's packed word (which
+ * needs the descriptor's address, but not `out`'s) already exists.
+ * Returns the raw descriptor pointer (not a tagged Value -- callers need
+ * the bare address both to pack elements and to patch `out` in after). */
+void *asnix_thunkmap_make_desc(Value f, const void *src_entries);
+
+/* Packs element `idx` of `desc`'s call into one ASNIX_TAG_PTR Value --
+ * this is what callers store directly into the output attrset's own
+ * entries[idx].value slot. `idx` must be <= ASNIX_THUNKMAP_MAX_IDX (the
+ * caller is responsible for falling back to the old per-element LazyApp
+ * path above that bound -- see heap.h's comment). */
+Value asnix_thunkmap_pack(void *desc, int64_t idx);
+
+/* Patches `out` into an already-allocated descriptor, once the caller has
+ * finished building it (see asnix_thunkmap_make_desc's own comment for
+ * why this has to happen in a separate, later step). */
+void asnix_thunkmap_set_out(void *desc, Value out);
+
+/* True iff `v` is an ASNIX_TAG_PTR value storing a packed ThunkMap word
+ * (see heap.h's ASNIX_THUNKMAP_MARKER note). False for any other tag,
+ * including String/Path/Float/Cell/LazyApp. */
+int asnix_value_is_thunkmap(Value v);
+
+/* The shared "run it (or return the already-cached result)" step for a
+ * ThunkMap element, called from each force chokepoint (force.S,
+ * op_var_ref.S, op_select.S, op_select_or.S, op_with.S's OP_WITH_TRY) and
+ * from main.c's printer once it's already established `v` IS a ThunkMap
+ * word. Same "exactly one step, may hand back another not-yet-forced
+ * Thunk/Cell/LazyApp/ThunkMap for the caller's own resolve loop to keep
+ * unwrapping" contract as asnix_resolve_lazyapp -- see that function's own
+ * comment, and heap.h's ASNIX_THUNKMAP_MARKER comment for the full
+ * memoization proof. */
+Value asnix_resolve_thunkmap(Value v);
+
+/* The ancestor-cycle-detection key main.c's printer needs for a ThunkMap
+ * word: a pointer to the SPECIFIC output slot this element's result will
+ * be (or already was) memoized into -- unique per (desc, idx) pair, unlike
+ * `v`'s own masked pointer (which names the shared descriptor, identical
+ * across every element of one call -- see heap.h's comment for why using
+ * THAT as the ancestor key would misfire on unrelated sibling elements). */
+Value *asnix_thunkmap_slot(Value v);
+
 /* Returns a pointer to the raw bytes (NOT NUL-terminated either way) and
  * length of an ASNIX_TAG_PTR value, whichever of the two kinds (String or
  * Path) it actually is -- for callers (printing, hashing, ...) that just
