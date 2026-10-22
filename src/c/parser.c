@@ -1382,6 +1382,8 @@ static Ast *parse_app(Parser *p) {
  * table at all). Reuses the existing binary `-` (AST_BINOP op='-') with
  * a literal `0` lhs, same desugaring real Nix itself uses -- no new AST
  * node or IR op needed. */
+static Ast *parse_binop(Parser *p, int min_prec); /* forward decl -- see parse_negate's own `!` case below */
+#define PREC_ADD 6 /* must match TOK_PLUS/TOK_MINUS's own `prec` entry in the BINOPS table, further down this file -- moved up here (not duplicated) since parse_negate's own `!`-operand case below needs it */
 static Ast *parse_negate(Parser *p) {
     if (cur(p)->kind == TOK_MINUS) {
         advance(p);
@@ -1392,6 +1394,26 @@ static Ast *parse_negate(Parser *p) {
         n->as.binop.op = '-';
         n->as.binop.lhs = zero;
         n->as.binop.rhs = operand;
+        return n;
+    }
+    /* Correctness fix: `-`'s own operand (just above) can start with `!`
+     * too (`-!x`, `-!-x`, ...) -- real Nix accepts this syntactically,
+     * failing only at runtime on `-`'s own operand-type check, never at
+     * parse time (confirmed: `nix-instantiate --eval '(-!true)'`
+     * evaluates to a type error, not a parse error). `parse_binop`'s own
+     * top-level `!` check (above, where this whole chain is entered) only
+     * ever runs ONCE, before `-` is consumed -- so it can't see this `!`,
+     * which only appears once we're already recursing into `-`'s operand
+     * position. Mirrors that same top-level check's own operand
+     * precedence (`PREC_ADD`) and AST shape exactly; harmless/unreached
+     * when `parse_negate` is entered directly (no leading `-` already
+     * consumed), since the top-level check above would have intercepted
+     * a leading `!` there first. */
+    if (cur(p)->kind == TOK_BANG) {
+        advance(p);
+        Ast *operand = parse_binop(p, PREC_ADD);
+        Ast *n = asnix_ast_new(AST_NOT);
+        n->as.not1.operand = operand;
         return n;
     }
     return parse_app(p);
@@ -1550,7 +1572,10 @@ static const BinOpInfo BINOPS[] = {
     { TOK_PLUSPLUS,   8, 1, 0, BINOP_K_BINOP, 'c' },
 };
 #define BINOPS_COUNT (sizeof(BINOPS) / sizeof(BINOPS[0]))
-#define PREC_ADD 6 /* must match TOK_PLUS/TOK_MINUS's own `prec` entry above */
+/* PREC_ADD itself is defined earlier in this file, right before
+ * parse_negate (which needs it for its own `!`-operand case) -- kept in
+ * sync with TOK_PLUS/TOK_MINUS's own `prec` entry above by that
+ * definition's own comment, not duplicated here. */
 
 static const BinOpInfo *lookup_binop(TokKind k) {
     for (size_t i = 0; i < BINOPS_COUNT; i++) {

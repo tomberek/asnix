@@ -13915,3 +13915,34 @@ green (new target, 4/4 fixture checks). `make test-nix-conformance`:
 confirmed unrelated -- this change touches no existing code path, only
 adds a new CLI flag and a new, separately-linked translation unit). `make
 test-nixpkgs-hash`: `pass=148 fail=0`.
+
+### M125 follow-up: `-!x`/`-!-x` was a hard parse error, but real Nix accepts it
+
+Found by an independent re-implementation of M125's own precedence-
+climbing rewrite (comparing against the landed version): `parse_negate`'s
+own recursive operand-parsing (for `-`'s operand, allowing `--x`) only
+ever checked for another `-`, never a `!` -- so `-!x` fell through
+straight to `parse_app`, which has no `TOK_BANG` case, giving a hard
+parse error. Real Nix accepts the syntax (`nix-instantiate --eval
+'(-!true)'` evaluates `-!true` as `-(!true)`, failing only at RUNTIME on
+`sub`'s own operand-type check, never at parse time) -- confirmed this
+asymmetry is real and one-directional: `!-1` already worked correctly
+(the top-level `!`-check's own operand recurses through the FULL primary
+chain, including `parse_negate`'s own `-`-check), but `-`'s own operand
+position never got the matching `!`-check.
+
+**The fix**: `parse_negate` now also checks for a leading `!` in its own
+fallthrough (after the `-`-check), mirroring the top-level `!`-handling
+in `parse_binop`'s own entry point exactly (same `PREC_ADD` operand
+precedence, same `AST_NOT` node shape) -- unreachable when `parse_negate`
+is entered directly with a leading `!` already present (the top-level
+check would have intercepted that earlier), only live for the specific
+"`!` appears as `-`'s own operand" position this asymmetry missed.
+
+**Verified**: `-!x`/`-!-x` now parse and fail at eval time with the
+correct error class, matching real Nix; `-a ? "x"` (the precedence
+interaction this fix had to NOT break -- `-`'s operand must not swallow
+a trailing `?`) still parses as `(-a) ? "x"`, confirmed directly.
+`make test`/`test-e2e`/`test-conformance`/`test-flake` all green;
+`test-nix-conformance pass=655 fail=3 skip=148` (same 3 pre-existing
+failures); `test-nixpkgs-hash pass=148 fail=0`. Output hash unchanged.
