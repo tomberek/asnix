@@ -336,27 +336,54 @@ static Value build_hashFile(void) { return asnix_bshared_make_curried_native((vo
  * e1, keeping e2's (still-lazy) values -- e1's values are never forced,
  * only its attribute *names* are consulted (verified:
  * numtide/nix-conformance's eval-okay-intersectAttrs.nix deliberately
- * fills e1 with `abort`-valued entries to check exactly this). Both
- * inputs are already sorted by symbol id, so a straight merge-style walk
- * (not a binary search per entry) is both correct and the simplest -- a
- * subsequence of a sorted sequence is still sorted, so the output needs
- * no re-sort either.
- * --------------------------------------------------------------------- */
+ * fills e1 with `abort`-valued entries to check exactly this).
+ *
+ * M86 perf: always walking e2 while binary-searching into e1 (the
+ * previous approach) is O(n2 log n1) -- fine when both sides are small,
+ * but real nixpkgs's `callPackageWith autoArgs f args` evaluates
+ * `intersectAttrs (functionArgs f) autoArgs` for every `callPackage`
+ * call, where e1 (a function's formal-argument names) is tiny (single
+ * digits to a few dozen) and e2 (autoArgs, effectively the whole `pkgs`
+ * set) is tens of thousands of entries. Profiling `./asnix d.nix`
+ * (ffmpeg.outPath) found this one function responsible for ~18% of
+ * total cycles, almost entirely inside calls with n2=28189 (nixpkgs's
+ * actual top-level package count). Walking whichever side is SMALLER
+ * and binary-searching into the other is O(min(n1,n2) log max(n1,n2))
+ * instead -- for the real callPackage shape that's ~20 * log2(28189)
+ * instead of 28189 * log2(20), a ~400x reduction in binary-search
+ * steps for that call shape. Correct regardless of which side is
+ * walked: both inputs are sorted by symbol id, so walking either one
+ * in order yields an output already sorted by symbol id (no re-sort
+ * needed), and the emitted value always comes from e2 either way. */
 static Value intersectAttrs2_impl(const Value *args, int64_t argc) {
     (void)argc;
     Value e1 = args[0], e2 = args[1];
     ASNIX_REQUIRE_ATTRS(e1, "intersectAttrs");
     ASNIX_REQUIRE_ATTRS(e2, "intersectAttrs");
+    int64_t n1 = asnix_bshared_attrs_count(e1);
     int64_t n2 = asnix_bshared_attrs_count(e2);
-    uint32_t *syms = n2 > 0 ? malloc((size_t)n2 * sizeof(uint32_t)) : NULL;
-    Value *vals = n2 > 0 ? malloc((size_t)n2 * sizeof(Value)) : NULL;
+    int64_t cap = n1 < n2 ? n1 : n2;
+    uint32_t *syms = cap > 0 ? malloc((size_t)cap * sizeof(uint32_t)) : NULL;
+    Value *vals = cap > 0 ? malloc((size_t)cap * sizeof(Value)) : NULL;
     int64_t out_n = 0;
-    for (int64_t i = 0; i < n2; i++) {
-        uint32_t sym = asnix_bshared_attrs_sym(e2, i);
-        if (asnix_bshared_attrs_find(e1, sym) >= 0) {
-            syms[out_n] = sym;
-            vals[out_n] = asnix_bshared_attrs_value(e2, i);
-            out_n++;
+    if (n1 <= n2) {
+        for (int64_t i = 0; i < n1; i++) {
+            uint32_t sym = asnix_bshared_attrs_sym(e1, i);
+            int64_t j = asnix_bshared_attrs_find(e2, sym);
+            if (j >= 0) {
+                syms[out_n] = sym;
+                vals[out_n] = asnix_bshared_attrs_value(e2, j);
+                out_n++;
+            }
+        }
+    } else {
+        for (int64_t i = 0; i < n2; i++) {
+            uint32_t sym = asnix_bshared_attrs_sym(e2, i);
+            if (asnix_bshared_attrs_find(e1, sym) >= 0) {
+                syms[out_n] = sym;
+                vals[out_n] = asnix_bshared_attrs_value(e2, i);
+                out_n++;
+            }
         }
     }
     Value result = asnix_bshared_make_attrs(syms, vals, out_n); /* already sorted -- re-sort is a cheap no-op */

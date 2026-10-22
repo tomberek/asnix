@@ -218,7 +218,13 @@ static Ast *parse_resolved_file(const char *resolved, char **base_dir_out) {
     char *src = read_file(resolved);
     size_t ntoks;
     Token *toks = asnix_lex(src, &ntoks);
-    return asnix_parse(toks, ntoks, src);
+    Ast *ast = asnix_parse(toks, ntoks, src);
+    free(toks); /* M86 perf: asnix_parse copies everything it needs out of
+                  * toks (names/strings point into src, not into this
+                  * array) -- nothing retains it after this call, but it
+                  * was never freed, leaking every file's whole token
+                  * array for the life of the process. */
+    return ast;
 }
 
 /* Shared by asnix_eval_file_scoped (M54) and the pre-M65 asnix_eval_file
@@ -445,6 +451,7 @@ Value asnix_eval_expr_source(const char *src) {
     size_t ntoks;
     Token *toks = asnix_lex(src, &ntoks);
     Ast *ast = asnix_parse(toks, ntoks, src);
+    free(toks); /* M86 perf: see parse_resolved_file's identical free() comment */
     IrProgram *prog = asnix_compile(ast, cwd, NULL);
     Env *root_env = make_root_env(NULL);
     return asnix_eval(prog, root_env);

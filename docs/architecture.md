@@ -99,7 +99,8 @@ what's actually implemented and the scope decisions made along the way.
 | M84 — root-caused and fixed the M82 `ffmpeg` mismatch: `asnix_collect_input_refs` blindly recursed into every field of any non-derivation attrset (correct only for genuine `__structuredAttrs` JSON blobs), so `lib.cleanSourceWith`'s `origSrc` field (the pre-filter Path, alongside the real filtered `outPath`) got NAR-copied a second time and added as a bogus extra `inputSrcs` entry real Nix never produces | done (see below; `./asnix d.nix` — `ffmpeg.outPath` — now matches real Nix byte-for-byte) |
 | M85 — `tests/nixpkgs-hash/attrs.txt` expanded from 4 packages to 74 (148 `outPath`/`drvPath` checks), spanning CLI tools, compilers/interpreters, multi-output libraries, build tooling, a GUI/graphics stack slice, fixed-output fetchers, and `nix` itself | done (see below; `make test-nixpkgs-hash`: **`pass=148 fail=0`** — no new divergence found beyond the one M84 already fixed) |
 | M86 — real `DrvDeep` string-context closure propagation (`eval-okay-context-inputs.nix`'s `drvPath` case): two small in-memory caches (`g_drv_closure_cache`/`g_drv_outputs_cache`) reconstruct what real Nix's `computeFSClosure` would compute off a real store, purely from this process's own call-by-need derivation-construction order; re-investigated and declined the `eq-slot-elem`/`eq-slot-identity` function-identity gap a second time, with a new concrete counterexample confirming it's still a genuine representation gap, not a narrow fix | done (see below; `make test-nix-conformance`: `pass=651 fail=7` → **`pass=652 fail=6`**; zero regressions; `make test-nixpkgs-hash` still `pass=148 fail=0`) |
-| M87+ | not started |
+| M87 — perf/memory regression triage on real nixpkgs workloads (`./asnix d.nix`, ffmpeg's closure): `builtins.intersectAttrs` was walking the LARGER attrset operand and binary-searching into the smaller one (backwards for `callPackageWith`'s own `intersectAttrs (functionArgs f) autoArgs` shape, where e1 is tiny and e2 is effectively the whole ~28,189-entry `pkgs` set); a leaked lexer token array (never freed after parsing); `IrBuilder`'s `ops`/`pool` arrays carrying permanent doubling-growth slack into every compiled program; `BTVec`'s own backing arrays never freed after `insert_attrpath`'s tree is flattened | done (see below; instructions 51.3B → 42.1B; peak RSS 1.42GB → 917MB on `d.nix`, 170MB → 134MB on `e.nix`; zero regressions) |
+| M88+ | not started |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
 
@@ -9405,3 +9406,187 @@ behavior before any such heuristic could be trusted).
 No code changes for this part. `eq-slot-elem.nix`/`eq-slot-
 identity.nix` remain in `make test-nix-conformance`'s failing list,
 unchanged from before this investigation.
+
+## M87: perf/memory regression triage -- `intersectAttrs` O(n log m)-vs-O(m log n) fix, three non-arena memory leaks
+
+The user flagged that performance (and separately, memory usage)
+"seems to be suffering" on the repo root's `d.nix`
+(`(import /home/tbereknyei/nixpkgs/default.nix {}).ffmpeg.outPath`,
+a ~100-derivation real nixpkgs closure). Measured first, rather than
+guessing: `perf stat -e instructions,cycles ./asnix d.nix` showed
+**~51.3 billion instructions / ~18.4 billion cycles / ~5.7s wall**,
+against real `nix-instantiate --eval --strict` on the identical
+expression's **~12.0 billion instructions / ~6.1 billion cycles /
+~2.0s wall** -- asnix, a hand-written assembly interpreter with no
+GC, was running *slower* than real Nix on real work. That shouldn't
+be possible for a well-tuned interpreter and was worth chasing
+rather than accepting as "the no-GC tradeoff" (the same discipline
+established earlier this session for the M78 memory investigation).
+
+### CPU: `builtins.intersectAttrs` walked the wrong side
+
+`perf record -g` + `perf report --no-children` on `./asnix d.nix`
+found `intersectAttrs2_impl` (`src/c/builtins_m23.c`) and its
+`asnix_bshared_attrs_find`/`asnix_bshared_attrs_sym` helpers
+responsible for **~18% of all sampled cycles alone** -- by far the
+single largest hotspot, well ahead of anything else. The existing
+implementation always iterated over `e2` (the second argument) and
+binary-searched each of its symbols into `e1` (the first), on the
+theory that "both inputs are sorted, so a merge-style walk needs no
+re-sort" -- true, but the code didn't actually do a merge walk, it
+did `n2` binary searches into `e1`, i.e. O(n2 log n1).
+
+Instrumenting the function directly (temporary call-counter +
+`fprintf`, reverted before committing) confirmed the real-world
+shape: real nixpkgs's own `lib.callPackageWith`
+(`pkgs/top-level/lib/customisation.nix`-equivalent in every
+`callPackage`-based package set) computes `intersectAttrs
+(functionArgs f) autoArgs` once per `callPackage` call -- `e1` is a
+handful of a function's formal-argument names (single digits to a
+few dozen), `e2` is `autoArgs`, effectively the *entire* `pkgs`
+attrset. Measured directly: evaluating `d.nix`'s ffmpeg closure
+calls `intersectAttrs` **~7,700+ times total, ~840 of them with
+`e2` at exactly 28,189 entries** (nixpkgs's real top-level package
+count) against an `e1` of single digits to dozens. Each such call
+was doing ~28,189 binary searches (O(n2 log n1) ≈ 28,189 × log2(20)
+≈ 122,000 comparisons) when the correct-but-unused approach (walk
+whichever side is smaller, binary-search into the larger) would do
+O(n1 log n2) ≈ 20 × log2(28189) ≈ 300 -- a ~400x reduction in
+comparison count for this call shape alone.
+
+Fixed by computing both `n1` and `n2` up front and walking whichever
+is smaller (binary-searching into whichever is larger), instead of
+unconditionally walking `e2`. Correct regardless of which side is
+walked: both inputs are sorted by symbol id, so walking either one
+in its own order yields an output already sorted by symbol id (no
+re-sort needed either way), and the emitted value always comes from
+`e2` as before.
+
+Measured impact on `./asnix d.nix` (3-run `perf stat -r 3`, low
+variance <0.4%): **instructions 51.3B → 42.1B (-18%)**, cycles
+18.4B → 17.8B. (Wall-clock improvement was harder to isolate cleanly
+in the moment -- the machine was concurrently running a separate
+background agent whose own unscoped filesystem search spiked system
+load average to 12+, corrupting timing comparisons; see the
+`~/.claude/CLAUDE.md`/memory entry this prompted. The instruction-
+count reduction, measured via hardware performance counters rather
+than wall-clock, is unaffected by concurrent system load and is the
+number to trust here.)
+
+### Memory: three non-arena leaks found via an LD_PRELOAD malloc tracer
+
+The user separately pushed back when `./asnix d.nix`'s peak RSS
+(measured via `/usr/bin/time -v`) came back at **1,451,720 KB
+(~1.42GB)** against real Nix's **374,188 KB (~374MB)** on the same
+expression -- a ~3.9x gap, far worse than the ~1.35x gap M78 had
+already closed for the much smaller `hello` closure (confirmed
+`e.nix`, i.e. `hello.drvPath`, was still exactly at M78's own
+169,856 KB figure -- so M78's own fix hadn't regressed, this was a
+*new*, ffmpeg-closure-scale problem M78 never touched).
+
+Reading `asnix_arena.total_allocated` directly (temporary debug
+hook, reverted) showed only ~538MB -- meaning roughly **900MB of
+the 1.42GB peak RSS wasn't going through the arena at all**. Since
+the arena is the project's one and only "permanent" allocator
+(deliberately never-free, by design -- see arena.h's own header
+comment), any OTHER large, persistent memory use has to be a plain
+`malloc`/`realloc` call somewhere that's either leaking or carrying
+unnecessary slack.
+
+Confirmed precisely via `gdb` (breaking at the process's one exit
+point, reading `/proc/<pid>/smaps`/`status` through gdb's own
+Python API rather than an external `pgrep` guess, which initially
+grabbed the wrong PID and gave a wildly wrong answer) and
+`malloc_stats()` called into the stopped inferior: glibc's main
+malloc arena alone (`[heap]`) was **~756MB resident, 99.95% "in
+use"** by glibc's own accounting -- not fragmentation slack, genuine
+live, unreleased allocations.
+
+Rather than guess which call site, wrote a small LD_PRELOAD shim
+(`malloc`/`calloc`/`realloc`/`free` interposition, header-prefix
+technique to recover each block's allocation site and size in O(1)
+at `free()` time without a second lookup table that would itself
+distort the measurement) tracking per-call-site cumulative and
+current-outstanding bytes, resolved via `addr2line` against the
+PIE binary's own load offset. This directly identified three
+distinct leaks/waste sources, ranked by outstanding bytes:
+
+1. **Lexer token array, never freed (`src/c/lexer.c`'s
+   `asnix_lex`/`push_tok`).** `~195MB outstanding across only 3,688
+   realloc call sites` (i.e. ~53KB average per file's token array,
+   consistent with "most files small, a handful huge"). Both call
+   sites (`src/c/eval_file.c`'s `parse_resolved_file` and
+   `asnix_eval_expr_source`) called `asnix_lex` then
+   `asnix_parse(toks, ...)` and simply never freed `toks` afterward.
+   Confirmed safe: nothing outside lexer.c/parser.c ever stores a
+   raw `Token*` (`asnix_parse` copies out whatever an `Ast` node
+   needs -- names/text point into the original source buffer, not
+   into the token array). Fixed with a `free(toks)` right after each
+   `asnix_parse` call returns.
+
+2. **`IrBuilder`'s `ops`/`pool` arrays carrying permanent
+   doubling-growth slack (`src/c/irbuild.c`).** `ib_emit`/
+   `ib_pool_add` grow these by doubling (standard, correct amortized-
+   O(1) growth) -- but `ib_finish` hands the *still-oversized*
+   buffers straight into the permanent, program-lifetime
+   `IrProgram` (one per compiled thunk/function/expression -- over a
+   **million** of them across a full nixpkgs evaluation) without
+   ever trimming to the final `len`/`pool_len`. Whichever fill
+   fraction a builder happened to land on when finished (e.g. 55%
+   full right after a doubling) was carried forever, times roughly a
+   million builders. Fixed with two `realloc`-to-exact-size calls in
+   `ib_finish` before the arrays are stored into `prog` (safe:
+   shrinking `realloc` never moves/invalidates the still-needed
+   prefix). This was the single largest contributor found --
+   trimming eliminated the vast majority of what had shown up at
+   `ib_emit`'s own (pre-trim) call site.
+
+3. **`BTVec`'s backing arrays never freed after `insert_attrpath`'s
+   tree is flattened (`src/c/parser.c`).** Every attrset literal
+   (`{...}`/`rec {...}`/`let`'s own binding list) builds a transient
+   `BTVec` tree (one node per attrpath segment, handling both plain
+   `name = val;` bindings and `a.b.c = val;` attrpath-sugar's nested-
+   attrset merging) that gets flattened into ordinary `AST_ATTRSET`
+   nodes by `finalize_bt_node`/`finalize_bt_vec` -- but neither
+   function freed the `BTVec`'s own `items`/`dyn.items` arrays after
+   copying out everything they needed (leaf values are `Ast*`
+   already living in the arena; `finalize_dyn_vec` copies its own
+   exact-size array). Fixed by freeing `node->children.items`/
+   `node->children.dyn.items` inside `finalize_bt_node`'s branch case
+   and `vec->items` at the end of `finalize_bt_vec`, after confirming
+   (by reading every one of its ~5 call sites) that none of them
+   reuse the `BTVec` afterward. A smaller, related leak in the same
+   file (`parse_binding_stmt`'s `inherit (expr) a b;` case never
+   freeing its own `AttrSegVec names`) was fixed the same way.
+
+Measured impact on `./asnix d.nix`: peak RSS **1,451,720 KB → 917,104
+KB (~37% reduction)**. The malloc tracer's own
+`sum_of_current_outstanding` dropped from **~903MB → ~366MB**
+(consistent with the measured RSS drop once combined with the
+arena's own roughly-unchanged ~538MB). Also measured a reduction on
+the much smaller `e.nix` (`hello.drvPath`) workload as a sanity
+check that these fixes generalize rather than being ffmpeg-closure-
+specific: peak RSS **169,856 KB → 133,588 KB**.
+
+`make test`/`make test-e2e`/`make test-conformance`: unchanged, all
+green. `make test-nix-conformance`: `pass=652 fail=6 skip=148`,
+identical to the pre-existing baseline -- zero regressions.
+`make test-nixpkgs-hash`: reconfirmed `pass=148 fail=0` both before
+and after (parser.c/irbuild.c/eval_file.c/builtins_m23.c are not
+among the project's hash-parity-critical files, but verified anyway
+since this touched derivation-construction-adjacent code paths).
+
+Not pursued further in this milestone (left as documented, scoped-
+out leads for a future pass, same discipline as declining
+eq-slot-elem/-identity rather than half-fixing them): `src/c/
+derivation.c`'s `asnix_prim_derivation` doing `strcmp`-based output-
+name comparisons where a symbol-id comparison might be cheaper;
+`builtins_compare.c`'s `sorted_name_order`/`prim_attrNames` repeated
+`strcmp`-based qsort comparator; a list literal's own `AstVec`
+(`src/c/parser.c`'s `astvec_push`) carrying the same kind of
+doubling-growth slack `IrBuilder` had, just not yet measured as
+large enough to prioritize. A separate background agent was
+dispatched to continue the CPU-side investigation specifically
+(further O(n^2)-pattern hunting, the `strcmp`/`compile_expr`
+leads above) -- see its own milestone section, if landed after this
+one, for what it found.

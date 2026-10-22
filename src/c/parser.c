@@ -295,6 +295,16 @@ static AstBinding finalize_bt_node(BTNode *node) {
      * one does. */
     attrs->as.attrset.dyn_bindings = finalize_dyn_vec(&node->children.dyn);
     attrs->as.attrset.dyn_count = node->children.dyn.len;
+    /* M86 perf: everything this branch's subtree needs has now been
+     * copied out (leaf values are Ast* already living in the arena;
+     * finalize_dyn_vec copies its own exact-size array) -- nothing
+     * retains node->children's own backing arrays past this point, but
+     * they were never freed. Profiling found this parser-time family
+     * (one BTVec per attrset literal, recursively one per nested
+     * attrpath-sugar branch) among the largest non-arena leaks across a
+     * full nixpkgs evaluation. */
+    free(node->children.items);
+    free(node->children.dyn.items);
     return (AstBinding){ .name = node->name, .name_len = node->name_len, .value = attrs, .is_inherit = 0 };
 }
 
@@ -302,6 +312,7 @@ static void finalize_bt_vec(BTVec *vec, BindingVec *out) {
     for (size_t i = 0; i < vec->len; i++) {
         bindingvec_push(out, finalize_bt_node(&vec->items[i]));
     }
+    free(vec->items); /* M86 perf: see finalize_bt_node's identical comment */
 }
 
 typedef struct {
@@ -867,6 +878,7 @@ static void parse_binding_stmt(Parser *p, BTVec *out, DynBindingVec *dyn_out) {
              * comment on why that's safe. */
             insert_attrpath(out, &name, 1, 0, value, (src_expr == NULL));
         }
+        free(names.items); /* M86 perf: insert_attrpath copies each AttrSeg by value -- nothing retains `names` itself */
         expect(p, TOK_SEMI, "';'");
         return;
     }

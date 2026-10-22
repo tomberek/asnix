@@ -245,6 +245,19 @@ size_t ib_select_or(IrBuilder *b, uint32_t sym) {
 
 IrProgram *ib_finish(IrBuilder *b) {
     ir_link(b->ops, b->len);
+    /* M86 perf: ops/pool are handed to `prog`, which lives for the rest
+     * of the process (every compiled function/thunk keeps its own
+     * IrProgram forever) -- but ib_emit/ib_pool_add grow them by
+     * doubling, so whichever one lands at e.g. 55% full right before
+     * ib_finish carries that ~45% of slack permanently. Profiling a full
+     * nixpkgs evaluation found this builder family responsible for the
+     * single largest chunk of asnix's non-arena malloc footprint,
+     * hundreds of MB across the many thousands of small per-function
+     * IrPrograms compiled -- trimming to the exact final size here
+     * (safe: realloc to a smaller size never moves/invalidates the
+     * still-needed prefix) removes that slack for good. */
+    if (b->len > 0 && b->len < b->cap) b->ops = realloc(b->ops, b->len * sizeof(IrOp));
+    if (b->pool_len > 0 && b->pool_len < b->pool_cap) b->pool = realloc(b->pool, b->pool_len * sizeof(int64_t));
     IrProgram *prog = calloc(1, sizeof(IrProgram));
     prog->ops = b->ops;
     prog->pool = b->pool;
