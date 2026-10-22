@@ -24,26 +24,61 @@ asnix_op_select:                        // a = symbol id; pops an attrset, pushe
     jne .Lselect_type_error
 
     // M88 (lazy `//` union-layering, heap.h): a UnionHdr has a NEGATIVE
-    // `count` at offset 0 -- resolve to the flat form before the binary
-    // search below ever reads raw layout. asnix_bshared_attrs_resolve is
-    // a single sign-bit check (no call overhead paid) on the common
-    // already-flat case, which is why this is checked inline here rather
-    // than always calling through.
+    // `count` at offset 0 -- a single sign-bit check (no call overhead
+    // paid) on the common already-flat case, which is why this is
+    // checked inline here rather than always calling through.
+    //
+    // fork (unionhdr-probe): the union (negative-count) case used to
+    // call asnix_bshared_attrs_resolve, which ALWAYS fully flattens +
+    // caches every leaf merged together before this function's own
+    // single-key binary search ever runs -- even though this is a
+    // point lookup that only wants ONE value. That made M88's lazy
+    // deferral provide essentially zero benefit the moment an attrset
+    // is read even once via `a.b` (the single most common real-world
+    // attrs operation), which is nearly always true for a real `//`
+    // result. Now calls asnix_bshared_attrs_probe instead: a bounded
+    // multi-leaf walk (highest-priority leaf first, matching `//`'s
+    // right-biased override semantics) that binary-searches each flat
+    // leaf directly and returns on the first hit, never materializing
+    // or allocating -- the same thing real Nix's own layered
+    // Bindings::get() does (walk the layer chain directly; only full
+    // iteration ever needs a flattened view). See
+    // asnix_bshared_attrs_probe's own comment (builtins_shared.c) for
+    // the full reasoning and scope note (deliberately NOT applied to
+    // asnix_bshared_attrs_find/_count/_sym/_value, whose 35+ callers
+    // expect a stable positional index into a flat form).
     movq %rax, %r9                      // r9 = tagged value, kept across the maybe-call below
     andq $-8, %rax                      // rax = real Attrs* (untagged)
     movq ASNIX_ATTRS_OFF_COUNT(%rax), %r8 // r8 = count (maybe negative -- union header)
     testq %r8, %r8
     jns .Lselect_resolved
+    movl ASNIX_IROP_OFF_A(%rsi), %r10d  // r10d = target symbol id, read now (safe: %rsi
+                                         // untouched since entry) before %rsi/%rdi get pushed
     pushq %rsi                          // save IP
-    pushq %rdi                          // save ENV (2 pushes -- stays 16-byte aligned)
+    pushq %rdi                          // save ENV
+    subq $16, %rsp                      // 16-byte-aligned scratch slot for out_value (only
+                                         // 8 used -- keeps the call's own stack-alignment
+                                         // requirement simple alongside the 2 pushes above)
     movq %r9, %rdi                      // arg1 = tagged attrs value
-    call asnix_bshared_attrs_resolve
-    movq %rax, %r9                      // r9 = resolved (flat) tagged value
+    movl %r10d, %esi                    // arg2 = symbol id
+    movq %rsp, %rdx                     // arg3 = &out_value (the scratch slot just reserved)
+    call asnix_bshared_attrs_probe
+    testl %eax, %eax
+    movq (%rsp), %r9                    // r9 = probed value (meaningful only if found; cheap
+                                         // to load unconditionally rather than branch around)
+    addq $16, %rsp
     popq %rdi
     popq %rsi
-    movq %r9, %rax
-    andq $-8, %rax                      // rax = real (flat) Attrs*
-    movq ASNIX_ATTRS_OFF_COUNT(%rax), %r8 // reload count -- now guaranteed non-negative
+    jz .Lselect_probe_missing
+    movq %r9, %rax                      // rax = found value -- feed into the SAME thunk-
+                                         // forcing/Cell-check/push logic every other select
+                                         // result already goes through, below
+    jmp .Lselect_resolve
+.Lselect_probe_missing:
+    movq ASNIX_IROP_OFF_A(%rsi), %rdx   // %rsi restored above -- .Lselect_missing's own
+                                         // handler expects %rdx = symbol id, same as the
+                                         // already-flat path sets it at .Lselect_resolved
+    jmp .Lselect_missing
 .Lselect_resolved:
 
     movq ASNIX_IROP_OFF_A(%rsi), %rdx   // rdx = target symbol id

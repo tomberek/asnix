@@ -370,6 +370,88 @@ int64_t asnix_bshared_attrs_find(Value attrs, uint32_t sym) {
     return -1;
 }
 
+/* fork (unionhdr-probe): binary search on a value ALREADY KNOWN to be
+ * flat (count >= 0) -- shared by asnix_bshared_attrs_probe below, raw-
+ * layout version of the lo/hi loop above without the resolve call,
+ * since every leaf of a union is already guaranteed flat by construction
+ * (asnix_attrs_update always resolves a would-be leaf before storing
+ * it). */
+static int64_t attrs_find_flat_noresolve(Value flat, uint32_t sym) {
+    const char *base = (const char *)(uintptr_t)(flat.raw & ~(uint64_t)ASNIX_TAG_MASK);
+    int64_t lo = 0, hi = *(const int64_t *)(base + ASNIX_ATTRS_OFF_COUNT);
+    while (lo < hi) {
+        int64_t mid = lo + (hi - lo) / 2;
+        const char *entry = base + ASNIX_ATTRS_OFF_ENTRIES + mid * ASNIX_ATTR_SIZE;
+        uint32_t s = *(const uint32_t *)(entry + ASNIX_ATTR_OFF_SYM);
+        if (s == sym) return mid;
+        if (s < sym) lo = mid + 1; else hi = mid;
+    }
+    return -1;
+}
+
+/* fork (unionhdr-probe): bounded multi-leaf probe for a SINGLE-KEY
+ * lookup on a lazy union (heap.h's UnionHdr, M88/M93). The existing
+ * asnix_bshared_attrs_find/_resolve ALWAYS fully materializes+caches
+ * every leaf merged together (a pairwise merge across all leaves, same
+ * cost as an eager `//`) before doing ANY lookup -- even when the caller
+ * only wants ONE key, which is op_select.S's `a.b` access, the single
+ * most common real-world attrs operation in compiled Nix code. That
+ * means M88's lazy deferral provides essentially zero benefit the
+ * moment an attrset is touched even once via a point lookup, which is
+ * nearly always, since why build `a // b` and never read from it --
+ * found by tracing exactly where every access path routes through
+ * asnix_bshared_attrs_resolve unconditionally.
+ *
+ * Real Nix's own layered Bindings::get() never has this problem: a
+ * point lookup walks the layer chain directly (binary-search the top
+ * layer, fall through to baseLayer on miss), with no flattened view
+ * ever required unless something genuinely needs full iteration. This
+ * function is the same idea for asnix's leaf-array union representation
+ * -- walk leaves from HIGHEST priority (last-stored, matching `//`'s
+ * right-biased override semantics -- heap.h's own comment confirms
+ * `leaves` is stored lowest-priority-first) to lowest, binary-search
+ * each flat leaf directly, return on first hit. Never touches
+ * flat_cache, never allocates, never mutates the union. If the union
+ * was ALREADY materialized by some earlier full-iteration caller, probe
+ * that cached flat form directly instead (still just one binary search,
+ * no leaf-walk needed).
+ *
+ * Deliberately narrow in scope: only wired into op_select.S's single-key
+ * `a.b` path (the hottest, most frequent case) for this one-shot fork,
+ * NOT into asnix_bshared_attrs_find/_count/_sym/_value, whose 35+
+ * callers expect a stable POSITIONAL index into v's own flat form --
+ * changing that contract to avoid materialization too would need
+ * auditing every one of those call sites, out of scope here. */
+int asnix_bshared_attrs_probe(Value attrs, uint32_t sym, Value *out_value) {
+    const char *base = (const char *)(uintptr_t)(attrs.raw & ~(uint64_t)ASNIX_TAG_MASK);
+    int64_t count = *(const int64_t *)(base + ASNIX_ATTRS_OFF_COUNT);
+    Value probe_target = attrs;
+    if (count < 0) {
+        Value cached = *(const Value *)(base + ASNIX_ATTRS_UNION_OFF_FLATCACHE);
+        if (cached.raw != 0) {
+            probe_target = cached;
+        } else {
+            int64_t nleaves = -count;
+            const Value *leaves = (const Value *)(base + ASNIX_ATTRS_UNION_OFF_LEAVES);
+            for (int64_t i = nleaves - 1; i >= 0; i--) {
+                int64_t idx = attrs_find_flat_noresolve(leaves[i], sym);
+                if (idx < 0) continue;
+                const char *lbase = (const char *)(uintptr_t)(leaves[i].raw & ~(uint64_t)ASNIX_TAG_MASK);
+                const char *entry = lbase + ASNIX_ATTRS_OFF_ENTRIES + idx * ASNIX_ATTR_SIZE;
+                *out_value = *(const Value *)(entry + ASNIX_ATTR_OFF_VALUE);
+                return 1;
+            }
+            return 0;
+        }
+    }
+    int64_t idx = attrs_find_flat_noresolve(probe_target, sym);
+    if (idx < 0) return 0;
+    const char *pbase = (const char *)(uintptr_t)(probe_target.raw & ~(uint64_t)ASNIX_TAG_MASK);
+    const char *entry = pbase + ASNIX_ATTRS_OFF_ENTRIES + idx * ASNIX_ATTR_SIZE;
+    *out_value = *(const Value *)(entry + ASNIX_ATTR_OFF_VALUE);
+    return 1;
+}
+
 typedef struct {
     uint32_t sym;
     int64_t idx;

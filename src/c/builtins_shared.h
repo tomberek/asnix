@@ -152,6 +152,9 @@ uint32_t asnix_bshared_attrs_sym(Value v, int64_t i);
 Value asnix_bshared_attrs_value(Value v, int64_t i);
 int64_t asnix_bshared_attrs_find(Value attrs, uint32_t sym);
 
+/* fork (unionhdr-probe): bounded multi-leaf probe, no materialization -- see builtins_shared.c */
+int asnix_bshared_attrs_probe(Value attrs, uint32_t sym, Value *out_value);
+
 /* M88 (lazy `//` union-layering, heap.h's UnionHdr comment): `v` MUST
  * already be ASNIX_TAG_ATTRS (callers check that first, same as every
  * other attrs_* accessor here). Returns `v` unchanged if it's already an

@@ -124,6 +124,7 @@ what's actually implemented and the scope decisions made along the way.
 | M108 — a permanent, always-on `NIX_SHOW_STATS=1`-equivalent (`ASNIX_SHOW_STATS=1`): per-category object counters (env/thunk/closure/attrs/list/cell/string/primop/path, plus element/entry sub-counts for env/attrs/list) incremented at every real allocation site -- `asnix_env_alloc` plus the four hot-path-inlined env-frame sites (`op_frame.S`/`op_let.S`/`op_call.S`/`op_with.S`/`apply.S`) that bypass it entirely, so a first attempt at just the shared helper undercounted envs by ~3x until all five sites were found and instrumented | done (see below; env/thunk/cell counts cross-checked exactly against this session's own independent arena-tracer investigation -- 1,675,074 / 2,342,967 / 836,471 -- confirming correctness; zero regressions) |
 | M109 — ported real Nix's `IndexedCallDescriptor` idea (`tomberek/nix#52`) to `mapAttrs`/`zipAttrsWith`: both build N lazy `(f name) value` thunks per call that all share the same `f`, but the per-thunk Env was re-storing `f` into a fresh 3-slot Env every time. Factored `f` out into one shared 1-slot Env (allocated once per builtin call, `asnix_bshared_make_call2_shared_env`), each per-attribute thunk now uses a 2-slot Env `{arg1, arg2}` whose `up` points at the shared Env, reading `f` via depth=1 instead of depth=0 (`asnix_bshared_make_lazy_call2_indexed`) -- no new Value kind, no new asm, no new force-path case, unlike the fuller `IndexedCallThunk` design the same PR also explores (deferring the attribute-name String's construction until the thunk is actually forced), which needs a new bytecode op or a native-call escape hatch in the force path and was left as a documented follow-on, out of scope for a one-shot | done (see below; per-thunk cost Env(3)+Thunk=48B -> Env(2)+Thunk=40B (~17%); measured on `d.nix`'s real ffmpeg closure: peak RSS 674,584 KB -> 670,796 KB (~0.56%, modest since ffmpeg's own closure doesn't lean on `mapAttrs`/`zipAttrsWith` heavily -- matches real Nix's own measured -2.1% to -4.2% gain for the analogous change); `mapAttrs` laziness canary (`attrNames (mapAttrs throw {...})` must not throw) and basic `mapAttrs`/`zipAttrsWith` correctness spot-checked directly; zero regressions) |
 | M110 — Ast nodes moved from the main never-free arena into their own dedicated, resettable chunk allocator, freed right after each top-level `asnix_compile`/`asnix_compile_scoped` call returns (an Ast tree is pure compile-time scratch, fully dead once walked into an `IrProgram`); a prior attempt at this exact change crashed on the real workload (`undefined variable 'list'` on `d.nix`, several real nixpkgs packages crashing in `test-nixpkgs-hash`) despite passing the small fixture suite -- root-caused via a zero-vs-garbage A/B test (poisoning freed chunks changed nothing, ruling out simple use-after-free; switching the chunk allocator from `malloc` to `calloc` fixed it outright): the arena it replaced is backed by zero-filled `mmap`, and at least one `Ast` constructor implicitly relied on an unset union field defaulting to zero, a latent assumption the whole codebase never had to confront until this allocator stopped providing it for free | done (see below; peak RSS on `d.nix` 736,920 → 691,780 KB (~6.2%), measured as a true paired before/after in one worktree/build; `make test-nixpkgs-hash`: `pass=148 fail=0`, including the specific packages (glib/gtk3/nix) that crashed under the original broken attempt; zero regressions) |
+| M111 — `op_select.S`'s `a.b` point lookup on a lazy union (M88/M93's `UnionHdr`) used to call `asnix_bshared_attrs_resolve`, which ALWAYS fully flattens+caches every leaf before any lookup -- even for a single key, meaning M88's deferral provided essentially zero benefit the moment a `//` result was read even once. New `asnix_bshared_attrs_probe` walks leaves highest-priority-first and binary-searches each flat leaf directly, matching real Nix's own layered `Bindings::get()` (point lookups walk the layer chain, never materializing); wired into `op_select.S` only (the hottest, most common access pattern), not into `attrs_find`/`_count`/`_sym`/`_value`'s 35+ callers, which need a stable positional index a bounded probe can't provide without materializing anyway | done (see below; peak RSS on `d.nix`: 673,748 -> 665,108 KB, ~1.3% reduction; instructions essentially flat, 10.874B -> 10.938B, within measurement noise; zero regressions) |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
 
@@ -12140,3 +12141,97 @@ documented elsewhere in this file, not a real regression).
 the pre-existing baseline. `make test-nixpkgs-hash`: **`pass=148
 fail=0`**, including the specific packages that crashed under the
 original broken attempt.
+## M111: `asnix_bshared_attrs_probe` -- point lookups on a lazy union no longer materialize
+
+The user asked why asnix's `UnionHdr` (M88/M93's lazy `//`-layering) ends
+up heavier than real Nix's layered `Bindings` in practice, and whether
+it's fixable. Tracing the actual access path found the real answer isn't
+primarily about struct-shape size (a `UnionHdr` header is cheap: 24 bytes
++ up to 64 leaf pointers) -- it's that **every single access, including
+a plain `a.b` point lookup wanting exactly one key, fully flattens and
+caches ALL leaves first**, via `asnix_bshared_attrs_resolve`
+(`builtins_shared.c`) -- confirmed by reading every call site
+(`asnix_bshared_attrs_find`/`_count`/`_sym`/`_value` all call it
+unconditionally, and `op_select.S`'s own inlined fast path does too).
+That means M88's lazy deferral provides essentially zero benefit the
+moment a `//` result is read even once, which is nearly always true --
+why build `a // b` and never touch it?
+
+Real Nix's own layered `Bindings::get()` never has this problem: a point
+lookup walks the layer chain directly (binary-search the top layer, fall
+through to `baseLayer` on miss), with no flattened view ever required
+unless something genuinely needs full iteration.
+
+Added `asnix_bshared_attrs_probe(Value attrs, uint32_t sym, Value
+*out_value)` (`builtins_shared.c`): for a flat attrs, an ordinary binary
+search; for a union, walks `leaves` from **highest priority (last-
+stored) to lowest** -- matching `//`'s right-biased override semantics,
+confirmed directly against heap.h's own "`leaves` stored lowest-
+priority-first" comment -- binary-searching each flat leaf directly and
+returning on the first hit. Never touches `flat_cache`, never
+allocates, never mutates the union. If the union was already
+materialized by an earlier full-iteration caller, probes the cached
+flat form directly instead (one binary search, no leaf-walk needed) --
+correctness confirmed by direct test: `merged.a` read, then `attrNames
+merged` (forces materialization), then `merged.b` read again, all
+returned correct values.
+
+Wired into `op_select.S`'s union branch only -- the single hottest,
+most common real-world attrs operation (`a.b` in compiled Nix source)
+-- replacing the `call asnix_bshared_attrs_resolve` sequence with a
+call to the new probe, jumping directly into the shared thunk-forcing/
+Cell-check/push logic (`.Lselect_resolve`) on a hit, or straight to the
+existing `.Lselect_missing` fatal-error path on a genuine miss (the
+probe already checked every leaf, so a miss there needs no fallback
+re-check). Deliberately NOT applied to `asnix_bshared_attrs_find`/
+`_count`/`_sym`/`_value`: their 35+ callers expect a stable *positional
+index* into `v`'s own flat form (most immediately turn around and call
+`attrs_value(v, idx)`), which a bounded leaf-probe can't provide without
+materializing anyway -- changing that contract would need auditing
+every one of those sites, out of scope for this fix.
+
+**Caught and fixed one bug in my own edit before landing**: an
+incomplete anchor match when patching `op_select.S` left a duplicate
+`.Lselect_resolved:` label and an orphaned, now-dead "reload count"
+instruction between the new probe path and the pre-existing flat-case
+fallthrough -- would have been a hard assembler error (duplicate
+label), caught immediately on the first build attempt, fixed before any
+testing.
+
+**Correctness verified directly**, not just via the test suite:
+override semantics (`big // small` with a 17-entry LHS/2-entry RHS,
+above/below M88's thresholds respectively, so genuinely builds a
+`UnionHdr`) -- confirmed right-biased override, fallthrough for
+non-overridden keys, missing-key fatal error unchanged, repeated access
+before/after materialization, and a chained double-union (`(big // {a})
+// {b,z}`) all give correct results.
+
+`make test`/`test-e2e`/`test-conformance`: unchanged, all green.
+`make test-nix-conformance`: `pass=655 fail=3 skip=148`, exact baseline
+match (one transient regex-timeout flake on a contended run reproduced
+clean in isolation and on rerun, not a real regression). `make
+test-nixpkgs-hash`: `pass=148 fail=0` (one transient `bash.outPath`
+crash on a contended run, same pattern, reproduced clean in isolation
+and on rerun).
+
+**Measured impact on `./asnix d.nix`** (real nixpkgs's `ffmpeg.outPath`,
+`perf stat -r 3` / `/usr/bin/time -v`, against an M108 baseline built
+side-by-side in a separate worktree for a clean comparison): peak RSS
+**673,748 -> 665,108 KB (~1.3% reduction)** -- small but real. Instructions
+**10.874B -> 10.938B**, essentially flat (within the ~0.7-0.8% run-to-run
+measurement noise observed on both sides) -- not a clear win or loss on
+CPU. The modest size of the RSS win is itself informative: it confirms
+(rather than just asserts) that most unions in this real workload DO
+eventually get fully materialized via some OTHER access path anyway
+(`attrNames`, the printer, `derivation.c`'s own input-collection walk,
+JSON encoding) regardless of this fix -- this fix only helps the subset
+of unions that are read ONLY via point lookups and never via full
+iteration, a real but limited class, not the dominant one. Consistent
+with M93's own "roughly a wash on the real ffmpeg workload" finding and
+the sibling fork's finding that *more* deferral (porting real Nix's
+relative-size heuristic) made things *worse* -- the structural
+overhead this milestone targets (forced full materialization on every
+touch) was real and is now fixed for the single most common access
+pattern, but the remaining materialize-on-full-iteration cost is
+inherent to needing a flat, indexable, deduped view at all, and wasn't
+and isn't attempted here.
