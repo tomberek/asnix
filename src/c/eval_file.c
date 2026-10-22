@@ -20,6 +20,7 @@
 #include "builtins_misc.h"
 #include "builtins_shared.h"
 #include "builtins_toml.h"
+#include "bytecode_cache.h"
 #include "compiler.h"
 #include "derivation.h"
 #include "lexer.h"
@@ -27,7 +28,10 @@
 #include "symtab.h"
 #include "value_util.h" /* asnix_canon_path, M57h symlink fix */
 
-static char *read_file(const char *path) {
+/* `out_len` (M92: bytecode-cache key hashing needs the exact byte count,
+ * not a strlen() guess that would silently misbehave on a file
+ * containing an embedded NUL) may be NULL for callers that don't. */
+static char *read_file(const char *path, size_t *out_len) {
     FILE *f = fopen(path, "rb");
     if (!f) {
         fprintf(stderr, "asnix: cannot open '%s'\n", path);
@@ -53,6 +57,7 @@ static char *read_file(const char *path) {
     fread(buf, 1, (size_t)size, f);
     buf[size] = '\0';
     fclose(f);
+    if (out_len) *out_len = (size_t)size;
     return buf;
 }
 
@@ -215,7 +220,7 @@ static char *resolve_file_path(const char *path) {
  * during the one compile call). */
 static Ast *parse_resolved_file(const char *resolved, char **base_dir_out) {
     *base_dir_out = dir_of(resolved);
-    char *src = read_file(resolved);
+    char *src = read_file(resolved, NULL);
     size_t ntoks;
     Token *toks = asnix_lex(src, &ntoks);
     Ast *ast = asnix_parse(toks, ntoks, src);
@@ -377,15 +382,58 @@ Value asnix_eval_file(const char *path) {
         return cached;
     }
 
-    char *base_dir;
-    Ast *ast = parse_resolved_file(resolved, &base_dir);
-    IrProgram *prog = asnix_compile(ast, base_dir, resolved);
+    /* M92: give an in-flight background prefetch producer (see
+     * bytecode_cache.h) a chance to finish before falling back to a
+     * synchronous compile -- no-op if prefetching is disabled or no
+     * producer was started for this exact path. */
+    asnix_bytecode_prefetch_wait(resolved);
+
+    char *base_dir = dir_of(resolved);
+    size_t src_len;
+    char *src = read_file(resolved, &src_len);
+
+    IrProgram *prog = asnix_bytecode_cache_lookup(resolved, src, src_len);
+    if (!prog) {
+        size_t ntoks;
+        Token *toks = asnix_lex(src, &ntoks);
+        Ast *ast = asnix_parse(toks, ntoks, src);
+        free(toks); /* M86 perf: see parse_resolved_file's identical free() comment */
+        prog = asnix_compile(ast, base_dir, resolved);
+        asnix_bytecode_cache_store(resolved, src, src_len, prog);
+        asnix_bytecode_prefetch_imports(ast, base_dir);
+    }
     Env *root_env = make_root_env(NULL);
     Value result = asnix_eval(prog, root_env);
     import_cache_insert(resolved, result);
     free(resolved);
     free(base_dir);
     return result;
+}
+
+/* M92: the fork()'d bytecode-prefetch producer's entire job (see
+ * bytecode_cache.h's own comment on asnix_bytecode_prefetch_imports for
+ * why this runs in a separate PROCESS, not a thread, and why that makes
+ * this function safe to just call the normal, unmodified resolve/read/
+ * lex/parse/compile pipeline with zero synchronization). Deliberately
+ * does NOT touch g_import_cache/g_top_level_file or call asnix_eval --
+ * this is cache-WARMING only, never evaluation; the only observable
+ * effect on anything outside this one forked process is whatever
+ * asnix_bytecode_cache_store writes to disk, read back later by the
+ * parent's own ordinary asnix_bytecode_cache_lookup call. Any failure
+ * (file doesn't exist, parse/compile error, cache store refused) just
+ * means this child exits having cached nothing -- identical, from the
+ * parent's point of view, to never having been forked at all. */
+void asnix_prefetch_compile_and_cache(const char *path) {
+    char *resolved = resolve_file_path(path);
+    char *base_dir = dir_of(resolved);
+    size_t src_len;
+    char *src = read_file(resolved, &src_len);
+    size_t ntoks;
+    Token *toks = asnix_lex(src, &ntoks);
+    Ast *ast = asnix_parse(toks, ntoks, src);
+    free(toks);
+    IrProgram *prog = asnix_compile(ast, base_dir, resolved);
+    asnix_bytecode_cache_store(resolved, src, src_len, prog);
 }
 
 /* M58: the one caller that needs make_root_env_ex's cycle-breaking
