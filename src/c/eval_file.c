@@ -243,10 +243,17 @@ static char *resolve_file_path(const char *path, struct stat *out_st) {
 /* Reads+lexes+parses an ALREADY-RESOLVED path, writing its containing
  * directory out through `*base_dir_out` (caller-owned, malloc'd -- freed
  * once done with it, which asnix_compile/asnix_compile_scoped only read
- * during the one compile call). */
-static Ast *parse_resolved_file(const char *resolved, char **base_dir_out) {
+ * during the one compile call), and the source-text buffer itself out
+ * through `*src_out` (perf: unlike toks below, this function's own AST
+ * nodes point directly INTO src -- AstBinding.name/AstFormal.name are not
+ * copies -- so src must stay alive through the caller's own subsequent
+ * asnix_compile()/asnix_compile_scoped() call; this function can't free
+ * it itself, only hand it back so the caller can free it once that
+ * compile call returns, same as asnix_eval_file's own free(src)). */
+static Ast *parse_resolved_file(const char *resolved, char **base_dir_out, char **src_out) {
     *base_dir_out = dir_of(resolved);
     char *src = read_file(resolved, NULL);
+    *src_out = src;
     size_t ntoks;
     Token *toks = asnix_lex(src, &ntoks);
     Ast *ast = asnix_parse(toks, ntoks, src);
@@ -267,12 +274,12 @@ static Ast *parse_resolved_file(const char *resolved, char **base_dir_out) {
  * call's `scope` argument can differ, so the same file path can
  * legitimately produce a different result per call -- caching by path
  * alone would be wrong there). */
-static Ast *parse_file(const char *path, char **resolved_out, char **base_dir_out) {
+static Ast *parse_file(const char *path, char **resolved_out, char **base_dir_out, char **src_out) {
     struct stat st; /* unused here -- scopedImport never consults the bytecode
                       * cache (see this function's own comment above) */
     char *resolved = resolve_file_path(path, &st);
     *resolved_out = resolved;
-    return parse_resolved_file(resolved, base_dir_out);
+    return parse_resolved_file(resolved, base_dir_out, src_out);
 }
 
 /* M65: real Nix memoizes `import <path>` by the resolved path -- a
@@ -469,6 +476,14 @@ Value asnix_eval_file(const char *path) {
             asnix_bytecode_prefetch_imports(ast, base_dir);
             asnix_ast_arena_reset(); /* perf: ast is dead past this point -- see ast.c */
         }
+        /* perf: src is dead past this point either way -- consumed by
+         * lex/parse/compile/cache_store above, or by
+         * asnix_bytecode_cache_lookup_verify's own content hash if that
+         * path produced prog instead; nothing downstream (the IrProgram,
+         * the Ast already reset above) retains a pointer into it. Never
+         * freed before this fix -- a ~24 MB leak across a real nixpkgs
+         * closure's ~1000+ imported files. */
+        free(src);
     }
     Env *root_env = make_root_env(NULL);
     Value result = asnix_eval(prog, root_env);
@@ -505,15 +520,17 @@ void asnix_prefetch_compile_and_cache(const char *path) {
     asnix_bytecode_cache_store(resolved, src, src_len, (int64_t)st.st_mtim.tv_sec, (int64_t)st.st_mtim.tv_nsec,
                                 (int64_t)st.st_size, prog);
     asnix_ast_arena_reset(); /* perf: ast is dead past this point -- see ast.c (also moot -- this forked child exits right after) */
+    free(src); /* perf: see asnix_eval_file's identical free(src) comment (also moot here) */
 }
 
 /* M58: the one caller that needs make_root_env_ex's cycle-breaking
  * `skip_derivation_wrapper=1` path -- see that function's comment. */
 Value asnix_eval_file_for_derivation_bootstrap(const char *path) {
-    char *resolved, *base_dir;
-    Ast *ast = parse_file(path, &resolved, &base_dir);
+    char *resolved, *base_dir, *src;
+    Ast *ast = parse_file(path, &resolved, &base_dir, &src);
     IrProgram *prog = asnix_compile(ast, base_dir, resolved);
     asnix_ast_arena_reset(); /* perf: ast is dead past this point -- see ast.c */
+    free(src); /* perf: see asnix_eval_file's identical free(src) comment */
     Env *root_env = make_root_env_ex(NULL, 1);
     Value result = asnix_eval(prog, root_env);
     free(resolved);
@@ -529,8 +546,8 @@ Value asnix_eval_file_for_derivation_bootstrap(const char *path) {
  * order its names were listed) wrapped around the ordinary 14-slot root
  * env (`up = scope_env`'s own `up`). */
 Value asnix_eval_file_scoped(const char *path, Value scope) {
-    char *resolved, *base_dir;
-    Ast *ast = parse_file(path, &resolved, &base_dir);
+    char *resolved, *base_dir, *src;
+    Ast *ast = parse_file(path, &resolved, &base_dir, &src);
 
     int64_t n = asnix_bshared_attrs_count(scope);
     const char **names = malloc((size_t)(n > 0 ? n : 1) * sizeof(const char *));
@@ -542,6 +559,10 @@ Value asnix_eval_file_scoped(const char *path, Value scope) {
 
     IrProgram *prog = asnix_compile_scoped(ast, base_dir, resolved, names, lens, (size_t)n);
     asnix_ast_arena_reset(); /* perf: ast is dead past this point -- see ast.c */
+    free(src); /* perf: see asnix_eval_file's identical free(src) comment --
+                 * names[]/lens[] above come from asnix_sym_name's own
+                 * interned storage, not from src, so nothing here still
+                 * points into it either. */
 
     Env *root_env = make_root_env(NULL);
     Env *scope_env = asnix_env_alloc(root_env, n);

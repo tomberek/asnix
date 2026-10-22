@@ -12348,3 +12348,64 @@ identical before and after -- same 3 pre-existing, unrelated failures
 (`eval-okay-getattrpos-functionargs.nix`, `eval-okay-getattrpos.nix`,
 `eval-okay-inherit-attr-pos.nix`, all pos-tracking gaps, not Env-shape
 related). `make test-nixpkgs-hash`: **`pass=148 fail=0`**, unchanged.
+
+## M115: `read_file`'s source-text buffer freed after compile -- the one buffer M87 (tokens) and M110 (AST) left leaking
+
+M87 freed the lexer's token array and M110 freed the AST itself once
+`asnix_compile` is done with each, but `read_file`'s own return value
+(`char *src`, the whole file's raw bytes) was never freed at any of its
+5 call sites in `eval_file.c` -- a plain, unconditional leak for the
+life of the process. An earlier investigation this session measured
+this at ~24.41 MB of logical bytes, summed across a real nixpkgs
+closure's ~1,057 imported files (`./asnix d.nix`, ffmpeg's closure).
+
+**The one real subtlety**: `Ast` nodes don't copy strings out of `src`
+-- `AstBinding.name`/`AstFormal.name` point directly into it (same
+"names/strings point into src, not into toks" fact M87's own `free(toks)`
+comment already relies on) -- so `src` must stay alive through the
+*whole* `asnix_compile`/`asnix_compile_scoped` call, not just through
+`asnix_parse`. That's trivially true in the main hot path
+(`asnix_eval_file`): `src` is read, compiled, and could be freed all in
+the same function scope, with nothing downstream (the already-reset
+`Ast`, the compiled `IrProgram`) retaining a pointer into it afterward.
+It was NOT already true for the other two real call sites:
+`parse_resolved_file` (shared by `asnix_eval_file_for_derivation_bootstrap`
+and `asnix_eval_file_scoped` via `parse_file`) read `src` locally and
+returned only the `Ast*`, with the caller's own `asnix_compile` call
+happening afterward in a DIFFERENT function -- freeing `src` inside
+`parse_resolved_file` itself would have freed it out from under the
+caller's still-pending compile. Fixed by threading a new `src_out`
+parameter through `parse_resolved_file` -> `parse_file` so both callers
+can free it themselves, in the same place they already free `resolved`/
+`base_dir`, right after their own `asnix_compile(_scoped)` call and
+`asnix_ast_arena_reset()` return. The fork()'d prefetch producer
+(`asnix_prefetch_compile_and_cache`) got the same one-line fix for
+consistency, though it's moot there (that child exits immediately after).
+
+**Verified correct via `valgrind --leak-check=full`, not just RSS**:
+RSS deltas for this one fix are noise-sized on `./asnix d.nix` (peak RSS
+varied by up to ~1 MB run-to-run on this same closure; M114's own much
+larger env-count fix only moved peak RSS by ~0.7% for comparison) --
+freed heap chunks get reused by the glibc arena for later allocations in
+the same process rather than shrinking the process's high-water mark, so
+a single-run RSS comparison can't distinguish "freed but reused" from
+"never freed". `valgrind --leak-check=full --show-leak-kinds=definite`
+on the same `./asnix d.nix` run gives a direct, allocator-reuse-proof
+signal instead: before this fix, `read_file`'s `malloc` (`eval_file.c`'s
+`read_file`, called from `asnix_eval_file`) appears as a "definitely
+lost" loss record for essentially every one of the ~1,057 imported
+files; after, exactly 2 small records remain (291 + 1,143 bytes). Those
+2 are not a bug in this fix: `builtins.tryEval`'s `longjmp`
+(`tryeval.c`/`builtins_tryeval.c`) unwinds past any C stack frame
+between its `setjmp` and the thrown error, skipping that frame's own
+cleanup code entirely -- the exact same documented, already-accepted
+limitation `builtins_tryeval.c`'s own comment describes for `op_*.S`/
+`force.S` epilogues, now also covering this new `free(src)` call for the
+rare case where a `tryEval`-wrapped import's compile is the frame being
+unwound through.
+
+`make test`/`make test-e2e`: all green (24/24 test binaries). `make
+test-nix-conformance`: `pass=655 fail=3 skip=148`, identical to the
+pre-existing baseline (same 3 pos-tracking failures). `make
+test-nixpkgs-hash`: **`pass=148 fail=0`**, unchanged. `./asnix d.nix`
+output unchanged: `/nix/store/29iacg6h530yx7rxz4k1fhvi0kxxhsam-ffmpeg-9.0.1-bin`.
