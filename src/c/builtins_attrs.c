@@ -90,28 +90,50 @@ static int name_cmp(const char *an, size_t al, const char *bn, size_t bl) {
     return (al > bl) - (al < bl);
 }
 
+/* Perf note (post-M86 CPU profiling pass): this used to be a plain
+ * insertion sort, on the theory ("attrsets are typically small and this
+ * isn't a hot path") that's true for a hand-written literal but false
+ * for the real thing `attrNames`/`attrValues` actually gets called on --
+ * real nixpkgs's own top-level `pkgs` attrset has over 28,000 entries
+ * (the same set `builtins_m23.c`'s `intersectAttrs` fix this session
+ * measured directly), and `perf record -g` on `./asnix d.nix` (ffmpeg's
+ * closure) showed `prim_attrNames`/`sorted_name_order`/`__memcmp_avx2_
+ * movbe`/`asnix_sym_name` together consuming roughly a third of all
+ * remaining cycles after this session's other two fixes (derivation.c's
+ * closure cache, parser.c's btvec_find) -- an O(n^2) insertion sort over
+ * tens of thousands of entries, each comparison re-resolving both sides'
+ * symbol name from scratch via `asnix_sym_name`. Fixed two ways at once:
+ * `qsort` (O(n log n) comparisons instead of O(n^2)), and resolving each
+ * entry's name exactly ONCE up front into a flat array `qsort`'s
+ * comparator reads directly, instead of once per comparison. */
+typedef struct {
+    int64_t idx;
+    const char *name;
+    size_t len;
+} NameOrderEntry;
+
+static int name_order_entry_cmp(const void *ap, const void *bp) {
+    const NameOrderEntry *a = (const NameOrderEntry *)ap;
+    const NameOrderEntry *b = (const NameOrderEntry *)bp;
+    return name_cmp(a->name, a->len, b->name, b->len);
+}
+
 /* Builds `order[0..n-1]`, a permutation of attrs's entry indices sorted
  * alphabetically by attribute name -- real Nix's attrNames/attrValues
  * report attributes in alphabetical order, NOT this project's internal
  * Attr-array order (sorted by symbol id, which is assignment order, not
  * alphabetical -- see heap.h's note and docs/architecture.md's "Known
- * bugs" #4 about a real bug once caused by assuming otherwise). Plain
- * insertion sort: attrsets are typically small and this isn't a hot path. */
+ * bugs" #4 about a real bug once caused by assuming otherwise). */
 static void sorted_name_order(Value attrs, int64_t n, int64_t *order) {
-    for (int64_t i = 0; i < n; i++) order[i] = i;
-    for (int64_t i = 1; i < n; i++) {
-        int64_t j = i;
-        while (j > 0) {
-            size_t al, bl;
-            const char *an = asnix_sym_name(attrs_entry_sym(attrs, order[j - 1]), &al);
-            const char *bn = asnix_sym_name(attrs_entry_sym(attrs, order[j]), &bl);
-            if (name_cmp(an, al, bn, bl) <= 0) break;
-            int64_t tmp = order[j - 1];
-            order[j - 1] = order[j];
-            order[j] = tmp;
-            j--;
-        }
+    NameOrderEntry *entries = malloc((size_t)n * sizeof(NameOrderEntry));
+    for (int64_t i = 0; i < n; i++) {
+        size_t len;
+        const char *name = asnix_sym_name(attrs_entry_sym(attrs, i), &len);
+        entries[i] = (NameOrderEntry){ .idx = i, .name = name, .len = len };
     }
+    qsort(entries, (size_t)n, sizeof(NameOrderEntry), name_order_entry_cmp);
+    for (int64_t i = 0; i < n; i++) order[i] = entries[i].idx;
+    free(entries);
 }
 
 static int64_t attrs_find(Value attrs, uint32_t sym) {

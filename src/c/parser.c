@@ -119,7 +119,22 @@ typedef struct BTNode BTNode;
  * name to merge them under. Empty/zero for the overwhelming majority of
  * BTVecs, which never go through a merge involving a dynamic-keyed
  * literal at all. */
-typedef struct { BTNode *items; size_t len, cap; DynBindingVec dyn; } BTVec;
+/* Perf note (post-M86 CPU profiling pass, same session as derivation.c's
+ * `cache_own_drv_closure` fix): `btvec_find` below was a linear memcmp
+ * scan over `items` -- fine for an ordinary handful-of-attrs literal, but
+ * `insert_attrpath` calls it once per binding statement in a block, so a
+ * SINGLE large attrset literal with n bindings (e.g. real nixpkgs's
+ * `pkgs/top-level/all-packages.nix`, which lists thousands of
+ * `name = callPackage ...;` bindings in one literal `{ ... }`) drove it
+ * to O(n) per insert * n inserts = O(n^2) for that one literal. `index`/
+ * `index_cap` (maintained by `btvec_push`, consulted by `btvec_find`) is
+ * an open-addressing hash index parallel to `items`, same convention as
+ * `symtab.c`'s own name table and this session's `string_context.c`/
+ * `derivation.c` fixes -- turns the dup-attr check inside
+ * `insert_attrpath` into O(1) amortized. */
+typedef struct { BTNode *items; size_t len, cap; DynBindingVec dyn; size_t *index; size_t index_cap; } BTVec;
+
+#define BTVEC_EMPTY_SLOT SIZE_MAX
 
 /* M67: folds a BTVec's own absorbed-via-merge dynamic bindings (see
  * reopen_attrset_into's comment) into this BLOCK's top-level explicit
@@ -150,21 +165,65 @@ struct BTNode {
     BTVec children;    /* valid iff !is_leaf */
 };
 
+static uint64_t btvec_hash_name(const char *name, size_t len) {
+    uint64_t h = 0;
+    for (size_t i = 0; i < len; i++) {
+        h ^= (uint64_t)(unsigned char)name[i];
+        h *= 0x517cc1b727220a95ULL;
+    }
+    h ^= h >> 30;
+    h *= 0xbf58476d1ce4e5b9ULL;
+    h ^= h >> 27;
+    h *= 0x94d049bb133111ebULL;
+    h ^= h >> 31;
+    return h;
+}
+
+/* Rebuilds `v->index` from scratch against `v->items[0..v->len)` (the
+ * item about to be pushed is NOT yet in `items` when this is called from
+ * `btvec_push` -- see there). */
+static void btvec_index_rehash(BTVec *v, size_t new_cap) {
+    size_t *new_table = malloc(new_cap * sizeof(size_t));
+    for (size_t i = 0; i < new_cap; i++) new_table[i] = BTVEC_EMPTY_SLOT;
+    for (size_t i = 0; i < v->len; i++) {
+        size_t slot = btvec_hash_name(v->items[i].name, v->items[i].name_len) & (new_cap - 1);
+        while (new_table[slot] != BTVEC_EMPTY_SLOT) slot = (slot + 1) & (new_cap - 1);
+        new_table[slot] = i;
+    }
+    free(v->index);
+    v->index = new_table;
+    v->index_cap = new_cap;
+}
+
 static void btvec_push(BTVec *v, BTNode item) {
     if (v->len == v->cap) {
         v->cap = v->cap ? v->cap * 2 : 8;
         v->items = realloc(v->items, v->cap * sizeof(BTNode));
     }
-    v->items[v->len++] = item;
+    /* Grow/rehash the index BEFORE appending -- rehash only ever sees
+     * `items[0..len)` (the not-yet-pushed new item isn't in there yet),
+     * so the explicit insert below never collides with work rehash just
+     * did. 75% load factor, matching symtab.c/derivation.c's tables. */
+    if (v->index_cap == 0) btvec_index_rehash(v, 16);
+    else if ((v->len + 1) * 4 > v->index_cap * 3) btvec_index_rehash(v, v->index_cap * 2);
+    v->items[v->len] = item;
+    size_t slot = btvec_hash_name(item.name, item.name_len) & (v->index_cap - 1);
+    while (v->index[slot] != BTVEC_EMPTY_SLOT) slot = (slot + 1) & (v->index_cap - 1);
+    v->index[slot] = v->len;
+    v->len++;
 }
 
 static BTNode *btvec_find(BTVec *v, const char *name, size_t name_len) {
-    for (size_t i = 0; i < v->len; i++) {
-        if (v->items[i].name_len == name_len && memcmp(v->items[i].name, name, name_len) == 0) {
-            return &v->items[i];
+    if (v->index_cap == 0) return NULL;
+    size_t slot = btvec_hash_name(name, name_len) & (v->index_cap - 1);
+    for (;;) {
+        size_t idx = v->index[slot];
+        if (idx == BTVEC_EMPTY_SLOT) return NULL;
+        if (v->items[idx].name_len == name_len && memcmp(v->items[idx].name, name, name_len) == 0) {
+            return &v->items[idx];
         }
+        slot = (slot + 1) & (v->index_cap - 1);
     }
-    return NULL;
 }
 
 static void fatal_dup_attr(const char *name, size_t name_len) {

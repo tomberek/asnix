@@ -495,6 +495,41 @@ static void input_ref_add_src(InputRefSet *s, const char *path) {
  *    drv's own (already-cached, already-flat) closure, so no recursion is
  *    needed at lookup time; each derivation's cache entry is already a
  *    fully expanded flat list by the time it's inserted. */
+/* Perf note (post-M86 profiling pass): `perf record -g` on `./asnix d.nix`
+ * (ffmpeg's closure, ~100 derivations) showed 73%+ of ALL cycles in
+ * `__strcmp_avx2`, almost entirely called (inlined) from
+ * `cache_own_drv_closure` below. The reason: every one of the three
+ * structures on this page -- `g_drv_outputs_cache`, `g_drv_closure_cache`,
+ * and the per-call `DrvClosureStrSet` scratch set -- was a linear array
+ * with an O(n) strcmp-based `find`/dedup-check. The two caches are
+ * append-only across the WHOLE run (so lookups against them are O(total
+ * derivations built so far)), and `DrvClosureStrSet` is rebuilt from
+ * scratch for every single derivation by unioning each direct input's
+ * already-flattened closure -- an O(closure_size) dedup-check performed
+ * closure_size-ish times, i.e. O(closure_size^2) PER derivation, for
+ * every derivation in the build (and real nixpkgs closures run into the
+ * hundreds of members once glibc/gcc/stdenv are pulled in). Same
+ * anti-pattern this project already fixed once in `string_context.c`
+ * (ptr-keyed) and `intersectAttrs2_impl` (builtins_m23.c) -- here fixed
+ * the same way: open-addressing hash tables/sets, keyed by the drv_path
+ * (or member-path) string's own hash, FxHash-style mix matching
+ * `symtab.c`'s `hash_bytes`. */
+static uint64_t dcc_hash_str(const char *s, size_t len) {
+    uint64_t h = 0;
+    for (size_t i = 0; i < len; i++) {
+        h ^= (uint64_t)(unsigned char)s[i];
+        h *= 0x517cc1b727220a95ULL;
+    }
+    h ^= h >> 30;
+    h *= 0xbf58476d1ce4e5b9ULL;
+    h ^= h >> 27;
+    h *= 0x94d049bb133111ebULL;
+    h ^= h >> 31;
+    return h;
+}
+
+#define DCC_EMPTY_SLOT SIZE_MAX
+
 typedef struct {
     char *drv_path;
     char **output_names;
@@ -502,12 +537,35 @@ typedef struct {
 } DrvOutputsCacheEntry;
 static DrvOutputsCacheEntry *g_drv_outputs_cache = NULL;
 static size_t g_drv_outputs_cache_count = 0, g_drv_outputs_cache_cap = 0;
+/* Index table: hash(drv_path) -> index into g_drv_outputs_cache, open
+ * addressing/linear probing, power-of-two capacity, grown at 75% load. */
+static size_t *g_drv_outputs_index = NULL;
+static size_t g_drv_outputs_index_cap = 0;
+
+static void drv_outputs_index_rehash(size_t new_cap) {
+    size_t *new_table = malloc(new_cap * sizeof(size_t));
+    for (size_t i = 0; i < new_cap; i++) new_table[i] = DCC_EMPTY_SLOT;
+    for (size_t i = 0; i < g_drv_outputs_cache_count; i++) {
+        const char *dp = g_drv_outputs_cache[i].drv_path;
+        size_t slot = dcc_hash_str(dp, strlen(dp)) & (new_cap - 1);
+        while (new_table[slot] != DCC_EMPTY_SLOT) slot = (slot + 1) & (new_cap - 1);
+        new_table[slot] = i;
+    }
+    free(g_drv_outputs_index);
+    g_drv_outputs_index = new_table;
+    g_drv_outputs_index_cap = new_cap;
+}
 
 static const DrvOutputsCacheEntry *drv_outputs_cache_find(const char *drv_path) {
-    for (size_t i = 0; i < g_drv_outputs_cache_count; i++) {
-        if (strcmp(g_drv_outputs_cache[i].drv_path, drv_path) == 0) return &g_drv_outputs_cache[i];
+    if (g_drv_outputs_index_cap == 0) return NULL;
+    size_t len = strlen(drv_path);
+    size_t slot = dcc_hash_str(drv_path, len) & (g_drv_outputs_index_cap - 1);
+    for (;;) {
+        size_t idx = g_drv_outputs_index[slot];
+        if (idx == DCC_EMPTY_SLOT) return NULL;
+        if (strcmp(g_drv_outputs_cache[idx].drv_path, drv_path) == 0) return &g_drv_outputs_cache[idx];
+        slot = (slot + 1) & (g_drv_outputs_index_cap - 1);
     }
-    return NULL;
 }
 
 static void drv_outputs_cache_insert(const char *drv_path, const char *const *output_names, size_t noutputs) {
@@ -515,12 +573,21 @@ static void drv_outputs_cache_insert(const char *drv_path, const char *const *ou
         g_drv_outputs_cache_cap = g_drv_outputs_cache_cap ? g_drv_outputs_cache_cap * 2 : 64;
         g_drv_outputs_cache = realloc(g_drv_outputs_cache, g_drv_outputs_cache_cap * sizeof(*g_drv_outputs_cache));
     }
+    if (g_drv_outputs_index_cap == 0) {
+        drv_outputs_index_rehash(128);
+    } else if ((g_drv_outputs_cache_count + 1) * 4 > g_drv_outputs_index_cap * 3) {
+        drv_outputs_index_rehash(g_drv_outputs_index_cap * 2);
+    }
     char **onames = malloc(noutputs * sizeof(char *));
     for (size_t i = 0; i < noutputs; i++) onames[i] = dup_cstr(output_names[i], strlen(output_names[i]));
-    g_drv_outputs_cache[g_drv_outputs_cache_count].drv_path = dup_cstr(drv_path, strlen(drv_path));
-    g_drv_outputs_cache[g_drv_outputs_cache_count].output_names = onames;
-    g_drv_outputs_cache[g_drv_outputs_cache_count].noutputs = noutputs;
+    size_t idx = g_drv_outputs_cache_count;
+    g_drv_outputs_cache[idx].drv_path = dup_cstr(drv_path, strlen(drv_path));
+    g_drv_outputs_cache[idx].output_names = onames;
+    g_drv_outputs_cache[idx].noutputs = noutputs;
     g_drv_outputs_cache_count++;
+    size_t slot = dcc_hash_str(drv_path, strlen(drv_path)) & (g_drv_outputs_index_cap - 1);
+    while (g_drv_outputs_index[slot] != DCC_EMPTY_SLOT) slot = (slot + 1) & (g_drv_outputs_index_cap - 1);
+    g_drv_outputs_index[slot] = idx;
 }
 
 typedef struct {
@@ -532,31 +599,79 @@ typedef struct {
 } DrvClosureCacheEntry;
 static DrvClosureCacheEntry *g_drv_closure_cache = NULL;
 static size_t g_drv_closure_cache_count = 0, g_drv_closure_cache_cap = 0;
+static size_t *g_drv_closure_index = NULL;
+static size_t g_drv_closure_index_cap = 0;
+
+static void drv_closure_index_rehash(size_t new_cap) {
+    size_t *new_table = malloc(new_cap * sizeof(size_t));
+    for (size_t i = 0; i < new_cap; i++) new_table[i] = DCC_EMPTY_SLOT;
+    for (size_t i = 0; i < g_drv_closure_cache_count; i++) {
+        const char *dp = g_drv_closure_cache[i].drv_path;
+        size_t slot = dcc_hash_str(dp, strlen(dp)) & (new_cap - 1);
+        while (new_table[slot] != DCC_EMPTY_SLOT) slot = (slot + 1) & (new_cap - 1);
+        new_table[slot] = i;
+    }
+    free(g_drv_closure_index);
+    g_drv_closure_index = new_table;
+    g_drv_closure_index_cap = new_cap;
+}
 
 static const DrvClosureCacheEntry *drv_closure_cache_find(const char *drv_path) {
-    for (size_t i = 0; i < g_drv_closure_cache_count; i++) {
-        if (strcmp(g_drv_closure_cache[i].drv_path, drv_path) == 0) return &g_drv_closure_cache[i];
+    if (g_drv_closure_index_cap == 0) return NULL;
+    size_t len = strlen(drv_path);
+    size_t slot = dcc_hash_str(drv_path, len) & (g_drv_closure_index_cap - 1);
+    for (;;) {
+        size_t idx = g_drv_closure_index[slot];
+        if (idx == DCC_EMPTY_SLOT) return NULL;
+        if (strcmp(g_drv_closure_cache[idx].drv_path, drv_path) == 0) return &g_drv_closure_cache[idx];
+        slot = (slot + 1) & (g_drv_closure_index_cap - 1);
     }
-    return NULL;
 }
 
 /* A small growable deduped string set -- the scratch structure used only
  * while assembling one derivation's own closure entry below, before it's
- * handed (ownership transferred) to drv_closure_cache_insert. */
+ * handed (ownership transferred) to drv_closure_cache_insert. Carries its
+ * own open-addressing index (parallel to `items`, same lifetime) so the
+ * dedup check below is O(1) amortized instead of an O(n) scan -- see
+ * this page's perf note above. */
 typedef struct {
     char **items;
     size_t n, cap;
+    size_t *index; /* hash(item) -> index into items, DCC_EMPTY_SLOT = empty */
+    size_t index_cap;
 } DrvClosureStrSet;
 
-static void drv_closure_strset_add(DrvClosureStrSet *s, const char *str) {
+static void drv_closure_strset_rehash(DrvClosureStrSet *s, size_t new_cap) {
+    size_t *new_table = malloc(new_cap * sizeof(size_t));
+    for (size_t i = 0; i < new_cap; i++) new_table[i] = DCC_EMPTY_SLOT;
     for (size_t i = 0; i < s->n; i++) {
-        if (strcmp(s->items[i], str) == 0) return;
+        size_t slot = dcc_hash_str(s->items[i], strlen(s->items[i])) & (new_cap - 1);
+        while (new_table[slot] != DCC_EMPTY_SLOT) slot = (slot + 1) & (new_cap - 1);
+        new_table[slot] = i;
+    }
+    free(s->index);
+    s->index = new_table;
+    s->index_cap = new_cap;
+}
+
+static void drv_closure_strset_add(DrvClosureStrSet *s, const char *str) {
+    size_t len = strlen(str);
+    if (s->index_cap == 0) drv_closure_strset_rehash(s, 64);
+    else if ((s->n + 1) * 4 > s->index_cap * 3) drv_closure_strset_rehash(s, s->index_cap * 2);
+    size_t slot = dcc_hash_str(str, len) & (s->index_cap - 1);
+    for (;;) {
+        size_t idx = s->index[slot];
+        if (idx == DCC_EMPTY_SLOT) break;
+        if (strcmp(s->items[idx], str) == 0) return;
+        slot = (slot + 1) & (s->index_cap - 1);
     }
     if (s->n == s->cap) {
         s->cap = s->cap ? s->cap * 2 : 8;
         s->items = realloc(s->items, s->cap * sizeof(*s->items));
     }
-    s->items[s->n++] = dup_cstr(str, strlen(str));
+    s->items[s->n] = dup_cstr(str, len);
+    s->index[slot] = s->n;
+    s->n++;
 }
 
 static void drv_closure_cache_insert(const char *drv_path, char **closure_drvs, size_t nclosure_drvs,
@@ -565,12 +680,21 @@ static void drv_closure_cache_insert(const char *drv_path, char **closure_drvs, 
         g_drv_closure_cache_cap = g_drv_closure_cache_cap ? g_drv_closure_cache_cap * 2 : 64;
         g_drv_closure_cache = realloc(g_drv_closure_cache, g_drv_closure_cache_cap * sizeof(*g_drv_closure_cache));
     }
-    g_drv_closure_cache[g_drv_closure_cache_count].drv_path = dup_cstr(drv_path, strlen(drv_path));
-    g_drv_closure_cache[g_drv_closure_cache_count].closure_drvs = closure_drvs;
-    g_drv_closure_cache[g_drv_closure_cache_count].nclosure_drvs = nclosure_drvs;
-    g_drv_closure_cache[g_drv_closure_cache_count].closure_srcs = closure_srcs;
-    g_drv_closure_cache[g_drv_closure_cache_count].nclosure_srcs = nclosure_srcs;
+    if (g_drv_closure_index_cap == 0) {
+        drv_closure_index_rehash(128);
+    } else if ((g_drv_closure_cache_count + 1) * 4 > g_drv_closure_index_cap * 3) {
+        drv_closure_index_rehash(g_drv_closure_index_cap * 2);
+    }
+    size_t idx = g_drv_closure_cache_count;
+    g_drv_closure_cache[idx].drv_path = dup_cstr(drv_path, strlen(drv_path));
+    g_drv_closure_cache[idx].closure_drvs = closure_drvs;
+    g_drv_closure_cache[idx].nclosure_drvs = nclosure_drvs;
+    g_drv_closure_cache[idx].closure_srcs = closure_srcs;
+    g_drv_closure_cache[idx].nclosure_srcs = nclosure_srcs;
     g_drv_closure_cache_count++;
+    size_t slot = dcc_hash_str(drv_path, strlen(drv_path)) & (g_drv_closure_index_cap - 1);
+    while (g_drv_closure_index[slot] != DCC_EMPTY_SLOT) slot = (slot + 1) & (g_drv_closure_index_cap - 1);
+    g_drv_closure_index[slot] = idx;
 }
 
 /* Builds and caches THIS derivation's own closure entry (`drv_path`'s
@@ -603,6 +727,11 @@ static void cache_own_drv_closure(const char *drv_path, const char *const *outpu
         }
     }
     for (size_t i = 0; i < refs->nsrcs; i++) drv_closure_strset_add(&csrcs, refs->srcs[i]);
+    /* `items`/`n` are handed off (ownership transferred) to the cache
+     * entry below; `index` is purely a scratch dedup aid for this one
+     * call and has no further use once insertion is done. */
+    free(cdrvs.index);
+    free(csrcs.index);
     drv_closure_cache_insert(drv_path, cdrvs.items, cdrvs.n, csrcs.items, csrcs.n);
     drv_outputs_cache_insert(drv_path, output_names, noutputs);
 }

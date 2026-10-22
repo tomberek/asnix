@@ -100,7 +100,8 @@ what's actually implemented and the scope decisions made along the way.
 | M85 — `tests/nixpkgs-hash/attrs.txt` expanded from 4 packages to 74 (148 `outPath`/`drvPath` checks), spanning CLI tools, compilers/interpreters, multi-output libraries, build tooling, a GUI/graphics stack slice, fixed-output fetchers, and `nix` itself | done (see below; `make test-nixpkgs-hash`: **`pass=148 fail=0`** — no new divergence found beyond the one M84 already fixed) |
 | M86 — real `DrvDeep` string-context closure propagation (`eval-okay-context-inputs.nix`'s `drvPath` case): two small in-memory caches (`g_drv_closure_cache`/`g_drv_outputs_cache`) reconstruct what real Nix's `computeFSClosure` would compute off a real store, purely from this process's own call-by-need derivation-construction order; re-investigated and declined the `eq-slot-elem`/`eq-slot-identity` function-identity gap a second time, with a new concrete counterexample confirming it's still a genuine representation gap, not a narrow fix | done (see below; `make test-nix-conformance`: `pass=651 fail=7` → **`pass=652 fail=6`**; zero regressions; `make test-nixpkgs-hash` still `pass=148 fail=0`) |
 | M87 — perf/memory regression triage on real nixpkgs workloads (`./asnix d.nix`, ffmpeg's closure): `builtins.intersectAttrs` was walking the LARGER attrset operand and binary-searching into the smaller one (backwards for `callPackageWith`'s own `intersectAttrs (functionArgs f) autoArgs` shape, where e1 is tiny and e2 is effectively the whole ~28,189-entry `pkgs` set); a leaked lexer token array (never freed after parsing); `IrBuilder`'s `ops`/`pool` arrays carrying permanent doubling-growth slack into every compiled program; `BTVec`'s own backing arrays never freed after `insert_attrpath`'s tree is flattened | done (see below; instructions 51.3B → 42.1B; peak RSS 1.42GB → 917MB on `d.nix`, 170MB → 134MB on `e.nix`; zero regressions) |
-| M88+ | not started |
+| M88 — three more O(n²)-or-worse CPU hotspots fixed after discovering M86 had itself introduced a severe regression (`./asnix d.nix`: ~275 billion instructions / ~31.8s, 73.59% of cycles in `cache_own_drv_closure`'s `__strcmp_avx2` calls): `cache_own_drv_closure`'s append-only linear-scan caches and its per-call O(closure_size²) dedup scan converted to hash tables/sets; `parser.c`'s `btvec_find` (hit by every attrpath-sugar binding/attrset literal) given its own open-addressing index; `builtins_attrs.c`'s `sorted_name_order` (backing `attrNames`/`attrValues`) switched from insertion sort to `qsort` over pre-resolved names | done (see below; instructions ~275B → **~37.9B** on `d.nix`, below the pre-M86 ~42B baseline; wall ~31.8s → ~6.09s; zero regressions) |
+| M89+ | not started |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
 
@@ -9590,3 +9591,164 @@ dispatched to continue the CPU-side investigation specifically
 (further O(n^2)-pattern hunting, the `strcmp`/`compile_expr`
 leads above) -- see its own milestone section, if landed after this
 one, for what it found.
+## M88: three more O(n^2)-or-worse CPU hotspots fixed -- `cache_own_drv_closure`'s own linear-scan caches (the ones M86 just added), `parser.c`'s `btvec_find`, and `builtins_attrs.c`'s insertion-sort `attrNames`/`attrValues`
+
+Continuing this session's CPU-time investigation (the one that
+already found and fixed `intersectAttrs2_impl`'s backwards-walk
+bug and flagged `parser.c`'s `btvec_find` as a lead). `perf stat -e
+instructions,cycles ./asnix d.nix` (real nixpkgs's `ffmpeg`, ~100
+derivations) on this session's starting point (M86's HEAD) measured
+**~275 billion `cpu_core/instructions`, ~31.8s wall** for the
+identical expression real `nix-instantiate` evaluates in ~12 billion
+instructions / ~1.6s -- i.e. M86's own `DrvDeep` closure-propagation
+feature (landed immediately before this investigation started) had
+itself introduced a severe new regression on top of the ~42B-
+instruction baseline the prior session's `intersectAttrs` fix had
+reached, even though M86's own correctness work was sound.
+
+### Fix 1: `derivation.c`'s `cache_own_drv_closure` family
+
+`perf record -g` immediately pointed at one place: **73.59% of all
+cycles** in `__strcmp_avx2`, almost entirely inlined-called from
+`cache_own_drv_closure` (via `asnix_prim_derivation`). M86's own
+comment had candidly described the three structures backing it --
+`g_drv_outputs_cache`, `g_drv_closure_cache`, and the per-call
+`DrvClosureStrSet` scratch set used to flatten one derivation's own
+closure -- as "two small per-drv-path **linear-scan** caches". That
+phrase was the bug: `g_drv_outputs_cache`/`g_drv_closure_cache` are
+append-only for the WHOLE run, so a linear `find` against them is
+O(total derivations built so far) per call; worse, `DrvClosureStrSet`
+is rebuilt from scratch for EVERY derivation by unioning each direct
+input's own already-flattened closure via a linear dedup-check scan
+-- O(closure_size) per dedup check, performed closure_size-ish times,
+i.e. **O(closure_size^2) per derivation**, for every derivation in
+the build. Real nixpkgs closures run into the hundreds of members
+once glibc/gcc/stdenv are pulled in, so this dominated the entire
+run.
+
+Fixed by converting all three to open-addressing hash
+tables/sets, keyed by the drv_path (or closure-member path) string's
+own FxHash-style hash (same mix `symtab.c`'s `hash_bytes` already
+uses, and the same pattern `string_context.c` was converted to
+earlier this session for an identical ptr-keyed diagnosis): a
+persistent index (`g_drv_outputs_index`/`g_drv_closure_index`, grown
+at 75% load factor) mapping hash(drv_path) -> array index for the two
+long-lived caches, and `DrvClosureStrSet` grew its own parallel
+`index`/`index_cap` fields so its per-call dedup check is O(1)
+amortized instead of O(n). Insertion order into the backing arrays is
+preserved exactly (first-seen-wins, same as before) -- only the
+dedup-check's cost changed, not its result, so this is a pure
+performance fix with no behavior change.
+
+### Fix 2: `parser.c`'s `btvec_find`/`btvec_push`
+
+Already flagged (not yet fixed) by the prior session: `btvec_find`
+was a linear memcmp scan over a BTVec's own accumulated items, used
+by `insert_attrpath` (every `a.b = v;`-style attrpath-sugar binding,
+AND every ordinary attrset literal's dup-key check) -- O(n) per
+lookup times n insertions = O(n^2) for one large attrset literal.
+Real nixpkgs's own `pkgs/top-level/all-packages.nix` is exactly that
+shape: thousands of `name = callPackage ...;` bindings in one literal
+block. Fixed the same way as Fix 1: `BTVec` grew its own open-
+addressing `index`/`index_cap` fields, maintained by `btvec_push`
+(rehashing `items[0..len)` -- which never yet includes the item being
+pushed -- before inserting the new entry, so no double-insertion) and
+consulted by `btvec_find` in O(1) amortized instead of O(n). All
+BTVec mutation in this file already went through `btvec_push`
+exclusively (confirmed by grep), so no other call site needed
+changes.
+
+### Fix 3: `builtins_attrs.c`'s `sorted_name_order` (backs `attrNames`/`attrValues`)
+
+Re-profiling after fixes 1 and 2 (which cut the top hotspot from
+73.59% to near-zero) surfaced a THIRD O(n^2): `sorted_name_order`
+was a plain insertion sort, with a comment explicitly reasoning
+"attrsets are typically small and this isn't a hot path" -- true for
+a hand-written literal, false for what `attrNames`/`attrValues`
+actually gets called on in real nixpkgs: the same top-level `pkgs`
+attrset `intersectAttrs2_impl`'s own fix (prior session) measured
+directly at **28,189 entries**. `perf report` confirmed
+`prim_attrNames`/`sorted_name_order`/`__memcmp_avx2_movbe`/
+`asnix_sym_name` together consuming roughly a third of all remaining
+cycles -- an O(n^2) insertion sort over tens of thousands of entries,
+with EVERY comparison re-resolving both sides' symbol name from
+scratch via `asnix_sym_name` on top of that. Fixed two ways at once:
+switched to `qsort` (O(n log n) comparisons instead of O(n^2)), and
+resolved each entry's name exactly ONCE up front into a flat
+`NameOrderEntry[]` array the comparator reads directly, instead of
+once per comparison. Symbol names are unique within one attrset (no
+duplicate keys possible), so `qsort`'s lack of a stability guarantee
+is immaterial -- no two entries can ever compare equal.
+
+### Results
+
+Measured via `perf stat -e instructions,cycles ./asnix d.nix`
+(`cpu_core/instructions`, the domain capturing ~95-99% of this
+process's execution on this hybrid CPU) and `hyperfine --shell=none`,
+same machine, same build (`make release`), cumulative after all three
+fixes:
+
+| | instructions | wall (hyperfine mean) |
+|---|---|---|
+| M86 HEAD (this session's start) | ~275 billion | ~31.8s (perf stat elapsed) |
+| + Fix 1 (`cache_own_drv_closure`) | ~46.2 billion (-83%) | ~6.77s (perf stat elapsed) |
+| + Fix 2 (`btvec_find`) | ~43.9 billion | ~5.94s |
+| + Fix 3 (`attrNames` sort) | **~37.9 billion** | **~6.09s** |
+
+Net: **~7.25x fewer instructions, ~5.2x less wall time** than this
+session's own starting point, and notably BELOW the ~42 billion
+instructions the prior session's `intersectAttrs` fix had reached
+(i.e. this fully absorbs M86's regression and then some) -- though
+still above real `nix-instantiate`'s ~12 billion instructions / 1.6s
+for the identical expression, so there is more headroom left (see
+"Investigated but not fixed" below).
+
+`./asnix e.nix` (the `hello` closure, used for fast iteration):
+`hyperfine` measured ~337ms mean after all three fixes (`e.nix`'s
+closure is far too small to exercise the `DrvDeep`-closure or giant-
+attrset-literal hotspots Fix 1/Fix 2 target, so most of its own time
+is fixed per-process overhead -- `attrNames`/`attrValues` on nixpkgs'
+own `lib`-scale attrsets still benefits from Fix 3).
+
+Verification: `make test`/`make test-e2e` identical output before and
+after all three fixes (byte-for-byte, confirmed via diff). `make
+test-nix-conformance`: `pass=652 fail=6 skip=148` before and after,
+same 6 pre-existing failures (`eq-slot-elem`, `eq-slot-identity`,
+`getattrpos-functionargs`, `getattrpos`, `inherit-attr-pos`, `print`)
+-- zero regressions. `make test-nixpkgs-hash` (hash-parity-critical
+since Fix 1 touches `derivation.c`): `pass=148 fail=0` before and
+after, unchanged -- Fix 1 only changes dedup-check cost, never the
+resulting `closure_drvs`/`closure_srcs` order or content, so hash
+parity was never at risk, and this confirms it directly.
+
+### Investigated but not fixed
+
+- The remaining post-fix profile is dominated by `drv_closure_strset_
+  add`/`drv_closure_strset_rehash` (~50% of remaining cycles) --
+  Fix 1 made this O(closure_size) amortized per derivation instead of
+  O(closure_size^2), but `cache_own_drv_closure`'s fundamental
+  approach (eagerly flattening and COPYING each direct input's own
+  flat closure array into every ancestor's own closure array) still
+  does O(total transitive edges * average closure size) work overall
+  for a deep dependency graph, since the same closure members get
+  copied into many ancestors' arrays redundantly. A sharing-based
+  redesign (e.g. a persistent/shared structure so ancestors reference
+  rather than copy their children's closures) would cut this further
+  but is a real architecture change to M86's data model, not a
+  bounded bug fix -- declined for this session; the O(n^2)-or-worse
+  algorithmic wins above already closed the gap this investigation
+  was scoped to close.
+- `compile_expr`'s deep recursion (`compiler.c`), flagged as a lead by
+  the prior session: re-checked in `perf report` after all three
+  fixes above and found to cost time strictly proportional to program
+  size (recursion depth times a small constant per frame, no
+  quadratic re-walking), i.e. this is accounted-for work, not an
+  avoidable hotspot -- declined.
+- `asnix_prim_derivation`'s own direct (non-`cache_own_drv_closure`)
+  `__strcmp_avx2` calls (still ~7% of cycles post-fix, under
+  `asnix_op_call` directly) and `prim_import`'s `__strcmp_avx2` (~0.7%,
+  almost certainly the import-cache path/dedup check) are both small
+  enough relative to the three fixes above that chasing them further
+  is micro-optimization, not an algorithmic win -- left for a future
+  pass if `d.nix`'s instruction count ever needs to close the
+  remaining gap to real Nix's ~12 billion.
