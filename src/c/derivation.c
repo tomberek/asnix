@@ -514,9 +514,24 @@ static void input_ref_add_src(InputRefSet *s, const char *path) {
  * the same way: open-addressing hash tables/sets, keyed by the drv_path
  * (or member-path) string's own hash, FxHash-style mix matching
  * `symtab.c`'s `hash_bytes`. */
+/* perf: widened from a byte-at-a-time multiply chain to 8 bytes/step --
+ * up to ~8x fewer dependent-multiply steps for the ~60-100 byte store-path
+ * strings this hashes (store paths dominate this file's hash-table keys).
+ * Pure internal bucket-placement hash (never persisted/shared across
+ * processes), so changing its byte-grouping only changes bucket
+ * distribution, not correctness -- find/insert both go through this same
+ * function. memcpy (not a cast) avoids unaligned-load UB on the tail
+ * bytes of a buffer that isn't 8-byte-aligned. */
 static uint64_t dcc_hash_str(const char *s, size_t len) {
     uint64_t h = 0;
-    for (size_t i = 0; i < len; i++) {
+    size_t i = 0;
+    for (; i + 8 <= len; i += 8) {
+        uint64_t word;
+        memcpy(&word, s + i, 8);
+        h ^= word;
+        h *= 0x517cc1b727220a95ULL;
+    }
+    for (; i < len; i++) {
         h ^= (uint64_t)(unsigned char)s[i];
         h *= 0x517cc1b727220a95ULL;
     }
@@ -592,10 +607,25 @@ static void drv_outputs_cache_insert(const char *drv_path, const char *const *ou
 
 typedef struct {
     char *drv_path;
+    /* M94 perf: direct layer only -- direct_drvs[0] is always `drv_path`
+     * itself (matching computeFSClosure's own root-inclusive semantics),
+     * the rest are each DIRECT input's drv_path. NOT recursively
+     * flattened at insert time anymore -- see drv_closure_materialize's
+     * header comment for why eager flattening here was this file's
+     * dominant cost. */
+    char **direct_drvs;
+    size_t ndirect_drvs;
+    char **direct_srcs;
+    size_t ndirect_srcs;
+    /* Memoized full transitive closure, computed lazily by
+     * drv_closure_materialize on first actual demand (a `DrvDeep`
+     * context element being expanded) -- NULL/0/`materialized == 0`
+     * until then. */
     char **closure_drvs;
     size_t nclosure_drvs;
     char **closure_srcs;
     size_t nclosure_srcs;
+    int materialized;
 } DrvClosureCacheEntry;
 static DrvClosureCacheEntry *g_drv_closure_cache = NULL;
 static size_t g_drv_closure_cache_count = 0, g_drv_closure_cache_cap = 0;
@@ -674,8 +704,8 @@ static void drv_closure_strset_add(DrvClosureStrSet *s, const char *str) {
     s->n++;
 }
 
-static void drv_closure_cache_insert(const char *drv_path, char **closure_drvs, size_t nclosure_drvs,
-                                      char **closure_srcs, size_t nclosure_srcs) {
+static void drv_closure_cache_insert(const char *drv_path, char **direct_drvs, size_t ndirect_drvs,
+                                      char **direct_srcs, size_t ndirect_srcs) {
     if (g_drv_closure_cache_count == g_drv_closure_cache_cap) {
         g_drv_closure_cache_cap = g_drv_closure_cache_cap ? g_drv_closure_cache_cap * 2 : 64;
         g_drv_closure_cache = realloc(g_drv_closure_cache, g_drv_closure_cache_cap * sizeof(*g_drv_closure_cache));
@@ -687,14 +717,82 @@ static void drv_closure_cache_insert(const char *drv_path, char **closure_drvs, 
     }
     size_t idx = g_drv_closure_cache_count;
     g_drv_closure_cache[idx].drv_path = dup_cstr(drv_path, strlen(drv_path));
-    g_drv_closure_cache[idx].closure_drvs = closure_drvs;
-    g_drv_closure_cache[idx].nclosure_drvs = nclosure_drvs;
-    g_drv_closure_cache[idx].closure_srcs = closure_srcs;
-    g_drv_closure_cache[idx].nclosure_srcs = nclosure_srcs;
+    g_drv_closure_cache[idx].direct_drvs = direct_drvs;
+    g_drv_closure_cache[idx].ndirect_drvs = ndirect_drvs;
+    g_drv_closure_cache[idx].direct_srcs = direct_srcs;
+    g_drv_closure_cache[idx].ndirect_srcs = ndirect_srcs;
+    g_drv_closure_cache[idx].closure_drvs = NULL;
+    g_drv_closure_cache[idx].nclosure_drvs = 0;
+    g_drv_closure_cache[idx].closure_srcs = NULL;
+    g_drv_closure_cache[idx].nclosure_srcs = 0;
+    g_drv_closure_cache[idx].materialized = 0;
     g_drv_closure_cache_count++;
     size_t slot = dcc_hash_str(drv_path, strlen(drv_path)) & (g_drv_closure_index_cap - 1);
     while (g_drv_closure_index[slot] != DCC_EMPTY_SLOT) slot = (slot + 1) & (g_drv_closure_index_cap - 1);
     g_drv_closure_index[slot] = idx;
+}
+
+/* M94 perf (chasing the user's "CPU/memory still ~2x real Nix" report):
+ * `perf record -g` on `./asnix d.nix` (ffmpeg's ~100-derivation closure)
+ * found `cache_own_drv_closure` (below) responsible for 43%+ of ALL
+ * cycles, almost entirely in `drv_closure_strset_add`/`dcc_hash_str` --
+ * it used to eagerly union EVERY direct input's own already-flattened
+ * closure into a brand new hash set, for EVERY SINGLE derivation built,
+ * unconditionally. That's O(direct_inputs x closure_size) hashing work
+ * per derivation, repeated for every derivation in the build, even
+ * though the ONLY real consumer of a flattened closure is a `DrvDeep`
+ * context element actually being expanded (below) -- confirmed by
+ * grepping every call site: `drv_closure_cache_find_materialized` is
+ * called from exactly one place in this whole file, and `DrvDeep` is a
+ * rare feature (M86) only exercised when a derivation's own `drvPath`
+ * gets embedded into another derivation via string interpolation.
+ * `cache_own_drv_closure` now stores ONLY the direct layer (O(1) per
+ * direct input, no hashing); this function does the real flattening,
+ * lazily, memoized via `materialized` so a shared sub-closure reached
+ * from multiple derivations is still only ever flattened once no matter
+ * how many times it's reached -- turning total flattening work from
+ * O(derivations_built x average_direct_closure_size) into O(size of
+ * whatever closures are actually ever demanded). */
+static void drv_closure_materialize(DrvClosureCacheEntry *e) {
+    if (e->materialized) return;
+    e->materialized = 1; /* set before recursing -- purely defensive: a derivation
+                           * graph is a DAG by construction (nothing can depend on
+                           * itself, even transitively), so this is never actually
+                           * revisited mid-recursion, not a cycle-breaking hack
+                           * papering over a real cycle. */
+    DrvClosureStrSet cdrvs;
+    memset(&cdrvs, 0, sizeof(cdrvs));
+    DrvClosureStrSet csrcs;
+    memset(&csrcs, 0, sizeof(csrcs));
+    for (size_t i = 0; i < e->ndirect_drvs; i++) {
+        const char *dp = e->direct_drvs[i];
+        drv_closure_strset_add(&cdrvs, dp);
+        if (i == 0) continue; /* direct_drvs[0] is always `e` itself -- no sub-closure to pull in */
+        DrvClosureCacheEntry *sub = (DrvClosureCacheEntry *)drv_closure_cache_find(dp);
+        if (sub) {
+            drv_closure_materialize(sub);
+            for (size_t j = 0; j < sub->nclosure_drvs; j++) drv_closure_strset_add(&cdrvs, sub->closure_drvs[j]);
+            for (size_t j = 0; j < sub->nclosure_srcs; j++) drv_closure_strset_add(&csrcs, sub->closure_srcs[j]);
+        }
+    }
+    for (size_t i = 0; i < e->ndirect_srcs; i++) drv_closure_strset_add(&csrcs, e->direct_srcs[i]);
+    free(cdrvs.index);
+    free(csrcs.index);
+    e->closure_drvs = cdrvs.items;
+    e->nclosure_drvs = cdrvs.n;
+    e->closure_srcs = csrcs.items;
+    e->nclosure_srcs = csrcs.n;
+}
+
+/* Find + lazily materialize -- the only call site that actually needs a
+ * derivation's full flattened closure (a `DrvDeep` context element
+ * expansion, below). `cache_own_drv_closure`'s own bookkeeping
+ * intentionally does NOT call this -- see drv_closure_materialize's own
+ * header comment for why staying lazy there is the whole point. */
+static DrvClosureCacheEntry *drv_closure_cache_find_materialized(const char *drv_path) {
+    DrvClosureCacheEntry *e = (DrvClosureCacheEntry *)drv_closure_cache_find(drv_path);
+    if (e) drv_closure_materialize(e);
+    return e;
 }
 
 /* Builds and caches THIS derivation's own closure entry (`drv_path`'s
@@ -707,32 +805,26 @@ static void drv_closure_cache_insert(const char *drv_path, char **closure_drvs, 
  * after a derivation's own `drv_path`/`output_names` are finalized. */
 static void cache_own_drv_closure(const char *drv_path, const char *const *output_names, size_t noutputs,
                                    const InputRefSet *refs) {
-    DrvClosureStrSet cdrvs;
-    memset(&cdrvs, 0, sizeof(cdrvs));
-    DrvClosureStrSet csrcs;
-    memset(&csrcs, 0, sizeof(csrcs));
-    /* real `computeFSClosure(drvPath)` includes the root path itself. */
-    drv_closure_strset_add(&cdrvs, drv_path);
+    /* M94 perf: direct layer only -- no hashing, no recursion, no
+     * lookups. `direct_drvs[0]` is `drv_path` itself (real
+     * `computeFSClosure(drvPath)` includes the root path), the rest are
+     * each direct input's drv_path, duplicates and all -- harmless,
+     * since drv_closure_materialize's own strset_add dedupes on demand
+     * when (if ever) this entry actually gets flattened. */
+    size_t ndirect_drvs = 1 + refs->ndrvs;
+    char **direct_drvs = malloc(ndirect_drvs * sizeof(char *));
+    direct_drvs[0] = dup_cstr(drv_path, strlen(drv_path));
     for (size_t i = 0; i < refs->ndrvs; i++) {
         const char *dp = refs->drvs[i].drv_path;
-        drv_closure_strset_add(&cdrvs, dp);
-        /* In a correctly-evaluated program this is always a hit: the same
-         * call-by-need invariant masked_hash_cache_find's own comment
-         * documents above -- `dp` was already fully built (hence already
-         * cached) before this derivation could reference it. */
-        const DrvClosureCacheEntry *sub = drv_closure_cache_find(dp);
-        if (sub) {
-            for (size_t j = 0; j < sub->nclosure_drvs; j++) drv_closure_strset_add(&cdrvs, sub->closure_drvs[j]);
-            for (size_t j = 0; j < sub->nclosure_srcs; j++) drv_closure_strset_add(&csrcs, sub->closure_srcs[j]);
-        }
+        direct_drvs[1 + i] = dup_cstr(dp, strlen(dp));
     }
-    for (size_t i = 0; i < refs->nsrcs; i++) drv_closure_strset_add(&csrcs, refs->srcs[i]);
-    /* `items`/`n` are handed off (ownership transferred) to the cache
-     * entry below; `index` is purely a scratch dedup aid for this one
-     * call and has no further use once insertion is done. */
-    free(cdrvs.index);
-    free(csrcs.index);
-    drv_closure_cache_insert(drv_path, cdrvs.items, cdrvs.n, csrcs.items, csrcs.n);
+    size_t ndirect_srcs = refs->nsrcs;
+    char **direct_srcs = ndirect_srcs ? malloc(ndirect_srcs * sizeof(char *)) : NULL;
+    for (size_t i = 0; i < ndirect_srcs; i++) {
+        const char *sp = refs->srcs[i];
+        direct_srcs[i] = dup_cstr(sp, strlen(sp));
+    }
+    drv_closure_cache_insert(drv_path, direct_drvs, ndirect_drvs, direct_srcs, ndirect_srcs);
     drv_outputs_cache_insert(drv_path, output_names, noutputs);
 }
 
@@ -886,7 +978,7 @@ static void asnix_collect_input_refs(Value v, InputRefSet *out, int json_mode) {
          * real Nix's `computeFSClosure` purely in-memory. */
         for (size_t i = 0; i < ctx->ndeep; i++) {
             const char *dp = ctx->deep[i];
-            const DrvClosureCacheEntry *closure = drv_closure_cache_find(dp);
+            const DrvClosureCacheEntry *closure = drv_closure_cache_find_materialized(dp);
             if (!closure) {
                 /* Not a derivation this process ever built itself (e.g. a
                  * path synthesized by `addDrvOutputDependencies` for a

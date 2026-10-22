@@ -107,7 +107,8 @@ what's actually implemented and the scope decisions made along the way.
 | M92 — real `maybeThunk`-style Env-slot aliasing (a new `Cell` value kind riding on `ASNIX_TAG_PTR`), implementing real Nix's `ExprVar::maybeThunk` override: a bare lexically-resolved variable reference now aliases its existing Env slot instead of allocating a fresh thunk, giving `==`/the printer the slot-identity shortcut real Nix's `eqValues`/`print.cc` depend on; wired into all 10 `ib_mk_thunk` call sites (composing with M90's literal-skip at the same sites), all 5 force chokepoints made Cell-transparent via a bounded resolver | done (see below; `eval-okay-eq-slot-elem.nix`/`eval-okay-eq-slot-identity.nix`/`eval-okay-print.nix` now pass; `make test-nix-conformance`: `pass=652 fail=6` → **`pass=655 fail=3`**; zero regressions) |
 | M93 — lazy union-layering for `//`: `asnix_attrs_update` now builds a `UnionHdr` (lowest-priority-first leaf array + lazily-materialized `flat_cache`, count's sign bit as the discriminator) instead of eagerly copying the LHS, when RHS≤16/LHS≥16/leaf depth<64 (matching real Nix's own thresholds); ~20 raw-ATTRS-layout call sites across asm fast paths (`op_select`/`op_select_or`/`op_has_attr`/`op_with`/`op_check_formals`) and C (`derivation.c`'s `asnix_prim_derivation`/`asnix_collect_input_refs`, the printer, `builtins_attrs.c`/`builtins_m54.c`) patched to resolve-before-read; a first implementation's naive left-to-right materialize fold (O(size×leaves)) was measured, found to show **zero** benefit, and fixed with a bottom-up pairwise merge (O(size×log leaves)) | done (see below; **8.8x peak-RSS reduction** (3.3GB→375MB) on a synthetic override-chain benchmark; on the real `d.nix`/ffmpeg target the effect is within measurement noise — ffmpeg's actual closure doesn't chain `//` deeply enough per-derivation to hit this regime; zero regressions) |
 | M94 — opt-in on-disk bytecode cache (`ASNIX_BYTECODE_CACHE=1`): a new portable (de)serialization format for a compiled `IrProgram` (op-ids not handler pointers, symbols by name not process-local id, heap-pointer-shaped pool Values by content), keyed by (resolved path, source content) so `__curPos`'s baked-in file path can never leak across a content collision; plus an opt-in `ASNIX_BYTECODE_PRODUCER=1` fork()-based prefetch producer that pre-warms the cache for statically-literal `import` targets in a separate process (not a thread -- the global arena/symtab have zero synchronization) | done (see below; verified against the full real `/tmp/nix-conformance` corpus and all 74 `test-nixpkgs-hash` packages with the cache both freshly-populated and fully-hit, byte-for-byte identical to the cache-disabled baseline; three real bugs found and fixed along the way, detailed below; zero regressions; off by default) |
-| M95+ | not started |
+| M95 — root-caused why M93's attrset-union layering showed no measurable win on the real `d.nix`/ffmpeg workload: it wasn't attrset layering at all -- `perf record` showed `cache_own_drv_closure` (derivation.c) at 43%+ of cycles, eagerly re-flattening every derivation's ENTIRE transitive closure (unioning each direct input's already-flattened closure into a brand-new hash set) for every one of ~100 derivations built, even though the only real consumer of a flattened closure is a rare `DrvDeep` context expansion. Changed to store only the direct layer at build time; added lazy, memoized materialization (`drv_closure_materialize`) triggered only by that one real consumer | done (see below; instructions on `d.nix` ~29.7B → **~12.07B**, matching real Nix's own ~12.0B; wall ~4.3s → ~2.1s; zero regressions) |
+| M96+ | not started |
 
 ## Design (see `docs/value-encoding.md`, `docs/ir-format.md`, `docs/abi.md`)
 
@@ -10734,3 +10735,73 @@ require not trusting the first failing run at face value.
   verify exhaustively," not "measure the speedup," given how much of
   the pass was consumed by finding and fixing the three bugs above.
   Worth a dedicated follow-up once the machine is quiet.
+
+## M95: root-cause of "M93 didn't help the real workload" -- `cache_own_drv_closure`'s eager, unconditional closure-flattening
+
+M93's lazy union-layering for `//` was correctly measured as showing no
+benefit on `./asnix d.nix` (ffmpeg's ~100-derivation closure) -- its own
+docs section already noted "ffmpeg's actual closure doesn't chain `//`
+deeply enough per-derivation to hit this regime." Verified that
+explanation directly via `perf record -g` on current master rather than
+accepting it as the whole story: the actual dominant cost has nothing
+to do with attrset representation at all.
+
+`cache_own_drv_closure` (`derivation.c`) is called once, unconditionally,
+right after every single derivation's `drv_path`/outputs are finalized.
+It used to eagerly compute that derivation's COMPLETE transitive closure
+by unioning each direct input's own already-flattened closure into a
+fresh hash set -- an O(direct_inputs x closure_size) dedup-hash pass,
+repeated for every derivation in the build. `perf record -g` confirmed
+this at 43%+ of all cycles (`drv_closure_strset_add`/`dcc_hash_str`
+33.25% + `drv_closure_strset_rehash` 10.02%, both inlined from
+`cache_own_drv_closure`, plus another ~7% in `__strcmp_avx2` from the
+same call chain).
+
+The flattened closure this eager work produces has exactly ONE real
+consumer in the entire file: a `DrvDeep` string-context element (M86)
+actually being expanded, when some derivation's own `drvPath` was
+embedded into another derivation via string interpolation -- confirmed
+by grepping every call site of the lookup function. That's rare in
+practice (only a handful of derivations anywhere in ffmpeg's own
+dependency graph ever trigger it), yet the eager version paid the full
+flattening cost for every one of the ~100 derivations built regardless
+of whether anything ever asked for its closure.
+
+Fixed by splitting the cache entry into a direct layer (this drv's own
+`drv_path` plus each direct input's `drv_path`/src -- O(1) per direct
+input, no hashing at all) and a memoized flattened result, computed
+lazily by a new `drv_closure_materialize` only when the one real
+consumer (`drv_closure_cache_find_materialized`) actually asks for it.
+Materialization recurses into each direct input's own entry (also
+lazily materialized, also memoized), so a closure shared by many
+derivations is still only ever flattened once no matter how many times
+it's reached from different call sites -- not merely deferred, but
+genuinely shared.
+
+Measured on `./asnix d.nix`: **instructions ~29.7 billion -> ~12.07
+billion** (3-run `perf stat`, <1.1% variance), landing almost exactly on
+real `nix-instantiate`'s own ~12.0 billion for the identical expression
+-- this closes essentially the entire remaining CPU gap to real Nix that
+M78-M93's earlier rounds hadn't reached. Wall-clock ~4.3s -> ~2.1s.
+Peak RSS also improved somewhat (the eager version's many short-lived
+hash-set reallocations added up) but the user-visible memory gap to
+real Nix (`853MB` vs real Nix's `375MB`, both measured after this fix)
+is unrelated to this bug -- it's the already-investigated, separately-
+documented irreducible cost of thunk/attrs/list/env node data from
+evaluating over a million distinct expressions in ffmpeg's closure (see
+the memory-usage-analysis pass elsewhere in this doc), not something
+this milestone could or should touch.
+
+Verified: `make test`/`test-e2e`/`test-conformance` unchanged, all
+green (two transient failures during verification -- an unrelated
+parse-error and four regex-fixture failures -- were confirmed via
+isolated reruns to be contention from other processes on this shared
+machine at the time, not real regressions; both suites came back fully
+clean on a quiet retry). `make test-nix-conformance`: `pass=655 fail=3
+skip=148`, byte-identical to the pre-fix baseline. `make
+test-nixpkgs-hash` (derivation.c is this project's hash-parity-critical
+file): `pass=148 fail=0`, unchanged. Direct sanity check: `./asnix
+d.nix` still prints real Nix's exact `ffmpeg.outPath`
+(`/nix/store/29iacg6h530yx7rxz4k1fhvi0kxxhsam-ffmpeg-9.0.1-bin`),
+confirming the lazy/memoized closure computation produces an identical
+flattened result to the old eager version, just far less redundantly.
