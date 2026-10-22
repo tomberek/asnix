@@ -26,6 +26,10 @@ void asnix_tryeval_unwind_inprogress(int64_t saved_head) {
     while (cur != saved_head) {
         char *cell = (char *)(intptr_t)cur;
         int64_t next = *(int64_t *)(cell + ASNIX_THUNK_OFF_ENV);
+        /* M103: OFF_STATE's IN_PROGRESS-time pointer bits (there are
+         * none left to preserve -- the one read that mattered already
+         * happened at the UNFORCED->IN_PROGRESS transition) are simply
+         * overwritten with the bare FAILED tag, same as before. */
         *(int64_t *)(cell + ASNIX_THUNK_OFF_STATE) = ASNIX_THUNK_STATE_FAILED;
         cur = next;
     }

@@ -771,9 +771,11 @@ int asnix_bshared_value_lt(Value a, Value b, const char *who) {
  * aliasing risk even though the IR body is a shared singleton). */
 static Value make_thunk_from(IrProgram *prog, Env *env) {
     void *mem = asnix_arena_alloc(ASNIX_THUNK_SIZE);
-    *(int64_t *)((char *)mem + ASNIX_THUNK_OFF_STATE) = ASNIX_THUNK_STATE_UNFORCED;
+    /* M103: OFF_STATE doubles as the prog pointer while UNFORCED -- prog
+     * is always >=8-byte-aligned (calloc/malloc), so its low 3 bits are
+     * already 0 == ASNIX_THUNK_STATE_UNFORCED; see ir.h's comment. */
+    *(IrProgram **)((char *)mem + ASNIX_THUNK_OFF_STATE) = prog;
     *(void **)((char *)mem + ASNIX_THUNK_OFF_ENV) = env;
-    *(IrProgram **)((char *)mem + ASNIX_THUNK_OFF_PROG) = prog; /* M100: one pointer, not {ops,pool} */
     return (Value){ .raw = (uint64_t)(uintptr_t)mem | ASNIX_TAG_THUNK };
 }
 

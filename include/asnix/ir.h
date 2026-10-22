@@ -118,15 +118,37 @@
  * requires) -- every tagged pointer to this same cell sees the memoized
  * value after the first force, exactly once computed.
  *
- * `prog` (an IrProgram*, M100) replaces what were two separate fields
- * (`body`/`pool`) through M96 -- see ASNIX_CLOSURE_OFF_PROG's identical
- * comment just above for the full rationale (8 bytes saved per thunk,
- * the single most common allocation kind, at the cost of one extra
- * pointer-chase through the already-tiny 16-byte IrProgram record). */
-#define ASNIX_THUNK_OFF_STATE 0
+ * M103: `state` and `prog` (M100's single IrProgram* replacing the old
+ * {body,pool} pair) are now PACKED into the same 8-byte word instead of
+ * living in two separate fields -- the same low-bits-are-free-on-an-
+ * aligned-pointer trick Value.raw's own ASNIX_TAG_MASK already uses
+ * (value.h), applied a second time here:
+ *   - every IrProgram* this field ever holds comes from either
+ *     ib_finish's calloc(), or malloc() (bytecode.c's deserializer) --
+ *     both glibc-guaranteed at least 8-byte-aligned -- so its low 3 bits
+ *     are always 0 while UNFORCED. The bare pointer IS the tagged word:
+ *     ASNIX_THUNK_STATE_UNFORCED == 0, so no OR is even needed to write
+ *     it, and reading it back doubles as reading the state (0 == UNFORCED).
+ *   - once the thunk transitions away from UNFORCED, the ONE read of the
+ *     real pointer that matters already happened (the jump into the
+ *     thunk's body, at the exact same insertion point as the old
+ *     ASNIX_THUNK_OFF_PROG read) -- so this word is overwritten with just
+ *     the bare state tag (1/2/3), discarding the pointer bits, exactly
+ *     mirroring how the old separate `state` field was overwritten in
+ *     place and the old separate `prog` field was simply never read again.
+ * This does NOT generalize to packing the tag into `env` instead: env's
+ * FORCED case caches a raw Value.raw, whose own ASNIX_TAG_MASK already
+ * saturates all 8 combinations of the low 3 bits (ASNIX_TAG_PTR=0x0
+ * through ASNIX_TAG_PRIMOP=0x7, value.h) -- there is no spare tag value
+ * left to distinguish "this word is a Value" from "this word is a
+ * state-tagged something else" without an external discriminator, which
+ * is exactly the field this change is trying to eliminate. `prog` has no
+ * such saturation problem: it is NEVER anything other than a plain
+ * IrProgram* (or, post-transition, a don't-care), so tagging it is safe. */
+#define ASNIX_THUNK_OFF_STATE 0  /* M103: UNFORCED -- this word IS the IrProgram* (tag bits 0);
+                                    IN_PROGRESS/FORCED/FAILED -- bare state tag alone, see above */
 #define ASNIX_THUNK_OFF_ENV   8  /* UNFORCED: Env*; IN_PROGRESS: intrusive "prev" link (M82); FORCED: cached Value.raw */
-#define ASNIX_THUNK_OFF_PROG  16
-#define ASNIX_THUNK_SIZE      24
+#define ASNIX_THUNK_SIZE      16
 
 #define ASNIX_THUNK_STATE_UNFORCED    0
 #define ASNIX_THUNK_STATE_IN_PROGRESS 1

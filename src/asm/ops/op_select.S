@@ -84,29 +84,36 @@ asnix_op_select:                        // a = symbol id; pops an attrset, pushe
     jne .Lselect_check_cell
 
     andq $-8, %rax
+    // M103: OFF_STATE is tagged now -- UNFORCED: this word IS the clean
+    // IrProgram* (tag bits 0); otherwise: the bare state tag alone.
+    // Extract into %r8 (dead since the binary search above) for
+    // dispatch, keeping %rcx (the possibly-a-pointer original word)
+    // intact for the UNFORCED path below.
     movq ASNIX_THUNK_OFF_STATE(%rax), %rcx
-    cmpq $ASNIX_THUNK_STATE_FORCED, %rcx
+    movq %rcx, %r8
+    andq $ASNIX_TAG_MASK, %r8
+    cmpq $ASNIX_THUNK_STATE_FORCED, %r8
     je .Lselect_forced
-    cmpq $ASNIX_THUNK_STATE_IN_PROGRESS, %rcx
+    cmpq $ASNIX_THUNK_STATE_IN_PROGRESS, %r8
     je .Lselect_blackhole
-    cmpq $ASNIX_THUNK_STATE_FAILED, %rcx
+    cmpq $ASNIX_THUNK_STATE_FAILED, %r8
     je .Lselect_reraise
 
     movq $ASNIX_THUNK_STATE_IN_PROGRESS, ASNIX_THUNK_OFF_STATE(%rax)
 
     movq %rsi, %rdx
     addq $ASNIX_IROP_SIZE, %rdx
-    ASNIX_CHECK_RETSP %rcx              // %rcx dead since the binary search above
+    ASNIX_CHECK_RETSP %r8               // %r8 dead (already consumed into the state tag above);
+                                         // %rcx must survive -- it holds the clean prog pointer
     movq %rdx, ASNIX_RETFRAME_OFF_IP(%r14)
     movq %rdi, ASNIX_RETFRAME_OFF_ENV(%r14)
     movq %r13, ASNIX_RETFRAME_OFF_POOL(%r14)
     movq %rax, ASNIX_RETFRAME_OFF_FORCE_TARGET(%r14)
     addq $ASNIX_RETFRAME_SIZE, %r14
 
-    // M100: prog (one pointer) replaces {body,pool} -- %rcx is free here
-    // (last written by the STATE check above; reused again right below
-    // for the IN_PROGRESS-stack push, after this).
-    movq ASNIX_THUNK_OFF_PROG(%rax), %rcx
+    // M103: %rcx already holds the clean prog pointer (read above, tag
+    // bits were 0) -- no second memory read needed (the old separate
+    // OFF_PROG field is gone).
     movq ASNIX_IRPROG_OFF_POOL(%rcx), %r13
     movq ASNIX_IRPROG_OFF_OPS(%rcx), %rsi
     movq ASNIX_THUNK_OFF_ENV(%rax), %rdi // last read of ENV's original meaning -- safe to repurpose below

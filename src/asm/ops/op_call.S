@@ -253,6 +253,10 @@ asnix_op_ret:
     movq %rax, asnix_inprogress_head(%rip)
     movq -8(%r12), %rdx
     movq %rdx, ASNIX_THUNK_OFF_ENV(%rcx)
+    // M103: OFF_STATE's prog-pointer bits (meaningful only while
+    // UNFORCED) are simply overwritten with the bare FORCED tag --
+    // nothing reads them again once forced, same as the old separate
+    // OFF_PROG field was already never re-read here.
     movq $ASNIX_THUNK_STATE_FORCED, ASNIX_THUNK_OFF_STATE(%rcx)
 .Lret_no_memo:
     movq ASNIX_RETFRAME_OFF_IP(%r14), %rsi

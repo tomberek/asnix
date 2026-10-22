@@ -178,9 +178,11 @@ static Value build_manual_thunk_chain(int64_t depth) {
         IrProgram *body_prog = ib_finish(body);
 
         void *thunk_mem = asnix_arena_alloc(ASNIX_THUNK_SIZE);
-        *(int64_t *)((char *)thunk_mem + ASNIX_THUNK_OFF_STATE) = ASNIX_THUNK_STATE_UNFORCED;
+        /* M103: OFF_STATE doubles as the prog pointer while UNFORCED
+         * (tag bits 0 == UNFORCED, free since body_prog is >=8-byte-
+         * aligned) -- see ir.h's comment. */
+        *(IrProgram **)((char *)thunk_mem + ASNIX_THUNK_OFF_STATE) = body_prog;
         *(void **)((char *)thunk_mem + ASNIX_THUNK_OFF_ENV) = frame;
-        *(IrProgram **)((char *)thunk_mem + ASNIX_THUNK_OFF_PROG) = body_prog; /* M100: one pointer, not {ops,pool} */
 
         Env *next = asnix_env_alloc(frame, 1);
         next->values[0].raw = (uint64_t)(uintptr_t)thunk_mem | ASNIX_TAG_THUNK;

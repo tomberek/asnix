@@ -16,8 +16,11 @@ asnix_op_mk_thunk:                      // b = pool index of {body IrProgram*} (
 
     movq $ASNIX_THUNK_SIZE, %rdi
     call asnix_arena_alloc
-    movq $ASNIX_THUNK_STATE_UNFORCED, ASNIX_THUNK_OFF_STATE(%rax)
-    movq %rbp, ASNIX_THUNK_OFF_PROG(%rax)
+    // M103: OFF_STATE now doubles as the prog pointer while UNFORCED --
+    // %rbp (an IrProgram*) is always 8-byte-aligned, so its low 3 bits
+    // are already 0 == ASNIX_THUNK_STATE_UNFORCED; one store, not two
+    // (see ir.h's comment).
+    movq %rbp, ASNIX_THUNK_OFF_STATE(%rax)
 
     popq %rdi                           // restore ENV (pushed last, popped first) -- see the
                                          // comment in op_lambda.S's matching fix for why this

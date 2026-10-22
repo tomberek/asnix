@@ -123,7 +123,9 @@ size_t ib_select_dynamic(IrBuilder *b) {
 
 size_t ib_mk_thunk(IrBuilder *b, IrProgram *body_prog) {
     /* M100: a single IrProgram* pool entry, not a {ops, pool} pair -- see
-     * ir.h's ASNIX_THUNK_OFF_PROG comment. */
+     * ir.h's ASNIX_THUNK_OFF_STATE comment (M103: the runtime Thunk cell's
+     * own prog field is now packed into that same word, not a separate
+     * one, but this compile-time IR pool entry is unaffected). */
     size_t pool_idx = ib_pool_add(b, (int64_t)(intptr_t)body_prog);
     return ib_emit(b, OP_MK_THUNK, 0, (int64_t)pool_idx);
 }

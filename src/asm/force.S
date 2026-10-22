@@ -82,12 +82,19 @@ asnix_force_for_print:                  // Value asnix_force_for_print(Value v)
     jne .Lforce_done                    // not a thunk: return v unchanged
 
     andq $-8, %rax                      // rax = Thunk*
+    // M103: OFF_STATE is tagged now -- UNFORCED: this word IS the clean
+    // IrProgram* (tag bits 0); IN_PROGRESS/FORCED/FAILED: the bare state
+    // tag alone. Extract the tag into %rdx (first use in this function)
+    // for dispatch, keeping %rcx (the possibly-a-pointer original word)
+    // intact for the UNFORCED path below.
     movq ASNIX_THUNK_OFF_STATE(%rax), %rcx
-    cmpq $ASNIX_THUNK_STATE_FORCED, %rcx
+    movq %rcx, %rdx
+    andq $ASNIX_TAG_MASK, %rdx
+    cmpq $ASNIX_THUNK_STATE_FORCED, %rdx
     je .Lforce_cached
-    cmpq $ASNIX_THUNK_STATE_IN_PROGRESS, %rcx
+    cmpq $ASNIX_THUNK_STATE_IN_PROGRESS, %rdx
     je .Lforce_blackhole
-    cmpq $ASNIX_THUNK_STATE_FAILED, %rcx
+    cmpq $ASNIX_THUNK_STATE_FAILED, %rdx
     je .Lforce_reraise
 
     // Bring our own VALSTACK/RETSP and save every candidate-scratch
@@ -101,6 +108,13 @@ asnix_force_for_print:                  // Value asnix_force_for_print(Value v)
     pushq %r15
     subq $8, %rsp                       // alignment padding, undone in the epilogue below
     movq %rax, %rbx                     // stash the Thunk* across the alloc calls
+    // M103: %rcx (the clean prog pointer) would otherwise be clobbered
+    // by the two asnix_force_scratch_* calls below (ordinary SysV calls,
+    // %rcx is caller-saved) -- stash it in %rbp instead: %rbp's
+    // caller-time value is already safely preserved on the stack by the
+    // push above, so the register itself is free scratch until the
+    // matching popq %rbp in the epilogue.
+    movq %rcx, %rbp
 
     // Save the enclosing dispatch context's VALSTACK/RETSP limits (the
     // outer asnix_eval, or an outer asnix_force_for_print if this call
@@ -136,19 +150,18 @@ asnix_force_for_print:                  // Value asnix_force_for_print(Value v)
     // Sentinel retframe: when the thunk's OP_RET fires, it memoizes into
     // force_target (this thunk) then jumps to the sentinel's handler.
     leaq .Lforce_sentinel_ir(%rip), %rax
-    ASNIX_CHECK_RETSP %rcx             // %rcx dead here (last written by the mask check above)
+    ASNIX_CHECK_RETSP %rcx             // %rcx dead here (the prog pointer it held is already
+                                        // safely stashed in %rbp, see above)
     movq %rax, ASNIX_RETFRAME_OFF_IP(%r14)
     movq $0, ASNIX_RETFRAME_OFF_ENV(%r14)
     movq $0, ASNIX_RETFRAME_OFF_POOL(%r14)
     movq %rbx, ASNIX_RETFRAME_OFF_FORCE_TARGET(%r14)
     addq $ASNIX_RETFRAME_SIZE, %r14
 
-    // M100: prog (one pointer) replaces {body,pool} -- %rax is free here
-    // (last held .Lforce_sentinel_ir's address, already written above;
-    // not read again until the dispatch jump further down).
-    movq ASNIX_THUNK_OFF_PROG(%rbx), %rax
-    movq ASNIX_IRPROG_OFF_POOL(%rax), %r13
-    movq ASNIX_IRPROG_OFF_OPS(%rax), %rsi
+    // M103: %rbp already holds the clean prog pointer (stashed above) --
+    // no memory read needed (the old separate OFF_PROG field is gone).
+    movq ASNIX_IRPROG_OFF_POOL(%rbp), %r13
+    movq ASNIX_IRPROG_OFF_OPS(%rbp), %rsi
     movq ASNIX_THUNK_OFF_ENV(%rbx), %rdi // last read of ENV's original meaning -- safe to repurpose below
     // M82: push onto the intrusive IN_PROGRESS stack -- see
     // stacklimits.S's asnix_inprogress_head comment. %rcx is dead here

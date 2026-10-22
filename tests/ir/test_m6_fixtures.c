@@ -44,7 +44,9 @@ static void fixture_thunk_not_evaluated_until_forced(void) {
 
     CHECK(asnix_tag_of(v) == ASNIX_TAG_THUNK, "unforced thunk keeps its THUNK tag at HALT");
     void *cell = (void *)(v.raw & ~0x7ULL);
-    int64_t state = *(int64_t *)((char *)cell + ASNIX_THUNK_OFF_STATE);
+    /* M103: OFF_STATE now doubles as the prog pointer while UNFORCED --
+     * mask to the low tag bits rather than comparing the raw word. */
+    int64_t state = *(int64_t *)((char *)cell + ASNIX_THUNK_OFF_STATE) & ASNIX_TAG_MASK;
     CHECK(state == ASNIX_THUNK_STATE_UNFORCED, "constructing a thunk never runs its body");
 }
 
@@ -75,10 +77,12 @@ static void fixture_memoization(void) {
     IrProgram *body_prog = ib_finish(body);
 
     void *thunk_mem = asnix_arena_alloc(ASNIX_THUNK_SIZE);
-    *(int64_t *)((char *)thunk_mem + ASNIX_THUNK_OFF_STATE) = ASNIX_THUNK_STATE_UNFORCED;
+    /* M103: OFF_STATE doubles as the prog pointer while UNFORCED (tag
+     * bits 0 == UNFORCED, free since body_prog is >=8-byte-aligned) --
+     * one store, not two; see ir.h's comment. */
+    *(IrProgram **)((char *)thunk_mem + ASNIX_THUNK_OFF_STATE) = body_prog;
     *(void **)((char *)thunk_mem + ASNIX_THUNK_OFF_ENV) = root_env();
-    *(IrProgram **)((char *)thunk_mem + ASNIX_THUNK_OFF_PROG) = body_prog; /* M100: one pointer, not {ops,pool} */
-    CHECK(*(int64_t *)((char *)thunk_mem + ASNIX_THUNK_OFF_STATE) == ASNIX_THUNK_STATE_UNFORCED,
+    CHECK((*(int64_t *)((char *)thunk_mem + ASNIX_THUNK_OFF_STATE) & ASNIX_TAG_MASK) == ASNIX_THUNK_STATE_UNFORCED,
           "memoization: starts UNFORCED");
 
     Env *frame = asnix_env_alloc(root_env(), 1);
@@ -116,9 +120,10 @@ static void fixture_blackhole_aborts(void) {
 
         Env *frame = asnix_env_alloc(root_env(), 1);
         void *thunk_mem = asnix_arena_alloc(ASNIX_THUNK_SIZE);
-        *(int64_t *)((char *)thunk_mem + ASNIX_THUNK_OFF_STATE) = ASNIX_THUNK_STATE_UNFORCED;
+        /* M103: OFF_STATE doubles as the prog pointer while UNFORCED --
+         * see fixture_memoization's matching comment above. */
+        *(IrProgram **)((char *)thunk_mem + ASNIX_THUNK_OFF_STATE) = body_prog;
         *(void **)((char *)thunk_mem + ASNIX_THUNK_OFF_ENV) = frame; /* captures its own frame */
-        *(IrProgram **)((char *)thunk_mem + ASNIX_THUNK_OFF_PROG) = body_prog; /* M100: one pointer, not {ops,pool} */
         Value thunk_val = { .raw = (uint64_t)(uintptr_t)thunk_mem | ASNIX_TAG_THUNK };
         frame->values[0] = thunk_val; /* ...at the very slot that references it */
 
