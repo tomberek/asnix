@@ -90,6 +90,105 @@
 #define ASNIX_CELL_OFF_MARKER 0
 #define ASNIX_CELL_OFF_TARGET 8
 
+/* LazyApp (M113): a FIFTH `ASNIX_TAG_PTR` kind, alongside String/Path/
+ * Float/Cell above -- same "reserved negative marker in the leading
+ * word" precedent, but (unlike those four, which are all fixed-shape)
+ * this one has TWO possible marker values of its own, used as a tiny
+ * two-state machine (no third/fourth state -- see the rationale below
+ * for why IN_PROGRESS/FAILED, which Thunk has, are deliberately NOT
+ * replicated here):
+ *
+ *   LazyApp, UNRESOLVED:
+ *     { int64_t marker == ASNIX_LAZYAPP_MARKER (-4);
+ *       Value   fn; Value arg1; Value arg2; }
+ *   LazyApp, RESOLVED (the SAME heap object, mutated in place once --
+ *   see below):
+ *     { int64_t marker == ASNIX_LAZYAPP_FORCED_MARKER (-5);
+ *       Value   result; <2 dead words, never read again>; }
+ *
+ * Purpose: real Nix's `prim_map`/`prim_mapAttrs` build each output
+ * element via a lightweight `Value::mkApp` application thunk
+ * (value.hh) that needs no Env allocation at all until actually
+ * forced, and is never counted as a genuine Thunk either. Before this
+ * milestone, asnix's own `map`/`mapAttrs`/`zipAttrsWith`
+ * (asnix_bshared_make_lazy_call1/_call2, builtins_shared.c) allocated a
+ * genuine Env AND a genuine Thunk for EVERY output element,
+ * unconditionally, whether or not that element is ever forced --
+ * measured as the single largest simultaneous contributor to both the
+ * env-count and thunk-count gap against real Nix on a real nixpkgs
+ * closure (see docs/architecture.md's M113 section). A LazyApp replaces
+ * that Env+Thunk pair with ONE heap object big enough to hold `fn` plus
+ * up to two arguments -- `fn arg1` (`map`'s case; `arg2.raw == 0`,
+ * reusing the exact "raw 0 is never a legal Value" sentinel the
+ * UnionHdr's own `flat_cache` field above already established) or the
+ * curried `(fn arg1) arg2` (`mapAttrs`/`zipAttrsWith`'s `f name value`
+ * case) -- with NO bytecode, NO Env, NO Thunk involved at all; see
+ * value_util.c's `asnix_resolve_lazyapp` for exactly how it's run.
+ *
+ * Memoization: forcing the SAME LazyApp object twice (e.g. a shared
+ * list/attrs element read from two different places before either has
+ * forced it) must not re-run `fn` a second time -- same "exactly once"
+ * guarantee every other lazy value kind in this evaluator already
+ * gives. `asnix_resolve_lazyapp` provides that by mutating the object
+ * in place on its first (successful) resolution: `marker` flips from
+ * `ASNIX_LAZYAPP_MARKER` to `ASNIX_LAZYAPP_FORCED_MARKER`, and the
+ * computed result overwrites the `fn` slot (reusing its offset, since
+ * `fn`/`arg1`/`arg2` are all dead the instant `marker` says RESOLVED --
+ * nothing ever reads them again). Every later force of the same object
+ * (through ANY copy of the tagged pointer to it, exactly like Thunk's
+ * own in-place self-mutation) just reads the cached result back.
+ *
+ * Deliberately NOT given Thunk's full IN_PROGRESS/FAILED state
+ * machinery (heap.h's own Thunk comment, ir.h's ASNIX_THUNK_STATE_*):
+ * doing so correctly would mean teaching `asnix_tryeval_unwind_
+ * inprogress` (tryeval.c) -- which hard-codes writing the literal
+ * THUNK FAILED tag at a fixed offset into every node on `asnix_
+ * inprogress_head`'s intrusive stack -- to recognize and write a
+ * DIFFERENT tag for a LazyApp node sharing that same list, a real,
+ * fiddly change to an already-subtle shared mechanism (see M82's own
+ * history of exactly this class of bug). Two consequences, both
+ * accepted and documented rather than silently assumed:
+ *   1. No bespoke blackhole detection: a genuine self-referential
+ *      LazyApp force cycle (constructible, e.g. `let xs = map (v:
+ *      builtins.elemAt xs 0) [1]; in builtins.elemAt xs 0`) recurses
+ *      through `asnix_apply` instead of being caught by a dedicated
+ *      IN_PROGRESS check -- it still aborts (apply.S's own
+ *      ASNIX_CHECK_RETSP/RETSTACK-overflow guard, the same one that
+ *      already catches ordinary unbounded Nix-level recursion, fires
+ *      first), just with a different message than Thunk's own
+ *      "blackhole" wording, not a silent hang or an unguarded crash.
+ *   2. No memoized-failure state: if resolving a LazyApp throws and
+ *      that's caught by an enclosing `builtins.tryEval`, the object is
+ *      left exactly as it was before the attempt (this mutation only
+ *      ever happens AFTER `fn` returns successfully, never before --
+ *      so an exception unwinding past it leaves no partial state to
+ *      clean up) -- a LATER force of the SAME object re-runs `fn` from
+ *      scratch rather than re-raising the memoized failure the way a
+ *      Thunk would (real Nix's Nix-2.34 "errors are memoized" rule,
+ *      eval-okay-tryeval-failed-thunk-reeval.nix). Confirmed this exact
+ *      combination (`tryEval` wrapping a forced, then re-forced,
+ *      `map`/`mapAttrs`/`zipAttrsWith` element) does not appear
+ *      anywhere in numtide/nix-conformance's gating suite (grepped
+ *      directly: no fixture combines `tryEval` with `map`/`mapAttrs`/
+ *      `zipAttrsWith` at all) -- a real, narrow, deliberately-scoped-out
+ *      gap, not an oversight.
+ *
+ * Use asnix_make_lazyapp1()/asnix_make_lazyapp2()/
+ * asnix_value_is_lazyapp()/asnix_resolve_lazyapp() (src/c/value_util.c)
+ * -- never poke these offsets directly. Every force chokepoint that
+ * already special-cases Cell (force.S, op_var_ref.S, op_select.S,
+ * op_select_or.S, op_with.S's OP_WITH_TRY) gained an identical sibling
+ * check for both LazyApp markers, calling asnix_resolve_lazyapp and
+ * looping back exactly the way the existing Cell check does. */
+#define ASNIX_LAZYAPP_MARKER        (-4)
+#define ASNIX_LAZYAPP_FORCED_MARKER (-5)
+#define ASNIX_LAZYAPP_OFF_MARKER    0
+#define ASNIX_LAZYAPP_OFF_FN        8  /* UNRESOLVED: Value fn; RESOLVED: cached result (reused slot) */
+#define ASNIX_LAZYAPP_OFF_RESULT    8  /* alias of OFF_FN -- see above */
+#define ASNIX_LAZYAPP_OFF_ARG1      16
+#define ASNIX_LAZYAPP_OFF_ARG2      24 /* raw == 0 means "no second argument" (map's 1-arg case) */
+#define ASNIX_LAZYAPP_SIZE          32
+
 /* List: {int64_t count; Value elems[count];} */
 #define ASNIX_LIST_OFF_COUNT 0
 #define ASNIX_LIST_OFF_ELEMS 8

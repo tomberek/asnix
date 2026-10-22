@@ -280,9 +280,6 @@ static Value zipAttrsWith2_impl(const Value *args, int64_t argc) {
     }
 
     Value *out_vals = distinct_n > 0 ? asnix_arena_alloc((uint64_t)distinct_n * sizeof(Value)) : NULL;
-    /* M109: see asnix_bshared_make_lazy_call2_indexed's own comment --
-     * one shared Env holding `f` instead of a fresh 3-slot Env per key. */
-    Env *shared = asnix_bshared_make_call2_shared_env(f);
     for (int64_t k = 0; k < distinct_n; k++) {
         uint32_t sym = distinct[k];
         Value *per_key = n > 0 ? asnix_arena_alloc((uint64_t)n * sizeof(Value)) : NULL;
@@ -295,7 +292,7 @@ static Value zipAttrsWith2_impl(const Value *args, int64_t argc) {
         size_t namelen;
         const char *name = asnix_sym_name(sym, &namelen);
         Value name_val = asnix_make_string_value(name, namelen);
-        out_vals[k] = asnix_bshared_make_lazy_call2_indexed(shared, name_val, value_list);
+        out_vals[k] = asnix_make_lazyapp2(f, name_val, value_list);
     }
     return asnix_bshared_make_attrs(distinct, out_vals, distinct_n);
 }

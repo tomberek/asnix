@@ -244,6 +244,25 @@ static int print_peel_wrappers(Value *v_out, int *pushed_out) {
                                             * here) or a genuinely concrete value. */
             continue;
         }
+        if (asnix_value_is_lazyapp(v)) {
+            /* M113: same ancestor-tracking shape as the Thunk case just
+             * above -- push THIS LazyApp object's own heap address (not
+             * whatever it resolves to) before resolving it, so a
+             * genuinely self-referential structure built through one
+             * (constructible the same way a Cell/Thunk cycle is) still
+             * prints "«repeated»" instead of looping forever. */
+            const void *lazyapp_addr = (const void *)(v.raw & ~0x7ULL);
+            if (!print_active_push(lazyapp_addr)) {
+                for (int i = 0; i < pushed; i++) print_active_pop();
+                printf("«repeated»");
+                *pushed_out = 0;
+                return 0;
+            }
+            pushed++;
+            v = asnix_resolve_lazyapp(v); /* one step -- may itself still be an unforced
+                                            * Thunk/Cell/LazyApp, looped by the `for` here. */
+            continue;
+        }
         break;
     }
     *v_out = v;

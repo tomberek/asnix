@@ -25,6 +25,7 @@ extern uint64_t asnix_stats_attrs_entries;
 extern uint64_t asnix_stats_list;
 extern uint64_t asnix_stats_list_elements;
 extern uint64_t asnix_stats_cell;
+extern uint64_t asnix_stats_lazyapp;
 extern uint64_t asnix_stats_string;
 extern uint64_t asnix_stats_primop;
 extern uint64_t asnix_stats_path;

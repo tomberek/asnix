@@ -12530,3 +12530,96 @@ the same way) is a qualitatively different, larger change -- it
 requires tracking VALUE-level origin through a binding, not just
 AST shape at the call site -- deliberately not attempted here, flagged
 instead of forced, matching this change's own honest-scoping mandate.
+
+## M117: `LazyApp` -- a lightweight `Value::mkApp`-style value kind for `map`/`mapAttrs`/`zipAttrsWith`, replacing a genuine Env+Thunk (or Env+Thunk-via-shared-Env) pair per output element
+
+Real Nix builds each `map`/`mapAttrs` output element via `Value::mkApp`
+(value.hh) -- a lightweight application thunk needing no Env allocation
+until actually forced, and never counted as a genuine Thunk at all.
+asnix's own `asnix_bshared_make_lazy_call1`/`_call2`
+(builtins_shared.c) instead allocated a genuine Env AND a genuine Thunk
+for EVERY output element, unconditionally, whether or not it was ever
+forced -- the single largest simultaneous contributor to both the
+env-count and thunk-count gap against real Nix on a real nixpkgs
+closure. M109 had already carved out a narrower, mapAttrs/zipAttrsWith-
+specific win here (one shared 1-slot Env holding `f`, so each
+per-attribute thunk only needs a 2-slot Env instead of 3), and M113
+further fused that 2-slot Env and its Thunk into a single
+`asnix_arena_alloc` call -- real instruction-count wins, but neither
+changed the actual OBJECT count: every output element was still one
+genuine Env plus one genuine Thunk, just packed more cheaply.
+
+`LazyApp` replaces that Env+Thunk pair (shared-env or not) with ONE
+heap object `{marker; fn; arg1; arg2}` (32 bytes), riding on the
+existing `ASNIX_TAG_PTR` reserved-marker scheme -- the same precedent
+M92's `Cell` established -- with two marker values (`ASNIX_LAZYAPP_MARKER`
+unresolved, `ASNIX_LAZYAPP_FORCED_MARKER` resolved) used as a tiny
+two-state machine. `arg2.raw == 0` means "no second argument" (`map`'s
+plain `fn arg1` case); any other value means the curried `(fn arg1)
+arg2` case `mapAttrs`/`zipAttrsWith` need for `f name value`.
+`asnix_make_lazyapp1`/`asnix_make_lazyapp2` (value_util.c) build one,
+replacing `map`'s/`mapAttrs`'s/`zipAttrsWith`'s calls one-for-one
+(builtins_list.c/builtins_attrs.c/builtins_m54.c) -- `asnix_bshared_
+make_lazy_call1`/`_call2`/`_make_call2_shared_env`/
+`_make_lazy_call2_indexed` and their shared `make_thunk_from` helper are
+all now dead code, removed from builtins_shared.c/.h.
+
+Resolved on demand via the identical 5 force chokepoints M92 already
+enumerated for Cell (force.S's `asnix_force_for_print`, op_var_ref.S,
+op_select.S, op_select_or.S, op_with.S's `OP_WITH_TRY`), calling the new
+shared `asnix_resolve_lazyapp` and looping back to re-dispatch, exactly
+mirroring `asnix_resolve_cell_chain`'s role. Memoized by mutating the
+object in place on first success: `marker` flips to
+`ASNIX_LAZYAPP_FORCED_MARKER` and the computed result overwrites the
+`fn` slot (reused, since `fn`/`arg1`/`arg2` are all dead once resolved)
+-- every later force of ANY copy of the tagged pointer just reads the
+cache back, confirmed directly via a `map` callback wrapping
+`builtins.trace`, forced twice through two independent `elemAt` reads
+of the same output element, tracing exactly once.
+
+Deliberately NOT given Thunk's full IN_PROGRESS/FAILED state machine
+(would mean teaching the shared `asnix_inprogress_head` intrusive-stack
+unwind walker, `asnix_tryeval_unwind_inprogress` in tryeval.c, to
+recognize and write a different tag for a second node shape on the same
+list -- real, fiddly, shared-mechanism risk, M82's own history warns
+about exactly this class of bug). Two accepted, documented
+consequences: (1) no bespoke blackhole detection for a constructed
+self-referential LazyApp cycle -- it still aborts via the same
+RETSTACK-overflow guard that already catches ordinary unbounded
+Nix-level recursion, just with a different message than Thunk's
+"blackhole" wording; (2) no memoized-failure replay -- a LazyApp whose
+resolution throws and is caught by an enclosing `tryEval` re-runs `fn`
+from scratch on a later force rather than re-raising the memoized
+failure a Thunk would. Confirmed no fixture in numtide/nix-conformance's
+gating suite combines `tryEval` with `map`/`mapAttrs`/`zipAttrsWith`.
+
+Printer (`main.c`'s `print_peel_wrappers`) and
+`asnix_bshared_slot_identical` (builtins_shared.c) both gained an
+identical sibling case to their existing Cell/Thunk handling.
+
+### Verification
+
+Laziness canaries: `builtins.length (map (x: throw "boom") [1 2 3])` =>
+`3`; `builtins.attrNames (builtins.mapAttrs (n: v: throw "boom") { a =
+1; b = 2; })` => `[ "a" "b" ]`; `builtins.attrNames (builtins.
+zipAttrsWith (n: v: throw "boom") [{a=1;} {a=2;}])` => `[ "a" ]` --
+none throw. `make test`/`make test-e2e`: fully green. `make
+test-nix-conformance`: `pass=655 fail=3 skip=148`, exact match to the
+pre-change baseline (same 3 pre-existing pos-tracking failures). `make
+test-nixpkgs-hash`: `pass=148 fail=0`.
+
+**Measured on `d.nix` (real nixpkgs's `ffmpeg.outPath`), paired against
+current master (post-M113) as the real baseline** -- not against the
+pre-M109/M113 numbers an earlier draft of this change was measured
+against, which are no longer comparable since M109/M113 already shrank
+the starting gap:
+- envs: 1,492,607 -> 978,030 (**-514,577, -34.5%**)
+- thunks: 2,342,967 -> 1,834,828 (**-508,139, -21.7%**)
+- lazyapps: 0 -> 502,964 (new -- one per `map`/`mapAttrs`/
+  `zipAttrsWith` output element across the whole evaluated closure)
+- peak RSS: 588,440 -> 584,592 KB (**-3,848 KB, -0.65%** -- much more
+  modest than LazyApp's own object-size win alone would suggest,
+  because M113 had already eliminated most of the malloc-call overhead
+  this change also removes; the real remaining win here is the env/
+  thunk COUNT reduction, not bytes)
+- output hash unchanged (`/nix/store/29iacg6h530yx7rxz4k1fhvi0kxxhsam-ffmpeg-9.0.1-bin`)

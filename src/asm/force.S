@@ -217,7 +217,7 @@ asnix_force_epilogue:
     andq $-8, %rdx                       // rdx = masked base pointer
     movq ASNIX_CELL_OFF_MARKER(%rdx), %rcx
     cmpq $ASNIX_CELL_MARKER, %rcx
-    jne .Lforce_ret                      // PTR but not a Cell (String/Path/Float): a real value
+    jne .Lforce_check_lazyapp            // PTR but not a Cell -- maybe a LazyApp instead
 
     // It's a Cell -- see op_var_ref.S's matching comment on
     // asnix_resolve_cell_chain (value_util.c). asnix_force_for_print is
@@ -231,6 +231,24 @@ asnix_force_epilogue:
     movq %rax, %rdi                      // arg1 = the Cell value
     subq $8, %rsp
     call asnix_resolve_cell_chain
+    addq $8, %rsp
+    movq %rax, %rdi
+    jmp .Lforce_top
+
+    // M113: not a Cell either -- maybe a LazyApp (heap.h's ASNIX_LAZYAPP_
+    // MARKER comment). %rcx already holds the marker value from the Cell
+    // check just above (the only path that reaches this label). Both
+    // LazyApp sub-states (unresolved/resolved) route through the same
+    // asnix_resolve_lazyapp call -- see op_var_ref.S's matching comment.
+.Lforce_check_lazyapp:
+    cmpq $ASNIX_LAZYAPP_MARKER, %rcx
+    je .Lforce_lazyapp
+    cmpq $ASNIX_LAZYAPP_FORCED_MARKER, %rcx
+    jne .Lforce_ret                      // PTR but not Cell/LazyApp (String/Path/Float): a real value
+.Lforce_lazyapp:
+    movq %rax, %rdi                      // arg1 = the LazyApp value
+    subq $8, %rsp
+    call asnix_resolve_lazyapp
     addq $8, %rsp
     movq %rax, %rdi
     jmp .Lforce_top

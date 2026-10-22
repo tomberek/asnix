@@ -117,7 +117,7 @@ asnix_op_var_ref:                       // a = depth, b = slot
     andq $-8, %r8                        // r8 = masked base pointer
     movq ASNIX_CELL_OFF_MARKER(%r8), %r9
     cmpq $ASNIX_CELL_MARKER, %r9
-    jne .Lvar_ref_push                   // PTR but not a Cell (String/Path/Float): a real value
+    jne .Lvar_ref_check_lazyapp          // PTR but not a Cell -- maybe a LazyApp instead
 
     // It's a Cell -- asnix_resolve_cell_chain (value_util.c) unwraps
     // however many are chained together (bounded -- see its own
@@ -130,6 +130,27 @@ asnix_op_var_ref:                       // a = depth, b = slot
     call asnix_resolve_cell_chain
     popq %rdi                            // restore ENV
     popq %rsi                            // restore IP
+    jmp .Lvar_ref_resolve
+
+    // M113: not a Cell either -- maybe a LazyApp (heap.h's
+    // ASNIX_LAZYAPP_MARKER comment). %r9 already holds the marker value
+    // from the Cell check just above. Both LazyApp sub-states
+    // (unresolved/resolved) route through the same asnix_resolve_lazyapp
+    // call, which may itself hand back another not-yet-forced value
+    // (Thunk/Cell/LazyApp) -- re-enter the resolve loop above, same as
+    // the Cell case.
+.Lvar_ref_check_lazyapp:
+    cmpq $ASNIX_LAZYAPP_MARKER, %r9
+    je .Lvar_ref_lazyapp
+    cmpq $ASNIX_LAZYAPP_FORCED_MARKER, %r9
+    jne .Lvar_ref_push                   // PTR but not Cell/LazyApp (String/Path/Float): a real value
+.Lvar_ref_lazyapp:
+    pushq %rsi
+    pushq %rdi
+    movq %rax, %rdi                      // arg1 = the LazyApp value
+    call asnix_resolve_lazyapp
+    popq %rdi
+    popq %rsi
     jmp .Lvar_ref_resolve
 .Lvar_ref_push:
     ASNIX_CHECK_VALSTACK %rcx

@@ -98,6 +98,55 @@ Value asnix_resolve_cell_chain(Value v) {
     return v;
 }
 
+/* M113: see heap.h's ASNIX_LAZYAPP_MARKER comment for the full
+ * rationale/layout. */
+Value asnix_make_lazyapp1(Value fn, Value arg1) {
+    void *mem = asnix_arena_alloc(ASNIX_LAZYAPP_SIZE);
+    asnix_stats_lazyapp++;
+    *(int64_t *)((char *)mem + ASNIX_LAZYAPP_OFF_MARKER) = ASNIX_LAZYAPP_MARKER;
+    *(Value *)((char *)mem + ASNIX_LAZYAPP_OFF_FN) = fn;
+    *(Value *)((char *)mem + ASNIX_LAZYAPP_OFF_ARG1) = arg1;
+    *(Value *)((char *)mem + ASNIX_LAZYAPP_OFF_ARG2) = (Value){ .raw = 0 }; /* "no arg2" sentinel */
+    return (Value){ .raw = (uint64_t)(uintptr_t)mem | ASNIX_TAG_PTR };
+}
+
+Value asnix_make_lazyapp2(Value fn, Value arg1, Value arg2) {
+    void *mem = asnix_arena_alloc(ASNIX_LAZYAPP_SIZE);
+    asnix_stats_lazyapp++;
+    *(int64_t *)((char *)mem + ASNIX_LAZYAPP_OFF_MARKER) = ASNIX_LAZYAPP_MARKER;
+    *(Value *)((char *)mem + ASNIX_LAZYAPP_OFF_FN) = fn;
+    *(Value *)((char *)mem + ASNIX_LAZYAPP_OFF_ARG1) = arg1;
+    *(Value *)((char *)mem + ASNIX_LAZYAPP_OFF_ARG2) = arg2;
+    return (Value){ .raw = (uint64_t)(uintptr_t)mem | ASNIX_TAG_PTR };
+}
+
+int asnix_value_is_lazyapp(Value v) {
+    if (asnix_tag_of(v) != ASNIX_TAG_PTR) return 0;
+    const char *base = (const char *)(v.raw & ~0x7ULL);
+    int64_t marker = *(const int64_t *)(base + ASNIX_LAZYAPP_OFF_MARKER);
+    return marker == ASNIX_LAZYAPP_MARKER || marker == ASNIX_LAZYAPP_FORCED_MARKER;
+}
+
+Value asnix_resolve_lazyapp(Value v) {
+    char *base = (char *)(v.raw & ~0x7ULL);
+    int64_t marker = *(int64_t *)(base + ASNIX_LAZYAPP_OFF_MARKER);
+    if (marker == ASNIX_LAZYAPP_FORCED_MARKER) {
+        return *(Value *)(base + ASNIX_LAZYAPP_OFF_RESULT);
+    }
+    Value fn = *(Value *)(base + ASNIX_LAZYAPP_OFF_FN);
+    Value arg1 = *(Value *)(base + ASNIX_LAZYAPP_OFF_ARG1);
+    Value arg2 = *(Value *)(base + ASNIX_LAZYAPP_OFF_ARG2);
+    Value result = (arg2.raw == 0) ? asnix_apply(fn, &arg1, 1) : asnix_bshared_apply2(fn, arg1, arg2);
+    /* Memoize in place -- see heap.h's comment for why this is safe to do
+     * unconditionally here (only ever reached after `fn` has already
+     * returned successfully; an exception unwinding past the two calls
+     * above never reaches this line at all, so there is no partial state
+     * to clean up). */
+    *(int64_t *)(base + ASNIX_LAZYAPP_OFF_MARKER) = ASNIX_LAZYAPP_FORCED_MARKER;
+    *(Value *)(base + ASNIX_LAZYAPP_OFF_RESULT) = result;
+    return result;
+}
+
 /* Shared by asnix_add_values/asnix_sub_values/asnix_mul_values/
  * asnix_div_values/the four asnix_cmp_*_values functions below: real
  * Nix promotes an int operand to float whenever the OTHER operand is

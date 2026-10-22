@@ -88,6 +88,39 @@ Value *asnix_cell_target(Value v);
  * for any other non-Cell value). */
 Value asnix_resolve_cell_chain(Value v);
 
+/* LazyApp (M113): see heap.h's ASNIX_LAZYAPP_MARKER comment for the full
+ * rationale -- a purely-internal "run `fn arg1[ arg2]` on demand,
+ * without allocating an Env or a Thunk" device, used by `map`
+ * (builtins_list.c)/`mapAttrs` (builtins_attrs.c)/`zipAttrsWith`
+ * (builtins_m54.c) in place of the old asnix_bshared_make_lazy_call1/
+ * _call2. `asnix_make_lazyapp1` is `map`'s single-argument `fn arg1`
+ * case; `asnix_make_lazyapp2` is the curried `(fn arg1) arg2` case
+ * (`fn name value`) `mapAttrs`/`zipAttrsWith` need. */
+Value asnix_make_lazyapp1(Value fn, Value arg1);
+Value asnix_make_lazyapp2(Value fn, Value arg1, Value arg2);
+
+/* True iff `v` is an ASNIX_TAG_PTR object storing a LazyApp (either
+ * sub-state -- see heap.h's ASNIX_LAZYAPP_MARKER/ASNIX_LAZYAPP_FORCED_
+ * MARKER). False for any other tag, including String/Path/Float/Cell. */
+int asnix_value_is_lazyapp(Value v);
+
+/* The shared "run it (or return the already-cached result)" step,
+ * called from each force chokepoint (force.S, op_var_ref.S,
+ * op_select.S, op_select_or.S, op_with.S's OP_WITH_TRY) once it's
+ * already established `v` IS a LazyApp (either marker). Mirrors
+ * asnix_resolve_cell_chain's role for Cell, with one difference: this
+ * does exactly ONE step (compute-and-memoize-if-unresolved, or just
+ * read back the cached result if already resolved) rather than
+ * looping internally -- the result may itself still be an unforced
+ * Thunk/Cell/LazyApp (the same "lazy native primop passthrough" case
+ * M23's force.S comment already documents for Thunk), so the CALLER's
+ * own resolve loop is what re-dispatches on it, exactly as it already
+ * does for asnix_resolve_cell_chain's own return value. See heap.h's
+ * own comment for why this deliberately has no bespoke IN_PROGRESS/
+ * blackhole or FAILED/memoized-failure handling the way Thunk's
+ * four-state machine does. */
+Value asnix_resolve_lazyapp(Value v);
+
 /* Returns a pointer to the raw bytes (NOT NUL-terminated either way) and
  * length of an ASNIX_TAG_PTR value, whichever of the two kinds (String or
  * Path) it actually is -- for callers (printing, hashing, ...) that just

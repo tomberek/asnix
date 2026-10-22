@@ -59,7 +59,8 @@
 #include "asnix/heap.h"
 #include "asnix/ir.h"
 #include "asnix/value.h"
-#include "builtins_shared.h" /* asnix_bshared_make_lazy_call1 -- see prim_map_stage2's comment */
+#include "builtins_shared.h"
+#include "value_util.h" /* asnix_make_lazyapp1 -- see prim_map_stage2's comment */
 
 /* Plain, non-capturing PrimOp (ASNIX_PRIMOP_SIZE bytes, heap.h). */
 static Value make_primop0(void *fn, int64_t arity) {
@@ -167,8 +168,10 @@ static Value apply2(Value fn, Value a, Value b) {
  * printing difference), found via numtide/nix-conformance's
  * eval-okay-intersectAttrs.nix exposing the identical bug in `mapAttrs`
  * (see builtins_attrs.c's own fix). Each element is now a genuinely
- * lazy Thunk (asnix_bshared_make_lazy_call1, builtins_shared.c) instead
- * of an already-computed Value. */
+ * lazy value instead of an already-computed one -- M117: a LazyApp
+ * (asnix_make_lazyapp1, value_util.c), not a Thunk+Env pair the way
+ * asnix_bshared_make_lazy_call1 (removed) used to build -- see heap.h's
+ * ASNIX_LAZYAPP_MARKER comment for the full rationale. */
 static Value prim_map_stage2(const Value *args, int64_t argc) {
     (void)argc;
     Value f = self_captures(args)[0];
@@ -179,7 +182,7 @@ static Value prim_map_stage2(const Value *args, int64_t argc) {
 
     Value *out = count > 0 ? malloc((size_t)count * sizeof(Value)) : NULL;
     for (int64_t i = 0; i < count; i++) {
-        out[i] = asnix_bshared_make_lazy_call1(f, elems[i]);
+        out[i] = asnix_make_lazyapp1(f, elems[i]);
     }
     Value result = make_list(count, out);
     free(out);

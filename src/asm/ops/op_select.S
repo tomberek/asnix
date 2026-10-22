@@ -178,7 +178,7 @@ asnix_op_select:                        // a = symbol id; pops an attrset, pushe
     andq $-8, %r8                        // r8 = masked base pointer
     movq ASNIX_CELL_OFF_MARKER(%r8), %r9
     cmpq $ASNIX_CELL_MARKER, %r9
-    jne .Lselect_push                    // PTR but not a Cell (String/Path/Float): a real value
+    jne .Lselect_check_lazyapp           // PTR but not a Cell -- maybe a LazyApp instead
 
     // It's a Cell -- see op_var_ref.S's matching comment on
     // asnix_resolve_cell_chain (value_util.c).
@@ -188,6 +188,24 @@ asnix_op_select:                        // a = symbol id; pops an attrset, pushe
     call asnix_resolve_cell_chain
     popq %rdi                            // restore ENV
     popq %rsi                            // restore IP
+    jmp .Lselect_resolve
+
+    // M113: not a Cell either -- maybe a LazyApp (heap.h's
+    // ASNIX_LAZYAPP_MARKER comment). %r9 already holds the marker value
+    // from the Cell check just above -- see op_var_ref.S's matching
+    // comment.
+.Lselect_check_lazyapp:
+    cmpq $ASNIX_LAZYAPP_MARKER, %r9
+    je .Lselect_lazyapp
+    cmpq $ASNIX_LAZYAPP_FORCED_MARKER, %r9
+    jne .Lselect_push                    // PTR but not Cell/LazyApp (String/Path/Float): a real value
+.Lselect_lazyapp:
+    pushq %rsi
+    pushq %rdi
+    movq %rax, %rdi                      // arg1 = the LazyApp value
+    call asnix_resolve_lazyapp
+    popq %rdi
+    popq %rsi
     jmp .Lselect_resolve
 .Lselect_push:
     ASNIX_CHECK_VALSTACK %rcx
