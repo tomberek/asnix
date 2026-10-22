@@ -443,14 +443,26 @@ Value asnix_coerce_to_string_for_derivation(Value v) {
             free(nul_terminated);
             return out;
         }
-        struct stat st;
-        if (lstat(nul_terminated, &st) != 0) {
-            fprintf(stderr, "asnix: path '%s' does not exist\n", nul_terminated);
-            free(nul_terminated);
-            exit(1);
-        }
+        /* Perf follow-up (strace-driven, nar.h's own comment): skip the
+         * existence-check `lstat` entirely when this exact literal path
+         * was already successfully copied earlier in this process -- the
+         * `asnix_copy_path_to_store` call below would just hit its own
+         * cache anyway, so the `lstat` above would be pure syscall
+         * overhead repeated on every one of this path's (frequently
+         * thousands of) call sites. */
+        const char *already = asnix_copy_path_to_store_cache_lookup(nul_terminated);
         char store_path[300];
-        asnix_copy_path_to_store(nul_terminated, store_path, sizeof(store_path));
+        if (already) {
+            snprintf(store_path, sizeof(store_path), "%s", already);
+        } else {
+            struct stat st;
+            if (lstat(nul_terminated, &st) != 0) {
+                fprintf(stderr, "asnix: path '%s' does not exist\n", nul_terminated);
+                free(nul_terminated);
+                exit(1);
+            }
+            asnix_copy_path_to_store(nul_terminated, store_path, sizeof(store_path));
+        }
         free(nul_terminated);
         Value out = asnix_make_string_value(store_path, strlen(store_path));
         AsnixStringContext ctx;
@@ -578,7 +590,15 @@ static Value coerce_to_string_for_interp(Value v, int check_path_exists, int cop
             char *nul_terminated = malloc((size_t)len + 1);
             memcpy(nul_terminated, bytes, (size_t)len);
             nul_terminated[len] = '\0';
-            if (check_path_exists) {
+            /* Perf follow-up (strace-driven, nar.h's own comment): when
+             * this call is also going to copy-to-store (below) and this
+             * exact literal path was already copied earlier in this
+             * process, skip the existence-check `lstat` -- the copy
+             * below will just hit its own cache, so a successful earlier
+             * copy already proves the path exists; re-`lstat`-ing it on
+             * every one of its (frequently thousands of) call sites is
+             * pure syscall overhead. */
+            if (check_path_exists && !(copy_to_store && asnix_copy_path_to_store_cache_lookup(nul_terminated))) {
                 struct stat st;
                 if (lstat(nul_terminated, &st) != 0) {
                     fprintf(stderr, "asnix: path '%s' does not exist\n", nul_terminated);

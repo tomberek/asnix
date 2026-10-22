@@ -47,6 +47,25 @@
  */
 void asnix_copy_path_to_store(const char *path, char *out, size_t out_cap);
 
+/* Perf follow-up (strace-driven): the SAME local path (e.g. nixpkgs's
+ * `pkgs/stdenv/generic/source-stdenv.sh`/`default-builder.sh`, referenced
+ * as a Path literal inside `make-derivation.nix`'s body) is coerced fresh
+ * on every single `stdenv.mkDerivation` call reachable from a build --
+ * thousands of times for one real-world eval (measured: 4616/2587/1945
+ * redundant `lstat`s for those three files alone building ffmpeg from
+ * nixpkgs). `asnix_copy_path_to_store` above already memoizes the actual
+ * NAR-hash+copy work by literal path, but every CALLER still pays an
+ * unconditional `lstat` of its own first (the `check_path_exists`
+ * existence check, value_util.c) before ever reaching that memoized
+ * function -- so the cache hit happens too late to save the syscall.
+ * This exposes a read-only lookup into that same cache so a caller can
+ * skip its own redundant existence-check `lstat` when the path was
+ * already successfully copied earlier in this process (existence can't
+ * change mid-run for a path this project only ever reads, never writes).
+ * Returns the cached store path (NUL-terminated, owned by this module,
+ * valid for the process lifetime) or NULL on a cache miss. */
+const char *asnix_copy_path_to_store_cache_lookup(const char *path);
+
 /* M80: per-entry predicate for `asnix_copy_path_to_store_ext` below --
  * `builtins.path`'s `filter`/`builtins.filterSource`'s own callback,
  * one layer removed from any actual Nix `Value`/`asnix_apply` (this

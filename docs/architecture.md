@@ -13553,3 +13553,42 @@ for follow-on work, not forgotten**:
   were all investigated and ruled out as contributing to the gap (asnix's
   own bare-startup latency is already 10-30x FASTER than iets's, if
   anything an argument in asnix's favor, not a lead).
+
+## M124: cache-aware existence-check skip for repeated Path-literal coercion (`asnix_copy_path_to_store`)
+
+A second fix from the same cross-evaluator speed investigation (M123),
+found via a full syscall path trace: the SAME local path (e.g. nixpkgs's
+`pkgs/stdenv/generic/source-stdenv.sh`/`default-builder.sh`, referenced as
+a Path literal inside `make-derivation.nix`'s body) is coerced fresh on
+every single `stdenv.mkDerivation` call reachable from a build -- measured
+directly: 4,616/2,587/1,945 redundant `lstat`s for just those three files
+building ffmpeg from real nixpkgs. `asnix_copy_path_to_store` (`nar.c`)
+already memoizes the actual NAR-hash+copy work by literal path, but every
+CALLER (`value_util.c`'s `asnix_coerce_to_string_for_derivation` and
+`coerce_to_string_for_interp`) still paid its own unconditional existence-
+check `lstat` first, before ever reaching that memoized function -- so the
+cache hit happened too late to save the syscall.
+
+**The fix**: a new read-only lookup, `asnix_copy_path_to_store_cache_
+lookup` (`nar.c`/`nar.h`), exposes the SAME cache `asnix_copy_path_to_
+store` already maintains, letting a caller skip its own redundant
+existence-check `lstat` when the exact literal path was already
+successfully copied earlier in this process -- existence can't change
+mid-run for a path this project only ever reads, never writes. Both call
+sites in `value_util.c` now check the cache first and only fall back to a
+real `lstat` on a cache miss (preserving the original behavior exactly
+for `check_path_exists=1, copy_to_store=0`, where there's no copy-cache
+to consult in the first place).
+
+**Measured**: combined with M123's own `readDir` `d_type` fix,
+`newfstatat` drops to 2,772 -- a 9.2x reduction off the original 25,388,
+closing nearly all of the stat-count gap against the comparison
+evaluator's own 6,326.
+
+**Verified**: `make test`/`test-e2e`/`test-conformance` all green. `make
+test-nix-conformance`: `pass=655 fail=3 skip=148` (same 3 pre-existing
+pos-tracking failures). `make test-nixpkgs-hash`: `pass=148 fail=0` (one
+transient `gnutar.outPath(crash)` on a run taken under heavy concurrent-
+agent machine load -- reproduced clean standalone and on a full rerun,
+this session's familiar contention-flakiness pattern). Output hash on
+`d.nix` (ffmpeg's closure) unchanged.

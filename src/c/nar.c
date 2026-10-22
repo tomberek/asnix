@@ -215,6 +215,10 @@ static void copy_cache_insert(const char *path, const char *result) {
     g_copy_cache_count++;
 }
 
+const char *asnix_copy_path_to_store_cache_lookup(const char *path) {
+    return copy_cache_find(path);
+}
+
 void asnix_copy_path_to_store(const char *path, char *out, size_t out_cap) {
     const char *cached = copy_cache_find(path);
     if (cached) {
