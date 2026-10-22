@@ -7,6 +7,7 @@
 #include "asnix/arena.h"
 #include "asnix/heap.h"
 #include "asnix/ir.h"
+#include "asnix/irpass.h"
 #include "asnix/stats.h"
 #include "asnix/value.h"
 #include "builtins_shared.h" /* M57i: asnix_bshared_attrs_* / make_attrs, CLI --arg/-A support */
@@ -581,6 +582,11 @@ static Value auto_call(Value fn, const CliArg *args, size_t nargs) {
 
 int main(int argc, char **argv) {
     asnix_arena_init(0);
+    /* M118: opt-in bytecode-to-bytecode pass pipeline, same
+     * env-var-flag convention as ASNIX_SHOW_STATS below -- off by
+     * default, so this changes nothing about a normal run. See
+     * asnix/irpass.h. */
+    if (getenv("ASNIX_IR_OPT")) asnix_irpass_register_cfold();
 
     const char *file_path = NULL;
     const char *attrpath = NULL;

@@ -12950,3 +12950,113 @@ just style -- a hand-rolled Env outside the dedicated arena can't be
 correctly compressed if anything ever points `up` at it), plus
 `tests/asm/test_env.c`'s one direct `up`-comparison check updated for
 the new compressed representation.
+
+## M120: a bytecode-to-bytecode optimization-pass framework, plus one proof-of-concept pass (int constant folding)
+
+Directive: now that this project has a real compiled bytecode format (the
+flat, fixed-width `IrOp` stream, ir.h) and a companion decoder (`irdump`,
+M99), can a proper optimizing compiler be layered on top of it -- and can
+testing/verifying such transformations be made systematic rather than
+ad hoc? This milestone builds the framework and one small, honest example
+pass to prove it end to end; it does NOT attempt a bytecode->assembly JIT
+(scope note at the end).
+
+**Design**: `include/asnix/irpass.h` + `src/c/irpass.c`. A pass is
+`int (*)(IrOp *ops, size_t *len)`, registered via `asnix_irpass_register`,
+run to a fixpoint by `asnix_irpass_run` -- which `ib_finish()` (irbuild.c)
+now calls unconditionally, immediately before its own `ir_link()`. With
+ZERO passes registered (every normal build/run, including the shipped
+`asnix` binary with no env var set), this is a no-op -- `ib_finish()`'s
+behavior is byte-for-byte identical to before this milestone. A pass
+becomes live only by explicit registration (a test harness, or
+`ASNIX_IR_OPT=1` -- same opt-in-env-var convention as `ASNIX_SHOW_STATS`,
+wired into both `main.c` and `irdump.c`). Because `ib_finish()` is the one
+chokepoint every `IrBuilder` in this codebase goes through (the top-level
+program, every lambda body, every thunk body -- each its own builder
+instance), registering a pass covers the WHOLE compiled program tree with
+no change needed at any of `compiler.c`'s many call sites.
+
+**The one real design problem this framework had to solve**: the IR is
+flat and fixed-width with RELATIVE BYTE-DELTA jumps (`OP_IF`/`OP_JMP`/
+`OP_WITH_TRY`/`OP_SELECT_OR`/`OP_SELECT_DYNAMIC_OR` -- exhaustive, per
+ir.h's own per-op comments), so removing ops to shrink the stream means
+every jump elsewhere in the program -- including ones compiled long before
+the removed region and targeting long after it -- must have its delta
+recomputed, or it silently lands on the wrong instruction. `asnix_irpass_
+remove(ops, len, start, count)` is the one shrink primitive every pass
+uses: it verifies no live jump's target falls INSIDE the removed range
+(fatal if one does -- a pass may only remove self-contained,
+unreferenced sequences), then re-derives every jump's old absolute
+position/target via the inverse of the memmove, and rewrites each delta
+to point at the same logical op in the new, shorter array.
+
+**Proof-of-concept pass** (`src/c/irpass_examples.c`,
+`asnix_irpass_register_cfold`): folds `OP_PUSH_INT a; OP_PUSH_INT b;
+OP_<binop>` into one `OP_PUSH_INT`/`OP_PUSH_TRUE`/`OP_PUSH_FALSE`, for
+ADD/SUB/MUL/DIV and all 6 comparisons -- 3 ops down to 1, net -2 per fold.
+`compiler.c` does no AST-level constant folding of any kind today
+(grepped directly -- confirmed), so this is also the first arithmetic
+constant-folding this project has, not just a bytecode-level backstop for
+an existing fold. DIV skips folding when the divisor is 0 (must still
+reach the runtime op and abort with "division by zero") or the pair is
+`(INT64_MIN, -1)` (would be signed-overflow UB to fold).
+
+**`irdump` extended** to take the same `ASNIX_IR_OPT=1` flag, so a before/
+after diff is one command each:
+```
+./irdump file.nix > before.txt
+ASNIX_IR_OPT=1 ./irdump file.nix > after.txt
+diff before.txt after.txt
+```
+Verified visually on `if (1 + 2) == 3 then "yes-" + (if (10 - 3) > (2 * 2)
+then "a" else "b") else "no"`: 22 ops -> 12 ops, every `IF`/`JMP` target
+correctly re-pointed at the same logical destination in the shrunk stream.
+
+**Verified for correctness, not just this one fixture**: diffed
+`ASNIX_IR_OPT=1` vs. unset output (stdout + exit code) across every
+`tests/e2e`/`tests/conformance` fixture (308, 0 divergences) and the FULL
+numtide/nix-conformance corpus (806 files: `eval-okay-*`/`eval-fail-*`, 0
+real divergences -- 3 initial mismatches were traced to transient,
+load-induced flakiness under this session's own heavy concurrent-agent
+contention, confirmed by direct, repeated, isolated reruns producing
+identical output both ways every time). `make test-nixpkgs-hash`:
+`pass=148 fail=0` both with and without the flag, output hash on
+`d.nix` (ffmpeg.outPath) unchanged either way.
+
+**Honest measured impact on `d.nix`** (`perf stat -r 3`, `cpu_core`
+instructions): 10,861,185,514 -> 10,919,663,525, i.e. flat within this
+measurement's own ~0.66% run-to-run noise -- no detectable real win.
+Expected, not a bug: real nixpkgs source has very few LITERAL
+adjacent-int-constant arithmetic expressions for this specific pass to
+find (nixpkgs's actual numeric values overwhelmingly come from parsed
+config/version strings and runtime computation, not bare `1 + 2`-shaped
+source text) -- the same "high raw hit count, small real-workload
+effect" pattern M116's curried-native fusion work already found and
+documented for a different reason (alias indirection there; source-text
+scarcity here). This milestone's deliverable is the FRAMEWORK and its
+verification method, not a performance claim from this one example pass.
+
+**Scope note, deliberately not attempted here: bytecode -> native
+assembly.** The directive asked about this too. `ir_link()` already
+proves every op dispatches through a real function-pointer jump table
+(`asnix_handler_table`), and each op's semantics live in a small,
+self-contained `.S` handler -- in principle a JIT backend could walk the
+same op stream this framework already walks and emit the SAME handler
+bodies' instructions inlined back-to-back (eliding the jump-table
+indirection itself) instead of rewriting `IrOp` records, slotting in as
+another kind of "pass" alongside this one. But this is a qualitatively
+larger undertaking, not attempted here: it would need an executable
+memory allocator (mmap+mprotect, nothing like this exists yet),
+register-allocation decisions for values this interpreter currently keeps
+on an explicit stack/pointer-chased Env (a real redesign question, not a
+mechanical translation), and correctness verification at a much finer
+grain (comparing emitted machine code's behavior, not just an IR
+rewrite's). Flagged as a real, larger follow-on -- deliberately scoped
+out rather than attempted partially, matching this project's own standing
+discipline (M100/M106's own "measured and rejected" relative-addressing
+work is the precedent for not building something whose cost is clear but
+whose payoff isn't yet measured).
+
+Files: `include/asnix/irpass.h`, `src/c/irpass.c`, `src/c/irpass_
+examples.c`, `src/c/irbuild.c` (one line in `ib_finish`), `src/c/main.c`
+(`ASNIX_IR_OPT` flag), `src/c/irdump.c` (same flag).

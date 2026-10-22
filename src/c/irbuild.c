@@ -2,6 +2,8 @@
 
 #include <stdlib.h>
 
+#include "asnix/irpass.h"
+
 IrBuilder *ib_new(void) {
     IrBuilder *b = calloc(1, sizeof(IrBuilder));
     return b;
@@ -254,6 +256,10 @@ size_t ib_select_or(IrBuilder *b, uint32_t sym) {
 }
 
 IrProgram *ib_finish(IrBuilder *b) {
+    /* M118: opt-in bytecode-to-bytecode pass pipeline (asnix/irpass.h) --
+     * a no-op (0 passes registered) in every normal build/run, so this
+     * line changes nothing by default; see that header's own comment. */
+    asnix_irpass_run(b->ops, &b->len);
     ir_link(b->ops, b->len);
     /* M86 perf: ops/pool are handed to `prog`, which lives for the rest
      * of the process (every compiled function/thunk keeps its own

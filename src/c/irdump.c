@@ -25,6 +25,7 @@
 
 #include "asnix/arena.h"
 #include "asnix/ir.h"
+#include "asnix/irpass.h"
 #include "asnix/value.h"
 #include "compiler.h"
 #include "lexer.h"
@@ -224,6 +225,18 @@ int main(int argc, char **argv) {
         return 1;
     }
     asnix_arena_init(0);
+    /* M118: same opt-in flag as main.c/ASNIX_SHOW_STATS -- set it to dump
+     * the bytecode AFTER the pass pipeline instead of before (compiler.c's
+     * asnix_compile ultimately goes through ib_finish() either way, so
+     * this one flag affects every nested lambda/thunk body too, exactly
+     * like it does for the real interpreter). Compare the two:
+     *   ./irdump file.nix > before.txt
+     *   ASNIX_IR_OPT=1 ./irdump file.nix > after.txt
+     *   diff before.txt after.txt */
+    if (getenv("ASNIX_IR_OPT")) {
+        asnix_irpass_register_cfold();
+        printf("(ASNIX_IR_OPT=1 -- showing bytecode AFTER the pass pipeline)\n");
+    }
 
     FILE *f = fopen(argv[1], "rb");
     if (!f) {
