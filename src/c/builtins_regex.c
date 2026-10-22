@@ -379,7 +379,7 @@ static Value groups_to_list_recomputed(const regmatch_t *pmatch, size_t nsub, co
  * Nix's own regex construction, which doesn't set multiline/dotall-excl
  * flags either -- verified `match "a.c" "a\nc"` == `[]`, i.e. matches).
  * --------------------------------------------------------------------- */
-static Value match2_impl(const Value *args, int64_t argc) {
+Value asnix_prim_match2_impl(const Value *args, int64_t argc) {
     (void)argc;
     int64_t plen, slen;
     const char *pbytes, *sbytes;
@@ -438,7 +438,7 @@ static Value match2_impl(const Value *args, int64_t argc) {
     free(subject);
     return result;
 }
-static Value build_match(void) { return asnix_bshared_make_curried_native((void *)match2_impl, 2); }
+static Value build_match(void) { return asnix_bshared_make_curried_native((void *)asnix_prim_match2_impl, 2); }
 
 /* ---------------------------------------------------------------------
  * builtins.split regex str -- finds every non-overlapping match of

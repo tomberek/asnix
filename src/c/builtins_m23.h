@@ -33,4 +33,11 @@ Value asnix_prim_toPath(const Value *args, int64_t argc);
 Value asnix_prim_getEnv(const Value *args, int64_t argc);
 Value asnix_prim_parseDrvName(const Value *args, int64_t argc);
 
+/* M110: exported so compiler.c's try_fused_native_call2 can fuse a
+ * statically-recognized, fully-saturated `builtins.intersectAttrs a b`
+ * call site into one direct native call -- see compiler.c's own
+ * comment. Ordinary force-by-default native, no special handling
+ * needed. */
+Value asnix_prim_intersectAttrs2_impl(const Value *args, int64_t argc);
+
 #endif /* ASNIX_BUILTINS_M23_H */

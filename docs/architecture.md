@@ -12409,3 +12409,124 @@ test-nix-conformance`: `pass=655 fail=3 skip=148`, identical to the
 pre-existing baseline (same 3 pos-tracking failures). `make
 test-nixpkgs-hash`: **`pass=148 fail=0`**, unchanged. `./asnix d.nix`
 output unchanged: `/nix/store/29iacg6h530yx7rxz4k1fhvi0kxxhsam-ffmpeg-9.0.1-bin`.
+
+## M116: generalizing the `builtins.elem a b` call-fusion peephole to the 4 next-highest-volume curried natives (`any`/`all`/`match`/`intersectAttrs`) -- and the real reason it barely moves the needle
+
+A prior session proved a narrower, compile-time-only alternative to the
+full `PrimOpApp`-style runtime redesign (explicitly ruled too large for
+one pass): a peephole, `try_fused_native_call2` (`compiler.c`), that
+recognizes the statically-verifiable shape `builtins.elem a b` (a
+literal, fully-saturated, unshadowed 2-arg call directly off `builtins`)
+and compiles one direct native call, skipping the curried native's own
+2 Closure/Env hops entirely. That prior pass scoped itself to `elem`
+alone and measured it firing only 10 times on `d.nix`'s real ffmpeg
+closure -- explicitly left extending to the other ~31 curried natives as
+a "documented, mechanically-clear follow-on," flagging the one real risk
+as each native's own forcing variant (noforce vs. force-by-default).
+
+**Measuring which natives actually matter first.** Rather than guess,
+this pass set a `gdb` breakpoint on each of the ~32 curried-native
+`*_impl` functions (`commands`/`silent`/`continue` on every hit) and ran
+the real `d.nix` workload once. Five natives dominate by a wide margin
+(next-highest, `compareVersions`, trails by 3x): `all` 18,151 hits,
+`any` 12,015, `match` 9,835, `elem` 7,825, `intersectAttrs` 7,763 --
+~86,000 combined, the large majority of all curried-native calls on this
+workload.
+
+**Generalizing the peephole.** `try_fused_native_call2` became
+table-driven (`FUSED_NATIVES_2[]`: name, native fn pointer, noforce
+flag), matching any of these 5 names off `builtins.<name>`. Reading
+op_call.S's own primop dispatch (`.Lop_call_is_primop`) clarified that
+the "noforce audit" the prior pass flagged as the main risk is actually
+*asymmetric* in difficulty, the opposite of what it looks like at first
+glance:
+- `elem` (NOFORCE) needs its own native impl to force exactly what the
+  ordinary curry chain would have forced by the time it got there (here,
+  only `list`, deliberately leaving `x` unforced for `eqValues`-style
+  slot-identity -- M92) -- a real, native-impl-specific fact that has to
+  be re-verified per native before reusing this path.
+- `any`/`all`/`match`/`intersectAttrs` (ordinary force-by-default) need
+  **no native-impl-specific handling at all**: op_call.S's own
+  post-dispatch force loop (M25/M30) already forces every argument
+  before calling ANY non-NOFORCE primop, fused or not -- minting an
+  ordinary (non-noforce) `PrimOp` via `asnix_bshared_make_primop` and
+  compiling the arguments exactly like any other ordinary call argument
+  (same `try_cell_ref`/`is_thunk_free_literal`/thunk fallback) reproduces
+  the curry chain's own forcing behavior automatically, for free. These
+  four were mechanically *simpler* to add correctly than `elem`'s own
+  case, not harder -- the one real risk surface is the AST-shape
+  recognition and shadow checks (unchanged, reused verbatim from the
+  `elem`-only pass), not the forcing semantics.
+
+`asnix_prim_{elem,any,all}2_impl` (`builtins_list2.c`),
+`asnix_prim_match2_impl` (`builtins_regex.c`), and
+`asnix_prim_intersectAttrs2_impl` (`builtins_m23.c`) were un-`static`'d
+and exported (each file's own header) so `compiler.c` can reference them
+directly, same mechanism the `elem`-only pass established.
+
+**Verified**: both shadow-check cases re-confirmed for all 4 new natives
+(`let builtins = { any = ...; }; in builtins.any ...` etc. -- each
+returns the user's own shadowed value, fusion correctly declines);
+basic correctness (`any (x: x>2) [1 2 3]`, `all (x: x>0) [1 2 3]`,
+`match "(f)(o+)" "foo"`, `intersectAttrs {a=1;b=2;} {b=20;c=30;}`) and
+laziness short-circuiting (`any`/`all` stop at the first
+deciding element, never evaluating a later `throw`) all match real Nix.
+`make test`/`make test-e2e`/`make test-conformance`: all green. `make
+test-nix-conformance`: `pass=655 fail=3 skip=148`, exact match to
+baseline (same 3 pre-existing pos-tracking failures). `make
+test-nixpkgs-hash`: `pass=148 fail=0`. All of this re-verified a SECOND
+time in a completely isolated `git archive`'d clone with only this
+change's own patch applied (necessary -- see below), not just in the
+shared worktree.
+
+**Measured, and the real surprise.** Comparing against a *stale*
+baseline (captured earlier in this same session, before an unrelated
+concurrent M110 landed on this shared branch and changed the env count
+on its own) first appeared to show a dramatic ~192K-env reduction --
+actually almost entirely M114's own effect bleeding into the comparison,
+a measurement mistake caught by re-running both sides as a true paired
+comparison in a fresh `git archive`'d clone of the *current* HEAD, with
+only this change's patch applied on one side. The honest, isolated,
+paired numbers on `d.nix` (real nixpkgs's `ffmpeg.outPath`):
+- envs: 1,485,165 -> 1,482,777 (**-2,388, -0.16%**)
+- closures: 362,661 -> 361,467 (**-1,194, -0.33%**)
+- primops: 61,308 -> 61,332 (+24 -- one fresh `PrimOp` per distinct
+  *static* fused call site found across the whole evaluated closure, not
+  per dynamic call; confirms only 24 source locations in this entire
+  build matched the fused shape)
+- peak RSS: 624,016 -> 623,348 KB (-668 KB, -0.11%)
+- instructions (`perf stat -r 5`, pinned to one P-core to avoid this
+  machine's hybrid-core PMU split): 10,640,582,084 -> 10,644,376,814,
+  essentially flat (a tiny +0.036%, inside this measurement's noise
+  floor, not a regression signal)
+
+Real, but two orders of magnitude smaller than the ~86,000 raw call-hit
+count suggested. **Why**: real nixpkgs's `lib` does not call
+`builtins.<name>` directly at the use site for any of these 5 -- it
+re-exports each one through an alias binding first (`lib/lists.nix`:
+`any = builtins.any;`, `all = builtins.all;`; `lib/customisation.nix`:
+`inherit (builtins) intersectAttrs;`, used inside `callPackageWith` as
+the bare local name `intersectAttrs fargs autoArgs`, confirmed directly
+against the real nixpkgs checkout this project tests against). Every
+one of those call sites is a bare-variable application, not
+`builtins.<name> a b` -- a shape this peephole, by design, cannot and
+should not recognize (seeing through an alias to "this variable's value
+happens to be exactly `builtins.foo`" is a value-flow fact, not an
+AST-shape fact, and forcing it would need either real alias-tracking or
+the very `PrimOpApp` runtime redesign this whole approach exists to
+avoid). The 24 static matches that DO fire are the rare cases where
+nixpkgs source writes `builtins.<name>` out directly in place (e.g.
+`lib/trivial.nix`'s `match = builtins.match "..." str;`) rather than
+through `lib`'s own re-export layer -- real, but a small minority of
+this workload's actual call volume for these 5 natives.
+
+**Scope note for any future continuation**: this is the ceiling for a
+purely syntactic, compile-time-local peephole on real nixpkgs as
+written today -- not a bug in the implementation, a structural fact
+about how nixpkgs's `lib` exposes `builtins` (alias-first). Pushing
+this approach further (e.g. recognizing `let x = builtins.foo;` /
+`inherit (builtins) foo;` as a compile-time alias and fusing uses of `x`
+the same way) is a qualitatively different, larger change -- it
+requires tracking VALUE-level origin through a binding, not just
+AST shape at the call site -- deliberately not attempted here, flagged
+instead of forced, matching this change's own honest-scoping mandate.

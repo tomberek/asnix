@@ -22,4 +22,17 @@
 extern const AsnixBuiltinMiscDef ASNIX_LIST2_BUILTINS[];
 extern const size_t ASNIX_LIST2_BUILTINS_COUNT;
 
+#include "asnix/value.h" /* Value */
+#include <stdint.h>       /* int64_t */
+
+/* M110: exported so compiler.c's try_fused_native_call2 can fuse a
+ * statically-recognized, fully-saturated `builtins.<name> a b` call site
+ * into one direct native call, skipping the curried-native Closure/Env
+ * hops -- see compiler.c's own comment for the recognition + safety
+ * conditions. `elem`'s is NOFORCE (see its own comment above); `any`/
+ * `all` are ordinary force-by-default natives. */
+Value asnix_prim_elem2_impl(const Value *args, int64_t argc);
+Value asnix_prim_any2_impl(const Value *args, int64_t argc);
+Value asnix_prim_all2_impl(const Value *args, int64_t argc);
+
 #endif /* ASNIX_BUILTINS_LIST2_H */

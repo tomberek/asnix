@@ -53,7 +53,7 @@ static Value check_bool(Value v, const char *who) {
  * `*args[0]` to `eqValues` with no forcing of its own either, for the
  * identical reason. `list` (args[1]) must still be forced explicitly
  * here, since NOFORCE means NEITHER argument arrives pre-forced. */
-static Value elem2_impl(const Value *args, int64_t argc) {
+Value asnix_prim_elem2_impl(const Value *args, int64_t argc) {
     (void)argc;
     Value x = args[0];
     Value list = asnix_force_for_print(args[1]);
@@ -65,7 +65,7 @@ static Value elem2_impl(const Value *args, int64_t argc) {
     }
     return ASNIX_FALSE;
 }
-static Value build_elem(void) { return asnix_bshared_make_curried_native_noforce((void *)elem2_impl, 2); }
+static Value build_elem(void) { return asnix_bshared_make_curried_native_noforce((void *)asnix_prim_elem2_impl, 2); }
 
 /* ---------------------------------------------------------------------
  * any pred list / all pred list -- verified:
@@ -75,7 +75,7 @@ static Value build_elem(void) { return asnix_bshared_make_curried_native_noforce
  * [2 1 3]` succeeds on real Nix (stops at the first `true`, never reaches
  * the throwing element) -- confirmed directly before relying on it.
  * --------------------------------------------------------------------- */
-static Value any2_impl(const Value *args, int64_t argc) {
+Value asnix_prim_any2_impl(const Value *args, int64_t argc) {
     (void)argc;
     Value pred = args[0], list = args[1];
     ASNIX_REQUIRE_LIST(list, "any");
@@ -87,9 +87,9 @@ static Value any2_impl(const Value *args, int64_t argc) {
     }
     return ASNIX_FALSE;
 }
-static Value build_any(void) { return asnix_bshared_make_curried_native((void *)any2_impl, 2); }
+static Value build_any(void) { return asnix_bshared_make_curried_native((void *)asnix_prim_any2_impl, 2); }
 
-static Value all2_impl(const Value *args, int64_t argc) {
+Value asnix_prim_all2_impl(const Value *args, int64_t argc) {
     (void)argc;
     Value pred = args[0], list = args[1];
     ASNIX_REQUIRE_LIST(list, "all");
@@ -101,7 +101,7 @@ static Value all2_impl(const Value *args, int64_t argc) {
     }
     return ASNIX_TRUE;
 }
-static Value build_all(void) { return asnix_bshared_make_curried_native((void *)all2_impl, 2); }
+static Value build_all(void) { return asnix_bshared_make_curried_native((void *)asnix_prim_all2_impl, 2); }
 
 /* ---------------------------------------------------------------------
  * concatMap f list -- verified: `builtins.concatMap (x: [x x]) [1 2 3]`

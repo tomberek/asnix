@@ -355,7 +355,7 @@ static Value build_hashFile(void) { return asnix_bshared_make_curried_native((vo
  * walked: both inputs are sorted by symbol id, so walking either one
  * in order yields an output already sorted by symbol id (no re-sort
  * needed), and the emitted value always comes from e2 either way. */
-static Value intersectAttrs2_impl(const Value *args, int64_t argc) {
+Value asnix_prim_intersectAttrs2_impl(const Value *args, int64_t argc) {
     (void)argc;
     Value e1 = args[0], e2 = args[1];
     ASNIX_REQUIRE_ATTRS(e1, "intersectAttrs");
@@ -392,7 +392,7 @@ static Value intersectAttrs2_impl(const Value *args, int64_t argc) {
     return result;
 }
 static Value build_intersectAttrs(void) {
-    return asnix_bshared_make_curried_native((void *)intersectAttrs2_impl, 2);
+    return asnix_bshared_make_curried_native((void *)asnix_prim_intersectAttrs2_impl, 2);
 }
 
 /* ---------------------------------------------------------------------

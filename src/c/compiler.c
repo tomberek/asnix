@@ -576,6 +576,167 @@ static int is_thunk_free_literal(Ast *node) {
     }
 }
 
+static void compile_expr(IrBuilder *b, Ast *node, ScopeFrame *scope);
+
+/* M110: table-driven generalization of a prior session's single-case
+ * `builtins.elem a b` fusion proof-of-concept (see docs/architecture.md's
+ * own M110 entry for the full story, and that prior attempt's commit for
+ * the original single-native version). Measured directly on `d.nix`'s
+ * real ffmpeg closure, via a gdb breakpoint-hit-count pass over all ~32
+ * curried natives' own `*_impl` functions (not guessed): `all`/`any`/
+ * `match`/`elem`/`intersectAttrs` are, in that order, the five highest-
+ * volume curried-native calls by a wide margin (18151/12015/9835/7825/
+ * 7763 hits respectively, next-highest `compareVersions` at 2715) --
+ * together they account for the large majority of all curried-native
+ * calls observed. All five are arity-2.
+ *
+ * Each table entry's `noforce` flag must match the native's own build_*
+ * registration EXACTLY (`asnix_bshared_make_curried_native_noforce` vs.
+ * the ordinary `asnix_bshared_make_curried_native`) -- this is the one
+ * real risk surface a wrong fusion could introduce (a silently wrong
+ * VALUE, not a crash), not the AST-shape recognition itself:
+ *
+ * - `elem` (NOFORCE): its own curry chain reassembles both arguments
+ *   with `ib_var_ref_raw` (no forcing) and its native impl
+ *   (asnix_prim_elem2_impl) forces ONLY `list` (args[1]) itself, leaving
+ *   `x` (args[0]) deliberately unforced -- see that function's own M92
+ *   comment for why (`eqValues`-style slot-identity preservation). The
+ *   fused call site below compiles both arguments exactly like any other
+ *   ordinary call argument (the same try_cell_ref/is_thunk_free_literal/
+ *   thunk fallback every AST_APP case already uses) and mints the primop
+ *   via `asnix_bshared_make_primop_noforce` -- op_call.S's own dispatch
+ *   (see its M25/M30 comments) then skips its post-dispatch force loop
+ *   for a NOFORCE primop, so both arguments reach the native function
+ *   exactly as unforced as the original 2-hop chain would have delivered
+ *   them. Reusing this exact mechanism for a 3rd/4th/5th noforce native
+ *   would need the SAME audit of what, if anything, that native forces
+ *   manually -- not attempted here beyond `elem`, which was already
+ *   proven correct by the prior session's work.
+ *
+ * - `any`/`all`/`match`/`intersectAttrs` (ordinary force-by-default):
+ *   their own curry chains reassemble arguments with plain `ib_var_ref`
+ *   (forces on read) before the tail call into an ordinary (non-NOFORCE)
+ *   primop -- op_call.S's post-dispatch force loop then forces them
+ *   AGAIN there, redundantly but cheaply (asnix_force_for_print's fast
+ *   path on an already-forced Value is a single tag check). The fused
+ *   call site compiles both arguments the identical ordinary way (same
+ *   thunk-wrap fallback) and mints an ordinary (force) primop via
+ *   `asnix_bshared_make_primop` -- op_call.S's SAME force loop then does
+ *   the forcing exactly once, landing in the exact same already-forced
+ *   state the native impl always required. No native-impl-specific
+ *   handling needed at all for this group: the generic OP_CALL dispatch
+ *   already provides it, which is *why* these four were mechanically
+ *   simpler to add correctly than `elem`'s own NOFORCE case, not harder.
+ *
+ * Every other curried native (`foldl'`/`replaceStrings`/`attrByPath`,
+ * arity-3; `add`/`sub`/`mul`/`div`/`bitAnd`/`bitOr`/`bitXor`/
+ * `compareVersions`/`concatMap`/`genList`/`sort`/`partition`/`catAttrs`/
+ * `split`/`seq`/`deepSeq`/`hashFile`/`groupBy`/`zipAttrsWith`/
+ * `appendContext`/`scopedImport`/`unsafeGetAttrPos`/`filterAttrs`/
+ * `filterSource`) is deliberately left out of this table: the same gdb
+ * measurement found each of them individually orders of magnitude rarer
+ * on this real workload than the five included here (the very next
+ * busiest, `compareVersions`, at 2715 hits vs. `intersectAttrs`'s 7763),
+ * so extending further buys steadily less for the same per-native
+ * forcing-semantics audit cost -- not a correctness concern, just not
+ * where the measured volume is. */
+typedef struct {
+    const char *name;
+    size_t name_len;
+    void *fn;
+    int noforce;
+} FusedNative2;
+
+static const FusedNative2 FUSED_NATIVES_2[] = {
+    { "elem", 4, (void *)asnix_prim_elem2_impl, 1 },
+    { "any", 3, (void *)asnix_prim_any2_impl, 0 },
+    { "all", 3, (void *)asnix_prim_all2_impl, 0 },
+    { "match", 5, (void *)asnix_prim_match2_impl, 0 },
+    { "intersectAttrs", 15, (void *)asnix_prim_intersectAttrs2_impl, 0 },
+};
+#define FUSED_NATIVES_2_COUNT (sizeof(FUSED_NATIVES_2) / sizeof(FUSED_NATIVES_2[0]))
+
+/* Recognizes the literal 2-deep application shape `builtins.<name> a b`
+ * where `<name>` is one of FUSED_NATIVES_2 above, `builtins` resolves
+ * lexically to the genuine root ScopeFrame (not shadowed by a user's own
+ * `let builtins = ...;`), and the select itself is static (no `.${...}`,
+ * no `or` default) -- see the big comment above for the per-native
+ * forcing-semantics rationale, and the original single-native
+ * (`elem`-only) proof-of-concept this generalizes for the root-frame-
+ * shadow-check rationale (identical here, reusing the same
+ * scope_find_lexical + `.up == NULL` walk M92 established). On a match,
+ * compiles a direct N-arg native call -- skipping the curried native's
+ * own Closure/Env hops entirely -- instead of falling through to the
+ * ordinary AST_APP compilation of a (by now fully-collected) call. */
+static int try_fused_native_call2(IrBuilder *b, Ast *node, ScopeFrame *scope) {
+    if (node->kind != AST_APP) return 0;
+    Ast *inner = node->as.app.fn;
+    if (inner->kind != AST_APP) return 0;
+    Ast *sel = inner->as.app.fn;
+    /* All ~32 "curried native" builtins (elem, any, all, intersectAttrs,
+     * match, etc.) are reachable ONLY as `builtins.<name>` -- a bare
+     * `elem 1 2` with no local binding is "undefined variable" in this
+     * codebase (confirmed directly by a prior session's work) -- so the
+     * shape to recognize is AST_SELECT(AST_VAR("builtins"), name), not a
+     * bare AST_VAR. */
+    if (sel->kind != AST_SELECT) return 0;
+    if (sel->as.select.attr_expr != NULL) return 0; /* dynamic .${expr} -- not statically known */
+    if (sel->as.select.default_ != NULL) return 0;  /* `or` form -- different op entirely, skip */
+    Ast *builtins_var = sel->as.select.target;
+    if (builtins_var->kind != AST_VAR) return 0;
+    if (!name_eq(builtins_var->as.var.name, builtins_var->as.var.name_len, "builtins", 8)) return 0;
+
+    const FusedNative2 *entry = NULL;
+    for (size_t i = 0; i < FUSED_NATIVES_2_COUNT; i++) {
+        if (name_eq(sel->as.select.attr, sel->as.select.attr_len, FUSED_NATIVES_2[i].name,
+                    FUSED_NATIVES_2[i].name_len)) {
+            entry = &FUSED_NATIVES_2[i];
+            break;
+        }
+    }
+    if (entry == NULL) return 0;
+
+    int depth;
+    int64_t slot;
+    if (!scope_find_lexical(scope, builtins_var->as.var.name, builtins_var->as.var.name_len, &depth, &slot))
+        return 0;
+    ScopeFrame *f = scope;
+    for (int i = 0; i < depth; i++) f = f->up;
+    if (f->up != NULL) return 0; /* `builtins` itself shadowed by a real local binding -- don't fuse */
+
+    Ast *arg1 = inner->as.app.arg;
+    Ast *arg2 = node->as.app.arg;
+    /* Callee pushed FIRST, matching every other call site's own stack
+     * convention (compile_expr(fn) always runs before the argument is
+     * compiled -- see AST_APP's own code below) -- OP_CALL expects the
+     * callee beneath its arguments on VALSTACK, not above them. */
+    Value native_primop = entry->noforce ? asnix_bshared_make_primop_noforce(entry->fn, 2)
+                                          : asnix_bshared_make_primop(entry->fn, 2);
+    ib_push_const(b, (int64_t)native_primop.raw);
+    if (!try_cell_ref(b, arg1, scope)) {
+        if (is_thunk_free_literal(arg1)) {
+            compile_expr(b, arg1, scope);
+        } else {
+            IrBuilder *arg_b = ib_new();
+            compile_expr(arg_b, arg1, scope);
+            ib_ret(arg_b);
+            ib_mk_thunk(b, ib_finish(arg_b));
+        }
+    }
+    if (!try_cell_ref(b, arg2, scope)) {
+        if (is_thunk_free_literal(arg2)) {
+            compile_expr(b, arg2, scope);
+        } else {
+            IrBuilder *arg_b = ib_new();
+            compile_expr(arg_b, arg2, scope);
+            ib_ret(arg_b);
+            ib_mk_thunk(b, ib_finish(arg_b));
+        }
+    }
+    ib_call(b, 2);
+    return 1;
+}
+
 static void compile_expr(IrBuilder *b, Ast *node, ScopeFrame *scope) {
     switch (node->kind) {
         case AST_INT:
@@ -912,6 +1073,7 @@ static void compile_expr(IrBuilder *b, Ast *node, ScopeFrame *scope) {
             return;
         }
         case AST_APP: {
+            if (try_fused_native_call2(b, node, scope)) return;
             /* Real Nix call arguments are call-by-need, not call-by-
              * value: `(x: 1) (abort "never runs")` returns `1` without
              * ever evaluating the unused argument, and a lazy fixed
@@ -1207,7 +1369,7 @@ static void compile_expr(IrBuilder *b, Ast *node, ScopeFrame *scope) {
                 size_t hidden_count = 0;
                 for (size_t i = 0; i < n; i++) if (node->as.attrset.bindings[i].is_hidden) hidden_count++;
                 if (hidden_count == 0) {
-                    /* M110: the overwhelming common case -- no `inherit
+                    /* M114: the overwhelming common case -- no `inherit
                      * (expr) a b;` clause needs a shared hidden slot, so
                      * NOTHING here needs its own frame at all. Real Nix's
                      * own non-recursive ExprAttrs::eval (eval.cc, ~line
