@@ -14527,3 +14527,154 @@ touches every single `Ast*`-typed field across `ast.h`/`compiler.c`/
 every builtin that walks an AST) than this milestone's own bar for a
 same-session landing -- left as explicit, scoped-out future work rather
 than forced.
+
+## M132: initial capacities for `IrBuilder.ops`/`.pool` and the parser's growable vectors tuned 8/16->24, measured directly
+
+Continuing the M123/M128/M131 allocation-pattern sweep across lex/parse/
+compile, this milestone targets the one remaining class of leftover
+`realloc` traffic: every one of these vectors already amortizes to O(1)
+per push and (for the ones with a permanent-storage lifetime) already
+trims to exact final size before handoff -- the only thing left on the
+table is how many times each one actually pays a growth-realloc before
+reaching its real final size.
+
+**Measured** (temporary counter instrumentation, same convention M123
+used for the lexer's `TokVec` fix, removed before landing) across a real
+nixpkgs eval (`d.nix`, ffmpeg's closure, 1057 imported files):
+`IrBuilder.ops` (old cap 16): 585,631 builders created, averaging 5.3 ops
+each, but 30,367 (5.2%) exceeded 16 and paid a growth-realloc anyway.
+`IrBuilder.pool` (old cap 8): 80,658 growth-reallocs -- a much worse
+29%-of-pool-using-builders tail, since several of this project's own
+emitted-ops sequences (e.g. every `ib_lambda`/`ib_rec_overrides_merge`
+call) pack 2 pool entries per source construct. `AstVec`/`BindingVec`/
+`BTVec` (old cap 8, parser.c): 23-25% regrow rate, ~11-14K growth-
+reallocs each. `FormalVec` (old cap 8): 66% regrow rate, 13,806 growth-
+reallocs -- real nixpkgs package functions routinely declare well over 8
+named formals (e.g. `{ lib, stdenv, fetchurl, ... }:`), so this one was
+undersized even at the average, not just the tail. `AttrSegVec`/
+`PartVec`/`DynBindingVec`/`RawIndVec`: under 0.2% regrow at their
+existing caps -- confirmed not worth touching.
+
+**Fix**: raised the initial capacity to 24 (chosen by testing 16/24/32
+directly against the measured regrow counts and picking the point of
+diminishing returns, not just doubling blindly) for `src/c/irbuild.c`'s
+`ib_emit`/`ib_pool_add`, and for `src/c/parser.c`'s `SCRATCH_VEC` macro's
+own shared-buffer growth default (covering `astvec`/`partvec`/
+`attrsegvec`/`formalvec`/`rawind` uniformly -- harmless even for the
+already-fine `partvec`/`attrsegvec`/`rawind`, since `SCRATCH_VEC`'s
+buffer is pure transient scratch, always copied out to an exact-size
+allocation by `_commit`, never carried into permanent storage regardless
+of how generous the initial guess is) plus `bindingvec_push`/
+`btvec_push` (still their own independent per-node growable arrays, not
+converted to `SCRATCH_VEC` -- M131's own documented reason: non-LIFO,
+tree-shaped lifetime -- but `VEC_TRIM` still trims any slack from the
+bigger initial guess before permanent handoff, so this is also a pure
+realloc-count reduction, not a permanent-memory cost). Cut measured
+growth-reallocs by roughly 50-98% depending on vector (the worst
+offenders -- `pool`, `BindingVec`/`BTVec`, `FormalVec` -- saw the biggest
+cuts, matching their worse starting regrow rates).
+
+**Measured impact**: instruction count dropped ~0.14-0.15% consistently
+across 3 interleaved before/after `perf stat` pairs on the full `d.nix`
+eval (a precise, low-noise metric for this kind of change). Cycles/wall-
+clock did not move outside this shared machine's noise floor in either
+direction -- honestly reported rather than overclaimed. Unlike M123's
+`TokVec` fix (few but individually expensive large-buffer reallocs on a
+single growing vector per file), these are many independently cheap
+tiny-buffer reallocs spread across hundreds of thousands of short-lived
+`IrBuilder`/AST-vector instances, so the win is real but small.
+
+**Verified**: `make test`/`test-e2e`/`test-conformance` all green.
+`make test-nix-conformance`: `pass=655 fail=3 skip=148` (exact baseline
+match). `make test-nixpkgs-hash`: `pass=148 fail=0`. Output hash on
+`d.nix` (ffmpeg's closure) unchanged:
+`/nix/store/29iacg6h530yx7rxz4k1fhvi0kxxhsam-ffmpeg-9.0.1-bin`.
+
+**Declined**: eliminating each `IrBuilder`'s own *first* allocation
+(585,631 of them, unavoidable under the current per-instance malloc/
+realloc/free lifecycle) -- not fixable via capacity tuning at all; would
+need an inline-small-buffer or shared-arena redesign touching
+`irpass.c`'s in-place pool-mutation API and the builder lifetime model.
+Flagged below (M133) as a bigger, separately-scoped lever, not attempted
+here.
+
+Files: `src/c/irbuild.c` (`ib_emit`/`ib_pool_add` only), `src/c/
+parser.c` (`SCRATCH_VEC`'s growth default, `bindingvec_push`,
+`btvec_push`).
+
+## M133: lex/parse/compile speed sweep -- consolidated status and the honest overall verdict
+
+Closes out the M123/M128-M132 lex/parse/compile investigation with a
+single consolidated accounting, after merging all 4 landed fixes
+(lexer `CHAR_CLASS` table, M129; symtab `hash_bytes` word-at-a-time
+mixing, M130; AST-chunk malloc+lazy-zero plus the parser's
+`SCRATCH_VEC` rewrite, M131; growable-vector initial-capacity tuning,
+M132) into one tree and resolving the one real cross-branch conflict
+(two independently-dispatched investigations both touched `parser.c`'s
+growable-vector capacities -- one via a wholesale `SCRATCH_VEC` rewrite,
+the other via a direct cap-8-to-24 tuning of the pre-rewrite per-struct
+`_push` functions the first change deleted; reconciled by folding the
+cap-24 tuning into `SCRATCH_VEC`'s own growth default instead of keeping
+two incompatible vector implementations, per M132 above).
+
+**Ranked causes found this round, with status**:
+1. `AstChunk` `calloc`'d per-file but freed every file, paying a real
+   full-1MiB `memset` via glibc's dynamic mmap-threshold drift --
+   **FIXED** (M131).
+2. 5 parser vectors each malloc-from-empty per literal despite provably
+   LIFO lifetime -- **FIXED** (M131, `SCRATCH_VEC`).
+3. `path_char`/`uri_scheme_char`/etc. ran a full ctype-chain on every
+   token's leading character, not just real paths/URIs -- **FIXED**
+   (M129).
+4. `hash_bytes` was a fully serial byte-at-a-time multiply chain --
+   **FIXED** (M130).
+5. `IrBuilder.pool`/`.ops`, `FormalVec`, `AstVec`/`BindingVec`/`BTVec`
+   initial capacities too small for real nixpkgs shapes -- **FIXED**
+   (M132).
+6. `scope_find_lexical`'s linear linked-list/`memcmp` scan vs. a
+   hashmap-based scope lookup -- architecturally real, but measured
+   self-time only 0.40% of sampled cycles on this workload --
+   **PLANNED, NOT ATTEMPTED**.
+7. `compile_expr` (4.03% self-time) and `asnix_intern` (2.87%
+   self-time, called from `compiler.c` once per identifier occurrence)
+   driven by re-hashing identifier strings at compile time instead of
+   carrying interned `Sym`s on AST nodes from parse time, the way `iets`
+   (`~/gnix/iets/src/compile/mod.rs`) does -- the single largest lever
+   identified this round (~7% of sampled cycles combined), but touches
+   `ast.c`/`parser.c`/`compiler.c` simultaneously and needs a full
+   correctness audit of every `AST_VAR`/`AST_SELECT`/binding/formal
+   site -- **PLANNED, NOT ATTEMPTED**, flagged as its own dedicated
+   future milestone.
+8. `iets`'s lexer skips path/URI scanning entirely unless a cheap peek
+   suggests one might follow, instead of unconditionally running the
+   predicate chain on every token's leading character -- a real,
+   likely-larger lever on top of M129's own fix, but has a genuine
+   correctness edge case (URI schemes containing `.`/`+` aren't in
+   `ident_cont`'s character set) that needs targeted unit-test coverage
+   before landing -- **PLANNED, NOT ATTEMPTED**.
+9. `IrBuilder`'s malloc/realloc/free-per-instance lifecycle vs. `iets`'s
+   bump-`Arena` with in-place-extend-last-allocation -- real design gap,
+   but `irbuild.c`'s own allocation-site cycles are under 1% of total
+   process cycles, so porting this wouldn't move the needle --
+   **INVESTIGATED, RULED OUT**.
+10. A per-call `asnix_intern` lookup cache mirroring `iets`'s
+    `Interner::cache` -- declined, since `iets`'s cache exists to skip a
+    locked/sharded map and asnix's table is unlocked with only 0.609
+    extra probe steps/call at steady state -- **INVESTIGATED, RULED
+    OUT**.
+
+**Honest overall verdict**: the lex/parse/compile subtree is ~43.9% of
+total process cycles per M123's own breakdown; the 4 landed fixes' full-
+`d.nix` deltas (lexer -1.8% cycles, parser/AST -2.1% cycles, symtab
+-0.97%, allocation-cap tuning noise-level) sum to roughly a 3-4
+percentage-point cut of *total* process cycles -- something like an 8-
+10% cut of the subtree's own cost once overlap between the fixes is
+accounted for. Multiplicatively, this moves asnix from roughly 8x to
+roughly 7.2-7.5x slower per byte than `iets` on this phase: real,
+verified, zero-regression progress, but nowhere near closing the gap on
+its own. The two largest remaining levers (items 6+7 combined, Sym-
+carrying AST nodes plus hashmap-based scope resolution; and item 8, the
+lexer peek-guard) were both explicitly investigated and deliberately
+left for a dedicated future milestone, not because they were ruled out,
+but because each is a genuinely separate, riskier, multi-file change
+that does not fit this session's bar for a bounded, same-pass landing.
