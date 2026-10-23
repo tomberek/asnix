@@ -37,16 +37,31 @@ static int prefetch_enabled(void) {
 /* Arena-free: this file only ever runs small, one-shot, process-lifetime
  * allocations (cache directory path, hex key) -- plain malloc, freed
  * locally, same convention nar.c's own store-copy helpers use for
- * their own scratch buffers. */
+ * their own scratch buffers.
+ *
+ * Memoized like asnix_bytecode_cache_enabled() above: the env vars this
+ * reads (ASNIX_BYTECODE_CACHE_DIR/HOME) are fixed for the process
+ * lifetime, but every call site resolves one cache file per imported
+ * file, so without memoizing this re-reads both env vars and
+ * reallocates the path string once per import -- potentially thousands
+ * of times on a real nixpkgs eval. The returned pointer is now a
+ * process-lifetime singleton, never freed by the caller (see
+ * cache_file_path below, the only call site). */
 static char *cache_dir(void) {
+    static char *cached = NULL;
+    if (cached) return cached;
     const char *override = getenv("ASNIX_BYTECODE_CACHE_DIR");
-    if (override) return strdup(override);
+    if (override) {
+        cached = strdup(override);
+        return cached;
+    }
     const char *home = getenv("HOME");
     if (!home) home = "/tmp";
     size_t n = strlen(home) + strlen("/.cache/asnix/bytecode") + 1;
     char *p = malloc(n);
     snprintf(p, n, "%s/.cache/asnix/bytecode", home);
-    return p;
+    cached = p;
+    return cached;
 }
 
 static int errno_is_exist(void) {
@@ -96,11 +111,10 @@ static void path_hash_hex(const char *resolved_path, char out_hex[64]) {
 static char *cache_file_path(const char *resolved_path) {
     char hex[64];
     path_hash_hex(resolved_path, hex);
-    char *dir = cache_dir();
+    char *dir = cache_dir(); /* memoized singleton -- do not free */
     size_t n = strlen(dir) + 1 + 2 + 1 + 64 + 4 + 1;
     char *p = malloc(n);
     snprintf(p, n, "%s/%.2s/%.64s.abc", dir, hex, hex);
-    free(dir);
     return p;
 }
 
