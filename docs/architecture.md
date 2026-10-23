@@ -18247,3 +18247,102 @@ Files: `src/c/builtins_shared.c` (`attrs_find_flat_noresolve` moved
 above `asnix_bshared_attrs_find`; `asnix_bshared_attrs_find` rewritten to
 resolve once and delegate to `attrs_find_flat_noresolve`; no other
 function touched).
+
+## M160: `nar.c`'s `copy_cache_find` was a plain linear `strcmp` scan -- given the same open-addressing hash index fix `derivation.c`'s `input_ref_add_src`/`input_ref_add_built` already got for the identical shape of anti-pattern
+
+A profiling candidate flagged `nar.c:202-213`'s `copy_cache_find`/
+`copy_cache_insert` (backing `asnix_copy_path_to_store` and
+`asnix_copy_path_to_store_cache_lookup`, called from `value_util.c`'s
+Path coercion at lines 453 and 601) as a plain array + for-loop-of-
+`strcmp` memoization cache, re-scanning every previously-copied path
+from the start on every lookup -- an `O(n)` per-call / unbounded-growth-
+within-one-eval anti-pattern. Reading the code directly confirmed the
+candidate's own claim: this is the exact same shape of problem this
+file's neighbor, `derivation.c`'s `input_ref_add_src`/
+`input_ref_add_built` (lines ~549-608), already diagnosed and fixed with
+an open-addressing hash index keyed by a local `dcc_hash_str` -- that
+code's own comment explicitly calls out "the same shape of anti-pattern
+this file's `dcc_hash_str`/`DrvClosureStrSet` fix already addressed",
+but `copy_cache_find` in `nar.c` had never received the equivalent
+treatment. Distinct from `eval_file.c`'s `import_cache_find`, which M91
+explicitly checked and declined to fix (there, a cache MISS costs a full
+parse+compile+eval of the missed file, dwarfing any linear-scan
+overhead); here a miss only costs a NAR-dump-and-hash of a typically-
+small source path, so the "miss is expensive, don't bother" justification
+doesn't transfer and the scan's own cost is proportionally more visible.
+
+**The fix**: a local `copy_cache_hash_str` (the identical 8-bytes-at-a-
+time multiply-chain hash `derivation.c`'s `dcc_hash_str` uses, kept as
+its own separate static copy per this codebase's existing convention
+of each file owning its own small hash helper rather than sharing one
+across translation units -- `symtab.c`'s own, differently-named
+`hash_bytes` is the precedent), plus an open-addressing index
+(`g_copy_cache_index`/`COPY_CACHE_EMPTY_SLOT`, 3/4 load factor,
+doubling on growth) parallel to the existing `g_copy_cache` array,
+mirroring `derivation.c`'s `input_ref_srcs_index_rehash`/
+`input_ref_add_src` structure exactly (single-string key, this file's
+case is actually simpler than `input_ref_add_built`'s combined two-
+field key). `copy_cache_find` probes the index instead of scanning
+linearly; `copy_cache_insert` rehashes-then-appends, inserting the new
+entry's index into its hashed slot. No change to either function's
+public behavior or signature -- `asnix_copy_path_to_store`,
+`asnix_copy_path_to_store_cache_lookup`, and callers in `value_util.c`
+are untouched.
+
+**Correctness.** `make test` (all C/IR unit suites) green. `make
+test-e2e` all OK. `make test-conformance` all OK. `make test-nix-
+conformance NIX_CONFORMANCE_DIR=/tmp/nix-conformance`: exact baseline
+`pass=655 fail=3 skip=148` (the same 3 pre-existing position-tracking
+failures: `eval-okay-getattrpos-functionargs.nix`, `eval-okay-
+getattrpos.nix`, `eval-okay-inherit-attr-pos.nix`). `make test-nixpkgs-
+hash`: `pass=148 fail=0`. `./asnix d.nix` output byte-identical to the
+expected hash both before and after this change:
+`/nix/store/29iacg6h530yx7rxz4k1fhvi0kxxhsam-ffmpeg-9.0.1-bin`.
+
+**Measured, interleaved** (12 before/after pairs, `perf stat`,
+`taskset -c 0`, `cpu_core/instructions/`+`cpu_core/cycles/`, before and
+after binaries built from the exact same tree with/without this
+milestone's own diff via `git stash`/`git stash pop`, strictly
+alternating before/after/before/after..., output hash checked every
+trial):
+
+| | instructions (avg) | stdev |
+|---|---|---|
+| before | 6,538,635,962 | 2,492,984 |
+| after | 6,489,388,411 | 2,125,817 |
+| delta | -49,247,551 (-0.753%) | |
+
+Every single AFTER trial (12/12) landed below every single BEFORE
+trial's own tight band (BEFORE: 6,535.5M-6,546.0M; AFTER: 6,487.4M-
+6,494.7M) -- a clean, non-overlapping, repetition-independent win, with
+a delta (~49.2M instructions, -0.75%) more than 20 standard deviations
+wide relative to either side's own run-to-run noise, and slightly larger
+than the candidate's own ~40M/0.6% hypothesis (plausibly because the
+real nixpkgs/ffmpeg closure referenced noticeably more than the handful
+of distinct local-path references the hypothesis's own instrumentation
+run may have undercounted, or because removing the quadratic-shaped
+scan cost also removes some second-order cache-miss/branch overhead the
+raw strcmp-comparison count alone doesn't capture).
+
+**Shipped** because it is a strict, behavior-preserving simplification
+(same cache semantics, same two public entry points, zero new externally
+visible state) directly modeled on this project's own existing, already-
+proven fix for the identical anti-pattern one file over, with a clean
+and comfortably-above-noise measured win.
+
+**Independent verification.** A separate adversarial-verify pass fetched
+this commit into its own isolated worktree, confirmed the diff matches
+`derivation.c`'s existing `input_ref_add_src` pattern exactly (probes
+until match or empty slot; rehash preserves every entry by its path
+hash), re-ran the full correctness ladder fresh, and ran its own 20-trial
+interleaved measurement (fresh independent builds, no `stash`/`pop`
+reuse): instructions before (4c663df) avg 6,532,298,262 (stdev 711,504),
+after avg 6,482,325,287 (stdev 782,007), delta **-0.765%** (~50.0M
+instructions), 20/20 wins, fully non-overlapping (max(after) <
+min(before), >60 stdev separation) -- within ~1.6% relative of the
+-0.753% reported above, well inside tolerance. Verdict: CONFIRMED.
+
+Files: `src/c/nar.c` (`copy_cache_hash_str`, `COPY_CACHE_EMPTY_SLOT`,
+`g_copy_cache_index`/`copy_cache_index_rehash` added; `copy_cache_find`/
+`copy_cache_insert` rewritten to probe the index instead of scanning
+linearly).

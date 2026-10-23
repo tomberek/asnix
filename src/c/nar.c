@@ -199,19 +199,80 @@ typedef struct {
 static CopyCacheEntry *g_copy_cache = NULL;
 static size_t g_copy_cache_count = 0, g_copy_cache_cap = 0;
 
+/* perf: open-addressing dedup index parallel to g_copy_cache, same shape
+ * as derivation.c's input_ref_add_src/InputRefSet.srcs_index fix (which
+ * itself cites this exact anti-pattern) -- asnix_copy_path_to_store is
+ * called once per Path-coerced value across a whole eval (M80's
+ * `builtins.path`-shaped fixed-output formula plus every bare Path
+ * string-context element), so a linear strcmp scan here was O(n) per
+ * call / O(n^2) over one eval's full set of distinct copied paths. Local
+ * copy of derivation.c's dcc_hash_str (not shared via a header -- this
+ * file and derivation.c, and symtab.c's own separate hash_bytes, each
+ * keep their own copy of the same small hash already; pure
+ * internal bucket-placement hash, never persisted, so each copy is free
+ * to diverge). */
+static uint64_t copy_cache_hash_str(const char *s, size_t len) {
+    uint64_t h = 0;
+    size_t i = 0;
+    for (; i + 8 <= len; i += 8) {
+        uint64_t word;
+        memcpy(&word, s + i, 8);
+        h ^= word;
+        h *= 0x517cc1b727220a95ULL;
+    }
+    for (; i < len; i++) {
+        h ^= (uint64_t)(unsigned char)s[i];
+        h *= 0x517cc1b727220a95ULL;
+    }
+    h ^= h >> 30;
+    h *= 0xbf58476d1ce4e5b9ULL;
+    h ^= h >> 27;
+    h *= 0x94d049bb133111ebULL;
+    h ^= h >> 31;
+    return h;
+}
+
+#define COPY_CACHE_EMPTY_SLOT SIZE_MAX
+static size_t *g_copy_cache_index = NULL;
+static size_t g_copy_cache_index_cap = 0;
+
+static void copy_cache_index_rehash(size_t new_cap) {
+    size_t *new_table = malloc(new_cap * sizeof(size_t));
+    for (size_t i = 0; i < new_cap; i++) new_table[i] = COPY_CACHE_EMPTY_SLOT;
+    for (size_t i = 0; i < g_copy_cache_count; i++) {
+        size_t slot = copy_cache_hash_str(g_copy_cache[i].path, strlen(g_copy_cache[i].path)) & (new_cap - 1);
+        while (new_table[slot] != COPY_CACHE_EMPTY_SLOT) slot = (slot + 1) & (new_cap - 1);
+        new_table[slot] = i;
+    }
+    free(g_copy_cache_index);
+    g_copy_cache_index = new_table;
+    g_copy_cache_index_cap = new_cap;
+}
+
 static const char *copy_cache_find(const char *path) {
-    for (size_t i = 0; i < g_copy_cache_count; i++)
-        if (strcmp(g_copy_cache[i].path, path) == 0) return g_copy_cache[i].result;
-    return NULL;
+    if (g_copy_cache_index_cap == 0) return NULL;
+    size_t len = strlen(path);
+    size_t slot = copy_cache_hash_str(path, len) & (g_copy_cache_index_cap - 1);
+    for (;;) {
+        size_t idx = g_copy_cache_index[slot];
+        if (idx == COPY_CACHE_EMPTY_SLOT) return NULL;
+        if (strcmp(g_copy_cache[idx].path, path) == 0) return g_copy_cache[idx].result;
+        slot = (slot + 1) & (g_copy_cache_index_cap - 1);
+    }
 }
 
 static void copy_cache_insert(const char *path, const char *result) {
+    if (g_copy_cache_index_cap == 0) copy_cache_index_rehash(16);
+    else if ((g_copy_cache_count + 1) * 4 > g_copy_cache_index_cap * 3) copy_cache_index_rehash(g_copy_cache_index_cap * 2);
     if (g_copy_cache_count == g_copy_cache_cap) {
         g_copy_cache_cap = g_copy_cache_cap ? g_copy_cache_cap * 2 : 16;
         g_copy_cache = realloc(g_copy_cache, g_copy_cache_cap * sizeof(*g_copy_cache));
     }
     g_copy_cache[g_copy_cache_count].path = strdup(path);
     g_copy_cache[g_copy_cache_count].result = strdup(result);
+    size_t slot = copy_cache_hash_str(path, strlen(path)) & (g_copy_cache_index_cap - 1);
+    while (g_copy_cache_index[slot] != COPY_CACHE_EMPTY_SLOT) slot = (slot + 1) & (g_copy_cache_index_cap - 1);
+    g_copy_cache_index[slot] = g_copy_cache_count;
     g_copy_cache_count++;
 }
 
