@@ -16340,3 +16340,178 @@ Files: `src/c/attrs_update.c` (`asnix_attrs_eager_merge` only --
 `make_union_header`, `asnix_attrs_update`, `asnix_attrs_insert_dynamic`
 untouched), plus the new `tests/e2e/ops_update_large_merge.nix`/
 `.expected` fixture pair.
+
+## M146: mimalloc as a static-link-time process-wide allocator override -- tested for real (not assumed), then adopted
+
+A fresh `perf record -e cpu_core/instructions/,-c 10000,-g` instruction-
+sampled profile (NOT the usual `-F`-based time sampling, specifically to
+rank where INSTRUCTIONS, not cycles, are spent) categorized asnix's full
+~2.97B-instruction gap against `iets` (cold, `--impure --no-cache
+--workers 1`, real `d.nix`/ffmpeg eval) and found the allocator family
+(glibc's `_int_malloc`/`_int_realloc`/`cfree`/`unlink_chunk`/`calloc`,
+charged against `iets`'s own mimalloc) as the single largest named
+category: asnix 1,055,398,725 instructions (13.14% of its own total) vs.
+`iets`'s 292,372,016 (5.78% of its own) -- a 763,026,709-instruction gap,
+~9.5% of asnix's whole-program instruction count if mimalloc eliminated
+100% of it (the theoretical ceiling, not expected in practice). This is
+the user's own direct, explicit suggestion -- adopt mimalloc as asnix's
+allocator -- tested for real before committing to anything, per this
+milestone's own explicit two-step mandate.
+
+**Step 1: LD_PRELOAD ceiling check, no code change.** mimalloc was
+already present in the local Nix store at two versions (3.1.5, 3.5.1)
+plus a 3.5.3 resolved later via the flake's own pinned nixpkgs -- found
+via a scoped `find /nix/store -maxdepth 1 -iname "*mimalloc*"`, not an
+unscoped filesystem search. `nm -D libmimalloc.so` confirmed it exports
+standard-named `malloc`/`free`/`calloc`/`realloc`/`aligned_alloc`/
+`posix_memalign` directly (mimalloc's Unix build has override baked in
+by default -- confirmed directly, not assumed from documentation alone),
+so the plain (non-"-override"-suffixed) shared library intercepts the
+full malloc family with no special variant needed. A real gotcha hit and
+solved along the way: `LD_PRELOAD=<mimalloc.so> taskset -c 0 perf stat
+... ./asnix d.nix` initially FAILED -- `taskset`/`perf` themselves are
+dynamically linked against the system's own (older) glibc, and
+inheriting `LD_PRELOAD` through the `taskset -> perf -> asnix` exec chain
+preloaded mimalloc into `taskset`/`perf` too, which then pulled in the
+nix-store-pinned `libpthread.so.0`'s newer glibc-ABI symbol versions
+(`GLIBC_ABI_DT_X86_64_PLT`/`GLIBC_ABI_DT_RELR`) that the system loader
+resolving `taskset` itself doesn't provide -- a real cross-glibc-version
+collision, not a mimalloc bug. Fixed by scoping `LD_PRELOAD` to just the
+measured process via `taskset -c 0 perf stat ... env LD_PRELOAD=<path>
+./asnix d.nix` (`env`'s own child process is the only one that inherits
+the preload; `taskset`/`perf` never see it).
+
+**Measured, interleaved (10 alternating plain/LD_PRELOAD trials, `taskset
+-c 0`, `cpu_core/instructions/`+`cpu_core/cycles/`, real `d.nix`/ffmpeg
+eval, output hash cross-checked byte-identical on every single trial)**:
+instructions 8,032,677,523 (avg) -> 7,311,069,127 (avg), **-8.98%**,
+B lower than A in all 10/10 trials, tight variance (every PLAIN trial
+within 8,029.7M-8,040.2M, every MIMALLOC trial within 7,309.1M-7,313.3M
+-- essentially noise-free, the same "hard, repetition-independent fact"
+character this project's measurement culture already established for
+instruction counts). Cycles: 4,346,104,737 -> 3,960,946,861 average,
+**-8.86%**, noisier trial-to-trial (as always on this shared, contended
+machine) but one-directional in every pair. This clears the bar by a
+wide margin against the 9.5%-of-total-instructions theoretical ceiling
+computed above -- mimalloc captures essentially the ENTIRE allocator-
+category gap, not just a fraction of it.
+
+**Step 2: full build integration**, per mimalloc's own documented Unix
+override mechanism (checked directly via `nm`, not improvised): on Unix,
+simply linking a program against mimalloc's own library (static or
+dynamic) is sufficient for a full process-wide override, since its
+default build already exports the standard `malloc`/`free`/`calloc`/
+`realloc` names rather than only `mi_malloc`-prefixed ones. Chose the
+STATIC path (`libmimalloc.a`, not `LD_PRELOAD`/dynamic linking) for the
+shipped build: confirmed via `nm libmimalloc.a` that the same standard
+names are defined there too, then verified directly that linking it into
+`asnix`'s own executable makes `malloc`/`free`/`calloc`/`realloc` resolve
+to DEFINED symbols inside `asnix`'s own symbol table (`nm asnix | grep -E
+" [tT] (malloc|free|calloc|realloc)$"` -- all 4 present, `T` not `U`) --
+this is the real override, happening at normal dynamic-symbol-resolution
+time with zero `LD_PRELOAD`/runtime environment-variable dependency, and
+zero new dependency on a nix-store path surviving into the running
+process (unlike `LD_PRELOAD`, which would need the exact store path kept
+alive and re-specified by whoever runs the binary later). Needed no
+`mimalloc.h` include, no `mi_malloc` call site, no source change
+anywhere in this tree -- the override is 100% a link-step change.
+
+**What changed, concretely**:
+- `flake.nix`: added `mimalloc` to the devShell's `packages`, and the
+  shellHook now exports `ASNIX_MIMALLOC_LIB="${pkgs.mimalloc}/lib/
+  libmimalloc.a"` -- an absolute nix-store path baked in at flake-eval
+  time (same convention this file already uses for `ASNIX_LIBCRYPTO_LIB`,
+  except that one's a runtime `dlopen` target resolved by `getenv`, while
+  this one is a build-time linker input).
+- `nix/asnix.nix`: added `mimalloc` to the derivation's inputs and sets
+  the same `ASNIX_MIMALLOC_LIB` env var directly on the derivation, so
+  `nix build`'s own packaged binary gets the identical override, not just
+  interactive `nix develop` sessions.
+- `Makefile`: a new `MIMALLOC_LDLIBS` variable, populated only `ifdef
+  ASNIX_MIMALLOC_LIB` (so a plain `cc`/`make` run outside the flake's
+  devShell -- no env var set -- degrades gracefully to the exact
+  pre-existing link command, not a build failure), appended ONLY to the
+  final `asnix` executable's own link rule (`$(CC) $(LDFLAGS) -o $@
+  $(MAIN_OBJ) -L. -lasnix $(MIMALLOC_LDLIBS)`) -- deliberately NOT
+  applied to `irdump` or any `tests/{asm,ir,c}/*` unit-test binary, since
+  this is a real-eval-workload speed change, not something the
+  correctness-focused test binaries need, keeping the blast radius to
+  exactly the one binary real users actually run. `-lpthread` is linked
+  alongside (mimalloc's own `pkg-config` metadata lists `-lpthread -lrt
+  -latomic` as `Libs.private`; linking confirmed `-lrt`/`-latomic` are
+  NOT actually needed on this glibc version -- modern glibc merges
+  `librt`'s/`libpthread`'s symbols into `libc` itself -- so only
+  `-lpthread` was kept, verified by a clean link with zero undefined-
+  symbol errors). The existing `OPT_STAMP` stale-build guard (previously
+  keyed on `$(OPT)` alone, to catch switching between `make`/`make
+  debug`/`make release` without an explicit `make clean`) now keys on
+  `$(EFFECTIVE_OPT)|$(MIMALLOC_LDLIBS)` instead, so switching in or out of
+  a devShell that sets `ASNIX_MIMALLOC_LIB` also correctly forces a full
+  rebuild+relink rather than silently keeping a stale `asnix` binary built
+  under the other configuration.
+
+**Verified, both configurations**:
+- WITH `ASNIX_MIMALLOC_LIB` set (`nix develop --command make`): link
+  command confirmed to include `.../libmimalloc.a -lpthread`;
+  `./asnix d.nix` output byte-identical:
+  `/nix/store/29iacg6h530yx7rxz4k1fhvi0kxxhsam-ffmpeg-9.0.1-bin`; `nm
+  asnix` confirms `malloc`/`free`/`calloc`/`realloc` all defined (`T`)
+  inside the executable itself.
+- WITHOUT it set (plain `make` in an ambient shell that merely happens to
+  have `cc` on `PATH`, no nix devShell): link command confirmed to
+  `MIMALLOC_LDLIBS` empty, identical to the pre-this-milestone command;
+  `./asnix d.nix` output byte-identical; `nm asnix` confirms ZERO locally-
+  defined `malloc`/`free`/`calloc`/`realloc` symbols (correctly falling
+  back to ordinary dynamic resolution against libc).
+- Full ladder (WITH mimalloc linked in, the shipped configuration): `make
+  test`/`test-e2e`/`test-conformance` all green. `make test-nix-
+  conformance NIX_CONFORMANCE_DIR=/tmp/nix-conformance`: `pass=655 fail=3
+  skip=148` (exact baseline, same 3 pre-existing pos-tracking failures).
+  `make test-nixpkgs-hash`: `pass=148 fail=0`, clean on the first attempt.
+
+**Final measured win, on the actual integrated build** (10 interleaved
+trials, `taskset -c 0`, `cpu_core/instructions/`+`cpu_core/cycles/`, the
+real nix-devShell-built mimalloc-linked `asnix` vs. the same tree built
+with `ASNIX_MIMALLOC_LIB` unset): instructions 8,032,677,523 (avg) ->
+7,407,413,639 (avg), **-7.79%**, B lower than A in all 10/10 trials
+(tightest band: every NO-MIMALLOC trial 8,029.7M-8,040.2M, every MIMALLOC
+trial 7,403.6M-7,410.0M); cycles 4,504,481,076 -> 4,221,017,404 average,
+**-6.3%**, directionally consistent in 9/10 pairs (the one reversal,
+pair 3, sits inside this shared machine's familiar load-drift noise band
+-- a single NO-MIMALLOC outlier elsewhere in the same run, pair 4,
+5,609M cycles vs. a typical ~4,350M, shows the same contention this
+project's whole measurement culture already documents and discounts).
+The ~7.8% final figure (vs. step 1's own ~8.98% LD_PRELOAD ceiling check)
+is close to, not identical to, the earlier number -- expected, since step
+1 used mimalloc 3.5.1 from an ad-hoc store path and this integrated
+build resolves the flake's own pinned nixpkgs mimalloc (3.5.3) instead;
+both are real, both clear the bar by a wide margin over the 9.5%
+theoretical ceiling's own ~82-94% capture rate.
+
+**Honest sizing against the full asnix-vs-iets gap**: this closes
+roughly 7.8% of asnix's OWN total instruction count, and (cross-
+referencing this session's running gap-accounting convention) a
+proportionally similar slice of the full inter-evaluator instruction
+gap -- not a silver bullet for the ~1.59x-and-shrinking overall ratio,
+but the single largest one-change win landed this campaign, larger than
+any individual lex/parse/compile fix (M129-M141) or any other allocator-
+adjacent fix (M144's derivation-scratch pooling, ~0.22%). This also
+RETIRES M144's own still-open "other named call sites... remain open"
+list (`InputRefSet`'s unbounded `dup_cstr`, `string_context.c`'s
+`dup_cstr`, `aterm.c`'s `buf_grow`, `builtins_compare.c`'s growable
+`Buf`/order arrays) as individually-worth-root-causing follow-ons --
+every one of those still goes through `malloc`/`free`/`realloc`, so this
+milestone's process-wide override already captures their aggregate cost
+too, without needing to find and fix each call site by hand.
+
+**What this does NOT change**: asnix's own hand-written `Value`/`Env`/
+`Thunk`/`Closure` arena (`asnix_arena_alloc`, `src/asm/arena.S`) was
+already, and remains, entirely separate from `malloc`/`free` -- this
+milestone affects only the C-side bookkeeping paths that already went
+through the malloc family (parser/AST vectors, derivation/regex/JSON
+scratch buffers, the symtab/import-cache/bytecode-cache/regex-cache hash
+tables), exactly as scoped in this milestone's own brief.
+
+Files: `flake.nix` (devShell `packages`/`shellHook`), `nix/asnix.nix`
+(`mimalloc` input, `ASNIX_MIMALLOC_LIB`), `Makefile` (`MIMALLOC_LDLIBS`,
+`asnix`'s link rule, the `OPT_STAMP` key). No `src/` file touched.

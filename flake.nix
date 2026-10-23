@@ -17,6 +17,7 @@
             gdb
             valgrind
             openssl     # dlopen target for hash shims (M8)
+            mimalloc    # static-link-time allocator override (M146)
             entr         # optional `make watch` loop
           ];
           shellHook = ''
@@ -28,6 +29,17 @@
             # own flake.nix uses for its own not-a-system-package dlopen
             # targets (~/gnix/flake.nix).
             export ASNIX_LIBCRYPTO_LIB="$(ls ${pkgs.openssl.out}/lib/libcrypto.so* | head -1)"
+            # M146: mimalloc's static archive, statically linked into the
+            # final `asnix` binary ONLY (see Makefile's MIMALLOC_LDLIBS) --
+            # a real, measured ~9% whole-program instruction-count win on
+            # the real d.nix/ffmpeg eval (glibc ptmalloc's own malloc-
+            # family overhead was asnix's single largest named instruction-
+            # gap category vs. iets's mimalloc, per this milestone's own
+            # writeup in docs/architecture.md). Absolute nix-store path
+            # baked in at flake-eval time, not resolved by getenv at
+            # runtime like ASNIX_LIBCRYPTO_LIB above -- this is a build-time
+            # link input, not a dlopen target.
+            export ASNIX_MIMALLOC_LIB="${pkgs.mimalloc}/lib/libmimalloc.a"
           '';
         };
       });

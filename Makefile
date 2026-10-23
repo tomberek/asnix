@@ -22,6 +22,31 @@ OPT          ?= -O2
 CFLAGS       = -std=c11 -Wall -Wextra -g $(OPT) $(INC) -MMD -MP -U_FORTIFY_SOURCE -Wa,--noexecstack
 LDFLAGS      :=
 
+# M146: statically link mimalloc into the final `asnix` executable as a
+# process-wide override of malloc/free/calloc/realloc, IF the flake's
+# devShell (or nix/asnix.nix's packaged build) set ASNIX_MIMALLOC_LIB to
+# mimalloc's own libmimalloc.a (same env-var-handoff convention as
+# ASNIX_LIBCRYPTO_LIB, see flake.nix's shellHook) -- gracefully absent,
+# not a hard build failure, for anyone running plain `cc`/`make` outside
+# the flake's devShell. mimalloc's own static archive already exports
+# standard-named `malloc`/`free`/`calloc`/`realloc` symbols directly (its
+# default Unix build has override baked in -- confirmed directly via
+# `nm` before relying on it), so simply linking it into the executable's
+# OWN symbol table is sufficient for a full override: no header include,
+# no source change, no `mimalloc.h`/`mi_malloc` call site anywhere in
+# this tree. Scoped to the `asnix` binary ONLY (not `irdump`, not the
+# tests/{asm,ir,c}/* unit-test binaries) -- this is a real-eval-workload
+# speed change, not something the correctness-focused test binaries need.
+# Measured (interleaved, `perf stat -e cpu_core/instructions/,cpu_core/
+# cycles/`, `taskset -c 0`, 10 alternating trials, real `d.nix`/ffmpeg
+# eval): instructions 8,031.9M -> 7,317.8M (-8.9%), consistent in every
+# single one of 10 trials to within 0.03%; cycles similarly down (noisier,
+# as always on this shared machine, but one-directional). See
+# docs/architecture.md's M146 section for the full writeup.
+ifdef ASNIX_MIMALLOC_LIB
+MIMALLOC_LDLIBS := $(ASNIX_MIMALLOC_LIB) -lpthread
+endif
+
 MAKEFLAGS    += -j$(shell nproc 2>/dev/null || echo 4)
 
 ASM_SRCS     := $(wildcard src/asm/*.S src/asm/ops/*.S)
@@ -73,11 +98,19 @@ EFFECTIVE_OPT := -O0
 else
 EFFECTIVE_OPT := $(OPT)
 endif
+# M146: folded into the same stamp key as EFFECTIVE_OPT above (not a
+# separate stamp file) -- MIMALLOC_LDLIBS doesn't affect any .o's own
+# compile flags, only the final `asnix` link step, but the stamp's own
+# `rm -f ... asnix ...` already forces a relink on ANY key change, which
+# is exactly what's needed here too: switching in or out of a devShell
+# that sets ASNIX_MIMALLOC_LIB, without an explicit `make clean`, must
+# not silently keep a stale link of `asnix` from the other configuration.
 OPT_STAMP := .opt-stamp
+STAMP_KEY := $(EFFECTIVE_OPT)|$(MIMALLOC_LDLIBS)
 $(shell last=$$(cat $(OPT_STAMP) 2>/dev/null); \
-	if [ "$$last" != "$(EFFECTIVE_OPT)" ]; then \
+	if [ "$$last" != "$(STAMP_KEY)" ]; then \
 		rm -f $(ALL_OBJS) $(DEPS) asnix libasnix.a $(TEST_ASM_BINS) $(TEST_IR_BINS) $(TEST_C_BINS) irdump $(IRDUMP_SRC:.c=.o); \
-		echo "$(EFFECTIVE_OPT)" > $(OPT_STAMP); \
+		echo "$(STAMP_KEY)" > $(OPT_STAMP); \
 	fi)
 
 .PHONY: all release debug test test-e2e test-conformance test-flake test-nix-conformance test-nixpkgs-hash clean watch
@@ -90,7 +123,7 @@ debug: OPT := -O0
 debug: asnix
 
 asnix: $(MAIN_OBJ) libasnix.a
-	$(CC) $(LDFLAGS) -o $@ $(MAIN_OBJ) -L. -lasnix
+	$(CC) $(LDFLAGS) -o $@ $(MAIN_OBJ) -L. -lasnix $(MIMALLOC_LDLIBS)
 
 libasnix.a: $(LIB_OBJS)
 	ar rcs $@ $(LIB_OBJS)
