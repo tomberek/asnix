@@ -14198,3 +14198,107 @@ own writeup flagged (IrBuilder's ops/pool arrays, parser.c's PartVec-style
 vectors, the AST arena) -- left for whichever milestone picks those up
 next (M128, per the in-flight work recovered above, appears to already be
 claimed for at least the irbuild.c/parser.c allocation sites).
+
+## M130: `symtab.c`'s `hash_bytes` goes word-at-a-time -- a real but small win, honestly sized
+
+Follow-up to M123's cross-evaluator speed investigation, this time
+targeting `asnix_intern` (`src/c/symtab.c`), the symbol table used for
+every identifier/attribute name the lexer sees and throughout
+parsing/compiling -- 3.14% self-time in M123's profile.
+
+**What's already right, read directly, not guessed**: the table is a
+single, unsynchronized, open-addressed hash table with linear probing
+(no chaining indirection), rehashing at a 75% load factor with stable
+ids across rehashes (`tests/c/test_symtab.c` already covers this). A
+temporary counter instrumentation run (`atexit`-gated, `ASNIX_SYMTAB_
+STATS`, removed before landing) over the real `d.nix` (nixpkgs/ffmpeg)
+benchmark measured 1,833,170 total `asnix_intern` calls, 95.8% hits
+(1,755,938) against 77,232 unique symbols, only 14 rehashes total, and
+an average of just 0.609 EXTRA linear-probe steps per call at the
+table's steady-state ~59% load factor -- collision resolution is cheap
+and the table is not the bottleneck. `asnix_intern`'s own lookup already
+short-circuits on length before `memcmp` (`g_symbols[id].len == len &&
+memcmp(...)`) -- nothing wasteful there either.
+
+**What was real**: `hash_bytes`'s mixing loop processed one byte, one
+multiply, per iteration (`h ^= byte; h *= C;`, repeated `len` times).
+Every iteration depends on the previous one's result (`h` is a genuine
+loop-carried dependency, not independent lanes an out-of-order core can
+overlap), so for an identifier of the corpus's own measured average
+length (9.12 bytes/call, measured via the same instrumentation summing
+`len` across all 1,833,170 calls) the CPU pays 9 fully serialized
+multiply-latency steps just to hash one short name. `~/gnix/iets`'s own
+`FxHasher::write` (`src/syntax/symbol.rs`) avoids exactly this: it reads
+a whole 8-byte word (then a 4-byte remainder, then individual bytes only
+for what's left) per multiply, cutting the serial chain length to at
+most 2-3 steps for the same input instead of 9.
+
+**Fix**: `hash_bytes` now mixes in 8-byte words via `memcpy` (avoiding
+unaligned-access UB, matching `iets`'s own structure) for `len/8`
+iterations, one 4-byte word for the next chunk if one remains, and falls
+back to the original byte-at-a-time loop only for the final <4-byte tail
+-- reads stay bounded to `s[0..len)` exactly as before, so this is safe
+for any caller's buffer regardless of alignment. The splitmix64 finalizer
+is untouched. Because `hash_bytes` is `static` and only ever feeds the
+in-process table (the bytecode cache, M94, persists symbols by NAME and
+re-interns on load, never by hash value), changing the hash's output is
+invisible outside this file.
+
+**Measured, three ways, all agreeing**:
+1. Isolated microbenchmark (`/tmp/bench_hash.c`, not committed --
+   one-off, like M127's own throwaway harnesses -- fed the REAL captured
+   corpus of all 1,833,170 `asnix_intern` call arguments from a full
+   `d.nix` run, 20 reps, `perf stat -r 5`): `cpu_core/instructions/`
+   3,865,388,978 -> 2,593,277,657 (**-32.9%**), `cpu_core/cycles/`
+   1,412,384,011 -> 1,187,892,691 (**-15.9%**) for the hash function
+   alone -- a real, chain-length-bound win, matching the serial-multiply
+   theory's prediction almost exactly (expected ~105 -> ~71
+   instructions/call matches the measured 105.4 -> 70.7).
+2. Scaling that per-call instruction delta (~34.7 instructions/call) by
+   the real run's 1,833,170 calls predicts an ~63.6M-instruction drop in
+   the full binary.
+3. Full-binary `perf stat -r 10 -e cpu_core/instructions/,cpu_core/
+   cycles/ ./asnix d.nix`: `cpu_core/instructions/` 10,317,816,273 ->
+   10,231,720,417 (**-0.83%**, low noise: +-0.43%/+-0.16%), matching
+   prediction #2's order of magnitude closely (86.1M observed vs 63.6M
+   predicted -- same ballpark, the gap plausibly from secondary effects
+   like code layout/icache, not a different mechanism). `cpu_core/
+   cycles/` 5,863,844,884 -> 5,806,951,845 (**-0.97%**, within/at the
+   edge of run-to-run noise: +-0.85%/+-0.28%). Wall-clock did not move
+   outside noise (1.594s -> 1.587s, both +-~2%).
+
+**Honest sizing**: this is a real, cleanly-explained, zero-risk
+micro-optimization of one hot function -- NOT a fix that meaningfully
+closes the asnix-vs-iets gap. `asnix_intern`'s total instruction volume
+turns out to be a much smaller slice of the real run (~1.8% of all
+instructions, back-computed from the measured per-call cost) than its
+3.14%-of-cycles profile share suggested, because hashing's latency chain
+is largely hidden by the surrounding dispatch loop's own independent
+work in the full program, the same "removing instructions doesn't
+proportionally remove cycles" pattern M127 already found for VALSTACK
+traffic. Landed anyway because the fix is trivial, fully contained to
+one static function, adds no new data structure or interface, and the
+~0.8% instruction reduction is real and reproducible, not because it
+closes any meaningful fraction of the ~2.07x gap.
+
+**Considered and declined**: a per-call direct-mapped lookup cache in
+front of the table, mirroring `iets`'s own `Interner::cache` (a 1024-
+entry array trading a hash+compare for a lock/shard lookup). Declined
+because `iets`'s cache exists to skip a sharded, `RwLock`-guarded
+`HashMap` lookup in a *multi-threaded* interner -- asnix's table has
+neither locks nor chaining indirection to skip, and the measured 0.609-
+extra-probe-steps/call figure above shows the open-addressed probe itself
+is already cheap; a front-cache would add real complexity (another data
+structure, another invalidation-free-but-still-reasoned-about path) for
+an upper bound of saving well under 1 extra probe step and one `memcmp`
+per call -- smaller than this milestone's own hash fix, for more
+complexity, not clearing the bar.
+
+**Verified**: `make test`/`test-e2e`/`test-conformance` all green.
+`make test-nix-conformance` (`NIX_CONFORMANCE_DIR=/tmp/nix-conformance`):
+`pass=655 fail=3 skip=148` (same 3 pre-existing pos-tracking failures).
+`make test-nixpkgs-hash`: `pass=148 fail=0`. Output hash on `d.nix`
+(ffmpeg's closure) unchanged: `/nix/store/29iacg6h530yx7rxz4k1fhvi0kxxhsam-ffmpeg-9.0.1-bin`.
+
+Files: `src/c/symtab.c` (`hash_bytes` only; `asnix_intern`/`asnix_sym_
+name`/the table/rehashing logic untouched).
