@@ -17456,3 +17456,100 @@ M129's own "not investigated here" footnotes always are).
 
 Files: none shipped (`src/c/lexer.c` reverted to its pre-milestone
 content; this section is the only durable artifact of this milestone).
+
+## M154: "slow it down to find what matters" -- validated as a real technique, but only on cycles/wall-clock, never on instruction count, and the hiding effect itself depends sharply on how long the injected chain is
+
+Investigated a specific methodological idea: deliberately inject a known,
+controlled amount of extra cost into one function, measure how much the
+whole program's real cost increases, and use that measured increase (not
+static self-time) to judge how much speeding that function up for real
+would actually help. This is the mirror image of the just-declined Coz
+investigation (causal profiling, which *virtually* speeds a region up to
+predict the effect of a real speedup) -- slowing a region down instead,
+with a real measurement, sidesteps Coz's own conceptual mismatch with a
+single-threaded program and its practical breakage on this toolchain.
+
+**Experiment**: `asnix_intern` (`src/c/symtab.c`), called exactly
+1,833,170 times on the real `d.nix` eval (an already-established, well-
+characterized call count from M130). A temporary, env-var-gated
+(`ASNIX_SLOWDOWN_INTERN_N`, 0 = no-op, identical code path to baseline)
+serially-dependent multiply-add chain was added at the top of the
+function -- NOT a NOP sequence, which a modern frontend can fold/fuse
+almost for free and would say nothing about real dependent-work
+hiding. `objdump` confirmed the compiler emitted exactly 5 instructions
+per loop iteration (`imul`/`add`/`add`/`cmp`/`jne`) plus 5 fixed one-time
+instructions (setup + final store) on the taken path, so the expected
+per-call instruction delta for the loop running N times is precisely
+`5N + 5`. Reverted before committing -- this is a read-only
+investigation, no production code changed.
+
+**Measured, interleaved (never batched), `taskset -c 0`,
+`cpu_core/instructions/,cpu_core/cycles/`, same env-var toggle on the
+same binary so the ~5-instruction fixed overhead cancels exactly in the
+delta**:
+
+| N (loop iters) | measured delta instructions | predicted delta instructions (`(5N+5) x 1,833,170`) | measured delta cycles | naive delta cycles (`delta_instr / baseline IPC`) | measured as % of naive |
+|---|---|---|---|---|---|
+| 20 | 193,218,621 | 192,482,850 | 16,080,182 | 109,114,212 | **14.7%** |
+| 200 | 1,844,333,762 | 1,842,335,850 | 1,103,568,721 | 1,031,473,566 | **107.0%** |
+
+**Instruction count behaves exactly as predicted at both sizes** (within
+0.4%) -- this is expected and not itself a finding: instruction count is
+a static count of retired instructions, so it cannot be "hidden" by
+out-of-order execution the way cycles can; injecting K instructions that
+must retire always shows up as +K in this metric, by construction. A
+slowdown-injection experiment measuring only instructions would be
+useless for this purpose -- it always just reports back the arithmetic
+you put in.
+
+**Cycles tell the real story, and it is NOT monotonic in the way a naive
+model predicts.** At N=20 (a ~105-instruction serial chain per call),
+85.3% of the naive linear cost vanishes -- the out-of-order core overlaps
+nearly all of it with surrounding independent work (the hash lookup/
+insert's own memory-latency-bound operations, and/or adjacent calls'
+own independent work), the same store-to-load-forwarding-adjacent
+hiding mechanism M127's `bench/regvm_poc/` already demonstrated for
+VALSTACK traffic. At N=200 (a ~1,005-instruction chain), that hiding
+essentially disappears -- measured cycles land almost exactly on the
+naive linear prediction. This is consistent with a reorder-buffer-size
+effect: a short dependent chain fits inside the core's out-of-order
+scheduling window and can be substantially overlapped with nearby
+independent work; a chain roughly 10x longer exceeds that window, so the
+core eventually has no choice but to stall on the dependency, and the
+cost becomes visible almost linearly. This project had not previously
+measured *where* that transition sits, only that hiding exists at all
+(M127) -- this experiment brackets it concretely between roughly 100 and
+1,000 serially-dependent instructions per occurrence, for this specific
+chain shape on this specific core.
+
+**Conclusion: the technique is sound and complements, not replaces,
+static profiling -- but only if read correctly.** "Slow down section X
+and see how much the real program slows down" is a genuine, direct way
+to estimate X's true optimization ceiling, avoiding the risk that a
+function's raw self-time share overstates its real end-to-end cost
+(exactly the risk M127 found for VALSTACK traffic and this experiment
+now reproduces independently, via the complementary direction). But the
+experiment is only informative on cycles or wall-clock -- never on
+instruction count, which is definitionally insensitive to this exact
+effect -- and the injected delay's own *shape* and *length* materially
+change the answer: a short injected delay will systematically
+*understate* a region's true importance (most of it gets hidden), while
+a long one will more honestly reveal it, because real code bottlenecks
+are not uniformly one length or the other. A slowdown experiment used to
+rank candidates for optimization should therefore use an injected delay
+long enough to exceed the core's own hiding window (this experiment's
+own data suggests comfortably over 200 serially-dependent instructions
+is a safer default than something short like 20), or risk systematically
+deprioritizing real targets the same way a naive self-time percentage
+already can.
+
+**Not attempted here**: building this into a reusable, general-purpose
+harness (e.g. a compile-time flag usable on any function, not just
+`asnix_intern`) -- this was a one-shot methodological validation, not a
+tool-building task. If this technique is adopted going forward, the
+`asnix_intern` mechanism built and reverted here (env-var-gated,
+serially-dependent multiply-add chain, `objdump`-verified instruction
+cost) is a template worth reusing rather than reinventing.
+
+Files: none shipped (`src/c/symtab.c` reverted to its clean content;
+this section is the only durable artifact of this investigation).
