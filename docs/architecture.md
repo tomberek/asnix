@@ -14863,3 +14863,59 @@ parser.c`/`parser.h` (`Parser.lc` replacing `Parser.toks`/`.count`,
 `asnix_parse`'s signature), `src/c/eval_file.c`, `src/c/irdump.c`,
 `tests/ir/test_m45_codegen.c`, `bench/microbench_m45.c` (all 7
 lex+parse call sites collapsed to one `asnix_parse(src)` call each).
+
+## M136: compile-time constant folding for int-literal `AST_BINOP`, unified with thunk avoidance
+
+`/subtask` follow-up to the `research-what-the` fork's survey of what
+would make an evaluator genuinely fast (item #4: "thunk avoidance as a
+first-class target... eagerly folds n-1/forced-int arithmetic"). Checked
+first, not assumed: `src/c/irpass_cfold.c` already folds int-literal
+arithmetic/comparison triples, but strictly at the bytecode level, and
+only when `ASNIX_IR_OPT=1` is set -- a real default-build gap, since an
+ordinary `./asnix file.nix` run (no env var set) performs ZERO
+constant folding of int arithmetic today: `1 + 2` compiles straight to
+`push 1; push 2; add`, executed at runtime on every evaluation.
+
+**Fix**: `src/c/compiler.c` gained `try_fold_const_binop` (next to
+`is_thunk_free_literal`, which it's now a case of), checked at the top
+of `compile_expr`'s `AST_BINOP` case. It folds `+`/`-`/`*`/`/` and all
+six comparisons when both operands are `AST_INT` literals, mirroring
+`op_arith.S`'s own checked semantics exactly: the true int64-overflow
+check (via `__builtin_add_overflow`/`__builtin_sub_overflow`/
+`__builtin_mul_overflow`, not plain C `+`/`-`/`*`, which would wrap
+silently) AND the narrower `ASNIX_INT_MIN`/`ASNIX_INT_MAX` tagged-value
+window `+`/`-`/`*` are additionally bounded to (per `op_arith.S`'s own
+M56 comment). Division by zero and the `ASNIX_INT_MIN / -1` edge are
+also left unfolded. Any case that would abort at runtime is
+deliberately NOT folded, so the ordinary runtime op still reaches the
+exact same abort with the exact same message -- verified directly:
+`1152921504606846975 + 1` (one past `ASNIX_INT_MAX`) and `5 / 0` both
+still abort with their original messages, not a silently wrong folded
+result.
+
+**Unified with thunk avoidance, not bolted on separately**: `is_thunk_
+free_literal`'s `AST_BINOP` case calls the same `try_fold_const_binop`
+function, so a foldable binop (e.g. `let x = 1 + 2; in ...`) is now ALSO
+recognized as thunk-free at every one of the ten `ib_mk_thunk` call
+sites (M92's own `maybeThunk` mechanism) -- it collapses to a single
+zero-cost push with no `Thunk` heap allocation and no later `OP_CALL`/
+force-machinery round trip, exactly like any other literal. Verified via
+`ASNIX_SHOW_STATS=1` on a synthetic `let a = 1+2; b = 3-4; c = 5*6; in
+a+b+c`: `thunks: 0` (previously each binding would have allocated one).
+
+**Verified**: `make test`/`test-e2e`/`test-conformance` all green.
+`make test-nix-conformance`: `pass=655 fail=3 skip=148` (exact baseline
+match). `make test-nixpkgs-hash`: `pass=148 fail=0`. Output hash on
+`d.nix` (ffmpeg's closure) unchanged:
+`/nix/store/29iacg6h530yx7rxz4k1fhvi0kxxhsam-ffmpeg-9.0.1-bin`.
+`compiler.c` itself compiles with zero new warnings.
+
+**Not attempted, flagged for follow-on**: `AST_FLOAT` operands, and
+constant-folding `builtins.x` (`builtins.currentSystem` etc.) at
+compile time when `builtins` resolves lexically to the genuine root
+frame -- the fork's own directive's third example, scoped out here to
+keep this a single, narrowly-verified change rather than widening the
+surface being audited for correctness in one pass.
+
+Files: `src/c/compiler.c` (`try_fold_const_binop`, `is_thunk_free_
+literal`'s `AST_BINOP` case, `compile_expr`'s `AST_BINOP` case).

@@ -539,6 +539,63 @@ static void sort_syms(uint32_t *syms, size_t n) {
  * identical, just cheaper -- not applicable to AST_VAR (a bare variable
  * reference): that's a distinct optimization (real Nix's own
  * `ExprVar::maybeThunk` slot-aliasing), out of scope here. */
+/* M136: compile-time constant folding for `AST_BINOP` when both operands
+ * are int literals -- mirrors op_arith.S's own overflow-checked semantics
+ * EXACTLY (both the true int64-overflow check via `__builtin_*_overflow`
+ * AND the narrower ASNIX_INT_MIN/MAX tagged-value window `+`/`-`/`*` are
+ * additionally bounded to there, see op_arith.S's own M56 comment) --
+ * any case that would abort at runtime (overflow, division by zero, the
+ * `ASNIX_INT_MIN / -1` edge) is deliberately left unfolded, so the
+ * ordinary runtime op still reaches the exact same abort with the exact
+ * same message, never silently wrapping or producing a different result
+ * than an unoptimized build would. `>`/`<=` (`'g'`/`'L'`) compute the
+ * same boolean real Nix's own operand-swap desugaring produces (see this
+ * file's AST_BINOP case's own M51 comment for why the swap exists in the
+ * *compiled* form) directly from the source-level operands here, since
+ * this function never emits IR, only a final bool/int. `//`/`++` (`'u'`/
+ * `'c'`) fall through to `default` and are never folded: those operators
+ * are for attrsets/lists, so two *int* literals on either side is always
+ * a runtime type error this function must not mask by computing a
+ * bogus int/bool result for it. Called both from the AST_BINOP case of
+ * `compile_expr` below (to actually fold) and from
+ * `is_thunk_free_literal` immediately below (so a foldable binop is ALSO
+ * recognized as thunk-free, exactly like any other literal -- M92's
+ * `maybeThunk` reasoning applies identically once this function has
+ * reduced the node to a single zero-cost push). */
+static int try_fold_const_binop(Ast *node, int *out_is_bool, int64_t *out_val) {
+    if (node->kind != AST_BINOP) return 0;
+    Ast *lhs = node->as.binop.lhs, *rhs = node->as.binop.rhs;
+    if (lhs->kind != AST_INT || rhs->kind != AST_INT) return 0;
+    int64_t a = lhs->as.int_val, b = rhs->as.int_val, result;
+    switch (node->as.binop.op) {
+        case '+':
+            if (__builtin_add_overflow(a, b, &result)) return 0;
+            break;
+        case '-':
+            if (__builtin_sub_overflow(a, b, &result)) return 0;
+            break;
+        case '*':
+            if (__builtin_mul_overflow(a, b, &result)) return 0;
+            break;
+        case '/':
+            if (b == 0) return 0;
+            if (a == INT64_MIN && b == -1) return 0;
+            result = a / b;
+            break;
+        case 'e': *out_is_bool = 1; *out_val = (a == b); return 1;
+        case 'n': *out_is_bool = 1; *out_val = (a != b); return 1;
+        case 'l': *out_is_bool = 1; *out_val = (a < b); return 1;
+        case 'G': *out_is_bool = 1; *out_val = (a >= b); return 1;
+        case 'g': *out_is_bool = 1; *out_val = (a > b); return 1;
+        case 'L': *out_is_bool = 1; *out_val = (a <= b); return 1;
+        default: return 0;
+    }
+    if (result < ASNIX_INT_MIN || result > ASNIX_INT_MAX) return 0;
+    *out_is_bool = 0;
+    *out_val = result;
+    return 1;
+}
+
 static int is_thunk_free_literal(Ast *node) {
     switch (node->kind) {
         case AST_INT:
@@ -547,6 +604,11 @@ static int is_thunk_free_literal(Ast *node) {
         case AST_NULL:
         case AST_CURPOS:
             return 1;
+        case AST_BINOP: {
+            int is_bool;
+            int64_t val;
+            return try_fold_const_binop(node, &is_bool, &val);
+        }
         case AST_STRING:
             for (size_t i = 0; i < node->as.string.count; i++) {
                 if (node->as.string.parts[i].is_expr) return 0;
@@ -1111,7 +1173,24 @@ static void compile_expr(IrBuilder *b, Ast *node, ScopeFrame *scope) {
             ib_call(b, 1);
             return;
         }
-        case AST_BINOP:
+        case AST_BINOP: {
+            /* M136: fold first, when safe -- see try_fold_const_binop's
+             * own header comment above for exactly which cases qualify
+             * and why every excluded case (overflow/div-by-zero/non-int
+             * operators) must fall through to the ordinary path below
+             * unchanged rather than risk silently diverging from the
+             * runtime op's own checked behavior. */
+            int fold_is_bool;
+            int64_t fold_val;
+            if (try_fold_const_binop(node, &fold_is_bool, &fold_val)) {
+                if (fold_is_bool) {
+                    if (fold_val) ib_push_true(b);
+                    else ib_push_false(b);
+                } else {
+                    ib_push_int(b, fold_val);
+                }
+                return;
+            }
             /* M51: `>` and `<=` evaluate their RIGHT operand first, not
              * left -- found while chasing numtide/nix-conformance's
              * eval-okay-compare-operand-order.nix (blocked until this
@@ -1169,6 +1248,7 @@ static void compile_expr(IrBuilder *b, Ast *node, ScopeFrame *scope) {
                 case '/': ib_div(b); return;
             }
             return;
+        }
         case AST_AND: {
             /* Short-circuit, compiled branch-shaped like `if lhs then rhs
              * else false` (NOT as an eager binop) -- see ir.h's OP_EQ
