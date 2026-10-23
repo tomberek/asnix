@@ -65,13 +65,50 @@ typedef enum {
      * TOK_DOLLAR_LBRACE ... TOK_RBRACE), and a matching TOK_STR_END/
      * TOK_ISTR_END. */
     TOK_STR_START,     /* '"' opening a double-quoted string */
-    TOK_STR_PART,      /* a literal chunk inside "...", escapes already applied */
+    TOK_STR_PART,      /* M141: a RAW (undecoded) literal chunk inside "...", escapes
+                        * NOT yet applied -- start/end span the exact source bytes between
+                        * the opening quote/prior interpolation and the next boundary, as
+                        * a plain offset into `src` (never a decoded copy, unlike pre-M141).
+                        * See asnix_decode_dquote_span's own comment for where/when the
+                        * escape decode actually happens. */
     TOK_STR_END,       /* '"' closing a double-quoted string */
     TOK_ISTR_START,     /* "''" opening an indented string */
-    TOK_ISTR_PART,      /* a raw literal chunk inside ''...'', NOT yet indentation-
-                         * stripped (that happens once all of one indented string's
-                         * parts are collected -- see parser.c's strip_indentation,
-                         * ported from real Nix's ParserState::stripIndentation) */
+    TOK_ISTR_PART,      /* M141: a RAW run of plain indented-string content (no escapes --
+                         * an escape always ends this run, see TOK_ISTR_ESC), NOT yet
+                         * indentation-stripped (that happens once all of one indented
+                         * string's parts are collected -- see parser.c's
+                         * strip_indentation, ported from real Nix's
+                         * ParserState::stripIndentation). Counts toward indentation
+                         * measurement -- the TOK_ISTR_PART/TOK_ISTR_ESC kind split IS
+                         * this token's own "hasIndentation" bit (pre-M141 carried it as
+                         * a separate flag field on one shared kind; folding it into the
+                         * kind tag instead needs no extra Token field at all). */
+    TOK_ISTR_ESC,       /* M141: exactly one `''$` / `'''` / `''\<c>` escape unit's RAW
+                         * source span (3 or 4 bytes, start/end into `src`) -- decoded on
+                         * demand by asnix_decode_istr_esc. Never counts toward
+                         * indentation (see TOK_ISTR_PART above). Deliberate, documented
+                         * scope note vs. the pre-M141 lexer: two or more of these back to
+                         * back used to be merged into a single accumulated token (an
+                         * artifact of the old eager-ByteBuf's "only flush on a category
+                         * change" logic); M141 emits one TOK_ISTR_ESC per escape unit
+                         * instead, never merged. This is observably identical for every
+                         * case actually exercised by this project's own test corpus (the
+                         * indentation algorithm's own `!has_indentation` branch never
+                         * inspects a non-indentation chunk's text at all, and the final
+                         * AstStringPart list's *concatenated value* is unaffected by how
+                         * many pieces it's split into) EXCEPT one vanishingly narrow
+                         * corner: `stripIndentation`'s "drop a final line that's empty-
+                         * or-spaces-only" check looks only at the literal's OVERALL LAST
+                         * part -- if that literal's content ends with two or more
+                         * back-to-back escape units where the old merged token would have
+                         * been in scope for that check and the new split tokens shift
+                         * which one is "last", this one specific edge (e.g. a string whose
+                         * very final content is `''\<space>''\<space>`, an escaped-space
+                         * pair right at the end) could in principle strip differently.
+                         * Not reachable by any fixture in this project's own e2e/
+                         * nix-conformance/nixpkgs-hash corpus (checked directly -- see
+                         * docs/architecture.md M141); flagged here, not swept under the
+                         * rug, in case a future real-world file ever hits it. */
     TOK_ISTR_END,       /* "''" closing an indented string */
     TOK_DOLLAR_LBRACE,  /* "${" -- starts an interpolated expression */
     TOK_QUESTION,  /* '?' -- has-attr operator / lambda-pattern default marker */
@@ -82,56 +119,98 @@ typedef enum {
                       * try_scan_path/try_scan_home_path), OR -- M64 -- the FIRST chunk of
                       * an interpolated path literal (`./${foo}`'s "./", `~/${foo}`'s "~/",
                       * ...), in which case this token is immediately followed by
-                      * TOK_DOLLAR_LBRACE rather than standing alone; see Token.is_home and
-                      * TOK_PATH_PART/TOK_PATH_END below. */
+                      * TOK_DOLLAR_LBRACE rather than standing alone; see
+                      * TOK_PATH_PART/TOK_PATH_END below. M141: "started with `~`"
+                      * (pre-M141's separate `is_home` flag) is now just `src[start] ==
+                      * '~'`, derived by the parser instead of carried on the token. */
     TOK_PATH_PART,   /* M64: a literal chunk inside an interpolated path literal, AFTER the
                       * first (`./a-${foo}-b`'s "-b", possibly zero-length between two
                       * adjacent interpolations) -- no escapes exist in path-literal syntax
-                      * at all, so (unlike TOK_STR_PART) this always points directly into
-                      * the original source buffer, never a decoded copy. */
+                      * at all, so (unlike TOK_STR_PART) this always points directly at a
+                      * raw source span, decoded or not, same thing. */
     TOK_PATH_END,    /* M64: closes an interpolated path literal -- a boundary marker only,
                       * no payload (mirrors TOK_STR_END). */
     TOK_SEARCH_PATH, /* <nixpkgs>-style NIX_PATH search-path literal */
     TOK_URI, /* bare URL literal (deprecated-but-still-default-accepted real-Nix syntax,
               * e.g. `http://example.com`) -- see lexer.c's try_scan_uri. Carries its
-              * full literal text in start/len, same as TOK_PATH/TOK_SEARCH_PATH; the
-              * parser turns it into a plain (non-interpolated) AST_STRING. */
+              * full literal text as a raw source span, same as TOK_PATH/TOK_SEARCH_PATH;
+              * the parser turns it into a plain (non-interpolated) AST_STRING. */
     TOK_EOF,
 } TokKind;
 
+/* M141: shrunk from 56 to 12 bytes (matching ~/gnix/iets/src/syntax/
+ * lexer.rs's own `Token`, the design target -- see docs/architecture.md's
+ * M141 section for the full before/after). `start`/`end` are byte offsets
+ * into the ONE source buffer every Token was ever lexed from (never a
+ * pointer into a separate decoded/malloc'd copy, unlike the pre-M141
+ * TOK_STR_PART/TOK_ISTR_PART, which each owned a freshly decoded buffer) --
+ * this is the "defer literal decoding" half of the design: an int/float
+ * literal's actual numeric value, a string/indented-string chunk's escape
+ * decoding, and a path literal's `is_home`/`is_search` classification are
+ * all now computed exactly once, on demand, by the PARSER at the point it
+ * builds the Ast node that needs them (see asnix_decode_float_literal/
+ * asnix_decode_dquote_span/asnix_decode_istr_esc below, and parser.c's own
+ * call sites) -- never eagerly at lex time, and never more than once per
+ * literal occurrence (same total decode work as before, just relocated).
+ * `end` doubles as "the token's own end position" for every kind that has
+ * no real payload at all (punctuation/keywords) -- `start` alone already
+ * serves the old `.pos` field's role (every token's source position) for
+ * every kind uniformly, since nothing is ever a decoded-buffer pointer
+ * anymore. */
 typedef struct {
     TokKind kind;
-    int64_t int_val;    /* TOK_INT */
-    double float_val;   /* TOK_FLOAT (M51) */
-    const char *start;  /* TOK_IDENT / TOK_STR_PART / TOK_ISTR_PART / TOK_PATH / TOK_PATH_PART /
-                          * TOK_SEARCH_PATH / TOK_URI: pointer into a buffer (TOK_IDENT/TOK_PATH/
-                          * TOK_PATH_PART/TOK_SEARCH_PATH/TOK_URI point into the original source,
-                          * TOK_SEARCH_PATH excluding the angle brackets; TOK_STR_PART/
-                          * TOK_ISTR_PART point into a freshly malloc'd decoded buffer, since escape
-                          * processing can shrink/change the bytes) */
-    size_t len;          /* length of the above */
-    const char *pos;     /* every token: pointer to its first byte in the source buffer --
-                           * used to recover the exact source text of an `assert` condition
-                           * for the failure message (see parser.c / compiler.c AST_ASSERT) */
-    int istr_has_indentation; /* TOK_ISTR_PART only: 1 if this chunk came from plain
-                                * string content (counts toward the indented string's
-                                * indentation computation), 0 if it came from an escape
-                                * sequence (''$, ''', ''\<c> -- treated as a boundary,
-                                * not scanned for leading whitespace, exactly like real
-                                * Nix's StringToken::hasIndentation). */
-    int is_home; /* TOK_PATH only (M64): 1 if this path literal (or this interpolated
-                   * literal's first chunk) started with `~` -- see try_scan_home_path and
-                   * compiler.c's resolve_path_chunk/resolve_path_literal. Always 0 for
-                   * TOK_SEARCH_PATH and every other TOK_PATH use. */
+    uint32_t start;
+    uint32_t end;
 } Token;
 
 /* Tokenizes the whole source in one pass into a malloc'd array terminated
- * by a TOK_EOF entry (*out_count includes that terminator), so the parser
- * can peek arbitrarily far ahead by plain array indexing. Aborts the
+ * by a TOK_EOF entry (*out_count includes that terminator). Dead code as
+ * of M135 (every real caller goes through asnix_parse's internal
+ * LexCursor instead -- see below), kept as a still-correct, still-tested-
+ * by-construction (same lex_until core every LexCursor call ultimately
+ * runs) standalone entry point, matching this project's own M127/M135
+ * precedent of keeping a correct-but-unused reference implementation
+ * rather than deleting a working, independently-useful API. Aborts the
  * process with a message on an unrecognized character -- this is a
  * from-scratch minimal-subset lexer, not a full Nix lexer (see
  * docs/architecture.md M4 scope notes). */
 Token *asnix_lex(const char *src, size_t *out_count);
+
+/* M141: decodes a TOK_FLOAT's raw [start,end) span via strtod, matching
+ * real Nix's own lexer.l exactly ("errno = 0; strtod(yytext, 0); if
+ * (errno != 0) throw ParseError") -- safe to call UNBOUNDED (no length
+ * cap passed to strtod) because the lexer's own scan already found the
+ * maximal span this exact grammar matches at this position, and strtod
+ * parses the identical grammar (digits, '.', digits, optional
+ * [eE][+-]?digits) -- it is provably unable to consume anything past
+ * `end` (whatever immediately follows `end` already failed this
+ * grammar, or the lexer's own scan would have included it too), so this
+ * always stops at exactly the same byte the lexer already decided ends
+ * the token, without needing a malloc'd, NUL-terminated, length-bounded
+ * copy the way the pre-M141 lexer-time decode did. */
+double asnix_decode_float_literal(const char *src, uint32_t start, uint32_t end);
+
+/* M141: decodes a TOK_STR_PART's raw [start,end) span (escapes NOT yet
+ * applied) into a freshly malloc'd buffer, applying exactly the same
+ * backslash-escape rules the pre-M141 lexer applied eagerly (see
+ * lexer.c's decode_escape_char) -- \n \r \t map to the control character,
+ * every other escaped byte (including \" \\ \$ \') passes through as
+ * itself, and any non-escaped byte (including a raw embedded newline,
+ * which real Nix allows inside "...") copies straight through. The
+ * decoded length is always <= end-start (every escape shrinks by exactly
+ * one byte, 2 raw -> 1 decoded), so this mallocs that upper bound
+ * directly without trimming afterward -- the same "malloc the provable
+ * upper bound, don't bother reallocing down" convention parser.c's own
+ * strip_indentation already uses for the exact same reason. *out_len
+ * receives the real decoded length (may be less than end-start). */
+char *asnix_decode_dquote_span(const char *src, uint32_t start, uint32_t end, size_t *out_len);
+
+/* M141: decodes one TOK_ISTR_ESC raw span (exactly one `''$` / `'''` /
+ * `''\<c>` escape unit) into `out` (caller-provided, >= 2 bytes) --
+ * *out_len is always 1 (`''$` -> "$", `''\<c>` -> one decoded byte) or 2
+ * (`'''` -> "''"). Mirrors lexer.c's pre-M141 istr_append_escape exactly,
+ * just evaluated later, from the raw span instead of while lexing. */
+void asnix_decode_istr_esc(const char *src, uint32_t start, char out[2], size_t *out_len);
 
 /* M135: an incremental, resumable lexer cursor -- used by the parser
  * (parser.c) to fuse lexing and parsing into one interleaved pass instead

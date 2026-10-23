@@ -274,34 +274,6 @@ static void mode_pop(ModeStack *m) {
     m->len--;
 }
 
-/* Growable byte buffer for accumulating decoded string-literal content:
- * escape processing can shrink/change bytes, so a literal chunk can't
- * just be a pointer+length into the original source the way TOK_IDENT is. */
-typedef struct {
-    char *buf;
-    size_t len, cap;
-} ByteBuf;
-
-static void bb_push(ByteBuf *bb, char c) {
-    if (bb->len == bb->cap) {
-        bb->cap = bb->cap ? bb->cap * 2 : 32;
-        bb->buf = realloc(bb->buf, bb->cap);
-    }
-    bb->buf[bb->len++] = c;
-}
-
-/* Hands ownership of a malloc'd copy of bb's current contents to the
- * token being pushed, then resets bb (keeping its underlying buffer, if
- * any, for the next chunk) -- tokens must outlive the ByteBuf that built
- * them, since asnix_lex returns the whole token array back to the caller. */
-static char *bb_take_copy(ByteBuf *bb, size_t *out_len) {
-    char *copy = malloc(bb->len ? bb->len : 1);
-    if (bb->len) memcpy(copy, bb->buf, bb->len);
-    *out_len = bb->len;
-    bb->len = 0;
-    return copy;
-}
-
 static void fatal_unterminated(const char *what) {
     fprintf(stderr, "asnix: unterminated %s\n", what);
     exit(1);
@@ -320,6 +292,50 @@ static char decode_escape_char(char c) {
     }
 }
 
+double asnix_decode_float_literal(const char *src, uint32_t start, uint32_t end) {
+    (void)end; /* see this function's own header comment (lexer.h) for why no bound is needed */
+    errno = 0;
+    double d = strtod(src + start, NULL);
+    if (errno == ERANGE) {
+        fprintf(stderr, "asnix: invalid float '%.*s'\n", (int)(end - start), src + start);
+        exit(1);
+    }
+    return d;
+}
+
+char *asnix_decode_dquote_span(const char *src, uint32_t start, uint32_t end, size_t *out_len) {
+    size_t cap = (size_t)(end - start);
+    char *out = malloc(cap ? cap : 1);
+    size_t n = 0;
+    uint32_t i = start;
+    while (i < end) {
+        char c = src[i];
+        if (c == '\\') {
+            out[n++] = decode_escape_char(src[i + 1]);
+            i += 2;
+        } else {
+            out[n++] = c;
+            i += 1;
+        }
+    }
+    *out_len = n;
+    return out;
+}
+
+void asnix_decode_istr_esc(const char *src, uint32_t start, char out[2], size_t *out_len) {
+    char third = src[start + 2];
+    if (third == '\'') {
+        out[0] = '\''; out[1] = '\'';
+        *out_len = 2;
+    } else if (third == '$') {
+        out[0] = '$';
+        *out_len = 1;
+    } else { /* '\\' */
+        out[0] = decode_escape_char(src[start + 3]);
+        *out_len = 1;
+    }
+}
+
 /* Scans one run of double-quoted string content starting at *i (which
  * must be positioned just inside the opening '"' or just after a closed
  * "${ ... }" interpolation), up to and including the next boundary --
@@ -328,60 +344,63 @@ static char decode_escape_char(char c) {
  * interpolations) followed by the boundary token (TOK_STR_END or
  * TOK_DOLLAR_LBRACE). Mutates *i and `modes` to reflect the boundary
  * crossed (pop back to NORMAL on close, push a fresh NORMAL on "${").
- * Verified against real `nix-instantiate` for raw embedded newlines
- * (allowed, unlike this lexer's pre-interpolation M5 behavior -- see
+ * M141: the TOK_STR_PART pushed here is a RAW span -- escapes are
+ * scanned over (to find where the span ends and to validate there's no
+ * unterminated trailing backslash) but never decoded; decoding happens
+ * later, on demand, via asnix_decode_dquote_span (see lexer.h). Verified
+ * against real `nix-instantiate` for raw embedded newlines (allowed,
+ * unlike this lexer's pre-interpolation M5 behavior -- see
  * docs/architecture.md's Known Bugs list) and the \n \r \t \" \\ \$
  * escapes. */
 static void lex_dquote_run(const char *src, size_t *i, ModeStack *modes, TokVec *v) {
-    ByteBuf bb = { 0 };
+    size_t start = *i;
     for (;;) {
         char c = src[*i];
         if (c == '\0') fatal_unterminated("string literal");
         if (c == '"') {
+            push_tok(v, (Token){ .kind = TOK_STR_PART, .start = (uint32_t)start, .end = (uint32_t)*i });
             (*i)++;
-            size_t len;
-            char *text = bb_take_copy(&bb, &len);
-            push_tok(v, (Token){ .kind = TOK_STR_PART, .start = text, .len = len });
             mode_pop(modes);
-            push_tok(v, (Token){ .kind = TOK_STR_END });
-            free(bb.buf);
+            push_tok(v, (Token){ .kind = TOK_STR_END, .start = (uint32_t)*i, .end = (uint32_t)*i });
             return;
         }
         if (c == '$' && src[*i + 1] == '{') {
+            push_tok(v, (Token){ .kind = TOK_STR_PART, .start = (uint32_t)start, .end = (uint32_t)*i });
             *i += 2;
-            size_t len;
-            char *text = bb_take_copy(&bb, &len);
-            push_tok(v, (Token){ .kind = TOK_STR_PART, .start = text, .len = len });
             mode_push(modes, MODE_NORMAL);
-            push_tok(v, (Token){ .kind = TOK_DOLLAR_LBRACE });
-            free(bb.buf);
+            push_tok(v, (Token){ .kind = TOK_DOLLAR_LBRACE, .start = (uint32_t)*i - 2, .end = (uint32_t)*i });
             return;
         }
         if (c == '\\') {
             char e = src[*i + 1];
             if (e == '\0') fatal_unterminated("string literal");
-            bb_push(&bb, decode_escape_char(e));
             *i += 2;
             continue;
         }
-        bb_push(&bb, c); /* includes raw '\n' -- real Nix allows literal newlines in "..." */
-        (*i)++;
+        (*i)++; /* includes raw '\n' -- real Nix allows literal newlines in "..." */
     }
 }
 
 /* Scans one or more runs of indented ('' ... '') string content starting
  * at *i, up to and including the next boundary (closing "''" or "${"),
- * pushing one TOK_ISTR_PART per plain-content/escape-sequence run (so
- * indentation stripping, done later over the whole collected sequence,
- * can tell real content from an escape the same way real Nix's
- * StringToken::hasIndentation does -- see ~/nix's ParserState::
- * stripIndentation) followed by the boundary token. Implements the
- * escapes verified against real nix-instantiate: ''$ -> literal "$"
- * (combined with plain "{" right after, this is how ''${ becomes a
- * literal "${" without starting an interpolation -- there is no separate
- * "''${" rule, it falls out of this one plus ordinary content scanning),
- * ''' -> literal "''", ''\<c> -> a backslash-style escape of <c>, and
- * bare '' (not followed by one of the above) always closes the string.
+ * pushing one TOK_ISTR_PART per plain-content run and one TOK_ISTR_ESC
+ * per escape unit (so indentation stripping, done later over the whole
+ * collected sequence, can tell real content from an escape the same way
+ * real Nix's StringToken::hasIndentation does -- see ~/nix's
+ * ParserState::stripIndentation) followed by the boundary token.
+ * Implements the escapes verified against real nix-instantiate: ''$ ->
+ * literal "$" (combined with plain "{" right after, this is how ''${
+ * becomes a literal "${" without starting an interpolation -- there is
+ * no separate "''${" rule, it falls out of this one plus ordinary
+ * content scanning), ''' -> literal "''", ''\<c> -> a backslash-style
+ * escape of <c>, and bare '' (not followed by one of the above) always
+ * closes the string. M141: both TOK_ISTR_PART and TOK_ISTR_ESC carry a
+ * RAW span only -- decoding (trivial for ISTR_PART: none needed at all,
+ * it's already plain source text; a small fixed-shape decode for
+ * TOK_ISTR_ESC) happens on demand, see asnix_decode_istr_esc. See
+ * lexer.h's own TOK_ISTR_ESC comment for the one narrow, documented
+ * behavioral difference from the pre-M141 lexer (back-to-back escape
+ * units used to merge into one token; M141 never merges).
  *
  * Deliberate, documented scope cut vs. real Nix's lexer: a lone "'"
  * immediately followed by "$" is treated here as two ordinary content
@@ -390,84 +409,58 @@ static void lex_dquote_run(const char *src, size_t *i, ModeStack *modes, TokVec 
  * in the vanishingly rare case of a leading "'$" run of whitespace, never
  * the produced string's actual bytes -- not exercised by any case in
  * tests/e2e, and not worth the extra complexity here. */
-static void istr_flush_if_nonempty(ByteBuf *bb, int acc_is_content, TokVec *v) {
-    if (bb->len == 0) return;
-    size_t len;
-    char *text = bb_take_copy(bb, &len);
-    push_tok(v, (Token){ .kind = TOK_ISTR_PART, .start = text, .len = len, .istr_has_indentation = acc_is_content });
-}
-
-static void istr_flush_always(ByteBuf *bb, int acc_is_content, TokVec *v) {
-    size_t len;
-    char *text = bb_take_copy(bb, &len);
-    push_tok(v, (Token){ .kind = TOK_ISTR_PART, .start = text, .len = len, .istr_has_indentation = acc_is_content });
-}
-
-/* Appends one escape sequence's decoded bytes to `bb`, flushing first if
- * the buffer currently holds a plain-content run (category changed).
- * `acc_is_content` is the caller's running category variable: always 0
- * (not content) after this returns. */
-static void istr_append_escape(ByteBuf *bb, int *acc_is_content, TokVec *v, const char *bytes, size_t n) {
-    if (bb->len > 0 && *acc_is_content != 0) istr_flush_if_nonempty(bb, *acc_is_content, v);
-    *acc_is_content = 0;
-    for (size_t k = 0; k < n; k++) bb_push(bb, bytes[k]);
-}
-
 static void lex_indented_run(const char *src, size_t *i, ModeStack *modes, TokVec *v) {
-    ByteBuf bb = { 0 };
-    int acc_is_content = 0; /* only meaningful once bb.len > 0 */
+    size_t content_start = *i;
 
     for (;;) {
         char c = src[*i];
         if (c == '\0') fatal_unterminated("indented string literal (''...'')");
 
         if (c == '$' && src[*i + 1] == '{') {
-            istr_flush_always(&bb, acc_is_content, v); /* always emit a (possibly empty) PART before the boundary */
+            /* Always emit a (possibly empty) PART before the boundary --
+             * matches the pre-M141 istr_flush_always convention. */
+            push_tok(v, (Token){ .kind = TOK_ISTR_PART, .start = (uint32_t)content_start, .end = (uint32_t)*i });
             *i += 2;
             mode_push(modes, MODE_NORMAL);
-            push_tok(v, (Token){ .kind = TOK_DOLLAR_LBRACE });
-            free(bb.buf);
+            push_tok(v, (Token){ .kind = TOK_DOLLAR_LBRACE, .start = (uint32_t)*i - 2, .end = (uint32_t)*i });
             return;
         }
 
         if (c == '\'' && src[*i + 1] == '\'') {
             char third = src[*i + 2];
-            if (third == '\'') { /* ''' -> literal "''" */
-                istr_append_escape(&bb, &acc_is_content, v, "''", 2);
-                *i += 3;
-                continue;
-            }
-            if (third == '$') { /* ''$ -> literal "$" (combined with a following plain '{', this is
-                                  * how ''${ reads as a literal "${" without starting an
-                                  * interpolation -- there's no separate "''${" rule, it falls out
-                                  * of this escape plus ordinary content scanning of the '{'). */
-                istr_append_escape(&bb, &acc_is_content, v, "$", 1);
-                *i += 3;
-                continue;
-            }
-            if (third == '\\') { /* ''\<c> -> one escaped character, same decode rules as "..." */
-                char e = src[*i + 3];
-                if (e == '\0') fatal_unterminated("indented string literal (''...'')");
-                char decoded = decode_escape_char(e);
-                istr_append_escape(&bb, &acc_is_content, v, &decoded, 1);
-                *i += 4;
+            if (third == '\'' || third == '$' || third == '\\') {
+                size_t esc_start = *i;
+                size_t esc_end;
+                if (third == '\\') {
+                    if (src[*i + 3] == '\0') fatal_unterminated("indented string literal (''...'')");
+                    esc_end = *i + 4;
+                } else {
+                    esc_end = *i + 3; /* ''' or ''$ -- both exactly 3 raw bytes */
+                }
+                /* Flush the pending content run only if nonempty -- matches
+                 * the pre-M141 istr_flush_if_nonempty convention (a
+                 * content-to-escape category change doesn't force an empty
+                 * PART the way a real boundary does). */
+                if (*i > content_start) {
+                    push_tok(v, (Token){ .kind = TOK_ISTR_PART, .start = (uint32_t)content_start, .end = (uint32_t)*i });
+                }
+                push_tok(v, (Token){ .kind = TOK_ISTR_ESC, .start = (uint32_t)esc_start, .end = (uint32_t)esc_end });
+                *i = esc_end;
+                content_start = *i;
                 continue;
             }
             /* Bare '' not followed by ', $, or \\ -- always the closing delimiter. */
-            istr_flush_always(&bb, acc_is_content, v);
+            push_tok(v, (Token){ .kind = TOK_ISTR_PART, .start = (uint32_t)content_start, .end = (uint32_t)*i });
             *i += 2;
             mode_pop(modes);
-            push_tok(v, (Token){ .kind = TOK_ISTR_END });
-            free(bb.buf);
+            push_tok(v, (Token){ .kind = TOK_ISTR_END, .start = (uint32_t)*i, .end = (uint32_t)*i });
             return;
         }
 
         /* Plain content: everything else, including a lone '$' not
          * followed by '{', a lone '\'' not followed by another '\'', and
-         * raw newlines (which indentation-stripping treats specially). */
-        if (bb.len > 0 && acc_is_content != 1) istr_flush_if_nonempty(&bb, acc_is_content, v);
-        acc_is_content = 1;
-        bb_push(&bb, c);
+         * raw newlines (which indentation-stripping treats specially) --
+         * just extend the pending content run, nothing to write yet. */
         (*i)++;
     }
 }
@@ -483,11 +476,11 @@ static void lex_indented_run(const char *src, size_t *i, ModeStack *modes, TokVe
  * allowance lex_dquote_run makes for TOK_STR_PART) followed by the
  * boundary token (TOK_DOLLAR_LBRACE or TOK_PATH_END). Unlike
  * lex_dquote_run/lex_indented_run, there is no escape processing at all
- * in path-literal syntax (no backslash is ever a path_char), so the
- * chunk can point straight into the original source buffer instead of
- * a decoded copy -- no ByteBuf needed. A chunk may start with plain
- * path_chars, a '/'-group run, or both, exactly like a fresh path
- * literal's own scan (reuses scan_path_groups the same way
+ * in path-literal syntax (no backslash is ever a path_char), so this
+ * chunk's span already points straight at the final text -- no decode
+ * step needed downstream at all, same as before M141. A chunk may start
+ * with plain path_chars, a '/'-group run, or both, exactly like a fresh
+ * path literal's own scan (reuses scan_path_groups the same way
  * try_scan_path does), EXCEPT it's never required to contain any
  * group at all (a bare trailing `-b`-style run with no slash, like
  * `./a-${foo}-b`'s "-b", is perfectly valid here -- only the very
@@ -503,34 +496,29 @@ static void lex_path_run(const char *src, size_t *i, ModeStack *modes, TokVec *v
     *i = j;
 
     if (at_dollar_brace(src, *i)) {
-        push_tok(v, (Token){ .kind = TOK_PATH_PART, .start = src + start, .len = *i - start });
+        push_tok(v, (Token){ .kind = TOK_PATH_PART, .start = (uint32_t)start, .end = (uint32_t)*i });
         *i += 2;
         mode_push(modes, MODE_NORMAL); /* MODE_PATH underneath is left in place -- the matching
                                          * '}' pops back to it, re-entering this same function */
-        push_tok(v, (Token){ .kind = TOK_DOLLAR_LBRACE });
+        push_tok(v, (Token){ .kind = TOK_DOLLAR_LBRACE, .start = (uint32_t)*i - 2, .end = (uint32_t)*i });
         return;
     }
-    push_tok(v, (Token){ .kind = TOK_PATH_PART, .start = src + start, .len = *i - start });
+    push_tok(v, (Token){ .kind = TOK_PATH_PART, .start = (uint32_t)start, .end = (uint32_t)*i });
     mode_pop(modes);
-    push_tok(v, (Token){ .kind = TOK_PATH_END });
+    push_tok(v, (Token){ .kind = TOK_PATH_END, .start = (uint32_t)*i, .end = (uint32_t)*i });
 }
 
-/* Shared tail-scan + strtod for a float literal already known to match
+/* M141: shared tail-scan for a float literal already known to match
  * (either a digit run followed by '.', or a bare '.' followed by a
- * digit) -- see asnix_lex's two call sites above. `*i` arrives already
+ * digit) -- see lex_until's two call sites below. `*i` arrives already
  * positioned just past the decisive '.'; this scans the fractional
- * digits and an optional exponent, then hands the whole [tok_start, *i)
- * span to strtod, mirroring real Nix's own lexer.l exactly ("errno = 0;
- * strtod(yytext, 0); if (errno != 0) throw ParseError"). Checked
- * directly against glibc: "1.0e-400" sets ERANGE (underflows to exactly
- * 0.0), "5.0e-324" sets ERANGE too (a nonzero subnormal result still
- * counts as underflow), "1.0e400" sets ERANGE (overflows to +-HUGE_VAL),
- * while "0.0e-400" does NOT (the mantissa is already exactly zero, so
- * there's no actual underflow to report) -- all four cross-checked
- * against numtide/nix-conformance's parse-fail-float-{overflow,
- * underflow,subnormal}.nix fixtures (and eval-okay-float-range.nix's own
- * `0.0e-400`/`0.0e5` cases) before trusting this. */
-static double scan_float_tail_and_parse(const char *src, size_t tok_start, size_t *i) {
+ * digits and an optional exponent ONLY (no strtod call here anymore --
+ * that's deferred to asnix_decode_float_literal, called later from
+ * parser.c once an AST_FLOAT node is actually being built). Mirrors real
+ * Nix's own lexer.l FLOAT regex exactly, same as the pre-M141 version of
+ * this function (renamed from scan_float_tail_and_parse, which also did
+ * the strtod+malloc+errno-check this split moved out). */
+static void scan_float_tail(const char *src, size_t *i) {
     while (cc_digit(src[*i])) (*i)++;
     if (src[*i] == 'e' || src[*i] == 'E') {
         size_t k = *i + 1;
@@ -540,18 +528,6 @@ static double scan_float_tail_and_parse(const char *src, size_t tok_start, size_
             while (cc_digit(src[*i])) (*i)++;
         } /* else: 'e'/'E' not actually followed by a valid exponent -- leave *i unchanged, unconsumed */
     }
-    size_t len = *i - tok_start;
-    char *buf = malloc(len + 1);
-    memcpy(buf, src + tok_start, len);
-    buf[len] = '\0';
-    errno = 0;
-    double d = strtod(buf, NULL);
-    if (errno == ERANGE) {
-        fprintf(stderr, "asnix: invalid float '%s'\n", buf);
-        exit(1);
-    }
-    free(buf);
-    return d;
 }
 
 static void lex_until(const char *src, size_t *i_inout, ModeStack *modes, TokVec *v, size_t min_len);
@@ -559,27 +535,10 @@ static void lex_until(const char *src, size_t *i_inout, ModeStack *modes, TokVec
 Token *asnix_lex(const char *src, size_t *out_count) {
     /* perf: presize the token array from the source length instead of
      * letting push_tok's cap-doubling start from scratch (0->64->128->...)
-     * on every single file. nixpkgs-style imports touch over a thousand
-     * separate .nix files in one eval (1057 on the real d.nix/ffmpeg
-     * closure), each paying its own doubling sequence -- every doubling
-     * step mallocs a brand-new, bigger block and memcpy's the old live
-     * tokens into it. One upfront malloc sized off strlen(src) (measured
-     * ~8.6 real source bytes per token on that same corpus; /3 here is a
-     * generous safety margin, not the measured average) cuts the
-     * per-file realloc count from an average of ~3.5 down to 0 (measured
-     * directly: ASNIX_LEX_STATS-instrumented build, 3688 reallocs across
-     * 1057 files before this change, 0 after) and gives a real, repeated
-     * ~10% wall-clock win on d.nix (perf stat -r 5: 1.893s -> 1.704s).
-     * NOTE, confirmed by direct measurement, so a future reader doesn't
-     * re-derive the wrong mental model from this comment alone: this is
-     * NOT a page-fault fix -- total page faults barely move (174,407 ->
-     * 173,303, -0.6%) because glibc's free-list reuse mostly satisfies a
-     * growing buffer's reallocs from already-first-touched heap space,
-     * not fresh pages. The win here is pure saved CPU (fewer realloc /
-     * memcpy calls), not fewer faults. push_tok's existing doubling still
-     * kicks in as a fallback for any file whose token density exceeds the
-     * estimate, so this is purely an initial-capacity tweak, not a
-     * behavior change. */
+     * on every single file -- see this project's own M123 writeup for the
+     * full measured rationale (unchanged by M141's Token shrink, since the
+     * measured-average "8.6 bytes of SOURCE per token" ratio this sizing
+     * is based on is about source bytes, not Token's own size). */
     size_t src_len = strlen(src);
     TokVec v = { .toks = malloc((src_len / 3 + 32) * sizeof(Token)), .len = 0, .cap = src_len / 3 + 32 };
     ModeStack modes = { 0 };
@@ -668,14 +627,15 @@ static void lex_until(const char *src, size_t *i_inout, ModeStack *modes, TokVec
          * never itself a path_char, so try_scan_path can never fire at
          * this position on its own -- a separate probe is required). Both
          * branches below handle the "immediately followed by ${" case
-         * identically: emit just this chunk as TOK_PATH (is_home set
-         * accordingly), then push MODE_PATH (so the matching '}' that
-         * closes the interpolation's expression returns here, not to
-         * plain MODE_NORMAL) underneath a fresh MODE_NORMAL for the
-         * expression itself, and emit TOK_DOLLAR_LBRACE -- exactly the
-         * same push-two-modes-and-emit-the-boundary-token shape
-         * lex_dquote_run/lex_indented_run already use for "${" inside a
-         * string.
+         * identically: emit just this chunk as TOK_PATH (its `~`-ness is
+         * recovered later by the parser directly from `src[start]`, see
+         * lexer.h -- no is_home flag carried here anymore), then push
+         * MODE_PATH (so the matching '}' that closes the interpolation's
+         * expression returns here, not to plain MODE_NORMAL) underneath a
+         * fresh MODE_NORMAL for the expression itself, and emit
+         * TOK_DOLLAR_LBRACE -- exactly the same push-two-modes-and-emit-
+         * the-boundary-token shape lex_dquote_run/lex_indented_run already
+         * use for "${" inside a string.
          *
          * M138: unlike the general try_scan_path call a few lines below
          * (kept unconditional, see that call site's own comment),
@@ -685,13 +645,13 @@ static void lex_until(const char *src, size_t *i_inout, ModeStack *modes, TokVec
         {
             size_t hlen = try_scan_home_path(src, i);
             if (hlen > 0) {
-                push_tok(v, (Token){ .kind = TOK_PATH, .start = src + i, .len = hlen, .pos = src + tok_start, .is_home = 1 });
+                push_tok(v, (Token){ .kind = TOK_PATH, .start = (uint32_t)i, .end = (uint32_t)(i + hlen) });
                 i += hlen;
                 if (at_dollar_brace(src, i)) {
                     i += 2;
                     mode_push(modes, MODE_PATH);
                     mode_push(modes, MODE_NORMAL);
-                    push_tok(v, (Token){ .kind = TOK_DOLLAR_LBRACE });
+                    push_tok(v, (Token){ .kind = TOK_DOLLAR_LBRACE, .start = (uint32_t)i - 2, .end = (uint32_t)i });
                 }
                 continue;
             }
@@ -734,28 +694,8 @@ static void lex_until(const char *src, size_t *i_inout, ModeStack *modes, TokVec
          * rescan, exactly the "a.b:foo"/"foo.bar/baz" case above).
          * Whenever NONE of those four hold, skipping both scans entirely
          * is PROVABLY equivalent to running them and having them both
-         * fail, not merely a fast-path approximation:
-         *   - Neither '/' nor ':' can appear anywhere strictly before the
-         *     peeked byte: both already stop an ident_cont run outright
-         *     (neither is in CC_IDENT_CONT), so if either had appeared
-         *     earlier, the run would never have reached this far.
-         *   - If the ident_cont run contains no '\'' (the overwhelmingly
-         *     common case), the path_char/uri_scheme_char run from this
-         *     token's start tracks the ident_cont run exactly on their
-         *     shared subset (alnum/'_'/'-') and can only diverge AT the
-         *     peeked byte itself, via '.'/'+' -- already excluded by the
-         *     guard's own condition, so it provably stops at that same
-         *     byte too.
-         *   - If the ident_cont run DOES contain a '\'' before the peeked
-         *     byte (rare -- a primed identifier like `lib'`), the real
-         *     path_char/uri_scheme_char run stops AT that '\'' instead,
-         *     long before the peeked byte -- but scan_path_groups/the
-         *     URI-colon check both require that exact stopping byte to be
-         *     '/' or ':' respectively, and a '\'' is neither, so both
-         *     scans are guaranteed to fail there regardless of what the
-         *     peeked byte is. Skipping is still safe.
-         * Every CC_* set used here is the same table M129 already built;
-         * this milestone reuses it, not a new predicate. */
+         * fail, not merely a fast-path approximation (see M138's own
+         * writeup, docs/architecture.md, for the full proof). */
         if (ident_start(c)) {
             size_t j = i + 1;
             while (ident_cont(src[j])) j++;
@@ -763,19 +703,19 @@ static void lex_until(const char *src, size_t *i_inout, ModeStack *modes, TokVec
             if (nb == '/' || nb == ':' || nb == '.' || nb == '+') {
                 size_t plen = try_scan_path(src, i);
                 if (plen > 0) {
-                    push_tok(v, (Token){ .kind = TOK_PATH, .start = src + i, .len = plen, .pos = src + tok_start });
+                    push_tok(v, (Token){ .kind = TOK_PATH, .start = (uint32_t)i, .end = (uint32_t)(i + plen) });
                     i += plen;
                     if (at_dollar_brace(src, i)) {
                         i += 2;
                         mode_push(modes, MODE_PATH);
                         mode_push(modes, MODE_NORMAL);
-                        push_tok(v, (Token){ .kind = TOK_DOLLAR_LBRACE });
+                        push_tok(v, (Token){ .kind = TOK_DOLLAR_LBRACE, .start = (uint32_t)i - 2, .end = (uint32_t)i });
                     }
                     continue;
                 }
                 size_t ulen = try_scan_uri(src, i);
                 if (ulen > 0) {
-                    push_tok(v, (Token){ .kind = TOK_URI, .start = src + i, .len = ulen, .pos = src + tok_start });
+                    push_tok(v, (Token){ .kind = TOK_URI, .start = (uint32_t)i, .end = (uint32_t)(i + ulen) });
                     i += ulen;
                     continue;
                 }
@@ -794,7 +734,7 @@ static void lex_until(const char *src, size_t *i_inout, ModeStack *modes, TokVec
                     break;
                 }
             }
-            push_tok(v, (Token){ .kind = kind, .start = src + start, .len = len, .pos = src + tok_start });
+            push_tok(v, (Token){ .kind = kind, .start = (uint32_t)start, .end = (uint32_t)j });
             i = j;
             continue;
         }
@@ -811,13 +751,13 @@ static void lex_until(const char *src, size_t *i_inout, ModeStack *modes, TokVec
         {
             size_t plen = try_scan_path(src, i);
             if (plen > 0) {
-                push_tok(v, (Token){ .kind = TOK_PATH, .start = src + i, .len = plen, .pos = src + tok_start });
+                push_tok(v, (Token){ .kind = TOK_PATH, .start = (uint32_t)i, .end = (uint32_t)(i + plen) });
                 i += plen;
                 if (at_dollar_brace(src, i)) {
                     i += 2;
                     mode_push(modes, MODE_PATH);
                     mode_push(modes, MODE_NORMAL);
-                    push_tok(v, (Token){ .kind = TOK_DOLLAR_LBRACE });
+                    push_tok(v, (Token){ .kind = TOK_DOLLAR_LBRACE, .start = (uint32_t)i - 2, .end = (uint32_t)i });
                 }
                 continue;
             }
@@ -834,7 +774,7 @@ static void lex_until(const char *src, size_t *i_inout, ModeStack *modes, TokVec
             size_t k = start;
             while (path_char(src[k]) || src[k] == '/') k++;
             if (k > start && src[k] == '>') {
-                push_tok(v, (Token){ .kind = TOK_SEARCH_PATH, .start = src + start, .len = k - start, .pos = src + tok_start });
+                push_tok(v, (Token){ .kind = TOK_SEARCH_PATH, .start = (uint32_t)start, .end = (uint32_t)k });
                 i = k + 1;
                 continue;
             }
@@ -873,12 +813,11 @@ static void lex_until(const char *src, size_t *i_inout, ModeStack *modes, TokVec
             }
             if (is_float) {
                 i++; /* consume '.' */
-                double d = scan_float_tail_and_parse(src, start, &i);
-                push_tok(v, (Token){ .kind = TOK_FLOAT, .float_val = d, .pos = src + tok_start });
+                scan_float_tail(src, &i);
+                push_tok(v, (Token){ .kind = TOK_FLOAT, .start = (uint32_t)start, .end = (uint32_t)i });
                 continue;
             }
-            Token t = { .kind = TOK_INT, .int_val = strtoll(src + start, NULL, 10), .pos = src + tok_start };
-            push_tok(v, t);
+            push_tok(v, (Token){ .kind = TOK_INT, .start = (uint32_t)start, .end = (uint32_t)i });
             continue;
         }
 
@@ -891,15 +830,15 @@ static void lex_until(const char *src, size_t *i_inout, ModeStack *modes, TokVec
         if (c == '.' && cc_digit(src[i + 1])) {
             size_t start = i;
             i++; /* consume '.' */
-            double d = scan_float_tail_and_parse(src, start, &i);
-            push_tok(v, (Token){ .kind = TOK_FLOAT, .float_val = d, .pos = src + tok_start });
+            scan_float_tail(src, &i);
+            push_tok(v, (Token){ .kind = TOK_FLOAT, .start = (uint32_t)start, .end = (uint32_t)i });
             continue;
         }
 
         if (c == '"') {
             i++;
             mode_push(modes, MODE_STRING);
-            push_tok(v, (Token){ .kind = TOK_STR_START });
+            push_tok(v, (Token){ .kind = TOK_STR_START, .start = (uint32_t)tok_start, .end = (uint32_t)i });
             continue;
         }
 
@@ -915,7 +854,7 @@ static void lex_until(const char *src, size_t *i_inout, ModeStack *modes, TokVec
             while (src[j] == ' ') j++;
             if (src[j] == '\n') i = j + 1;
             mode_push(modes, MODE_ISTRING);
-            push_tok(v, (Token){ .kind = TOK_ISTR_START });
+            push_tok(v, (Token){ .kind = TOK_ISTR_START, .start = (uint32_t)tok_start, .end = (uint32_t)i });
             continue;
         }
 
@@ -933,14 +872,14 @@ static void lex_until(const char *src, size_t *i_inout, ModeStack *modes, TokVec
         if (c == '$' && src[i + 1] == '{') {
             i += 2;
             mode_push(modes, MODE_NORMAL);
-            push_tok(v, (Token){ .kind = TOK_DOLLAR_LBRACE });
+            push_tok(v, (Token){ .kind = TOK_DOLLAR_LBRACE, .start = (uint32_t)tok_start, .end = (uint32_t)i });
             continue;
         }
 
         if (c == '{') {
             i++;
             mode_push(modes, MODE_NORMAL);
-            push_tok(v, (Token){ .kind = TOK_LBRACE });
+            push_tok(v, (Token){ .kind = TOK_LBRACE, .start = (uint32_t)tok_start, .end = (uint32_t)i });
             continue;
         }
         if (c == '}') {
@@ -950,7 +889,7 @@ static void lex_until(const char *src, size_t *i_inout, ModeStack *modes, TokVec
             }
             i++;
             mode_pop(modes);
-            push_tok(v, (Token){ .kind = TOK_RBRACE, .pos = src + tok_start });
+            push_tok(v, (Token){ .kind = TOK_RBRACE, .start = (uint32_t)tok_start, .end = (uint32_t)i });
             continue;
         }
 
@@ -964,7 +903,7 @@ static void lex_until(const char *src, size_t *i_inout, ModeStack *modes, TokVec
          * double-character operator, same lookahead style as the two-char
          * operators below. */
         if (c == '.' && src[i + 1] == '.' && src[i + 2] == '.') {
-            push_tok(v, (Token){ .kind = TOK_ELLIPSIS, .pos = src + tok_start });
+            push_tok(v, (Token){ .kind = TOK_ELLIPSIS, .start = (uint32_t)tok_start, .end = (uint32_t)(tok_start + 3) });
             i += 3;
             continue;
         }
@@ -1015,11 +954,11 @@ static void lex_until(const char *src, size_t *i_inout, ModeStack *modes, TokVec
                     exit(1);
             }
         }
-        push_tok(v, (Token){ .kind = kind, .pos = src + tok_start });
+        push_tok(v, (Token){ .kind = kind, .start = (uint32_t)tok_start, .end = (uint32_t)(tok_start + width) });
         i += width;
     }
 
-    push_tok(v, (Token){ .kind = TOK_EOF, .pos = src + i });
+    push_tok(v, (Token){ .kind = TOK_EOF, .start = (uint32_t)i, .end = (uint32_t)i });
     *i_inout = i;
 }
 

@@ -649,6 +649,17 @@ static void curpos_line_col(const char *src, const char *at, int *out_line, int 
     *out_col = col;
 }
 
+/* M141: every Token now carries a raw [start,end) source-byte-offset span
+ * instead of a decoded pointer+length (see lexer.h) -- these two tiny
+ * helpers recover the "pointer into src, plus length" shape almost every
+ * call site below still wants, for the (overwhelming majority of) token
+ * kinds whose span IS its final text verbatim (identifiers, keywords,
+ * path/URI/search-path literals -- never TOK_STR_PART/TOK_ISTR_PART/
+ * TOK_ISTR_ESC, which need a real decode step instead, see
+ * asnix_decode_dquote_span/asnix_decode_istr_esc's own call sites below). */
+static const char *tok_text(Parser *p, Token *t) { return p->src + t->start; }
+static size_t tok_len(Token *t) { return (size_t)(t->end - t->start); }
+
 static Token *cur(Parser *p) {
     return lexcur_tok(p->lc, p->pos);
 }
@@ -762,10 +773,10 @@ static AttrSeg parse_attr_segment(Parser *p, const char *what) {
         if (cur(p)->kind == TOK_OR) {
             Token *t = cur(p);
             advance(p);
-            return (AttrSeg){ .is_dynamic = 0, .attr = t->start, .attr_len = t->len };
+            return (AttrSeg){ .is_dynamic = 0, .attr = tok_text(p, t), .attr_len = tok_len(t) };
         }
         Token *t = expect(p, TOK_IDENT, what);
-        return (AttrSeg){ .is_dynamic = 0, .attr = t->start, .attr_len = t->len };
+        return (AttrSeg){ .is_dynamic = 0, .attr = tok_text(p, t), .attr_len = tok_len(t) };
     }
     /* Quoted-string segment -- reuses parse_dquote_string's own chunk-
      * collecting loop (same TOK_STR_PART/TOK_DOLLAR_LBRACE/TOK_STR_END
@@ -1080,16 +1091,16 @@ static void parse_binding_stmt(Parser *p, BTVec *out, DynBindingVec *dyn_out) {
  * OP_PATH_CONCAT chain. */
 static Ast *parse_path_literal_interp(Parser *p, Token *t) {
     Ast *n = asnix_ast_new(AST_PATH);
-    n->as.path.text = t->start;
-    n->as.path.len = t->len;
+    n->as.path.text = tok_text(p, t);
+    n->as.path.len = tok_len(t);
     n->as.path.is_search = 0;
-    n->as.path.is_home = t->is_home;
+    n->as.path.is_home = (p->src[t->start] == '~'); /* M141: derived, not carried on Token (see lexer.h) */
 
     size_t parts_mark = partvec_mark();
     while (cur(p)->kind != TOK_PATH_END) {
         if (cur(p)->kind == TOK_PATH_PART) {
             Token *pt = cur(p);
-            partvec_push((AstStringPart){ .is_expr = 0, .text = pt->start, .text_len = pt->len });
+            partvec_push((AstStringPart){ .is_expr = 0, .text = tok_text(p, pt), .text_len = tok_len(pt) });
             advance(p);
         } else if (cur(p)->kind == TOK_DOLLAR_LBRACE) {
             advance(p);
@@ -1119,8 +1130,14 @@ static Ast *parse_dquote_string(Parser *p) {
     size_t parts_mark = partvec_mark();
     while (cur(p)->kind != TOK_STR_END) {
         if (cur(p)->kind == TOK_STR_PART) {
+            /* M141: TOK_STR_PART is now a raw (escapes-not-yet-applied) span --
+             * decode exactly once, right here, at the point this AstStringPart
+             * is actually built (see asnix_decode_dquote_span's own comment,
+             * lexer.h). */
             Token *t = cur(p);
-            partvec_push((AstStringPart){ .is_expr = 0, .text = t->start, .text_len = t->len });
+            size_t dlen;
+            char *dtext = asnix_decode_dquote_span(p->src, t->start, t->end, &dlen);
+            partvec_push((AstStringPart){ .is_expr = 0, .text = dtext, .text_len = dlen });
             advance(p);
         } else if (cur(p)->kind == TOK_DOLLAR_LBRACE) {
             advance(p);
@@ -1151,9 +1168,33 @@ static Ast *parse_indented_string(Parser *p) {
     size_t raw_mark = rawind_mark();
     while (cur(p)->kind != TOK_ISTR_END) {
         if (cur(p)->kind == TOK_ISTR_PART) {
+            /* M141: a raw content run never has escapes in it by construction
+             * (an escape always ends the run, see lex_indented_run) -- its
+             * span IS its final text verbatim, no decode and no copy needed
+             * at all (points straight into the long-lived source buffer,
+             * unlike the pre-M141 lexer, which always malloc'd a copy here
+             * even though nothing about this case ever needed one). */
             Token *t = cur(p);
-            rawind_push((RawIndPart){ .is_expr = 0, .text = t->start, .text_len = t->len,
-                                       .has_indentation = t->istr_has_indentation });
+            rawind_push((RawIndPart){ .is_expr = 0, .text = tok_text(p, t), .text_len = tok_len(t),
+                                       .has_indentation = 1 });
+            advance(p);
+        } else if (cur(p)->kind == TOK_ISTR_ESC) {
+            /* M141: one `''$`/`'''`/`''\<c>` escape unit -- decode now, into a
+             * freshly malloc'd (<=2-byte) owned buffer, matching the owned-
+             * copy convention every other RawIndPart.text already relies on
+             * (strip_indentation never frees these directly, but the whole
+             * raw_items array -- and every RawIndPart.text it points at --
+             * is freed together right after strip_indentation runs, see
+             * parse_indented_string below; the TOK_ISTR_PART case above is
+             * the one deliberate exception, since IT points into source,
+             * which this file never frees). */
+            Token *t = cur(p);
+            char decoded[2];
+            size_t dlen;
+            asnix_decode_istr_esc(p->src, t->start, decoded, &dlen);
+            char *owned = malloc(dlen);
+            memcpy(owned, decoded, dlen);
+            rawind_push((RawIndPart){ .is_expr = 0, .text = owned, .text_len = dlen, .has_indentation = 0 });
             advance(p);
         } else if (cur(p)->kind == TOK_DOLLAR_LBRACE) {
             advance(p);
@@ -1185,13 +1226,17 @@ static Ast *parse_atom(Parser *p) {
         case TOK_INT: {
             advance(p);
             Ast *n = asnix_ast_new(AST_INT);
-            n->as.int_val = t->int_val;
+            /* M141: decoded on demand, straight from the raw source span --
+             * see lexer.h's own Token comment for why strtoll here is safe
+             * unbounded (the lexer's own digit-run scan already found the
+             * exact same stopping point this call will). */
+            n->as.int_val = strtoll(p->src + t->start, NULL, 10);
             return n;
         }
         case TOK_FLOAT: {
             advance(p);
             Ast *n = asnix_ast_new(AST_FLOAT);
-            n->as.float_val = t->float_val;
+            n->as.float_val = asnix_decode_float_literal(p->src, t->start, t->end);
             return n;
         }
         case TOK_TRUE: {
@@ -1226,16 +1271,16 @@ static Ast *parse_atom(Parser *p) {
              * ever becoming an ordinary AST_VAR, exactly like real Nix's
              * own grammar treats it as a distinct token/production
              * rather than a lexically-rebindable identifier. */
-            if (t->kind == TOK_IDENT && t->len == 8 && memcmp(t->start, "__curPos", 8) == 0) {
+            if (t->kind == TOK_IDENT && tok_len(t) == 8 && memcmp(tok_text(p, t), "__curPos", 8) == 0) {
                 advance(p);
                 Ast *n = asnix_ast_new(AST_CURPOS);
-                curpos_line_col(p->src, t->pos, &n->as.curpos.line, &n->as.curpos.column);
+                curpos_line_col(p->src, p->src + t->start, &n->as.curpos.line, &n->as.curpos.column);
                 return n;
             }
             advance(p);
             Ast *n = asnix_ast_new(AST_VAR);
-            n->as.var.name = t->start;
-            n->as.var.name_len = t->len;
+            n->as.var.name = tok_text(p, t);
+            n->as.var.name_len = tok_len(t);
             return n;
         }
         case TOK_PATH: {
@@ -1252,10 +1297,10 @@ static Ast *parse_atom(Parser *p) {
                 return parse_path_literal_interp(p, t);
             }
             Ast *n = asnix_ast_new(AST_PATH);
-            n->as.path.text = t->start;
-            n->as.path.len = t->len;
+            n->as.path.text = tok_text(p, t);
+            n->as.path.len = tok_len(t);
             n->as.path.is_search = 0;
-            n->as.path.is_home = t->is_home;
+            n->as.path.is_home = (p->src[t->start] == '~'); /* M141: derived, see lexer.h */
             n->as.path.interp_parts = NULL;
             n->as.path.interp_count = 0;
             return n;
@@ -1270,8 +1315,8 @@ static Ast *parse_atom(Parser *p) {
             Ast *n = asnix_ast_new(AST_STRING);
             AstStringPart *parts = malloc(sizeof(AstStringPart));
             parts[0].is_expr = 0;
-            parts[0].text = t->start;
-            parts[0].text_len = t->len;
+            parts[0].text = tok_text(p, t);
+            parts[0].text_len = tok_len(t);
             parts[0].expr = NULL;
             n->as.string.parts = parts;
             n->as.string.count = 1;
@@ -1280,8 +1325,8 @@ static Ast *parse_atom(Parser *p) {
         case TOK_SEARCH_PATH: {
             advance(p);
             Ast *n = asnix_ast_new(AST_PATH);
-            n->as.path.text = t->start;
-            n->as.path.len = t->len;
+            n->as.path.text = tok_text(p, t);
+            n->as.path.len = tok_len(t);
             n->as.path.is_search = 1;
             n->as.path.is_home = 0;
             n->as.path.interp_parts = NULL;
@@ -1848,7 +1893,7 @@ static void parse_formals(Parser *p, AstFormal **out_items, size_t *out_count, i
             advance(p);
             default_ = parse_expr(p); /* arbitrary lazy expression -- see compiler.c's AST_LAMBDA case */
         }
-        formalvec_push((AstFormal){ .name = name->start, .name_len = name->len, .default_ = default_ });
+        formalvec_push((AstFormal){ .name = tok_text(p, name), .name_len = tok_len(name), .default_ = default_ });
         if (cur(p)->kind == TOK_COMMA) {
             advance(p);
             continue;
@@ -1924,8 +1969,8 @@ static Ast *parse_expr(Parser *p) {
         advance(p); /* ':' */
         Ast *body = parse_expr(p); /* recursing here is what makes `a: b: body` curry */
         Ast *n = asnix_ast_new(AST_LAMBDA);
-        n->as.lambda.param = param->start;
-        n->as.lambda.param_len = param->len;
+        n->as.lambda.param = tok_text(p, param);
+        n->as.lambda.param_len = tok_len(param);
         n->as.lambda.body = body;
         return n;
     }
@@ -1935,13 +1980,13 @@ static Ast *parse_expr(Parser *p) {
         Ast *cond = parse_expr(p);
         Token *semi_tok = cur(p); /* captured before expect() consumes it */
         expect(p, TOK_SEMI, "';'");
-        size_t span_len = (size_t)(semi_tok->pos - start_tok->pos);
-        while (span_len > 0 && isspace((unsigned char)start_tok->pos[span_len - 1])) span_len--;
+        size_t span_len = (size_t)(semi_tok->start - start_tok->start);
+        while (span_len > 0 && isspace((unsigned char)p->src[start_tok->start + span_len - 1])) span_len--;
         Ast *body = parse_expr(p);
         Ast *n = asnix_ast_new(AST_ASSERT);
         n->as.assert1.cond = cond;
         n->as.assert1.body = body;
-        n->as.assert1.cond_text = start_tok->pos;
+        n->as.assert1.cond_text = p->src + start_tok->start;
         n->as.assert1.cond_text_len = span_len;
         return n;
     }
@@ -1963,8 +2008,8 @@ static Ast *parse_expr(Parser *p) {
         n->as.lambda.formals_count = fcount;
         n->as.lambda.has_ellipsis = ellipsis;
         n->as.lambda.has_as_name = 1;
-        n->as.lambda.as_name = asname->start;
-        n->as.lambda.as_name_len = asname->len;
+        n->as.lambda.as_name = tok_text(p, asname);
+        n->as.lambda.as_name_len = tok_len(asname);
         n->as.lambda.body = body;
         return n;
     }
@@ -1988,8 +2033,8 @@ static Ast *parse_expr(Parser *p) {
                 advance(p);
                 Token *asname = expect(p, TOK_IDENT, "a name after '@'");
                 has_as = 1;
-                as_name = asname->start;
-                as_name_len = asname->len;
+                as_name = tok_text(p, asname);
+                as_name_len = tok_len(asname);
             }
             expect(p, TOK_COLON, "':'");
             Ast *body = parse_expr(p);
