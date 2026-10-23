@@ -16775,3 +16775,166 @@ Files: `src/c/hash_shim.c` (`asnix_hash_one` and the four public
 `asnix_hash_{md5,sha1,sha256,sha512}` wrappers -- `asnix_load_libcrypto`,
 `asnix_hash_to_hex`, and `hash_shim.h`'s public signatures untouched),
 plus the new `tools/bench_hash_shim.c` isolated microbenchmark.
+
+## M149: `compiler.c`'s own `compile_expr` -- the real source of the remaining 763M-instruction allocator gap, not any single runtime call site
+
+A prior task handed off a precise, categorized instruction-gap figure:
+glibc's malloc family (`_int_malloc`/`_int_realloc`/`cfree`/`unlink_chunk`/
+`calloc`) cost asnix 1,055,398,725 instructions (13.14% of its own total)
+vs. iets's mimalloc at 292,372,016 (5.78%) -- a 763,026,709-instruction
+gap, the single largest named category in a fresh instruction-sampled
+profile, measured AFTER M144 (derivation.c's scratch arrays) and M145
+(attrs_update.c's merge loop) had already landed. The task's own
+hypothesis list (parser.c's growable vectors, the M143 regex cache,
+builtins_compare.c's JSON buffers, string_context.c) was explicitly
+flagged as unconfirmed and possibly incomplete -- this milestone profiled
+first, instead of picking from that list.
+
+**Profiling.** `perf record -g -e cpu_core/instructions/ -c 10000 --
+taskset -c 0 -- ./asnix d.nix` (confirmed cpu_core 0-11 are the P-cores on
+this Meteor Lake host; kptr_restrict=1 hides kernel-internal symbols only,
+not this userspace call-graph attribution, consistent with what a prior
+session's own note already established). The single biggest caller chain
+into `_int_malloc` (5.23% of all instructions in this run, the top-ranked
+symbol overall after `lex_until`) was not any runtime builtin or value
+operation at all: `asnix_op_call -> prim_import -> asnix_eval_file ->
+asnix_compile -> compile_expr` (recursing into itself 8 frames deep
+before resolving to a leaf `malloc` call) accounted for 2.77% of the
+*entire program's* instructions directly, dwarfing every runtime
+allocation site this project's own prior hypotheses named. The other
+malloc-family entries in the same profile (`malloc` 1.27%, `cfree` 0.86%,
+`_int_realloc` 0.73%, `__libc_calloc` 0.59%, `realloc` 0.63%, etc., ~11.6%
+total self-time in this sampled run) attribute the same way: mostly to
+`compile_expr`'s own recursive descent, not to any of the previously-named
+runtime hypotheses.
+
+**Root cause, confirmed by reading `compiler.c` directly.** Three of
+`compile_expr`'s switch cases each `malloc` a handful of small,
+fixed-shape scratch arrays -- sized by a purely SOURCE-LEVEL count, filled,
+used for the span of that one node's compilation, and `free`d again before
+returning:
+- `AST_LET`: `names`/`name_lens`, sized by the `let`'s own binding count.
+- `AST_LAMBDA` (pattern form, `{a, b ? d, ...}: body`): SEVEN separate
+  `malloc`s per lambda-pattern literal (`all_syms`, `required_syms`,
+  `all_syms_sorted`, `field_names`, `field_name_lens`, `fa_syms`,
+  `fa_vals`), all sized by the lambda's own formals count.
+- `AST_ATTRSET`: `syms`/`order`/`sorted_syms` unconditionally, plus
+  `hnames`/`hname_lens`/`visible_sorted_syms` (non-`rec`, hidden-inherit
+  case) or `names`/`name_lens`/`visible_sorted_syms` (`rec` case) when
+  applicable -- all sized by the literal's own binding count.
+
+None of these are runtime hot loops -- `compile_expr` runs exactly once
+per AST node, at compile time, for the whole program. But a real nixpkgs
+eval compiles roughly 1057 imported files' worth of source for one
+`d.nix` run, and nixpkgs's own idioms are built almost entirely out of
+these three constructs at huge volume: every `callPackage`-style function
+(`{ lib, stdenv, fetchurl, ... }: ...`) is an `AST_LAMBDA` pattern, every
+package/overlay/attribute-set body is an `AST_ATTRSET`, and `let ... in`
+is pervasive throughout. The aggregate call count across the whole source
+tree, not any single call's cost, is what the profile's 2.77% direct
+share reflects -- exactly the same shape of problem M144 found in
+`derivation.c`, just at compile time over source text instead of runtime
+over the dependency graph.
+
+**Fix.** NOT M144's depth-indexed pool -- `compile_expr`'s own recursion
+is plain, single-threaded C call-stack recursion with no cross-call reuse
+opportunity (each node compiles exactly once, so there is nothing to
+pool across calls). Instead, each `malloc`d buffer above got a sibling
+fixed-size stack array (`ASNIX_COMPILE_SCRATCH_MAX` = 32, deliberately
+`#define`d to literally BE the pre-existing
+`ASNIX_ATTRSET_SORT_INSERTION_MAX` constant the AST_ATTRSET case already
+used for its insertion-sort-vs-qsort threshold, so the two decisions can
+never drift apart) and a per-site boolean (`names_on_stack`/`nf_on_stack`/
+`small_n`) choosing the stack array when the real count fits, falling
+back to the ORIGINAL `malloc` path, unchanged, when it doesn't (the known
+outlier, `pkgs/top-level/all-packages.nix`'s ~4,280-binding attrset
+literal, already took a dedicated large-n path for the sort algorithm
+pre-existing this fix -- it now takes the large-n path for allocation
+too, automatically, via the same flag). Every buffer within one case
+switches on the SAME flag, never a mix (e.g. `AST_LAMBDA`'s seven buffers
+all key off one `nf_on_stack`), so there's no risk of a buffer outliving
+a sibling that independently chose the other path. Correctness of the
+scheme follows directly from C's own stack semantics: these are ordinary
+automatic (non-`static`) local arrays, so a nested recursive
+`compile_expr` call (e.g. an `AST_LAMBDA` whose body contains another
+`AST_LAMBDA`) gets its own fresh stack frame and its own fresh array
+automatically -- unlike M144's runtime pool, there is no depth-indexing,
+acquire/release bracketing, or shared-frame invariant to verify at all.
+
+**Correctness.** `make test`/`test-e2e`/`test-conformance` all green.
+`make test-nix-conformance NIX_CONFORMANCE_DIR=/tmp/nix-conformance`:
+`pass=655 fail=3 skip=148` (exact baseline, same 3 pre-existing
+pos-tracking failures). `make test-nixpkgs-hash`: `pass=148 fail=0`.
+Output hash on `d.nix` (ffmpeg's closure) unchanged:
+`/nix/store/29iacg6h530yx7rxz4k1fhvi0kxxhsam-ffmpeg-9.0.1-bin`, verified
+byte-identical against a `before` binary built from the pre-fix commit.
+
+**Measured.** Two independent, complementary measurements, both against a
+`before` binary built from the pre-fix tree and an `after` binary built
+from this milestone's tree, both run from the SAME invocation of `./asnix
+d.nix`:
+- **Malloc call COUNT** (an `LD_PRELOAD`'d `malloc` wrapper counting every
+  call, deterministic, not sampled): 2,176,862 -> 1,812,778, a 364,084-call
+  (16.7%) reduction, exactly reproducible across repeated runs (not a
+  statistical claim -- ran twice each, identical both times).
+- **Instructions, interleaved** (`perf stat -e
+  cpu_core/instructions/,cpu_core/cycles/`, `taskset -c 0`, 8 alternating
+  before/after trials, B,A,B,A,...): instructions dropped in all 8/8
+  paired trials, mean -25,045,659 (8,027,207,174 -> 8,002,161,515,
+  -0.312%), tight and consistent (range -23.9M to -26.7M across all 8
+  trials) -- the same clean, deterministic-direction signal M144/M145's
+  own instruction measurements found for fixed, timing-independent
+  per-call work. Cycles were, as every prior milestone on this shared,
+  contended machine has found, too noisy to read directly: mean +0.18%
+  (4,431,649,591 -> 4,439,519,247), won only 2/8 paired trials -- consistent
+  with noise dominating a change this size, not a real regression (the
+  instruction count, which does NOT depend on scheduling/cache timing,
+  is the trustworthy signal here, exactly as this project's own
+  measurement discipline already concludes for every small, surgical fix
+  in this gap-closing series).
+
+**Honest sizing.** This closes roughly 25M of the ~2,974M-instruction
+total asnix-vs-iets gap (~0.84% of the whole gap, ~3.3% of the
+763M-instruction allocator-category slice specifically) -- a real,
+clean, fully-verified win, but a modest fraction of the allocator
+category's own total, not a resolution of it. The malloc-call-count drop
+(16.7% of ALL malloc calls in the whole run) is substantially larger in
+relative terms than the instruction-count drop (0.31% of the whole
+program) because most of the REMAINING malloc calls are for larger,
+costlier allocations (the ones already paying for real heap bookkeeping,
+not just call overhead) -- removing a sixth of the total call volume,
+concentrated in exactly the smallest, cheapest, most call-overhead-bound
+allocations, naturally buys a smaller share of instructions than of call
+count. What's genuinely still open, not touched by this milestone:
+- The qsort-based `sort_attrset_bindings_large`/`SymIdxPair` path (`n >
+  32`) still mallocs unconditionally -- correctly out of scope here (it's
+  already the deliberately-rare branch) but still a real, if much
+  smaller, remaining per-large-literal cost.
+- `AST_LET`/`AST_ATTRSET`/`AST_LAMBDA`'s own child compiles (the thunk
+  bodies -- `ib_new()`/`IrBuilder` allocation, `irbuild.c`'s `ops`/`pool`
+  growable arrays) are untouched; M132 already tuned their initial
+  capacities, but each one is still a fresh heap allocation per thunk,
+  not covered by this milestone's stack-buffer technique (their lifetime
+  outlives the compiling call -- they're handed off as `IrProgram*` --
+  so they are NOT eligible for the same fix; a different technique,
+  if any, would be needed there).
+- This milestone did not re-examine `libc_misc` (memcmp/memmove/memset,
+  10.32% of asnix's own instructions, 448.5M-instruction gap) or
+  `string_ops` (8.54%, 483.1M-instruction gap) -- both still open, as
+  handed off, and explicitly out of this milestone's scope (allocator
+  only).
+- The SHA256/crypto symbol-resolution blind spot (asnix's hashing showing
+  as 0.00% in instruction-sampled profiles due to `dlopen`'d
+  `libcrypto.so.3` not resolving symbols) was NOT re-investigated here --
+  still needs the fix a prior session flagged (either `perf`'s own
+  `--objdump`/symbol-file options for the `.so`, or a non-`dlopen`
+  static-link build for profiling purposes only).
+
+Files: `src/c/compiler.c` only (`compile_expr`'s `AST_LET`, `AST_LAMBDA`
+pattern-form, and `AST_ATTRSET` cases, plus the new
+`ASNIX_COMPILE_SCRATCH_MAX` constant and `sort_attrset_bindings_large`'s
+threshold constant now derived from it). No new test fixtures needed --
+this is a pure allocation-strategy change with no behavioral surface
+(verified via the full existing conformance/e2e/nixpkgs-hash suites
+above, which already exercise every one of `AST_LET`/`AST_LAMBDA`-pattern/
+`AST_ATTRSET`'s branches at both small and large `n`).

@@ -535,10 +535,40 @@ static int symidxpair_cmp(const void *a, const void *b) {
     uint32_t sa = ((const SymIdxPair *)a)->sym, sb = ((const SymIdxPair *)b)->sym;
     return (sa > sb) - (sa < sb);
 }
+/* M146: compile_expr's AST_LET/AST_LAMBDA(pattern)/AST_ATTRSET cases each
+ * malloc a handful of small scratch arrays -- sized by a purely
+ * SOURCE-LEVEL count (`let` binding count, lambda-pattern formal count,
+ * attrset literal binding count) -- fill them, use them for the span of
+ * one compile_expr call, and free them again before returning. Real
+ * nixpkgs compiles ~1057 imported files' worth of source for one `d.nix`
+ * eval, and the overwhelming majority of these literals have a handful
+ * of bindings/formals (a `{ lib, stdenv, fetchurl, ... }:` lambda pattern,
+ * a small `let x = ...; in`, a package's attrset) -- a profiling pass
+ * (instruction-sampled call-graph, M146) found `compile_expr`'s own
+ * recursive descent responsible for a large, direct share of asnix's
+ * malloc-family instruction cost, ahead of any single runtime call site.
+ * A fixed-size stack array below this cap, used whenever the real count
+ * fits, removes the malloc/free pair entirely for that overwhelmingly
+ * common case; a literal with MORE bindings/formals than the cap (rare --
+ * the known outlier, pkgs/top-level/all-packages.nix's ~4,280-binding
+ * attrset, already takes a dedicated large-n path for its OWN sort
+ * algorithm below) falls back to the original malloc path unchanged. This
+ * is NOT the depth-indexed pool M144 used for derivation.c's runtime
+ * scratch arrays -- compile_expr's own recursion is plain, single-
+ * threaded C call-stack recursion with no cross-call reuse opportunity
+ * (each node is compiled exactly once), so a plain C-local array --
+ * fresh, and automatically distinct, on every recursive activation -- is
+ * simpler and sufficient; no pooling/indexing scheme is needed at all.
+ * Deliberately the SAME constant as the insertion-sort-vs-qsort threshold
+ * right below (`#define`d FROM it, not just equal by coincidence) so the
+ * two decisions -- "is this literal small enough to sort with plain
+ * insertion sort" and "is this literal small enough to put its scratch on
+ * the stack" -- can never drift apart. */
+#define ASNIX_COMPILE_SCRATCH_MAX 32
 /* Threshold below which plain insertion sort beats qsort's per-comparison
  * indirect-call overhead -- tuned empirically against the real d.nix eval,
  * see the AST_ATTRSET case's own comment. */
-#define ASNIX_ATTRSET_SORT_INSERTION_MAX 32
+#define ASNIX_ATTRSET_SORT_INSERTION_MAX ASNIX_COMPILE_SCRATCH_MAX
 /* Factored out of compile_expr's AST_ATTRSET case so the (astronomically
  * rare -- only literals bigger than the threshold above ever reach this)
  * qsort path doesn't grow compile_expr's own code size/layout for the
@@ -1002,8 +1032,13 @@ static void compile_expr(IrBuilder *b, Ast *node, ScopeFrame *scope) {
              * back up with where the name actually lives at runtime. */
             size_t n = node->as.let1.count;
             AstBinding *bindings = node->as.let1.bindings;
-            const char **names = malloc(n * sizeof(char *));
-            size_t *name_lens = malloc(n * sizeof(size_t));
+            /* M146: stack scratch for the common small-n case -- see
+             * ASNIX_COMPILE_SCRATCH_MAX's own comment. */
+            const char *names_stack[ASNIX_COMPILE_SCRATCH_MAX];
+            size_t name_lens_stack[ASNIX_COMPILE_SCRATCH_MAX];
+            int names_on_stack = (n <= ASNIX_COMPILE_SCRATCH_MAX);
+            const char **names = names_on_stack ? names_stack : malloc(n * sizeof(char *));
+            size_t *name_lens = names_on_stack ? name_lens_stack : malloc(n * sizeof(size_t));
             for (size_t i = 0; i < n; i++) {
                 names[i] = bindings[i].name;
                 name_lens[i] = bindings[i].name_len;
@@ -1028,8 +1063,7 @@ static void compile_expr(IrBuilder *b, Ast *node, ScopeFrame *scope) {
             }
             compile_expr(b, node->as.let1.body, &frame);
             ib_frame_exit(b);
-            free(names);
-            free(name_lens);
+            if (!names_on_stack) { free(names); free(name_lens); }
             return;
         }
         case AST_IF: {
@@ -1095,13 +1129,29 @@ static void compile_expr(IrBuilder *b, Ast *node, ScopeFrame *scope) {
              * or (without `...`) an extra field all abort immediately on
              * application, even if the body never reads the offending
              * field (confirmed against nix-instantiate). -- */
-            uint32_t *all_syms = malloc((nf ? nf : 1) * sizeof(uint32_t));
+            /* M146: stack scratch for the common small-nf case -- see
+             * ASNIX_COMPILE_SCRATCH_MAX's own comment. All seven of this
+             * case's scratch buffers (below, and field_names/
+             * field_name_lens/fa_syms/fa_vals further down) switch
+             * together on the SAME `nf_on_stack` flag, so a pattern with
+             * more formals than the cap falls back to malloc for every
+             * one of them uniformly, never a mix. */
+            int nf_on_stack = (nf <= ASNIX_COMPILE_SCRATCH_MAX);
+            uint32_t all_syms_stack[ASNIX_COMPILE_SCRATCH_MAX];
+            uint32_t required_syms_stack[ASNIX_COMPILE_SCRATCH_MAX];
+            uint32_t all_syms_sorted_stack[ASNIX_COMPILE_SCRATCH_MAX];
+            const char *field_names_stack[ASNIX_COMPILE_SCRATCH_MAX];
+            size_t field_name_lens_stack[ASNIX_COMPILE_SCRATCH_MAX];
+            uint32_t fa_syms_stack[ASNIX_COMPILE_SCRATCH_MAX];
+            Value fa_vals_stack[ASNIX_COMPILE_SCRATCH_MAX];
+
+            uint32_t *all_syms = nf_on_stack ? all_syms_stack : malloc((nf ? nf : 1) * sizeof(uint32_t));
             size_t required_count = 0;
             for (size_t i = 0; i < nf; i++) {
                 all_syms[i] = asnix_intern(node->as.lambda.formals[i].name, node->as.lambda.formals[i].name_len);
                 if (!node->as.lambda.formals[i].default_) required_count++;
             }
-            uint32_t *required_syms = malloc((required_count ? required_count : 1) * sizeof(uint32_t));
+            uint32_t *required_syms = nf_on_stack ? required_syms_stack : malloc((required_count ? required_count : 1) * sizeof(uint32_t));
             {
                 size_t k = 0;
                 for (size_t i = 0; i < nf; i++) {
@@ -1112,7 +1162,7 @@ static void compile_expr(IrBuilder *b, Ast *node, ScopeFrame *scope) {
             uint32_t *all_syms_sorted = NULL;
             int64_t total_count = -1; /* `...`: no "unexpected argument" check at all */
             if (!node->as.lambda.has_ellipsis) {
-                all_syms_sorted = malloc((nf ? nf : 1) * sizeof(uint32_t));
+                all_syms_sorted = nf_on_stack ? all_syms_sorted_stack : malloc((nf ? nf : 1) * sizeof(uint32_t));
                 memcpy(all_syms_sorted, all_syms, nf * sizeof(uint32_t));
                 sort_syms(all_syms_sorted, nf);
                 total_count = (int64_t)nf;
@@ -1120,15 +1170,17 @@ static void compile_expr(IrBuilder *b, Ast *node, ScopeFrame *scope) {
 
             ib_var_ref(body_b, 0, 0); /* the raw attrset arg: argframe is depth 0 until OP_FRAME_NEW below */
             ib_check_formals(body_b, (int64_t)required_count, required_syms, total_count, all_syms_sorted);
-            free(all_syms);
-            free(required_syms);
-            free(all_syms_sorted);
+            if (!nf_on_stack) {
+                free(all_syms);
+                free(required_syms);
+                free(all_syms_sorted);
+            }
 
             /* -- The letrec-capable field frame. -- */
             ib_frame_alloc(body_b, (int64_t)nf);
 
-            const char **field_names = malloc((nf ? nf : 1) * sizeof(char *));
-            size_t *field_name_lens = malloc((nf ? nf : 1) * sizeof(size_t));
+            const char **field_names = nf_on_stack ? field_names_stack : malloc((nf ? nf : 1) * sizeof(char *));
+            size_t *field_name_lens = nf_on_stack ? field_name_lens_stack : malloc((nf ? nf : 1) * sizeof(size_t));
             for (size_t i = 0; i < nf; i++) {
                 field_names[i] = node->as.lambda.formals[i].name;
                 field_name_lens[i] = node->as.lambda.formals[i].name_len;
@@ -1187,8 +1239,10 @@ static void compile_expr(IrBuilder *b, Ast *node, ScopeFrame *scope) {
             compile_expr(body_b, node->as.lambda.body, &fieldframe);
             ib_ret(body_b);
             IrProgram *body_prog = ib_finish(body_b);
-            free(field_names);
-            free(field_name_lens);
+            if (!nf_on_stack) {
+                free(field_names);
+                free(field_name_lens);
+            }
 
             /* `builtins.functionArgs` (M37): `{name: hasDefault}` for
              * every declared field, built once here (straight from
@@ -1197,15 +1251,17 @@ static void compile_expr(IrBuilder *b, Ast *node, ScopeFrame *scope) {
              * b ? 1, ...}: a)` == `{ a = false; b = true; }` (the `...`
              * ellipsis itself doesn't add an entry or change any field's
              * reported default-ness). */
-            uint32_t *fa_syms = malloc((nf ? nf : 1) * sizeof(uint32_t));
-            Value *fa_vals = malloc((nf ? nf : 1) * sizeof(Value));
+            uint32_t *fa_syms = nf_on_stack ? fa_syms_stack : malloc((nf ? nf : 1) * sizeof(uint32_t));
+            Value *fa_vals = nf_on_stack ? fa_vals_stack : malloc((nf ? nf : 1) * sizeof(Value));
             for (size_t i = 0; i < nf; i++) {
                 fa_syms[i] = asnix_intern(node->as.lambda.formals[i].name, node->as.lambda.formals[i].name_len);
                 fa_vals[i] = node->as.lambda.formals[i].default_ ? ASNIX_TRUE : ASNIX_FALSE;
             }
             Value function_args = asnix_bshared_make_attrs(fa_syms, fa_vals, (int64_t)nf);
-            free(fa_syms);
-            free(fa_vals);
+            if (!nf_on_stack) {
+                free(fa_syms);
+                free(fa_vals);
+            }
 
             ib_lambda(b, 1, body_prog, (int64_t)function_args.raw);
             return;
@@ -1529,8 +1585,22 @@ static void compile_expr(IrBuilder *b, Ast *node, ScopeFrame *scope) {
         }
         case AST_ATTRSET: {
             size_t n = node->as.attrset.count;
-            uint32_t *syms = malloc(n * sizeof(uint32_t));
-            size_t *order = malloc(n * sizeof(size_t));
+            /* M146: stack scratch for the common small-n case -- see
+             * ASNIX_COMPILE_SCRATCH_MAX's own comment. `small_n` doubles
+             * as the stack-vs-heap decision for every scratch buffer in
+             * this whole case (hnames/hname_lens and visible_sorted_syms
+             * below included: their own sizes -- hidden_count, visible_
+             * count -- are always <= n, so whenever n itself fits the
+             * cap, so do they) -- deliberately the SAME threshold the
+             * insertion-sort-vs-qsort choice right below already uses,
+             * so a literal that takes the "large" path for one takes it
+             * for the other too, never a mix. */
+            uint32_t syms_stack[ASNIX_COMPILE_SCRATCH_MAX];
+            size_t order_stack[ASNIX_COMPILE_SCRATCH_MAX];
+            uint32_t sorted_syms_stack[ASNIX_COMPILE_SCRATCH_MAX];
+            int small_n = (n <= ASNIX_ATTRSET_SORT_INSERTION_MAX);
+            uint32_t *syms = small_n ? syms_stack : malloc(n * sizeof(uint32_t));
+            size_t *order = small_n ? order_stack : malloc(n * sizeof(size_t));
             for (size_t i = 0; i < n; i++) {
                 syms[i] = asnix_intern(node->as.attrset.bindings[i].name, node->as.attrset.bindings[i].name_len);
                 order[i] = i;
@@ -1556,7 +1626,7 @@ static void compile_expr(IrBuilder *b, Ast *node, ScopeFrame *scope) {
              * key literals are merged earlier via reopen_attrset_into), so
              * no two syms ever compare equal and stability is a non-issue
              * either way. */
-            if (n <= ASNIX_ATTRSET_SORT_INSERTION_MAX) {
+            if (small_n) {
                 for (size_t i = 1; i < n; i++) {
                     size_t j = i;
                     while (j > 0 && syms[order[j - 1]] > syms[order[j]]) {
@@ -1569,7 +1639,7 @@ static void compile_expr(IrBuilder *b, Ast *node, ScopeFrame *scope) {
             } else {
                 sort_attrset_bindings_large(syms, order, n);
             }
-            uint32_t *sorted_syms = malloc(n * sizeof(uint32_t));
+            uint32_t *sorted_syms = small_n ? sorted_syms_stack : malloc(n * sizeof(uint32_t));
             for (size_t i = 0; i < n; i++) sorted_syms[i] = syms[order[i]];
 
             if (!node->as.attrset.is_rec) {
@@ -1659,13 +1729,16 @@ static void compile_expr(IrBuilder *b, Ast *node, ScopeFrame *scope) {
                         }
                         ib_insert_dynamic_attr(b);
                     }
-                    free(syms);
-                    free(order);
-                    free(sorted_syms);
+                    if (!small_n) { free(syms); free(order); free(sorted_syms); }
                     return;
                 }
-                const char **hnames = malloc((hidden_count ? hidden_count : 1) * sizeof(char *));
-                size_t *hname_lens = malloc((hidden_count ? hidden_count : 1) * sizeof(size_t));
+                /* hidden_count <= n, so whenever `small_n` is true (n fit
+                 * the stack cap) so does hidden_count -- same flag reused,
+                 * see ASNIX_COMPILE_SCRATCH_MAX's comment. */
+                const char *hnames_stack[ASNIX_COMPILE_SCRATCH_MAX];
+                size_t hname_lens_stack[ASNIX_COMPILE_SCRATCH_MAX];
+                const char **hnames = small_n ? hnames_stack : malloc((hidden_count ? hidden_count : 1) * sizeof(char *));
+                size_t *hname_lens = small_n ? hname_lens_stack : malloc((hidden_count ? hidden_count : 1) * sizeof(size_t));
                 size_t hi = 0;
                 for (size_t i = 0; i < n; i++) {
                     if (node->as.attrset.bindings[i].is_hidden) {
@@ -1719,7 +1792,8 @@ static void compile_expr(IrBuilder *b, Ast *node, ScopeFrame *scope) {
                     hi++;
                 }
                 size_t visible_count = n - hidden_count;
-                uint32_t *visible_sorted_syms = malloc((visible_count ? visible_count : 1) * sizeof(uint32_t));
+                uint32_t visible_sorted_syms_stack[ASNIX_COMPILE_SCRATCH_MAX];
+                uint32_t *visible_sorted_syms = small_n ? visible_sorted_syms_stack : malloc((visible_count ? visible_count : 1) * sizeof(uint32_t));
                 size_t vi = 0;
                 for (size_t i = 0; i < n; i++) {
                     if (node->as.attrset.bindings[order[i]].is_hidden) continue;
@@ -1764,9 +1838,7 @@ static void compile_expr(IrBuilder *b, Ast *node, ScopeFrame *scope) {
                     ib_insert_dynamic_attr(b);
                 }
                 ib_frame_exit(b);
-                free(hnames);
-                free(hname_lens);
-                free(visible_sorted_syms);
+                if (!small_n) { free(hnames); free(hname_lens); free(visible_sorted_syms); }
             } else {
                 /* `rec { ... }`: same frame-first trick as AST_LET, keyed
                  * by original (unsorted) binding index so the ScopeFrame
@@ -1787,8 +1859,10 @@ static void compile_expr(IrBuilder *b, Ast *node, ScopeFrame *scope) {
                  * Thunk itself still gets forced later, lazily, the
                  * first time something actually selects that field. */
                 AstBinding *bindings = node->as.attrset.bindings;
-                const char **names = malloc(n * sizeof(char *));
-                size_t *name_lens = malloc(n * sizeof(size_t));
+                const char *names_stack[ASNIX_COMPILE_SCRATCH_MAX];
+                size_t name_lens_stack[ASNIX_COMPILE_SCRATCH_MAX];
+                const char **names = small_n ? names_stack : malloc(n * sizeof(char *));
+                size_t *name_lens = small_n ? name_lens_stack : malloc(n * sizeof(size_t));
                 for (size_t i = 0; i < n; i++) {
                     names[i] = bindings[i].name;
                     name_lens[i] = bindings[i].name_len;
@@ -1867,7 +1941,8 @@ static void compile_expr(IrBuilder *b, Ast *node, ScopeFrame *scope) {
                      * loop is identical to the pre-M80 unfiltered one. */
                     size_t visible_count = 0;
                     for (size_t i = 0; i < n; i++) if (!bindings[order[i]].is_hidden) visible_count++;
-                    uint32_t *visible_sorted_syms = malloc((visible_count ? visible_count : 1) * sizeof(uint32_t));
+                    uint32_t visible_sorted_syms_stack[ASNIX_COMPILE_SCRATCH_MAX];
+                    uint32_t *visible_sorted_syms = small_n ? visible_sorted_syms_stack : malloc((visible_count ? visible_count : 1) * sizeof(uint32_t));
                     size_t vi = 0;
                     for (size_t i = 0; i < n; i++) {
                         if (bindings[order[i]].is_hidden) continue;
@@ -1875,7 +1950,7 @@ static void compile_expr(IrBuilder *b, Ast *node, ScopeFrame *scope) {
                         visible_sorted_syms[vi++] = sorted_syms[i];
                     }
                     ib_mk_attrs(b, (int64_t)visible_count, visible_sorted_syms);
-                    free(visible_sorted_syms);
+                    if (!small_n) free(visible_sorted_syms);
                 }
                 /* M67: `${expr} = value;` entries (M28), merged in HERE --
                  * still inside the rec's own frame, before `ib_frame_exit`
@@ -1919,12 +1994,9 @@ static void compile_expr(IrBuilder *b, Ast *node, ScopeFrame *scope) {
                     ib_insert_dynamic_attr(b);
                 }
                 ib_frame_exit(b);
-                free(names);
-                free(name_lens);
+                if (!small_n) { free(names); free(name_lens); }
             }
-            free(syms);
-            free(order);
-            free(sorted_syms);
+            if (!small_n) { free(syms); free(order); free(sorted_syms); }
             return;
         }
         case AST_SELECT: {
