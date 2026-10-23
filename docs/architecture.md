@@ -14678,3 +14678,60 @@ lexer peek-guard) were both explicitly investigated and deliberately
 left for a dedicated future milestone, not because they were ruled out,
 but because each is a genuinely separate, riskier, multi-file change
 that does not fit this session's bar for a bounded, same-pass landing.
+
+## M134: why iets is still ~2x faster, beyond lex/parse/compile's own internal costs -- the two-phase lex/parse boundary itself, not yet named
+
+Research-only follow-up to M123/M127/M129-M133 (`/subtask` "identify why
+iets is twice as fast," no implementation requested or attempted).
+M129-M132 sped up asnix's existing lex-then-parse architecture; this
+pass instead asked whether the architecture itself, not just its
+constant factors, differs from `iets`'s in a way not yet named in this
+project's own docs.
+
+**Finding, verified directly against both source trees (not re-derived
+from the prior milestones' own numbers)**: asnix's `Token` struct
+(`src/c/lexer.h:102-126`) is 56 bytes (`kind` + `int_val` (8B) +
+`float_val` (8B) + `start` pointer + `len` + `pos` pointer + 2 int
+flags), and every field is written for every token regardless of kind
+-- `int_val`/`float_val` are meaningless for the 95%+ of tokens that are
+identifiers, punctuation, or keywords, but still get populated.
+`asnix_lex` (`src/c/lexer.c:569`) runs as a fully separate phase: it
+scans the entire file and writes every token into a `TokVec` array
+before the parser sees a single one; `asnix_parse` (`src/c/
+parser.c:2009`) then indexes back into that same array
+(`p->toks[p->pos]`, `parser.c:648`) rather than pulling tokens on
+demand. Two full passes over the same ~159 MB of token data on a real
+nixpkgs eval (M123's own measured corpus: 2,836,205 tokens x 56 bytes):
+one that writes it, one that reads it back.
+
+`iets`'s `Token` (`~/gnix/iets/src/syntax/lexer.rs:138-142`) is 12
+bytes: `kind` (enum tag) + `start: u32` + `end: u32`. No `int_val`/
+`float_val` field exists at all -- integer/float/string payloads are
+never decoded at lex time; they're parsed lazily from
+`self.src[start..end]` only once, exactly when the parser's AST-
+building step actually needs that specific token's value. `iets`'s
+parser calls `self.lx.next_token()` directly (`parser.rs:212/225/235`)
+-- a pull-based, single-token-lookahead design fusing lexing and
+parsing into one pass, with no intermediate token array allocated,
+written, or re-read at all.
+
+**Why this is additional, not a restatement of M129-M133**: those
+milestones (the `CHAR_CLASS` table, `hash_bytes` mixing, the `AstChunk`/
+`SCRATCH_VEC` allocator fixes, the growable-vector capacity tuning) all
+reduced the constant-factor cost of asnix's existing two-phase lex-then-
+parse architecture. None of them touched the phase boundary itself.
+This finding says the boundary's existence -- a ~56-byte-per-token
+eager array, fully materialized before parsing starts, then fully re-
+read -- is itself a real, distinct, previously-unnamed cost with no
+counterpart in `iets`'s fused, pull-based, lazily-decoded design.
+
+**Not attempted, by design (a research-only task)**: fusing lex+parse
+into one pull-based pass, or shrinking `Token` to a 12-byte offset pair
+with deferred int/float decoding, would be a large, correctness-risky
+rewrite touching essentially every one of `parser.c`'s 40+ direct
+`Token`-field access sites (`.kind`/`.int_val`/`.float_val`/`.start`/
+`.len`/`.pos`/the two flag fields) plus every lexer call site that
+currently decodes a literal's value eagerly. Flagged here as a
+candidate future milestone, scoped as its own dedicated pass with a
+correctness audit of every access site, not a one-session bounded fix.
+No files changed, no commits made.
