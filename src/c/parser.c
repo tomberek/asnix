@@ -1835,43 +1835,49 @@ static Ast *parse_let_bindings(Parser *p) {
     return n;
 }
 
-/* Scans forward from an TOK_LBRACE at `open_idx`, tracking brace depth, and
- * returns the index of the matching TOK_RBRACE -- used to look past an
- * entire `{ ... }` (lambda-pattern formals or an attrset literal, whichever
- * it turns out to be) without actually parsing it, just to disambiguate
- * the two forms by checking what follows the close brace (':' or '@' means
- * a lambda pattern; anything else means an ordinary attrset-literal
- * expression, parsed as such by parse_atom). Depth-counting on braces
- * alone is safe regardless of what's nested inside (parens, brackets, a
- * default expression that itself contains `{ }`) since braces are always
- * balanced in valid source independent of their semantic role -- EXCEPT a
- * string interpolation/dynamic-select's `${` lexes as its own distinct
- * TOK_DOLLAR_LBRACE (not TOK_LBRACE), while its closing brace is an
- * ordinary TOK_RBRACE like any other -- so it must also increment depth
- * here, or every `${...}`/`.${...}` inside the scanned range (e.g. a
- * formal's default-value expression) decrements depth one extra time
- * with no matching increment, closing the scan early at the WRONG brace
- * and misclassifying a genuine lambda pattern as a plain attrset literal
- * (found evaluating real nixpkgs: `pkgs/stdenv/linux/default.nix`'s
- * `bootstrapFiles ? let ... archLookupTable.${system} ... in ...`
- * default value has three `.${...}` dynamic selects before the formals
- * list's real closing `}`). */
-static size_t find_matching_rbrace(Parser *p, size_t open_idx) {
-    size_t depth = 0;
-    size_t i = open_idx;
-    for (;;) {
-        TokKind k = lexcur_tok(p->lc, i)->kind;
-        if (k == TOK_LBRACE || k == TOK_DOLLAR_LBRACE) {
-            depth++;
-        } else if (k == TOK_RBRACE) {
-            depth--;
-            if (depth == 0) return i;
-        } else if (k == TOK_EOF) {
-            fprintf(stderr, "asnix: parse error: unterminated '{' (lambda pattern or attrset)\n");
-            exit(1);
-        }
-        i++;
+/* Decides whether a TOK_LBRACE at `open_idx` opens a lambda-pattern formals
+ * list (`{...}: body` / `{...}@name: body`) or an ordinary attrset-literal
+ * expression, using only the next 1-2 tokens -- never scanning ahead to the
+ * matching '}'. A prior version (`find_matching_rbrace`) scanned the ENTIRE
+ * `{...}` span counting brace depth just to peek at what follows the close
+ * brace; profiling against a real nixpkgs eval found that scan responsible
+ * for the single largest self-time share in the whole program (~7% of
+ * total instructions, via lex_until -- it was usually the first code to
+ * reach not-yet-lexed source text, since it runs ahead of the parser's own
+ * position). `iets` (a sibling evaluator, ~/gnix/iets/src/syntax/parser.rs
+ * `is_formals`) resolves the identical grammar ambiguity with a bounded
+ * lookahead instead, ported directly here: a lambda pattern's own grammar
+ * is fully determined by its first one or two tokens --
+ *   `{ ...`                    -- ellipsis-only or ellipsis-leading formals
+ *   `{ }` followed by ':'/'@'  -- empty formals
+ *   `{ IDENT` followed by ','/'?'/'}' -- a formals entry (name[, ...] /
+ *                                        name?default / the sole formal)
+ * -- anything else is an attrset literal (a bare identifier followed by
+ * '=' or '.', a string/dynamic key, `inherit`, etc., none of which share a
+ * prefix with a valid formals list). This also sidesteps the old function's
+ * own `${`-depth-counting special case entirely -- there is nothing to
+ * miscount when only 1-2 tokens are ever inspected. Open/malformed input
+ * (e.g. `{` at EOF) now surfaces its own "expecting '}'"-style error from
+ * the normal attrset-literal/formals parse path instead of this function's
+ * own dedicated check -- matching this project's standing convention of
+ * matching an error's class, not its exact wording (see Makefile's
+ * test-nix-conformance target comment). */
+static int is_formals_pattern(Parser *p, size_t open_idx) {
+    TokKind t1 = lexcur_tok(p->lc, open_idx + 1)->kind;
+    if (t1 == TOK_ELLIPSIS) return 1;
+    if (t1 == TOK_RBRACE) {
+        /* t1 != TOK_EOF here, so open_idx+1 is strictly before the source's
+         * TOK_EOF index, making open_idx+2 a legal lexcur_tok query (at
+         * most that EOF index) -- see lexer.h's own precondition comment
+         * on lexcur_tok/lexcur_tok_slow. */
+        TokKind t2 = lexcur_tok(p->lc, open_idx + 2)->kind;
+        return t2 == TOK_COLON || t2 == TOK_AT;
     }
+    if (t1 == TOK_IDENT) {
+        TokKind t2 = lexcur_tok(p->lc, open_idx + 2)->kind;
+        return t2 == TOK_COMMA || t2 == TOK_QUESTION || t2 == TOK_RBRACE;
+    }
+    return 0;
 }
 
 /* Parses the comma-separated formals list of a lambda pattern, with the
@@ -2015,12 +2021,10 @@ static Ast *parse_expr(Parser *p) {
     }
     if (cur(p)->kind == TOK_LBRACE) {
         /* Could be a lambda pattern (`{...}: body` / `{...}@name: body`) or
-         * an ordinary attrset-literal expression -- look past the matching
-         * '}' to tell which, same disambiguation real Nix's own grammar
-         * makes (see find_matching_rbrace's comment). */
-        size_t close = find_matching_rbrace(p, p->pos);
-        TokKind after = lexcur_tok(p->lc, close + 1)->kind;
-        if (after == TOK_COLON || after == TOK_AT) {
+         * an ordinary attrset-literal expression -- a bounded lookahead at
+         * the first 1-2 tokens tells which, same disambiguation real Nix's
+         * own grammar makes (see is_formals_pattern's comment). */
+        if (is_formals_pattern(p, p->pos)) {
             advance(p); /* '{' */
             AstFormal *formals;
             size_t fcount;

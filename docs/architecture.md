@@ -18031,3 +18031,119 @@ rewrite that would need a bigger win to justify its own risk.
 
 Files: `src/c/builtins_compare.c` (`JsonAttrEntry`, `json_encode_attrs_
 ctx` rewritten to collect once then sort; `json_name_cmp` unchanged).
+
+## M158: `find_matching_rbrace`'s full brace-depth scan to disambiguate `{...}` -- replaced with `iets`'s own bounded 1-2 token lookahead
+
+A fresh instruction-weighted profile (`perf record`, DWARF call-graph
+unwinding, `cpu_core/instructions/`) on a real `d.nix`/ffmpeg eval found
+`lex_until` as the single largest self-time symbol in the whole program,
+at 7.28% -- nearly double the next entry. The dominant call path was
+`asnix_parse -> parse_expr (x3) -> find_matching_rbrace -> lexcur_tok ->
+lexcur_tok_slow -> lex_until`. Every `{` in the grammar is ambiguous
+between a lambda-pattern formals list (`{...}: body` / `{...}@name:
+body`) and an ordinary attrset-literal expression until something past
+the matching `}` is examined; `find_matching_rbrace` (shipped since
+before this project's milestone numbering reached double digits) resolved
+that ambiguity by scanning the ENTIRE `{...}` span token-by-token,
+counting brace depth (including `${`'s own depth contribution, to avoid
+miscounting a formal's default-value expression that itself contains a
+dynamic select), just to peek at the one token immediately following the
+real closing brace.
+
+Because the project's lexer cursor only ever lexes forward and never
+re-lexes an already-produced token (`lexcur_tok`/`lexcur_tok_slow`,
+`src/c/lexer.h`/`lexer.c`), this scan wasn't literally wasted work in the
+sense of re-doing anything -- but it was usually the FIRST code to reach
+fresh, not-yet-lexed source text (since it runs ahead of wherever the
+parser's own cursor otherwise is), so it ended up attributed the bulk of
+the program's real lexing cost, concentrated in one place, for every
+single `{` in every imported nixpkgs file.
+
+**The fix.** `iets` (a sibling evaluator, `~/gnix/iets/src/syntax/
+parser.rs`'s `is_formals`) resolves the exact same grammar ambiguity with
+a bounded lookahead at the first one or two tokens after `{`, never
+scanning to the matching brace at all:
+  - first token is `...` -> formals (ellipsis-leading or ellipsis-only)
+  - first token is `}`, second is `:` or `@` -> formals (empty formals)
+  - first token is an identifier, second is `,`/`?`/`}` -> formals (a
+    formal's name, immediately followed by the next separator/default/
+    close that only a formals list's grammar can produce there)
+  - anything else -> an attrset literal (a bare identifier followed by
+    `=` or `.`, a string/dynamic key, `inherit`, `rec`, etc. -- none of
+    which share a token-level prefix with a valid formals list)
+
+Ported directly as `is_formals_pattern(Parser*, size_t open_idx)` in
+`src/c/parser.c`, replacing `find_matching_rbrace` and its single call
+site. The old function's own `${`-depth special case (needed because a
+formal's default-value expression can itself contain a dynamic select,
+e.g. real nixpkgs's `pkgs/stdenv/linux/default.nix`'s `bootstrapFiles ?
+let ... archLookupTable.${system} ... in ...`) disappears entirely --
+there is nothing to miscount when only 1-2 tokens are ever inspected.
+Looking 2 tokens past `open_idx` is always a safe `lexcur_tok` query: the
+second lookahead only happens inside the `TOK_RBRACE`/`TOK_IDENT` branches,
+both of which already confirm the first lookahead token is NOT `TOK_EOF`
+(the lexer's own sentinel final token), so the second query can never
+land past it. A malformed/truncated `{` at end-of-input no longer gets
+its own dedicated "unterminated '{'" message -- it now surfaces the
+normal "expecting '}'"-style error from whichever real parse path
+(formals or attrset literal) it falls into, matching this project's
+standing convention of matching an error's class, not its exact wording.
+
+**Correctness.** Full ladder green: `make test`, `make test-e2e`, `make
+test-conformance` all pass. `make test-nix-conformance
+NIX_CONFORMANCE_DIR=/tmp/nix-conformance`: exact baseline `pass=655
+fail=3 skip=148` (the same 3 pre-existing pos-tracking gaps). `make
+test-nixpkgs-hash`: `pass=148 fail=0`. Twelve hand-written differential
+cases, cross-checked byte-for-byte against real `nix-instantiate --eval
+--strict`, specifically targeting the disambiguation boundary: an
+ordinary attrset-literal argument (`(x: x) { a = 1; b = 2; }`), empty
+formals (`{ }: ...`), ellipsis-only formals (`{ ... }: ...`), a single
+bare formal (`{ a }: a`), a formal with a default (`{ a, b ? 10 }: ...`),
+both `@`-binding orders (`{ a, ... }@args: ...` and `{ }@x: x`), an
+attrset literal with a dotted attrpath (`{ a.b = 1; }`), `inherit` (`{
+inherit (builtins) toString; }`), a dynamic-key attrset (`{ "${x}" = 1;
+}`), and -- the exact hazard the old function's own comment called out
+-- a formal's default value containing its own nested attrset literal
+(`{ a ? let inner = { b = 1; }; in inner.b }: a`). All twelve matched
+real Nix exactly, both before and after. `./asnix d.nix` output unchanged:
+`/nix/store/29iacg6h530yx7rxz4k1fhvi0kxxhsam-ffmpeg-9.0.1-bin`, verified
+byte-identical on every trial below.
+
+**Measured** (`perf stat`, `taskset -c 0`, `cpu_core/instructions/`+
+`cpu_core/cycles/`, 20 interleaved trials (before,after,before,after,...)
+on the real cold `d.nix`/ffmpeg eval, output hash checked every trial,
+zero mismatches):
+
+| | instructions | cycles |
+|---|---|---|
+| before (M157 baseline) | 6,541,536,795 (avg) | 3,898,556,994 (avg) |
+| after (M158) | 6,494,331,550 (avg) | 3,924,281,876 (avg) |
+| delta | **-0.722%** (~47.2M instructions) | +0.660% |
+| wins | 20/20 | n/a |
+
+Instructions: completely non-overlapping across all 20 pairs (every
+BEFORE trial 6,538.5M-6,544.5M, every AFTER trial 6,491.3M-6,498.5M) --
+a small but hard, repetition-independent win by this project's own
+standard for what counts as real. Cycles: flat/noisy in the usual
+direction-ambiguous band for this shared, contended machine, not treated
+as an independent signal.
+
+**Honest sizing against the profile that motivated it.** The realized
+win (~47.2M instructions) is well below the ~7.28%/~476M-instruction
+self-time share the profile attributed to `lex_until` via this call
+path. This is not a discrepancy to chase further: most of that self-time
+was always going to be spent regardless of which code path first touches
+a given span of source text, since every token still has to be lexed
+exactly once before parsing can finish (the project's lexer cursor never
+re-lexes). What this milestone actually removes is the explicit
+depth-counting loop's own overhead (a `lexcur_tok` call, a branch, and an
+`i++` per token across the full scanned span, for every single `{` in
+every imported file) and the fact that lexing was being forced ahead of
+where the parser's own position otherwise needed it yet -- both real, but
+a much narrower slice than the raw self-time attribution implied. This
+matches this campaign's own repeated finding (M152, M157) that
+instrumented/self-time estimates reliably indicate DIRECTION but not
+MAGNITUDE; only a real interleaved measurement settles the latter.
+
+Files: `src/c/parser.c` (`find_matching_rbrace` replaced by
+`is_formals_pattern`; one call site updated).
