@@ -16515,3 +16515,107 @@ tables), exactly as scoped in this milestone's own brief.
 Files: `flake.nix` (devShell `packages`/`shellHook`), `nix/asnix.nix`
 (`mimalloc` input, `ASNIX_MIMALLOC_LIB`), `Makefile` (`MIMALLOC_LDLIBS`,
 `asnix`'s link rule, the `OPT_STAMP` key). No `src/` file touched.
+
+## M147: the lexer's keyword lookup called `strlen()` on all 13 `KEYWORDS` entries for every single identifier-shaped token in the source -- fixed by carrying each keyword's length as a compile-time constant
+
+This campaign's instruction-event-sampled profile (`perf record -g -e
+cpu_core/instructions/ -c 10000`, `taskset -c 0`, pinned to a confirmed
+P-core) had flagged `libc_misc` (`memcmp`/`memmove`/`memset`/`strlen`/
+`strcmp`/`memchr`) as a 448,510,508-instruction gap vs. iets, not yet
+investigated this campaign. Re-running that same profile on `d.nix` and
+walking ordinary userspace call-graphs (`perf report -g graph,...,caller
+--symbol-filter=__strlen_avx2`) found `__strlen_avx2` itself at 2.63%
+self-time, with the single largest identified call site:
+
+```
+asnix_eval_file -> asnix_parse -> parse_expr (x3) ->
+  find_matching_rbrace (inlined) -> lexcur_tok_slow -> __strlen_avx2   (0.83%)
+```
+
+Chasing that down through `lexcur_tok_slow` -> `lex_until` landed on
+`src/c/lexer.c`'s identifier/keyword-classification block (the `ident_start`
+case in `lex_until`, immediately below the M138 path/URI-scan guard): for
+every identifier-shaped token -- the single most common token shape in any
+real Nix file, and nixpkgs has an enormous number of them -- the lookup
+loop ran
+
+```c
+for (size_t k = 0; k < sizeof(KEYWORDS) / sizeof(KEYWORDS[0]); k++) {
+    size_t kwlen = strlen(KEYWORDS[k].kw);
+    if (kwlen == len && memcmp(KEYWORDS[k].kw, src + start, len) == 0) { ... }
+}
+```
+
+`KEYWORDS` is a fixed, compile-time-known 13-entry table of C string
+literals (`"let"`, `"in"`, `"if"`, ... `"or"`) -- its lengths never change
+at runtime, yet this call re-derived `strlen(KEYWORDS[k].kw)` from the NUL
+terminator on *every one of those 13 entries, for every single identifier
+token in the whole program*. The exact same class of waste M141's `Token`
+shrink and M143's regex cache fixed elsewhere (a runtime length re-derived
+from a NUL-terminated string when the real length was knowable up front),
+just on a literal table instead of a parsed string.
+
+**Fix**: added a `kwlen` field (`uint8_t`, 13 keywords all fit) to the
+`Keyword` struct, populated via a small `KW(lit, kind)` macro that computes
+`sizeof(lit) - 1` at compile time (the string literal's own length minus
+its NUL), and dropped the runtime `strlen()` call from the lookup loop
+entirely -- it now just compares `KEYWORDS[k].kwlen == len`. No change to
+`memcmp`'s own cost (unchanged, still does the real byte comparison when
+lengths match); this only removes the now-redundant length computation.
+
+**Measured** (interleaved `taskset -c 0 perf stat -e
+cpu_core/instructions/,cpu_core/cycles/`, before/after/before/after/
+before/after, same `d.nix`, byte-identical output
+`/nix/store/29iacg6h530yx7rxz4k1fhvi0kxxhsam-ffmpeg-9.0.1-bin` confirmed
+on both binaries before measuring):
+
+| trial | before instructions | after instructions |
+|---|---|---|
+| 1 | 8,037,857,775 | 7,832,706,335 |
+| 2 | 8,034,579,393 | 7,831,919,845 |
+| 3 | 8,032,592,655 | 7,829,700,827 |
+
+Mean before: 8,034,676,608. Mean after: 7,831,442,336. A consistent
+-203,234,272 instruction reduction (-2.53% of the whole program's
+instructions), reproduced identically on all 3 interleaved pairs (this
+workload is deterministic, so trial-to-trial variance here reflects
+measurement noise, not real run-to-run variation) -- closing roughly 45%
+of this profiling pass's named 448,510,508-instruction `libc_misc` gap
+with one bounded, mechanical change. Cycle counts moved in the same
+direction but, as usual on this shared machine, noisier
+(4,327M/4,418M/4,238M before vs. 4,251M/4,077M/4,243M after).
+
+**Other `libc_misc` leads found but not fixed this milestone** (left for
+a follow-on, since each needs a broader signature change to thread a
+known length through, not a single bounded edit):
+- `asnix_build_derivation_aterm`'s `buf_put_escaped`/`buf_puts` (aterm.c)
+  take plain `const char *` and `strlen()` internally, even though every
+  caller (`derivation.c`) already holds these strings as length-carrying
+  `Value`s before coercing them down to C strings for this function --
+  measured at ~0.50% self-time (`__strlen_avx2`) plus a further
+  `__memmove_avx_unaligned_erms`/`__strcmp_avx2` share from the same
+  function and its neighbor `asnix_collect_input_refs`'s dedup-by-strcmp
+  walk (derivation.c). Fixing this means changing
+  `AtermOutput`/`AtermInputDrv`/`AtermEnvVar`'s field shapes (or adding a
+  parallel `_len` field to each), a wider-blast-radius change than this
+  milestone's scope.
+- A further `__memmove_avx_unaligned_erms` share (~1.03%) attributes to
+  kernel addresses as the immediate "child" of the userspace `memmove`
+  frame -- this is page-fault service cost for newly-touched heap pages
+  (COW/zero-fill faults during `realloc`/arena growth), misleadingly
+  nested under `memmove` in the call graph because the fault happened on
+  the very instruction that touched the new page, not an actual callee;
+  not actionable at the C-call-site level, and outside what ordinary
+  userspace call-graph profiling can attribute further (kptr_restrict
+  hides the kernel-internal symbols, as expected -- see this campaign's
+  own clarification that this does NOT block userspace-side attribution,
+  which is all that was needed here).
+
+**Verification**: `make test`, `make test-e2e`, `make test-conformance`
+all pass; `make test-nix-conformance NIX_CONFORMANCE_DIR=/tmp/nix-conformance`
+reproduces the documented baseline exactly (pass=655 fail=3 skip=148);
+`make test-nixpkgs-hash` passes (pass=148 fail=0). `./asnix d.nix` output
+unchanged byte-for-byte before and after.
+
+Files: `src/c/lexer.c` (`Keyword` struct, `KEYWORDS` table, and the
+keyword-lookup loop in `lex_until`'s `ident_start` case only).

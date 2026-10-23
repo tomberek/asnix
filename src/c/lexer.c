@@ -234,17 +234,31 @@ static int ident_cont(char c) {
 
 typedef struct {
     const char *kw;
+    uint8_t kwlen;
     TokKind kind;
 } Keyword;
 
+/* perf: `kwlen` is `sizeof(lit) - 1` (the string literal's own compile-time
+ * length, minus its NUL), computed once here instead of via a runtime
+ * `strlen(KEYWORDS[k].kw)` inside the lookup loop below -- that loop runs
+ * once per keyword-table-entry for EVERY identifier-shaped token in the
+ * source (the single most common token shape in any real Nix file), so a
+ * redundant strlen there multiplies out badly. Same "carry a known length
+ * instead of re-deriving it from a NUL terminator" fix as M141's Token
+ * shrink and M143's regex cache, just applied to this fixed, compile-time-
+ * known table instead of a runtime string. */
+#define KW(lit, k) { lit, sizeof(lit) - 1, k }
+
 static const Keyword KEYWORDS[] = {
-    { "let", TOK_LET },         { "in", TOK_IN },     { "if", TOK_IF },
-    { "then", TOK_THEN },       { "else", TOK_ELSE },  { "true", TOK_TRUE },
-    { "false", TOK_FALSE },     { "null", TOK_NULL },
-    { "rec", TOK_REC },         { "inherit", TOK_INHERIT },
-    { "assert", TOK_ASSERT },   { "with", TOK_WITH },
-    { "or", TOK_OR },
+    KW("let", TOK_LET),         KW("in", TOK_IN),     KW("if", TOK_IF),
+    KW("then", TOK_THEN),       KW("else", TOK_ELSE),  KW("true", TOK_TRUE),
+    KW("false", TOK_FALSE),     KW("null", TOK_NULL),
+    KW("rec", TOK_REC),         KW("inherit", TOK_INHERIT),
+    KW("assert", TOK_ASSERT),   KW("with", TOK_WITH),
+    KW("or", TOK_OR),
 };
+
+#undef KW
 
 /* Lexer mode stack -- a from-scratch equivalent of real Nix's flex state
  * stack (see ~/nix's src/libexpr/lexer.l, %option stack / PUSH_STATE /
@@ -728,8 +742,7 @@ static void lex_until(const char *src, size_t *i_inout, ModeStack *modes, TokVec
             size_t len = j - start;
             TokKind kind = TOK_IDENT;
             for (size_t k = 0; k < sizeof(KEYWORDS) / sizeof(KEYWORDS[0]); k++) {
-                size_t kwlen = strlen(KEYWORDS[k].kw);
-                if (kwlen == len && memcmp(KEYWORDS[k].kw, src + start, len) == 0) {
+                if (KEYWORDS[k].kwlen == len && memcmp(KEYWORDS[k].kw, src + start, len) == 0) {
                     kind = KEYWORDS[k].kind;
                     break;
                 }
