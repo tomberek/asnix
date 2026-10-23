@@ -45,6 +45,23 @@ LDFLAGS      :=
 # docs/architecture.md's M146 section for the full writeup.
 ifdef ASNIX_MIMALLOC_LIB
 MIMALLOC_LDLIBS := $(ASNIX_MIMALLOC_LIB) -lpthread
+else
+# M150: make the win above the DEFAULT, not something that only happens
+# inside the flake's devShell -- auto-detect a system-installed mimalloc
+# for plain `make` too, via the same portable "does this link probe
+# succeed" pattern Autoconf-style build systems use for optional-library
+# detection, rather than guessing at distro-specific lib paths. Never a
+# hard build failure: if the probe fails (mimalloc genuinely isn't
+# installed anywhere the linker's own default search path reaches),
+# MIMALLOC_LDLIBS stays empty and the link falls back to plain glibc
+# malloc, exactly as before this milestone. Explicit ASNIX_MIMALLOC_LIB
+# (the devShell/packaged-build case, above) always wins over this
+# auto-detection -- this `else` branch only runs when nobody has already
+# pointed at a specific archive.
+MIMALLOC_PROBE := $(shell printf 'int main(void){return 0;}' | $(CC) -xc - -lmimalloc -o /dev/null 2>/dev/null && echo yes)
+ifeq ($(MIMALLOC_PROBE),yes)
+MIMALLOC_LDLIBS := -lmimalloc -lpthread
+endif
 endif
 
 MAKEFLAGS    += -j$(shell nproc 2>/dev/null || echo 4)

@@ -16938,3 +16938,61 @@ this is a pure allocation-strategy change with no behavioral surface
 (verified via the full existing conformance/e2e/nixpkgs-hash suites
 above, which already exercise every one of `AST_LET`/`AST_LAMBDA`-pattern/
 `AST_ATTRSET`'s branches at both small and large `n`).
+
+## M150: mimalloc as the real default -- plain `make` now auto-detects it too, not just the flake devShell
+
+Directed follow-up to M146 after the user asked "how can we make mimalloc
+the default?" -- M146 deliberately scoped mimalloc to an opt-in, env-var-
+gated path (`ASNIX_MIMALLOC_LIB`, set only by the flake's devShell or
+`nix/asnix.nix`'s packaged build) specifically so plain `cc`/`make`
+outside Nix would never hard-fail. That design choice is unchanged here,
+but it meant anyone building this project without the flake -- a system
+package manager's own mimalloc, or a `nix-shell -p mimalloc`-style ad hoc
+environment -- got plain glibc malloc with no way to opt in short of
+manually exporting the exact static-archive path themselves.
+
+**The fix**: when `ASNIX_MIMALLOC_LIB` is NOT already set, the Makefile
+now auto-detects a system-reachable mimalloc via a plain link probe --
+`printf 'int main(void){return 0;}' | $(CC) -xc - -lmimalloc -o /dev/null`
+-- the same portable "does this optional library resolve via the
+linker's own default search path" pattern Autoconf-style build systems
+use, rather than guessing at distro-specific library directory layouts
+(`/usr/lib/x86_64-linux-gnu`, `/usr/lib64`, Homebrew's `/opt/homebrew/
+lib`, etc., which vary and would need constant upkeep). If the probe
+succeeds, `-lmimalloc -lpthread` is added to the link line, same as
+before but via dynamic linking (the probe's own default mode) rather
+than the devShell path's static archive -- a reasonable, normal
+tradeoff for a system-package-manager-installed library, matching how
+glibc itself is already linked dynamically in this configuration. If
+the probe fails (mimalloc genuinely unreachable), `MIMALLOC_LDLIBS`
+stays empty and the build falls back to plain glibc malloc exactly as
+before this milestone -- never a hard failure either way. The explicit
+`ASNIX_MIMALLOC_LIB` path (devShell/packaged build) is checked FIRST and
+always wins when set; the probe only runs in its `else` branch, so
+nothing about the existing, already-verified static-link behavior
+changes.
+
+**Verified, three configurations, each independently**:
+1. Explicit `ASNIX_MIMALLOC_LIB` set (devShell-equivalent): unchanged --
+   `nm` confirms `malloc` as a locally-defined (`T`) symbol via the
+   static archive, exactly as M146 landed.
+2. No env var set, but mimalloc reachable via the normal linker search
+   path (this machine's own broad Nix profile environment, via
+   `NIX_LDFLAGS`, provides exactly this case): the probe succeeds,
+   `-lmimalloc -lpthread` gets added, `ldd` confirms `libmimalloc.so.3`
+   as a real runtime dependency, `./asnix d.nix` produces the correct,
+   unchanged output hash. Full ladder green: `make test`/`test-e2e`/
+   `test-conformance` all pass; `test-nix-conformance` `pass=655 fail=3
+   skip=148` (exact baseline); `test-nixpkgs-hash` `pass=148 fail=0`.
+3. No env var, AND mimalloc genuinely unreachable (tested directly via
+   `env -i PATH="$PATH" HOME="$HOME" make`, stripping the rich profile
+   environment case 2 relies on): the probe correctly fails (`ld.bfd:
+   cannot find -lmimalloc`), the build still completes with a plain
+   `gcc -o asnix src/c/main.o -L. -lasnix` link line (no mimalloc flags
+   at all), and `./asnix d.nix` still produces the correct output --
+   confirming the fallback is genuinely safe, not just assumed.
+
+Files: `Makefile` only (`MIMALLOC_LDLIBS`'s own definition, now with an
+`else` branch; `MIMALLOC_PROBE`, new). No change to `flake.nix`/`nix/
+asnix.nix` -- the explicit, static-link devShell/packaged-build path
+they set up is untouched and still takes priority.
