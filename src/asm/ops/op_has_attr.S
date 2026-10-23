@@ -20,24 +20,46 @@ asnix_op_has_attr:                      // a = symbol id; pops a value, pushes T
     cmpq $ASNIX_TAG_ATTRS, %rcx
     jne .Lhas_attr_false
 
-    // M88 (lazy `//` union-layering, heap.h): resolve a UnionHdr (negative
-    // `count`) to its flat form first -- see op_select.S's matching
-    // comment for the full rationale.
+    // M88 (lazy `//` union-layering, heap.h): a UnionHdr has a NEGATIVE
+    // `count` at offset 0 -- a single sign-bit check (no call overhead
+    // paid) on the common already-flat case.
+    //
+    // M154 (unionhdr-probe, generalizing M111's op_select.S-only fork):
+    // the union case used to call asnix_bshared_attrs_resolve, which
+    // ALWAYS fully flattens + caches every leaf merged together before
+    // this function's own single-key binary search ever runs, even
+    // though `?` is a pure membership test that never needs the found
+    // value or a positional index. Now calls asnix_bshared_attrs_probe
+    // instead -- see op_select.S's matching comment and
+    // asnix_bshared_attrs_probe's own comment (builtins_shared.c) for
+    // the full reasoning. The probed value itself is discarded (`?`
+    // never forces or returns it, matching the pre-existing behavior
+    // above -- a present-but-unforced entry still counts as present).
     movq %rax, %r9                      // r9 = tagged value, kept across the maybe-call below
     andq $-8, %rax                      // rax = Attrs* (untagged)
-    movq ASNIX_ATTRS_OFF_COUNT(%rax), %r8 // r8 = count (maybe negative)
+    movq ASNIX_ATTRS_OFF_COUNT(%rax), %r8 // r8 = count (maybe negative -- union header)
     testq %r8, %r8
     jns .Lhas_attr_resolved
-    pushq %rsi
-    pushq %rdi
-    movq %r9, %rdi
-    call asnix_bshared_attrs_resolve
-    movq %rax, %r9
+    pushq %rsi                          // save IP
+    pushq %rdi                          // save ENV
+    subq $16, %rsp                      // 16-byte-aligned scratch slot for out_value (unused
+                                         // by the caller, but asnix_bshared_attrs_probe always
+                                         // writes it on a hit)
+    movq %r9, %rdi                      // arg1 = tagged attrs value
+    movl ASNIX_IROP_OFF_A(%rsi), %esi   // arg2 = symbol id (read before clobbering %rsi below)
+    movq %rsp, %rdx                     // arg3 = &out_value (discarded)
+    call asnix_bshared_attrs_probe
+    addq $16, %rsp
     popq %rdi
     popq %rsi
-    movq %r9, %rax
-    andq $-8, %rax
-    movq ASNIX_ATTRS_OFF_COUNT(%rax), %r8 // reload -- now guaranteed non-negative
+    // M154: `testl %eax, %eax` MUST be the LAST thing before `jnz` -- see
+    // op_select.S's matching comment for the real bug this ordering
+    // avoids (an intervening `addq $16, %rsp` between the test and the
+    // branch silently clobbers the flags `testl` just set, found by
+    // direct repro on a sibling file during this milestone).
+    testl %eax, %eax
+    jnz .Lhas_attr_true
+    jmp .Lhas_attr_false
 .Lhas_attr_resolved:
 
     movq ASNIX_IROP_OFF_A(%rsi), %rdx   // rdx = target symbol id

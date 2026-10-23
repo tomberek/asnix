@@ -17553,3 +17553,136 @@ cost) is a template worth reusing rather than reinventing.
 
 Files: none shipped (`src/c/symtab.c` reverted to its clean content;
 this section is the only durable artifact of this investigation).
+
+## M155: extending M111's `asnix_bshared_attrs_probe` to `op_select_or.S`/`op_has_attr.S` -- and a latent flag-clobbering bug in M111's own `op_select.S` found and fixed along the way
+
+A fresh profiling pass re-ranked `attrs_sets`' 139.1M-instruction gap and
+re-confirmed (consistent with the prior callPackage-specializations
+investigation) that it's NOT one concentrated bug: the dominant half is
+ordinary `//`-operator volume building nixpkgs's own ~12-layer overlay
+`pkgs` (the single largest eager-merge call site measured had
+`lhs_count=rhs_count=28,189` -- the top-level `pkgs` build itself), which
+M93 already measured isn't worth re-architecting further. The one
+genuinely concentrated, fixable slice the profile pointed at: 0.36%+0.23%
+of `asnix_attrs_eager_merge`'s self-time attributed to `op_select_or`'s
+and `op_has_attr`'s own union-resolve paths -- the exact two call sites
+M111 (`asnix_bshared_attrs_probe`, a bounded leaf-probe that avoids
+`asnix_bshared_attrs_resolve`'s full materialize-on-any-read) deliberately
+left un-converted, having only wired the probe into `op_select.S`'s `a.b`
+path. `op_select_or.S` (`a.b or default`) and `op_has_attr.S` (`a ? b`)
+are both pure single-key point lookups on the union path -- the probe's
+exact target shape -- so this milestone ported M111's already-proven
+technique to both, mechanically mirroring `op_select.S`'s own call
+sequence (`op_has_attr.S` additionally discards the probed value, since
+`?` never forces or returns it).
+
+**A real, pre-existing bug found and fixed along the way, not assumed
+away.** Direct correctness testing (not just the existing suite) on a
+genuine point-lookup MISS against a real `UnionHdr` --
+`(listToAttrs-built 20-entry base // { extra = 100; }).nope` and `.nope or
+99` -- segfaulted on the first working draft of both new call sites.
+Tracing with `gdb` found the bug wasn't in the new code's logic: it's a
+latent flag-clobbering bug in the exact sequence `op_select.S` ALREADY
+shipped in M111, copied faithfully (bug and all) into the new sites. The
+shared pattern was:
+```
+call asnix_bshared_attrs_probe
+testl %eax, %eax     // sets ZF from the probe's return value
+movq (%rsp), %r9
+addq $16, %rsp        // ADD unconditionally OVERWRITES ZF/SF/CF/OF
+                       // from its OWN result (here, always a nonzero
+                       // stack address) -- silently destroying the
+                       // `testl`'s flags before they're ever read
+popq %rdi
+popq %rsi
+jz .Lselect_probe_missing   // branches on the CLOBBERED flags, not
+                             // the probe's real result
+```
+On a genuine miss (`eax==0`), the clobbered `ZF` read back as 0 (since
+`rsp+16` is never literally zero) instead of 1, so `jz` was never taken --
+the miss path fell through treating the never-written `out_value` scratch
+slot's garbage contents as a "found" value, corrupting `%rax` with stack
+garbage that then got misread as a tagged pointer by the Cell/LazyApp/
+ThunkMap dispatch a few instructions later, segfaulting. On a genuine HIT
+(`eax!=0`), the SAME clobbering happened, but the clobbered `ZF` also
+happened to read back as 0 (`rsp+16` still nonzero) -- which is
+coincidentally the CORRECT "don't take the missing branch" outcome for a
+hit, masking the bug completely. This is exactly why M111's own
+verification (which covered override semantics, `MAX_LEAVES` boundaries,
+chained unions, `==`, `toJSON`, etc. -- see that section) and every run of
+`make test`/`test-nix-conformance`/`test-nixpkgs-hash` since never caught
+it: real nixpkgs's own `UnionHdr`s, by construction, are never genuinely
+point-missed via `op_select.S`'s `a.b` path in practice (a plain `a.b`
+miss on a real union is already a fatal abort real Nix code basically
+never triggers deliberately), so the one case that exposes the bug was
+never exercised. Fixed in all three files (`op_select.S`, `op_select_or.S`,
+`op_has_attr.S`) by moving `testl %eax, %eax` to be the LAST instruction
+before the branch, after all stack cleanup -- `%eax` itself is untouched
+by the intervening `movq`/`addq`/`popq` instructions, only the FLAGS were
+at risk.
+
+**Correctness, verified directly, not just via the test suite.** Minimal
+repro (`(20-entry-base // {extra=100;}) .nope`, `.nope or 99`, `? extra`,
+`? nope`, plain `.extra`) cross-checked byte-for-byte against real
+`nix-instantiate --eval`: `[ 100 99 true false ]` both before (on the
+flat/hit cases, which never exercised the bug) and after the fix, and the
+genuine-miss cases (which segfaulted on the buggy intermediate draft) now
+correctly print `asnix: attribute 'nope' missing, aborting` for plain
+`.nope`, matching real Nix's own abort for that case exactly. `./asnix
+d.nix` unchanged: `"/nix/store/29iacg6h530yx7rxz4k1fhvi0kxxhsam-ffmpeg-9.0.1-bin"`,
+byte-identical.
+
+**Verification ladder.** `make test`: all green. `make test-e2e`: all
+green. `make test-conformance`: all green. `make test-nix-conformance
+NIX_CONFORMANCE_DIR=/tmp/nix-conformance`: `pass=655 fail=3 skip=148`,
+exact baseline match (the same 3 known pre-existing gaps: `eval-okay-
+getattrpos{,-functionargs}.nix`, `eval-okay-inherit-attr-pos.nix`). `make
+test-nixpkgs-hash`: `pass=148 fail=0`.
+
+**Measured impact on `./asnix d.nix`** (real nixpkgs's `ffmpeg.outPath`,
+`perf stat`, `taskset -c 0`, `cpu_core/instructions/,cpu_core/cycles/`,
+4 INTERLEAVED trials each against a clean M153-baseline binary built
+side-by-side in a separate directory, never batched): instructions
+dropped from a tight, consistently-higher baseline band
+(6,776,717,191-6,779,630,661, mean 6,777,971,462) to a tighter, lower,
+non-overlapping fixed band (6,756,307,103-6,756,778,844, mean
+6,756,452,991) -- a consistent **~21.5M-instruction (~0.32%) reduction**,
+small but real given every one of the 4 interleaved pairs showed fixed
+strictly below baseline with no overlap. Cycles were noisier, as this
+campaign has repeatedly found on this shared machine (baseline
+3,760,376,593-3,964,593,040, mean 3,830,734,796; fixed 3,729,179,311-
+3,866,067,118, mean 3,781,882,027) -- directionally the same ~1.3%
+reduction but within a band wide enough that it's not treated as an
+independently confirmed signal on its own, only as consistent with the
+instruction-count result. This is an honestly small, not dramatic, win --
+consistent with M111's own finding that most real nixpkgs unions
+eventually get materialized via some OTHER full-iteration access path
+anyway (`attrNames`, the printer, `derivation.c`'s input-collection walk,
+JSON encoding), so converting two more POINT-lookup sites only helps the
+subset of accesses that touch a union exclusively through `or`/`?` and
+never through full iteration -- real, but not the dominant share of
+`attrs_sets`' 139.1M gap (which this milestone's own profiling re-confirms
+is genuinely diffuse `//`-volume, not a concentrated bug, matching the
+prior investigation's verdict).
+
+**What was declined, and why.** `op_with_try.S`/`op_with.S`'s `OP_WITH_TRY`
+(`with expr; body`'s runtime fallback lookup) is structurally the same
+single-key point-lookup shape and was enumerated as a correct target in
+M93's own call-site list, but this milestone did NOT convert it: the
+profiling evidence motivating this milestone specifically named
+`op_select_or`/`op_has_attr` (0.36%+0.23%), not `op_with_try`, and
+converting it without a specific measured signal risks the same class of
+subtle flag-ordering mistake this milestone just found and fixed for no
+demonstrated payoff -- left as a plausible, low-risk follow-up for
+whichever future pass actually profiles it hot, not bundled in here on
+spec. `op_check_formals.S` (lambda-pattern destructuring) was considered
+and declined for a structural reason, not just caution: its phase 2 (every
+GIVEN entry must be a declared field) requires genuine POSITIONAL
+iteration over every entry in the given attrset, which already requires
+materializing the union regardless of phase 1's point lookups -- converting
+phase 1 to a probe would save nothing, since the full resolve already has
+to happen for phase 2 to run at all.
+
+Files: `src/asm/ops/op_select.S` (bug fix only -- the probe wiring itself
+is unchanged from M111), `src/asm/ops/op_select_or.S`,
+`src/asm/ops/op_has_attr.S`.

@@ -51,24 +51,48 @@ asnix_op_select_or:
     cmpq $ASNIX_TAG_ATTRS, %rcx
     jne .Lselect_or_not_found           // not even an attrset -- not fatal, see header comment
 
-    // M88 (lazy `//` union-layering, heap.h): resolve a UnionHdr (negative
-    // `count`) to its flat form first -- see op_select.S's matching
-    // comment for the full rationale.
+    // M88 (lazy `//` union-layering, heap.h): a UnionHdr has a NEGATIVE
+    // `count` at offset 0 -- a single sign-bit check (no call overhead
+    // paid) on the common already-flat case.
+    //
+    // M154 (unionhdr-probe, generalizing M111's op_select.S-only fork):
+    // the union case used to call asnix_bshared_attrs_resolve, which
+    // ALWAYS fully flattens + caches every leaf merged together before
+    // this function's own single-key binary search ever runs, even
+    // though `.b or default` only ever wants ONE value. Now calls
+    // asnix_bshared_attrs_probe instead -- see op_select.S's matching
+    // comment and asnix_bshared_attrs_probe's own comment
+    // (builtins_shared.c) for the full reasoning.
     movq %rax, %r9                      // r9 = tagged value, kept across the maybe-call below
     andq $-8, %rax                      // rax = real Attrs* (untagged)
-    movq ASNIX_ATTRS_OFF_COUNT(%rax), %r8 // r8 = count (maybe negative)
+    movq ASNIX_ATTRS_OFF_COUNT(%rax), %r8 // r8 = count (maybe negative -- union header)
     testq %r8, %r8
     jns .Lselect_or_resolved
-    pushq %rsi
-    pushq %rdi
-    movq %r9, %rdi
-    call asnix_bshared_attrs_resolve
-    movq %rax, %r9
+    pushq %rsi                          // save IP
+    pushq %rdi                          // save ENV
+    subq $16, %rsp                      // 16-byte-aligned scratch slot for out_value (only
+                                         // 8 used -- keeps the call's own stack-alignment
+                                         // requirement simple alongside the 2 pushes above)
+    movq %r9, %rdi                      // arg1 = tagged attrs value
+    movl ASNIX_IROP_OFF_B(%rsi), %esi   // arg2 = symbol id (read before clobbering %rsi below)
+    movq %rsp, %rdx                     // arg3 = &out_value (the scratch slot just reserved)
+    call asnix_bshared_attrs_probe
+    movq (%rsp), %r9                    // r9 = probed value (meaningful only if found; cheap
+                                         // to load unconditionally rather than branch around)
+    addq $16, %rsp
     popq %rdi
     popq %rsi
-    movq %r9, %rax
-    andq $-8, %rax
-    movq ASNIX_ATTRS_OFF_COUNT(%rax), %r8 // reload -- now guaranteed non-negative
+    // M154: `testl %eax, %eax` MUST be the LAST thing before `jz` -- see
+    // op_select.S's matching comment for the real bug this ordering
+    // avoids (an intervening `addq $16, %rsp` between the test and the
+    // branch silently clobbers the flags `testl` just set, found by
+    // direct repro on this exact file during this milestone).
+    testl %eax, %eax
+    jz .Lselect_or_not_found
+    movq %r9, %rax                      // rax = found value -- feed into the SAME thunk-
+                                         // forcing/Cell-check/push logic every other select-or
+                                         // result already goes through, below
+    jmp .Lselect_or_resolve
 .Lselect_or_resolved:
 
     movq ASNIX_IROP_OFF_B(%rsi), %rdx   // rdx = target symbol id

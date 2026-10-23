@@ -63,12 +63,34 @@ asnix_op_select:                        // a = symbol id; pops an attrset, pushe
     movl %r10d, %esi                    // arg2 = symbol id
     movq %rsp, %rdx                     // arg3 = &out_value (the scratch slot just reserved)
     call asnix_bshared_attrs_probe
-    testl %eax, %eax
     movq (%rsp), %r9                    // r9 = probed value (meaningful only if found; cheap
                                          // to load unconditionally rather than branch around)
     addq $16, %rsp
     popq %rdi
     popq %rsi
+    // M154: `testl %eax, %eax` MUST happen here, immediately before the
+    // `jz` -- found and fixed a real pre-existing bug in this exact spot
+    // (landed by M111, never caught by any test): the ORIGINAL ordering
+    // tested %eax right after the call but then ran `addq $16, %rsp`
+    // before branching on the result. `addq` unconditionally clobbers
+    // ZF/SF/CF/OF based on ITS OWN result (here, always a nonzero stack
+    // address), silently overwriting the `testl`'s flags. On a genuine
+    // miss (`eax==0`), the clobbered ZF read back as 0 (since rsp+16 is
+    // never literally zero), so `jz` wasn't taken -- the miss path fell
+    // through treating garbage stack-slot contents as a "found" value,
+    // corrupting %rax with whatever was left in the never-written
+    // out_value scratch slot and then segfaulting soon after (reached
+    // via .Lselect_resolve's Cell/LazyApp/ThunkMap dispatch misreading
+    // that garbage as a tagged pointer). The hit path happened to still
+    // work by coincidence (its own clobbered ZF read back as 0 too,
+    // which is the correct "don't take jz" outcome for a hit) -- this is
+    // exactly why `make test`/`test-nix-conformance`/`test-nixpkgs-hash`
+    // never caught it: every real nixpkgs point lookup that reaches a
+    // UnionHdr apparently always HITS (confirmed by direct repro: a
+    // genuinely-missing key on a real UnionHdr, e.g. `(base // {extra=1;})
+    // .nope` with base >=16 entries, reliably segfaulted before this fix
+    // and returns the correct fatal "attribute missing" error after it).
+    testl %eax, %eax
     jz .Lselect_probe_missing
     movq %r9, %rax                      // rax = found value -- feed into the SAME thunk-
                                          // forcing/Cell-check/push logic every other select
