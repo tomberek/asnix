@@ -14302,3 +14302,228 @@ complexity, not clearing the bar.
 
 Files: `src/c/symtab.c` (`hash_bytes` only; `asnix_intern`/`asnix_sym_
 name`/the table/rehashing logic untouched).
+
+## M131: clean M125 re-measurement, plus two AST/parser allocation fixes found profiling the compile-only phase in isolation
+
+Continuing M123/M125/M127's cross-evaluator speed investigation, scoped
+to the parser (`src/c/parser.c`) and its own AST allocator (`src/c/
+ast.c`). Two parts: (1) the clean before/after measurement for M125
+itself that its own writeup flagged as never having been taken on a
+quiet host, and (2) a further architectural issue found profiling
+`parser.c` directly, beyond the already-fixed precedence chain.
+
+**Methodology, used throughout**: a dedicated lex+parse+compile-ONLY
+timing harness (`timeit_compile.c`, built directly against `libasnix.a`,
+not part of the normal build) that loops over the exact 1057 real `.nix`
+files `d.nix` (`(import /home/tbereknyei/nixpkgs/default.nix {}).ffmpeg.
+outPath`) imports (collected via `strace -e trace=openat`, matching
+M123's own corpus exactly), calling `asnix_lex`/`asnix_parse`/`asnix_
+compile`/`asnix_ast_arena_reset` directly with NO evaluation at all --
+isolates compile-phase cycles from the eval phase that dominates total
+d.nix wall-clock, giving a much cleaner signal than running the whole
+binary for changes confined to lex/parse/compile. Cross-checked against
+the full real `asnix d.nix` binary (`perf stat`, CPU-pinned via `taskset
+-c 2` to one confirmed P-core throughout, plus `hyperfine` as a second,
+independent measurement methodology) for an end-to-end sanity check.
+Host checked quiet before every measurement (`uptime`/`ps aux`, no
+concurrent `asnix`/`iets` processes running) -- load average 1-3
+throughout (other background agents' own non-asnix tooling), contrasted
+explicitly against M125's own writeup, which landed under two OTHER
+agents' `asnix` processes pegged at 100-200% CPU.
+
+**Part 1: M125's own clean re-measurement.** Built the exact pre-M125
+and M125 commits (`2f768bb~1`/`2f768bb`, which touches `parser.c` and
+`docs/architecture.md` ONLY -- no other file -- confirmed via `git show
+--stat`) into separate directories via `git archive`, so the ONLY
+difference between the two binaries is the precedence-chain collapse
+itself. Measured (`perf stat -r 5-7`, pinned, quiet host):
+
+| | instructions | cycles | wall (perf stat avg) |
+|---|---|---|---|
+| compile-only harness, 1057 files | -0.54% | -0.79% | -3.57% |
+| full `asnix d.nix` (lex+parse+compile+eval) | -0.21% (noise) | -1.14% | -3.46% |
+
+Both measurements agree: a real, repeatable, single-digit-percent win,
+much smaller than "9 call/ret pairs down to 1-2 per leaf expression"
+might suggest in isolation, but LARGER in wall-clock than in raw
+instruction count -- consistent with the win being mostly about reduced
+call/return overhead (branch-predictor/return-stack-buffer pressure,
+I-cache footprint from 9 separate non-inlined function bodies) rather
+than raw instruction volume, matching M123's own observation that
+asnix's IPC is already close to iets's (so cycle reduction, not
+instruction-count reduction, is the resource actually being saved here).
+This closes M125's own flagged gap: a real, trustworthy, quiet-host
+number now exists and is small but genuinely positive.
+
+**Part 2: profiling `parser.c` for further hot paths.** `perf record -g`
++ `perf report` on the compile-only harness (built with `-g`, M125-level
+binary) surfaced a result the task's own hypothesis (iets's flatter,
+less-indirect AST representation) only partly predicted: asnix's AST
+node allocator ALREADY uses a dedicated bump arena (`ast.c`'s `asnix_ast_
+new`, documented there as "Ast nodes are pure compile-time scratch, ~17%
+of peak memory, freed in one shot per file"), not a slower general-
+purpose malloc per node -- so the iets-style "flatten the tree into
+index-based tables" rewrite this task's own brief suggested checking
+turned out to be substantially already-equivalent in spirit (bump-
+allocated nodes, not individually malloc'd) and NOT the real gap. Two
+bugs/inefficiencies in how that EXISTING design was implemented were
+the real finding instead:
+
+**Fix 1 -- `ast.c`'s per-FILE chunk `calloc` was re-zeroing a full 1 MiB
+on every single one of 1057 files, usually for far fewer live bytes than
+that.** `asnix_ast_new`'s chunk allocator used to `calloc(1, sizeof(
+AstChunk))` (1 MiB) whenever a fresh chunk was needed, with a `/* DEBUG:
+test zero-init hypothesis */` comment flagging it as an open question.
+Confirmed BOTH halves of that question directly: (a) the zero-init
+itself IS load-bearing -- `parser.c`'s plain `a: body` lambda case
+(`parse_expr`'s `TOK_IDENT && peek2 == TOK_COLON` branch) never sets
+`AST_LAMBDA.is_pattern`/`formals`/`has_ellipsis`/`has_as_name` at all,
+relying on them defaulting to 0/NULL, so simply switching to `malloc`
+would have been a real, silent correctness bug (every ordinary `a: b`
+lambda would get garbage `is_pattern`, misrouting through compiler.c's
+pattern-destructuring path); (b) but the zero-fill only needs to cover
+the bytes a node ACTUALLY occupies, not the fixed 1 MiB chunk size --
+`perf report` found `__memset_avx2_unaligned_erms` as a genuine ~5.7%-
+of-total-cycles hot symbol in the compile-only harness, NOT eliminated
+by `calloc`'s usual "fresh mmap page is already zero, skip the memset"
+fast path, because `asnix_ast_arena_reset()` frees every chunk right
+after each FILE's own compile (by design, see ast.c's own header
+comment -- Ast nodes are reclaimable compile-time scratch), so this
+process allocates-then-frees a ~1 MiB chunk roughly once per imported
+file. glibc's malloc dynamically RAISES its own internal mmap threshold
+every time a chunk at or above the current threshold is freed (`mallopt
+(M_MMAP_THRESHOLD)`'s own documented dynamic-adjustment behavior, meant
+to stop mmap/munmap thrashing for a workload that repeats the same large
+size) -- so after the first one or two ~1 MiB frees, the threshold climbs
+past 1 MiB and every SUBSEQUENT same-sized chunk is served from the
+ordinary heap instead of a fresh mmap, where `calloc` can no longer
+assume pre-zeroed pages and must really `memset` the whole 1 MiB, most
+of which the file's own (usually much smaller) AST never even touches.
+
+**The fix**: `malloc` the chunk (no zero-fill promise, so nothing to
+skip or fall back to -- sidesteps the dynamic-threshold problem
+entirely) and `memset(n, 0, sizeof(Ast))` on exactly the one node being
+carved out, inside `asnix_ast_new` itself, preserving the EXACT same
+"every node starts fully zeroed" guarantee the correctness audit above
+confirmed is needed -- just scoped to the bytes actually used instead of
+the whole chunk, strictly less total zeroing for any file that doesn't
+fill a whole chunk (the common case for 1057 real files averaging
+~23 KB of source each) and no worse for one that does.
+
+**Fix 2 -- `parser.c`'s other growable vectors (`AstVec`/`PartVec`/
+`FormalVec`/`AttrSegVec`/`RawIndVec`) each started a fresh malloc-from-
+cap-0 for EVERY list literal, string/path interpolation, lambda formals
+list, and attrpath/inherit-name segment list in the whole file**, unlike
+a comparison evaluator's (iets, `~/gnix/iets/src/syntax/parser.rs`)
+`sc_ids`/`sc_elems`/`sc_parts`/`sc_formals`/`sc_names` -- ONE shared,
+file-lifetime growable scratch buffer per table kind, reused across
+every node via a `mark`/`commit` protocol (push onto the shared stack,
+then copy the just-pushed span into permanent storage and roll the
+stack's length back down). `perf report`'s self-time breakdown on the
+compile harness found the whole malloc-family (`_int_malloc`/`malloc`/
+`realloc`/`_int_realloc`/`__libc_calloc2`/`_int_free_merge_chunk`/
+`unlink_chunk`) summing to roughly 14% of total self-time, with `BTVec`'s
+OWN already-hash-indexed family (`btvec_push`/`insert_attrpath`) only
+accounting for ~2.65 points of that -- leaving the bulk attributable to
+these simpler, flat, append-then-finalize vector types.
+
+**The fix**: a `SCRATCH_VEC(name, T)` macro (`parser.c`) adapted from
+iets's own technique, generating a `_push`/`_mark`/`_commit` trio backed
+by one `static` buffer per vector kind, applied to exactly the five
+types above. Each `_commit(mark, &count)` copies the span pushed since
+`mark` into a freshly `malloc`'d exact-size array (preserving this
+project's existing "every Ast node owns its own permanent, exact-size
+array" output shape, unlike iets's single ever-growing flat table
+indexed by `(start,len)` -- that bigger representation change was
+deliberately NOT adopted, see below) and rewinds the shared buffer's
+length back down, so only the single largest node of each kind in the
+WHOLE file ever forces a real `realloc` -- every other node of that kind
+reuses already-grown capacity for free.
+
+**Safety argument (the one real subtlety, verified against every call
+site actually converted, not assumed)**: sharing one buffer across the
+whole file is sound exactly because recursive-descent parsing is
+strictly LIFO -- a NESTED use of the same vector kind (e.g. a list
+literal nested inside another list literal's own element expression, or
+an attrpath-sugar binding's value expression that itself contains
+another binding block) always completes its own full push...push...
+commit cycle and shrinks the shared length back down BEFORE the
+enclosing use's own next push, simply because that's how a call that
+hasn't returned yet works. The one discipline this places on every call
+site: never dereference a stale pointer captured before a call that
+might recurse into the SAME macro instance (a nested `_push`'s `realloc`
+can move the buffer) -- audited specifically for `parse_binding_stmt`'s
+attrpath-sugar `segs` (which parses the binding's VALUE expression,
+`parse_expr`, strictly BETWEEN collecting `segs` and finally reading
+`segs_items` -- fixed by moving the `_commit` call to AFTER `parse_expr`
+returns, not immediately after the collection loop as the naive
+translation would do) and `inherit`'s `names` (no such gap -- everything
+between the collection loop and `free` is pure tree manipulation, no
+parser recursion, so committing right after the loop is safe). **NOT
+applied** to `BTVec`/`BindingVec`/`DynBindingVec`: those have an
+irregularly-nested, TREE-shaped (not flat), incrementally mutated-and-
+reopened lifetime (`reopen_attrset_into` can populate several different
+BTNode-owned `DynBindingVec`s in a non-LIFO interleaved order within one
+block's own parse) where the same safety argument does NOT hold --
+converting those would need a materially bigger, riskier change (either
+re-deriving the family's own O(1) hash-index scheme against a shared
+backing store, or the full iets-style flat-table-with-`Range`
+representation change) and was deliberately left alone, flagged below
+as a real but out-of-scope follow-on, not attempted here.
+
+**Measured** (compile-only harness, 1057 files, `perf stat -r 5`, quiet
+host, pinned):
+
+| | instructions | cycles | wall (harness internal "best") |
+|---|---|---|---|
+| + ast.c fix only | +0.13% (noise) | -4.83% | -5.35% |
+| + both fixes (full) | -1.60% | -6.72% | -7.12% |
+
+(percentages relative to the M125-level baseline; the scratch-vec fix's
+own marginal contribution, full vs. ast.c-fix-only: instructions -1.73%,
+cycles -1.99%, wall -1.87% -- smaller than the ast.c fix alone, but real
+and in the same direction, not noise).
+
+**Full end-to-end `asnix d.nix` (lex+parse+compile+eval combined)**,
+both fixes together vs. the same commit with neither (`perf stat -r 7`,
+pinned, quiet host):
+
+| | instructions | cycles | page-faults | wall |
+|---|---|---|---|---|
+| neither fix | 10,259,392,435 | 5,797,927,153 | 173,322 | 1.549s (±1.79%) |
+| both fixes | 10,214,974,464 (-0.43%) | 5,679,358,453 (-2.05%) | 171,866 (-0.84%) | 1.444s (-6.78%, ±0.10%) |
+
+Cross-checked with `hyperfine` (15 runs, 2 warmups, same pinning):
+`after` measured 1.03x +- 0.03 faster than `before`, matching direction
+and rough magnitude, with a notably tighter variance in the "after"
+binary (±0.006s vs ±0.036s) -- a believable side-effect of removing a
+cost that was itself contingent on glibc's own internal dynamic-
+threshold state, which is exactly the kind of thing that varies run to
+run.
+
+**Verified**: `make test`/`test-e2e`/`test-conformance` all green.
+`make test-nix-conformance` (`NIX_CONFORMANCE_DIR=/tmp/nix-conformance`):
+`pass=655 fail=3 skip=148` -- exact match to the pre-existing baseline
+(same 3 pos-tracking failures). `make test-nixpkgs-hash`: one run showed
+`pass=147 fail=1` (`clang.outPath(crash)`), reproduced clean standalone
+(`./asnix -A clang.outPath`/`-A clang.drvPath` both rc=0, correct output)
+and on a full rerun (`pass=148 fail=0`) -- this session's familiar
+transient-contention flakiness pattern, not a real regression, per the
+exact same pattern M123/M124/M125 all independently hit and confirmed.
+Output hash on `d.nix` (ffmpeg's closure) unchanged:
+`/nix/store/29iacg6h530yx7rxz4k1fhvi0kxxhsam-ffmpeg-9.0.1-bin`.
+
+**Not attempted, flagged for follow-on work**: converting `BTVec`/
+`BindingVec`/`DynBindingVec` (attrset/let/rec binding lists, the single
+largest remaining concentration of parser-side malloc-family overhead
+after this milestone, per the ~2.65-points-of-14% breakdown above) to
+the same shared-scratch technique, OR the bigger iets-style flat-table-
+with-`Range`-indices `Ast` representation change (which would also
+subsume this fix and the existing bump-arena design into one coherent
+scheme) -- both are real, visible, NOT yet root-caused-away opportunities,
+but each is a materially bigger, riskier change (the former needs a new
+non-LIFO-safe sharing scheme or a rederived hash-index; the latter
+touches every single `Ast*`-typed field across `ast.h`/`compiler.c`/
+every builtin that walks an AST) than this milestone's own bar for a
+same-session landing -- left as explicit, scoped-out future work rather
+than forced.

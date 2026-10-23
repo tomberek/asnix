@@ -5,18 +5,74 @@
 #include <stdlib.h>
 #include <string.h>
 
-typedef struct {
-    Ast **items;
-    size_t len, cap;
-} AstVec;
-
-static void astvec_push(AstVec *v, Ast *item) {
-    if (v->len == v->cap) {
-        v->cap = v->cap ? v->cap * 2 : 8;
-        v->items = realloc(v->items, v->cap * sizeof(Ast *));
+/* perf (M128 follow-up): a flat, append-then-finalize vector whose
+ * backing store is one SHARED, never-freed-mid-parse buffer reused
+ * across EVERY node of this same kind for the whole file, instead of
+ * each node paying for its own fresh malloc-from-cap-0 -- the same
+ * "shared scratch stack, commit a finished run into permanent storage"
+ * technique a comparison evaluator (iets, ~/gnix/iets/src/syntax/
+ * parser.rs's `commit`/`sc_ids`/`sc_elems`/etc.) uses for its own
+ * equivalent vectors, adapted here to keep this project's existing
+ * "each Ast node owns its own permanent, exact-size array" output shape
+ * (VEC_TRIM's old job, for the vectors converted to this macro) instead
+ * of iets's single ever-growing flat table indexed by (start,len).
+ *
+ * Safety argument for why sharing ONE buffer across the whole file is
+ * sound (verified against every call site this macro is actually used
+ * at, below): a NESTED use of the exact same vector kind -- e.g. a list
+ * literal nested inside another list literal's own element expression,
+ * or a lambda-formal's default-value expression that itself contains
+ * another lambda pattern -- always runs its own complete push...push...
+ * commit cycle and shrinks the shared length back down to where it
+ * found it BEFORE the outer use's own next push, simply because that's
+ * how a recursive-descent parser's call/return structure works (the
+ * inner construct's Ast* is fully built and returned up the call stack
+ * before the outer loop resumes). So at every point `_push` or `_commit`
+ * actually runs, the buffer's current length is always exactly
+ * "whatever the (possibly several, properly nested) callers above me on
+ * the C call stack have each already pushed, plus however far EACH ONE
+ * has run so far" -- never corrupted by a sibling call that hasn't
+ * returned yet, because recursive descent has no such thing (only
+ * nested calls that fully return before the next statement). The one
+ * discipline this places on every call site: never dereference a stale
+ * `T*` captured before a call that might recurse into the SAME macro
+ * instance (a `realloc` inside a nested `_push` can move the buffer) --
+ * every call site below only ever reads from the buffer via a fresh
+ * `_commit(mark, ...)` call made AFTER all such recursion for that span
+ * has already returned, never a cached pointer held across one.
+ *
+ * NOT applied to BTVec/BindingVec/DynBindingVec (irregularly-nested,
+ * tree-shaped, incrementally mutated-and-reopened lifetimes -- see
+ * BTVec's own header comment above -- where several of these can be
+ * simultaneously "open" in a non-LIFO order, so this same argument does
+ * NOT hold; left exactly as before, each with its own fresh `{0}`-
+ * started allocation per node). */
+#define SCRATCH_VEC(name, T)                                                                                           \
+    static T *name##_buf = NULL;                                                                                       \
+    static size_t name##_len = 0, name##_cap = 0;                                                                      \
+    static size_t name##_mark(void) { return name##_len; }                                                             \
+    static void name##_push(T item) {                                                                                  \
+        if (name##_len == name##_cap) {                                                                                \
+            name##_cap = name##_cap ? name##_cap * 2 : 8;                                                               \
+            name##_buf = realloc(name##_buf, name##_cap * sizeof(T));                                                   \
+        }                                                                                                               \
+        name##_buf[name##_len++] = item;                                                                                \
+    }                                                                                                                   \
+    /* Copies the span pushed since `mark` into a fresh, exact-size, caller-owned      \
+     * array and rewinds the shared buffer back to `mark` -- MUST be called only       \
+     * after every nested use of this same macro instance (if any) has already         \
+     * committed and returned; see this macro's own header comment above. */           \
+    static T *name##_commit(size_t mark, size_t *out_count) {                                                          \
+        size_t n = name##_len - mark;                                                                                   \
+        name##_len = mark;                                                                                              \
+        *out_count = n;                                                                                                 \
+        if (n == 0) return NULL;                                                                                        \
+        T *out = malloc(n * sizeof(T));                                                                                 \
+        memcpy(out, name##_buf + mark, n * sizeof(T));                                                                  \
+        return out;                                                                                                     \
     }
-    v->items[v->len++] = item;
-}
+
+SCRATCH_VEC(astvec, Ast *)
 
 typedef struct {
     AstBinding *items;
@@ -31,18 +87,23 @@ static void bindingvec_push(BindingVec *v, AstBinding item) {
     v->items[v->len++] = item;
 }
 
-/* perf: every one of these growable vectors (AstVec/BindingVec/PartVec/
- * FormalVec below) doubles its capacity on growth -- correct amortized-
- * O(1) push, but whichever fill fraction a vector happens to land on
- * when parsing finishes (e.g. 55% full right after a doubling) gets
- * handed straight into PERMANENT Ast storage (list elements, attrset/let
- * bindings, string/path interpolation parts, lambda formals) with that
- * slack never trimmed -- the exact same bug M87 already found and fixed
- * for IrBuilder's ops/pool arrays (irbuild.c's ib_finish), just never
- * applied here. Measured via an LD_PRELOAD malloc tracer on a real
- * nixpkgs closure: tens of MB of pure doubling slack across these four
- * vector types combined. Safe to trim unconditionally before handoff:
- * shrinking realloc never moves/invalidates the still-needed prefix. */
+/* perf: BindingVec (above) doubles its capacity on growth -- correct
+ * amortized-O(1) push, but whichever fill fraction it happens to land
+ * on when parsing finishes (e.g. 55% full right after a doubling) gets
+ * handed straight into PERMANENT Ast storage (attrset/let bindings)
+ * with that slack never trimmed -- the exact same bug M87 already found
+ * and fixed for IrBuilder's ops/pool arrays (irbuild.c's ib_finish),
+ * just never applied here. Measured via an LD_PRELOAD malloc tracer on
+ * a real nixpkgs closure: tens of MB of pure doubling slack across this
+ * and the sibling vector types below (AstVec/PartVec/FormalVec/
+ * AttrSegVec/RawIndVec), before those were converted (M128 follow-up,
+ * see SCRATCH_VEC above) to a shared, file-lifetime scratch buffer that
+ * trims itself via `_commit`'s own exact-size copy-out instead -- only
+ * BindingVec (tightly coupled to BTVec's own tree-shaped, non-LIFO
+ * lifetime, see BTVec's header comment) and BTVec's own DynBindingVec
+ * still need this macro at all. Safe to trim unconditionally before
+ * handoff: shrinking realloc never moves/invalidates the still-needed
+ * prefix. */
 #define VEC_TRIM(v, T)                                                                                               \
     do {                                                                                                             \
         if ((v).len > 0 && (v).len < (v).cap) (v).items = realloc((v).items, (v).len * sizeof(T));                   \
@@ -398,48 +459,22 @@ static void finalize_bt_vec(BTVec *vec, BindingVec *out) {
     free(vec->index); /* perf: see finalize_bt_node's identical .index comment */
 }
 
-typedef struct {
-    AstStringPart *items;
-    size_t len, cap;
-} PartVec;
+/* M128 follow-up: AstStringPart's own interpolation-part collection --
+ * see SCRATCH_VEC's own header comment above for why sharing one
+ * never-mid-parse-freed buffer across every string/path literal in the
+ * file is safe. */
+SCRATCH_VEC(partvec, AstStringPart)
 
 /* A growable array of AttrSeg -- used by parse_binding_stmt to collect an
  * attrpath's segments (`a.b.c`/`a.${k}.c`) before handing them to
  * insert_attrpath (the static prefix) and/or build_dynamic_chain_value
- * (everything from the first dynamic segment onward). */
-typedef struct {
-    AttrSeg *items;
-    size_t len, cap;
-} AttrSegVec;
+ * (everything from the first dynamic segment onward). M128 follow-up:
+ * see SCRATCH_VEC's own header comment above. */
+SCRATCH_VEC(attrsegvec, AttrSeg)
 
-static void attrsegvec_push(AttrSegVec *v, AttrSeg item) {
-    if (v->len == v->cap) {
-        v->cap = v->cap ? v->cap * 2 : 4;
-        v->items = realloc(v->items, v->cap * sizeof(AttrSeg));
-    }
-    v->items[v->len++] = item;
-}
-
-static void partvec_push(PartVec *v, AstStringPart item) {
-    if (v->len == v->cap) {
-        v->cap = v->cap ? v->cap * 2 : 8;
-        v->items = realloc(v->items, v->cap * sizeof(AstStringPart));
-    }
-    v->items[v->len++] = item;
-}
-
-typedef struct {
-    AstFormal *items;
-    size_t len, cap;
-} FormalVec;
-
-static void formalvec_push(FormalVec *v, AstFormal item) {
-    if (v->len == v->cap) {
-        v->cap = v->cap ? v->cap * 2 : 8;
-        v->items = realloc(v->items, v->cap * sizeof(AstFormal));
-    }
-    v->items[v->len++] = item;
-}
+/* M128 follow-up: lambda-pattern formals -- see SCRATCH_VEC's own header
+ * comment above. */
+SCRATCH_VEC(formalvec, AstFormal)
 
 /* Raw piece of a '' ... '' literal as collected straight off the lexer,
  * before indentation stripping -- same shape as AstStringPart plus the
@@ -454,18 +489,8 @@ typedef struct {
     Ast *expr;
 } RawIndPart;
 
-typedef struct {
-    RawIndPart *items;
-    size_t len, cap;
-} RawIndVec;
-
-static void rawind_push(RawIndVec *v, RawIndPart item) {
-    if (v->len == v->cap) {
-        v->cap = v->cap ? v->cap * 2 : 8;
-        v->items = realloc(v->items, v->cap * sizeof(RawIndPart));
-    }
-    v->items[v->len++] = item;
-}
+/* M128 follow-up: see SCRATCH_VEC's own header comment above. */
+SCRATCH_VEC(rawind, RawIndPart)
 
 /* Ported directly from real Nix's ParserState::stripIndentation
  * (~/nix's src/libexpr/include/nix/expr/parser-state.hh), verified against
@@ -478,8 +503,7 @@ static void rawind_push(RawIndVec *v, RawIndPart item) {
  * strip exactly that many leading spaces from every content line, and (for
  * a literal's very last raw part only) drop a final line that is entirely
  * spaces. */
-static AstStringPart *strip_indentation(RawIndVec *raw, size_t *out_count) {
-    size_t n = raw->len;
+static AstStringPart *strip_indentation(RawIndPart *raw, size_t n, size_t *out_count) {
     if (n == 0) {
         AstStringPart *parts = malloc(sizeof(AstStringPart));
         parts[0] = (AstStringPart){ .is_expr = 0, .text = "", .text_len = 0 };
@@ -491,7 +515,7 @@ static AstStringPart *strip_indentation(RawIndVec *raw, size_t *out_count) {
     size_t min_indent = 1000000;
     size_t cur_indent = 0;
     for (size_t idx = 0; idx < n; idx++) {
-        RawIndPart *p = &raw->items[idx];
+        RawIndPart *p = &raw[idx];
         if (p->is_expr || !p->has_indentation) {
             if (at_start) {
                 at_start = 0;
@@ -520,7 +544,7 @@ static AstStringPart *strip_indentation(RawIndVec *raw, size_t *out_count) {
     at_start = 1;
     size_t cur_dropped = 0;
     for (size_t idx = 0; idx < n; idx++) {
-        RawIndPart *p = &raw->items[idx];
+        RawIndPart *p = &raw[idx];
         if (p->is_expr) {
             at_start = 0;
             cur_dropped = 0;
@@ -834,7 +858,7 @@ static void parse_binding_stmt(Parser *p, BTVec *out, DynBindingVec *dyn_out) {
          * anything is done with them) so the `src_expr != NULL` case
          * below can decide, from the final count, whether to share one
          * evaluation of `expr` across every name. */
-        AttrSegVec names = { 0 };
+        size_t names_mark = attrsegvec_mark();
         while (cur(p)->kind == TOK_IDENT || cur(p)->kind == TOK_STR_START || cur(p)->kind == TOK_DOLLAR_LBRACE) {
             AttrSeg name = parse_attr_segment(p, "an inherited name");
             /* real Nix's grammar lets a bare `${...}`/interpolated
@@ -849,8 +873,14 @@ static void parse_binding_stmt(Parser *p, BTVec *out, DynBindingVec *dyn_out) {
                 fprintf(stderr, "asnix: parse error: dynamic attributes not allowed in inherit\n");
                 exit(1);
             }
-            attrsegvec_push(&names, name);
+            attrsegvec_push(name);
         }
+        /* M128 follow-up: commit now, right as collection ends -- nothing
+         * between here and this clause's own final `free` below recurses
+         * into the parser (btvec_push/asnix_ast_new/insert_attrpath are
+         * pure tree-manipulation, see SCRATCH_VEC's own safety argument). */
+        size_t names_count;
+        AttrSeg *names_items = attrsegvec_commit(names_mark, &names_count);
         /* M80: `inherit (expr) a b;` must evaluate `expr` exactly ONCE,
          * shared by every inherited name -- found via numtide/nix-
          * conformance's eval-okay-inherit-from.nix (`inherit (builtins.
@@ -880,7 +910,7 @@ static void parse_binding_stmt(Parser *p, BTVec *out, DynBindingVec *dyn_out) {
          * binding already uses to memoize itself, with zero new runtime
          * machinery needed. */
         Ast *hidden_var = NULL;
-        if (src_expr && names.len > 1) {
+        if (src_expr && names_count > 1) {
             /* M80: only bother introducing the hidden shared-source
              * binding when there's more than one name to share it
              * between -- a single-name `inherit (expr) x;` already
@@ -908,12 +938,12 @@ static void parse_binding_stmt(Parser *p, BTVec *out, DynBindingVec *dyn_out) {
             v->as.var.name_len = (size_t)hlen;
             hidden_var = v;
         }
-        for (size_t ni = 0; ni < names.len; ni++) {
-            AttrSeg name = names.items[ni];
+        for (size_t ni = 0; ni < names_count; ni++) {
+            AttrSeg name = names_items[ni];
             Ast *value;
             if (src_expr) {
                 /* Single-name `inherit (expr) x;` (no hidden binding was
-                 * created -- `names.len` wasn't `> 1`) still selects off
+                 * created -- `names_count` wasn't `> 1`) still selects off
                  * `src_expr` directly, exactly as before M80; a multi-name
                  * clause selects off the shared `hidden_var` instead. Bug
                  * fix (caught before landing, isolating this same change):
@@ -961,7 +991,7 @@ static void parse_binding_stmt(Parser *p, BTVec *out, DynBindingVec *dyn_out) {
              * comment on why that's safe. */
             insert_attrpath(out, &name, 1, 0, value, (src_expr == NULL));
         }
-        free(names.items); /* M86 perf: insert_attrpath copies each AttrSeg by value -- nothing retains `names` itself */
+        free(names_items); /* M86 perf: insert_attrpath copies each AttrSeg by value -- nothing retains `names_items` itself */
         expect(p, TOK_SEMI, "';'");
         return;
     }
@@ -981,35 +1011,40 @@ static void parse_binding_stmt(Parser *p, BTVec *out, DynBindingVec *dyn_out) {
      * value;` binding: "dynamic attributes not allowed in let"). Found
      * needed evaluating real nixpkgs: `lib/systems/architectures.nix`
      * has `"${ident}Fallback" = fallback;`-shaped bindings. */
-    AttrSegVec segs = { 0 };
-    attrsegvec_push(&segs, parse_attr_segment(p, "a binding name"));
+    size_t segs_mark = attrsegvec_mark();
+    attrsegvec_push(parse_attr_segment(p, "a binding name"));
     while (cur(p)->kind == TOK_DOT) {
         advance(p);
-        attrsegvec_push(&segs, parse_attr_segment(p, "an attribute name"));
+        attrsegvec_push(parse_attr_segment(p, "an attribute name"));
     }
     expect(p, TOK_EQUALS, "'='");
-    Ast *value = parse_expr(p);
+    Ast *value = parse_expr(p); /* may recurse into another attrsegvec user -- that fully
+                                  * commits and unwinds before returning, so it's still safe
+                                  * to commit THIS span only now, below (see SCRATCH_VEC's
+                                  * own safety argument) */
     expect(p, TOK_SEMI, "';'");
 
-    size_t first_dyn = segs.len;
-    for (size_t i = 0; i < segs.len; i++) {
-        if (segs.items[i].is_dynamic) { first_dyn = i; break; }
+    size_t segs_count;
+    AttrSeg *segs_items = attrsegvec_commit(segs_mark, &segs_count);
+    size_t first_dyn = segs_count;
+    for (size_t i = 0; i < segs_count; i++) {
+        if (segs_items[i].is_dynamic) { first_dyn = i; break; }
     }
-    if (first_dyn == segs.len) {
+    if (first_dyn == segs_count) {
         /* Fully static -- unchanged original behavior. */
-        insert_attrpath(out, segs.items, segs.len, 0, value, 0);
+        insert_attrpath(out, segs_items, segs_count, 0, value, 0);
     } else if (first_dyn == 0) {
         if (!dyn_out) {
             fprintf(stderr, "asnix: parse error: dynamic attributes not allowed in let\n");
             exit(1);
         }
-        Ast *inner = build_dynamic_chain_value(segs.items, 1, segs.len - 1, value);
-        dynbindingvec_push(dyn_out, (DynBinding){ .name_expr = segs.items[0].name_expr, .value = inner });
+        Ast *inner = build_dynamic_chain_value(segs_items, 1, segs_count - 1, value);
+        dynbindingvec_push(dyn_out, (DynBinding){ .name_expr = segs_items[0].name_expr, .value = inner });
     } else {
-        Ast *inner = build_dynamic_chain_value(segs.items, first_dyn, segs.len - first_dyn, value);
-        insert_attrpath(out, segs.items, first_dyn, 0, inner, 0);
+        Ast *inner = build_dynamic_chain_value(segs_items, first_dyn, segs_count - first_dyn, value);
+        insert_attrpath(out, segs_items, first_dyn, 0, inner, 0);
     }
-    free(segs.items);
+    free(segs_items);
 }
 
 /* M64: an interpolated path literal's tail -- `t` is the already-consumed
@@ -1031,26 +1066,27 @@ static Ast *parse_path_literal_interp(Parser *p, Token *t) {
     n->as.path.is_search = 0;
     n->as.path.is_home = t->is_home;
 
-    PartVec parts = { 0 };
+    size_t parts_mark = partvec_mark();
     while (cur(p)->kind != TOK_PATH_END) {
         if (cur(p)->kind == TOK_PATH_PART) {
             Token *pt = cur(p);
-            partvec_push(&parts, (AstStringPart){ .is_expr = 0, .text = pt->start, .text_len = pt->len });
+            partvec_push((AstStringPart){ .is_expr = 0, .text = pt->start, .text_len = pt->len });
             advance(p);
         } else if (cur(p)->kind == TOK_DOLLAR_LBRACE) {
             advance(p);
             Ast *e = parse_expr(p);
             expect(p, TOK_RBRACE, "'}' closing a path interpolation");
-            partvec_push(&parts, (AstStringPart){ .is_expr = 1, .expr = e });
+            partvec_push((AstStringPart){ .is_expr = 1, .expr = e });
         } else {
             fprintf(stderr, "asnix: parse error: malformed path literal\n");
             exit(1);
         }
     }
     advance(p); /* TOK_PATH_END */
-    VEC_TRIM(parts, AstStringPart);
-    n->as.path.interp_parts = parts.items;
-    n->as.path.interp_count = parts.len;
+    size_t parts_count;
+    AstStringPart *parts_items = partvec_commit(parts_mark, &parts_count);
+    n->as.path.interp_parts = parts_items;
+    n->as.path.interp_count = parts_count;
     return n;
 }
 
@@ -1061,27 +1097,28 @@ static Ast *parse_path_literal_interp(Parser *p, Token *t) {
  * parse_expr here safe, see lexer.c). */
 static Ast *parse_dquote_string(Parser *p) {
     advance(p); /* TOK_STR_START */
-    PartVec parts = { 0 };
+    size_t parts_mark = partvec_mark();
     while (cur(p)->kind != TOK_STR_END) {
         if (cur(p)->kind == TOK_STR_PART) {
             Token *t = cur(p);
-            partvec_push(&parts, (AstStringPart){ .is_expr = 0, .text = t->start, .text_len = t->len });
+            partvec_push((AstStringPart){ .is_expr = 0, .text = t->start, .text_len = t->len });
             advance(p);
         } else if (cur(p)->kind == TOK_DOLLAR_LBRACE) {
             advance(p);
             Ast *e = parse_expr(p);
             expect(p, TOK_RBRACE, "'}' closing a string interpolation");
-            partvec_push(&parts, (AstStringPart){ .is_expr = 1, .expr = e });
+            partvec_push((AstStringPart){ .is_expr = 1, .expr = e });
         } else {
             fprintf(stderr, "asnix: parse error: malformed string literal\n");
             exit(1);
         }
     }
     advance(p); /* TOK_STR_END */
-    VEC_TRIM(parts, AstStringPart);
+    size_t parts_count;
+    AstStringPart *parts_items = partvec_commit(parts_mark, &parts_count);
     Ast *n = asnix_ast_new(AST_STRING);
-    n->as.string.parts = parts.items;
-    n->as.string.count = parts.len;
+    n->as.string.parts = parts_items;
+    n->as.string.count = parts_count;
     return n;
 }
 
@@ -1092,18 +1129,18 @@ static Ast *parse_dquote_string(Parser *p) {
  * every part (the minimum indentation is computed across ALL of them). */
 static Ast *parse_indented_string(Parser *p) {
     advance(p); /* TOK_ISTR_START */
-    RawIndVec raw = { 0 };
+    size_t raw_mark = rawind_mark();
     while (cur(p)->kind != TOK_ISTR_END) {
         if (cur(p)->kind == TOK_ISTR_PART) {
             Token *t = cur(p);
-            rawind_push(&raw, (RawIndPart){ .is_expr = 0, .text = t->start, .text_len = t->len,
-                                             .has_indentation = t->istr_has_indentation });
+            rawind_push((RawIndPart){ .is_expr = 0, .text = t->start, .text_len = t->len,
+                                       .has_indentation = t->istr_has_indentation });
             advance(p);
         } else if (cur(p)->kind == TOK_DOLLAR_LBRACE) {
             advance(p);
             Ast *e = parse_expr(p);
             expect(p, TOK_RBRACE, "'}' closing a string interpolation");
-            rawind_push(&raw, (RawIndPart){ .is_expr = 1, .expr = e });
+            rawind_push((RawIndPart){ .is_expr = 1, .expr = e });
         } else {
             fprintf(stderr, "asnix: parse error: malformed indented string literal\n");
             exit(1);
@@ -1111,9 +1148,11 @@ static Ast *parse_indented_string(Parser *p) {
     }
     advance(p); /* TOK_ISTR_END */
 
+    size_t raw_count;
+    RawIndPart *raw_items = rawind_commit(raw_mark, &raw_count);
     size_t count;
-    AstStringPart *parts = strip_indentation(&raw, &count);
-    free(raw.items);
+    AstStringPart *parts = strip_indentation(raw_items, raw_count, &count);
+    free(raw_items);
 
     Ast *n = asnix_ast_new(AST_STRING);
     n->as.string.parts = parts;
@@ -1238,13 +1277,14 @@ static Ast *parse_atom(Parser *p) {
         }
         case TOK_LBRACKET: {
             advance(p);
-            AstVec elems = { 0 };
-            while (cur(p)->kind != TOK_RBRACKET) astvec_push(&elems, parse_select(p));
+            size_t elems_mark = astvec_mark();
+            while (cur(p)->kind != TOK_RBRACKET) astvec_push(parse_select(p));
             advance(p); /* ']' */
-            VEC_TRIM(elems, Ast *);
+            size_t elems_count;
+            Ast **elems_items = astvec_commit(elems_mark, &elems_count);
             Ast *n = asnix_ast_new(AST_LIST);
-            n->as.list.elems = elems.items;
-            n->as.list.count = elems.len;
+            n->as.list.elems = elems_items;
+            n->as.list.count = elems_count;
             return n;
         }
         case TOK_LBRACE: {
@@ -1775,7 +1815,7 @@ static size_t find_matching_rbrace(Parser *p, size_t open_idx) {
  * including) the matching '}'. Trailing commas are accepted (including
  * right before `...`), matching real Nix. */
 static void parse_formals(Parser *p, AstFormal **out_items, size_t *out_count, int *out_ellipsis) {
-    FormalVec formals = { 0 };
+    size_t formals_mark = formalvec_mark();
     int ellipsis = 0;
     while (cur(p)->kind != TOK_RBRACE) {
         if (cur(p)->kind == TOK_ELLIPSIS) {
@@ -1789,7 +1829,7 @@ static void parse_formals(Parser *p, AstFormal **out_items, size_t *out_count, i
             advance(p);
             default_ = parse_expr(p); /* arbitrary lazy expression -- see compiler.c's AST_LAMBDA case */
         }
-        formalvec_push(&formals, (AstFormal){ .name = name->start, .name_len = name->len, .default_ = default_ });
+        formalvec_push((AstFormal){ .name = name->start, .name_len = name->len, .default_ = default_ });
         if (cur(p)->kind == TOK_COMMA) {
             advance(p);
             continue;
@@ -1797,9 +1837,7 @@ static void parse_formals(Parser *p, AstFormal **out_items, size_t *out_count, i
         break;
     }
     expect(p, TOK_RBRACE, "'}'");
-    VEC_TRIM(formals, AstFormal);
-    *out_items = formals.items;
-    *out_count = formals.len;
+    *out_items = formalvec_commit(formals_mark, out_count);
     *out_ellipsis = ellipsis;
 }
 

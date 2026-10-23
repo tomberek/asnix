@@ -26,16 +26,58 @@ typedef struct AstChunk {
 
 static AstChunk *g_ast_chunks = NULL;
 
+/* perf (M128): this chunk used to be `calloc`'d whole (1 MiB) instead of
+ * `malloc`'d -- correctness NEEDS every Ast node to start zero-filled
+ * (confirmed real: parser.c's plain `a: body` lambda case never sets
+ * AST_LAMBDA.is_pattern/formals/has_ellipsis/has_as_name explicitly,
+ * relying on it defaulting to 0/NULL; AST_ATTRSET's bare `{}` and
+ * several other call sites lean on the same guarantee for fields they
+ * don't bother re-stating), but that guarantee only has to hold for the
+ * bytes a node ACTUALLY occupies, not the whole 1 MiB chunk up front --
+ * so it's cheaper to zero exactly `sizeof(Ast)` bytes once per node
+ * (below) than the entire chunk once per chunk.
+ *
+ * Why this mattered in practice, found via `perf record`/`perf report`
+ * on an isolated lex+parse+compile-only harness over the real 1057-file
+ * nixpkgs corpus `d.nix` touches: `calloc`'s own zero-fill showed up as a
+ * genuine `__memset_avx2_unaligned_erms` hot symbol (~5.7% of that
+ * harness's total cycles), NOT eliminated by `calloc`'s usual "mmap
+ * already gives zero pages, skip the memset" fast path -- because
+ * `asnix_ast_arena_reset()` frees every chunk right after each FILE's
+ * compile (by design, see this file's own header comment: Ast nodes are
+ * ~17% of peak memory and fully reclaimable), so this process allocates-
+ * then-frees a ~1 MiB chunk roughly once per imported file (1057 times
+ * for this corpus). glibc's malloc dynamically RAISES its own mmap
+ * threshold every time a chunk at or above the current threshold is
+ * freed (to stop thrashing mmap/munmap for a workload that repeats the
+ * same large size) -- confirmed via glibc's own `mallopt(M_MMAP_
+ * THRESHOLD)` documentation of this dynamic-adjustment behavior -- so
+ * after the first one or two ~1 MiB frees, the threshold climbs above
+ * 1 MiB and every SUBSEQUENT same-sized chunk is served from the
+ * ordinary heap instead of a fresh mmap, where `calloc` can no longer
+ * assume pre-zeroed pages and must really `memset` the whole thing.
+ * Worse, the overwhelming majority of nixpkgs's 1057 imported files are
+ * far smaller than 1 MiB of AST, so most of that `memset` work was spent
+ * zeroing bytes the file's own parse never even touched.
+ *
+ * `malloc`ing the chunk instead sidesteps the dynamic-threshold problem
+ * entirely (malloc makes no zero-fill promise either way, so there's
+ * nothing to skip or fall back to), and the new per-node `memset` is
+ * proportional to the file's ACTUAL node count, not the fixed chunk
+ * size -- strictly less total zeroing than before for every file that
+ * doesn't fill a whole chunk (the common case), and no worse for one
+ * that does. */
 Ast *asnix_ast_new(AstKind kind) {
     size_t need = sizeof(Ast);
     if (!g_ast_chunks || g_ast_chunks->used + need > AST_CHUNK_SIZE) {
-        AstChunk *c = calloc(1, sizeof(AstChunk)); /* DEBUG: test zero-init hypothesis */
+        AstChunk *c = malloc(sizeof(AstChunk));
         c->next = g_ast_chunks;
         c->used = 0;
         g_ast_chunks = c;
     }
     Ast *n = (Ast *)(g_ast_chunks->data + g_ast_chunks->used);
     g_ast_chunks->used += need;
+    memset(n, 0, need);
     n->kind = kind;
     return n;
 }
