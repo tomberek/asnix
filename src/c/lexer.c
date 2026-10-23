@@ -1,10 +1,72 @@
 #include "lexer.h"
 
-#include <ctype.h>
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* perf: one 256-entry character-classification table, replacing the
+ * isalnum()/isalpha()/isdigit()/isspace() calls (each a ctype-table load
+ * plus a bit test) chained with up to four more byte-compares that
+ * path_char/ident_cont/uri_scheme_char/uri_tail_char below used to run
+ * from scratch on every single call. Confirmed via `perf annotate
+ * asnix_lex` on a standalone lex-only microbenchmark (all-packages.nix,
+ * 300+ iterations): path_char alone (inlined into try_scan_path's
+ * per-character scan loop, which runs on every leading character of
+ * every identifier/number/operator token, not just real path literals)
+ * was ~15-20% of asnix_lex's own self time, and try_scan_uri/
+ * uri_scheme_char another ~9-10% -- almost entirely from re-deriving
+ * each byte's classification one comparison at a time instead of a
+ * single table lookup. Every CC_* bit here mirrors one of this file's
+ * EXISTING predicates byte-for-byte (not a new/changed character set --
+ * a pure speed change): this project never calls setlocale(), so the
+ * "C" locale's ASCII-only isalnum/isalpha/isdigit/isspace behavior these
+ * predicates relied on is a fixed fact for the whole process lifetime,
+ * safe to precompute once into a table instead of recomputing per call.
+ * Verified by an exhaustive 256-value comparison against the original
+ * isalnum()-based bodies (every byte 0-255) before this table replaced
+ * them -- see this milestone's own commit message for the standalone
+ * check used (a throwaway harness, not shipped, since this file has no
+ * existing unit-test binary of its own to extend; the real regression
+ * net here is this file's own thorough use by every test in `make
+ * test-e2e`/`test-conformance`/`test-nix-conformance`, which lex every
+ * byte of every fixture through this exact table). */
+enum {
+    CC_SPACE      = 1 << 0, /* isspace: ' ' '\t' '\n' '\v' '\f' '\r' */
+    CC_DIGIT      = 1 << 1, /* isdigit: '0'-'9' */
+    CC_ALPHA      = 1 << 2, /* isalpha: 'A'-'Z' 'a'-'z' */
+    CC_IDENT_CONT = 1 << 3, /* ident_cont's old body: alnum, '_', '\'', '-' */
+    CC_PATH_CHAR  = 1 << 4, /* path_char's old body: alnum, '.', '_', '-', '+' */
+    CC_URI_SCHEME = 1 << 5, /* uri_scheme_char's old body: alnum, '+', '-', '.' */
+    CC_URI_TAIL   = 1 << 6, /* uri_tail_char's old body: alnum, or one of
+                              * % / ? : @ & = + $ , _ . ! ~ * ' - */
+};
+
+static const unsigned char CHAR_CLASS[256] = {
+    ['\t'] = CC_SPACE, ['\n'] = CC_SPACE, ['\v'] = CC_SPACE, ['\f'] = CC_SPACE, ['\r'] = CC_SPACE, [' '] = CC_SPACE,
+
+    ['0' ... '9'] = CC_DIGIT | CC_IDENT_CONT | CC_PATH_CHAR | CC_URI_SCHEME | CC_URI_TAIL,
+    ['A' ... 'Z'] = CC_ALPHA | CC_IDENT_CONT | CC_PATH_CHAR | CC_URI_SCHEME | CC_URI_TAIL,
+    ['a' ... 'z'] = CC_ALPHA | CC_IDENT_CONT | CC_PATH_CHAR | CC_URI_SCHEME | CC_URI_TAIL,
+
+    ['\''] = CC_IDENT_CONT | CC_URI_TAIL,
+    ['_']  = CC_IDENT_CONT | CC_PATH_CHAR | CC_URI_TAIL,
+    ['-']  = CC_IDENT_CONT | CC_PATH_CHAR | CC_URI_SCHEME | CC_URI_TAIL,
+    ['.']  = CC_PATH_CHAR | CC_URI_SCHEME | CC_URI_TAIL,
+    ['+']  = CC_PATH_CHAR | CC_URI_SCHEME | CC_URI_TAIL,
+
+    ['!'] = CC_URI_TAIL, ['$'] = CC_URI_TAIL, ['%'] = CC_URI_TAIL, ['&'] = CC_URI_TAIL,
+    ['*'] = CC_URI_TAIL, [','] = CC_URI_TAIL, ['/'] = CC_URI_TAIL, [':'] = CC_URI_TAIL,
+    ['='] = CC_URI_TAIL, ['?'] = CC_URI_TAIL, ['@'] = CC_URI_TAIL, ['~'] = CC_URI_TAIL,
+};
+
+/* Table-backed drop-in replacements for the plain isdigit()/isspace()/
+ * isalpha() calls this file used at every digit-run/trivia/URI-entry
+ * check -- same CHAR_CLASS table as path_char/ident_cont/uri_scheme_char/
+ * uri_tail_char above, see this file's own top-of-file comment. */
+static int cc_digit(char c) { return (CHAR_CLASS[(unsigned char)c] & CC_DIGIT) != 0; }
+static int cc_space(char c) { return (CHAR_CLASS[(unsigned char)c] & CC_SPACE) != 0; }
+static int cc_alpha(char c) { return (CHAR_CLASS[(unsigned char)c] & CC_ALPHA) != 0; }
 
 typedef struct {
     Token *toks;
@@ -31,7 +93,7 @@ static void push_tok(TokVec *v, Token t) {
  * digit/ident scanning below, not after: `foo/bar.nix` must lex as one
  * TOK_PATH, not TOK_IDENT("foo") followed by an unrecognized '/'. */
 static int path_char(char c) {
-    return isalnum((unsigned char)c) || c == '.' || c == '_' || c == '-' || c == '+';
+    return (CHAR_CLASS[(unsigned char)c] & CC_PATH_CHAR) != 0;
 }
 
 /* True iff src[j..] is exactly "${" -- the interpolation-hole marker
@@ -132,20 +194,13 @@ static size_t try_scan_home_path(const char *src, size_t i) {
  * on (d.nix/e.nix) for any whitespace-free `ident:ident` lambda that
  * this might newly misparse -- none found. */
 static int uri_scheme_char(char c) {
-    return isalnum((unsigned char)c) || c == '+' || c == '-' || c == '.';
+    return (CHAR_CLASS[(unsigned char)c] & CC_URI_SCHEME) != 0;
 }
 static int uri_tail_char(char c) {
-    switch (c) {
-        case '%': case '/': case '?': case ':': case '@': case '&': case '=':
-        case '+': case '$': case ',': case '_': case '.': case '!': case '~':
-        case '*': case '\'': case '-':
-            return 1;
-        default:
-            return isalnum((unsigned char)c);
-    }
+    return (CHAR_CLASS[(unsigned char)c] & CC_URI_TAIL) != 0;
 }
 static size_t try_scan_uri(const char *src, size_t i) {
-    if (!isalpha((unsigned char)src[i])) return 0;
+    if (!cc_alpha(src[i])) return 0;
     size_t j = i + 1;
     while (uri_scheme_char(src[j])) j++;
     if (src[j] != ':') return 0;
@@ -157,7 +212,7 @@ static size_t try_scan_uri(const char *src, size_t i) {
 }
 
 static int ident_start(char c) {
-    return isalpha((unsigned char)c) || c == '_';
+    return cc_alpha(c) || c == '_';
 }
 static int ident_cont(char c) {
     /* M23: now INCLUDES '-' -- real Nix's own identifier regex is
@@ -179,7 +234,7 @@ static int ident_cont(char c) {
      * (checked: every existing `-` arithmetic use already has at least one
      * space), so this is a pure feature add, not a documented-behavior
      * change to anything previously exercised. */
-    return isalnum((unsigned char)c) || c == '_' || c == '\'' || c == '-';
+    return (CHAR_CLASS[(unsigned char)c] & CC_IDENT_CONT) != 0;
 }
 
 typedef struct {
@@ -488,13 +543,13 @@ static void lex_path_run(const char *src, size_t *i, ModeStack *modes, TokVec *v
  * underflow,subnormal}.nix fixtures (and eval-okay-float-range.nix's own
  * `0.0e-400`/`0.0e5` cases) before trusting this. */
 static double scan_float_tail_and_parse(const char *src, size_t tok_start, size_t *i) {
-    while (isdigit((unsigned char)src[*i])) (*i)++;
+    while (cc_digit(src[*i])) (*i)++;
     if (src[*i] == 'e' || src[*i] == 'E') {
         size_t k = *i + 1;
         if (src[k] == '+' || src[k] == '-') k++;
-        if (isdigit((unsigned char)src[k])) {
+        if (cc_digit(src[k])) {
             *i = k;
-            while (isdigit((unsigned char)src[*i])) (*i)++;
+            while (cc_digit(src[*i])) (*i)++;
         } /* else: 'e'/'E' not actually followed by a valid exponent -- leave *i unchanged, unconsumed */
     }
     size_t len = *i - tok_start;
@@ -569,7 +624,7 @@ Token *asnix_lex(const char *src, size_t *out_count) {
             break;
         }
 
-        if (isspace((unsigned char)c)) {
+        if (cc_space(c)) {
             i++;
             continue;
         }
@@ -638,7 +693,7 @@ Token *asnix_lex(const char *src, size_t *out_count) {
             }
         }
 
-        if (isalpha((unsigned char)c)) {
+        if (cc_alpha(c)) {
             size_t ulen = try_scan_uri(src, i);
             if (ulen > 0) {
                 push_tok(&v, (Token){ .kind = TOK_URI, .start = src + i, .len = ulen, .pos = src + tok_start });
@@ -664,9 +719,9 @@ Token *asnix_lex(const char *src, size_t *out_count) {
             }
         }
 
-        if (isdigit((unsigned char)c)) {
+        if (cc_digit(c)) {
             size_t start = i;
-            while (isdigit((unsigned char)src[i])) i++;
+            while (cc_digit(src[i])) i++;
             size_t int_len = i - start;
             /* M51: real Nix's FLOAT grammar (grepped directly from
              * ~/nix's src/libexpr/lexer.l):
@@ -690,7 +745,7 @@ Token *asnix_lex(const char *src, size_t *out_count) {
             int is_float = 0;
             if (src[i] == '.') {
                 if (int_len == 1 && src[start] == '0') {
-                    if (isdigit((unsigned char)src[i + 1])) is_float = 1;
+                    if (cc_digit(src[i + 1])) is_float = 1;
                 } else if (src[start] != '0') {
                     is_float = 1;
                 }
@@ -712,7 +767,7 @@ Token *asnix_lex(const char *src, size_t *out_count) {
          * nix-instantiate: `.5` == `0.5`). Checked before the ELLIPSIS/
          * plain-DOT handling below, since this starts with the same '.'
          * character. */
-        if (c == '.' && isdigit((unsigned char)src[i + 1])) {
+        if (c == '.' && cc_digit(src[i + 1])) {
             size_t start = i;
             i++; /* consume '.' */
             double d = scan_float_tail_and_parse(src, start, &i);

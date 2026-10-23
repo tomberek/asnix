@@ -14074,3 +14074,127 @@ Files: `bench/regvm_poc/chains.S`, `bench/regvm_poc/harness.c`,
 `bench/regvm_poc/README.md` (full methodology, build/measure commands,
 and the reasoning above in more detail) -- kept for reference, not
 linked into `make`/`make test`/the production binary.
+
+## M129: table-driven character classification in `asnix_lex` -- replacing isalnum()-chain predicates with one 256-entry lookup
+
+Directed follow-up to M123's speed investigation, assigned specifically to
+`asnix_lex` (`src/c/lexer.c`), confirmed as the single hottest function in
+the whole binary (6.61% self-time on a real nixpkgs eval). Profiled
+directly rather than guessing from source alone: a standalone lex-only
+microbenchmark (a small harness linking `lexer.o`, looping `asnix_lex`
+over `pkgs/top-level/all-packages.nix`, a real 326KB nixpkgs file, 300+
+times) under `perf record -F 999 -g` + `perf annotate asnix_lex` found
+`path_char` -- inlined into `try_scan_path`'s per-character scan loop,
+which (per the file's own comment) runs on the leading character of
+EVERY identifier/number/operator token, not just real path literals, to
+rule paths out first -- was ~15-20% of `asnix_lex`'s own self time on its
+own, and `try_scan_uri`/`uri_scheme_char` another ~9-10%. Neither
+predicate's cost came from the `isalnum()` call itself being slow (the
+disassembly confirms gcc hoists glibc's one `__ctype_b_loc()` call out of
+the loop, since it's declared `__attribute__((const))` -- no repeated
+TLS/function-call overhead per character); the cost is every character of
+every token paying a 16-bit ctype-table load plus a bit test for
+`isalnum()`, then up to four MORE byte-compares for the `.`/`_`/`-`/`+`-
+style extras every one of `path_char`/`ident_cont`/`uri_scheme_char`/
+`uri_tail_char` chains on top.
+
+**Checked against iets** (`~/gnix/iets/src/syntax/lexer.rs`): its own
+`is_path_char`/`is_uri_scheme_char`/`is_id_char` are the same kind of
+short boolean-OR chains asnix already had -- iets does NOT win via a
+classification table, it wins via NOT calling its expensive path/URI
+scanners unconditionally on every token the way asnix's main loop did
+(iets's `next_token` only re-scans for a path/URI after an identifier
+once a cheap single-byte peek at the character immediately following the
+identifier's own run suggests one might be there -- see `next_token`'s
+`b'a'..=b'z' | ...` arm). That guard-based restructuring is a real,
+larger lever (effectively doubling the scan of most identifier/number
+tokens today, since `try_scan_path`'s own prefix scan and the later
+`ident_cont`/digit scan largely re-walk the same bytes) but changes
+*which* bytes get scanned under what conditions, with a genuine edge case
+to get right (`uri_scheme_char` and `ident_cont` are not the same
+character set -- a URI scheme containing `.`/`+`, e.g. a token shaped
+like `a.b:foo`, needs the *URI* scan's own character set checked, not an
+identifier-run endpoint, to stay correct) -- flagged below as a follow-on,
+NOT attempted this milestone, in line with this project's bar for what
+ships now vs. what's written up as a plan.
+
+**What shipped instead**: a single `static const unsigned char
+CHAR_CLASS[256]` table plus seven `CC_*` bit flags (`CC_SPACE`,
+`CC_DIGIT`, `CC_ALPHA`, `CC_IDENT_CONT`, `CC_PATH_CHAR`, `CC_URI_SCHEME`,
+`CC_URI_TAIL`), built with plain C11 designated initializers (GNU range
+designators for the `0-9`/`A-Z`/`a-z` runs, explicit entries for every
+other classified byte). `path_char`/`ident_cont`/`uri_scheme_char`/
+`uri_tail_char`/`ident_start` (plus three new small helpers, `cc_digit`/
+`cc_space`/`cc_alpha`, replacing the file's remaining bare `isdigit()`/
+`isspace()`/`isalpha()` call sites) all became one table load + one `AND`
++ one compare, with the exact same character sets as before -- a pure
+speed change, not a grammar change. `<ctype.h>` is no longer included at
+all. Every `CC_*` bit was checked for an exact match against the original
+`isalnum()`-based bodies across all 256 byte values before this table
+replaced them (a throwaway standalone C harness, not shipped -- this file
+has no dedicated unit-test binary to extend, and bare `isalnum()` under
+the "C" locale is a fixed ASCII fact this project can rely on since it
+never calls `setlocale()`).
+
+**Measured** (`perf stat -r 7`, `taskset -c 0` pinned to one performance
+core to avoid this host's hybrid P/E-core scheduling noise, two binaries
+built from the otherwise-identical tree with only `lexer.c` swapped,
+never relying on git-stash for the swap after this same session hit a
+live shared-`refs/stash` collision -- see below):
+- **Lex-only microbenchmark** (`all-packages.nix` x 300 iterations):
+  instructions 5,068,325,003 -> 4,464,488,191 (-11.9%), cycles
+  2,114,024,044 -> 1,587,067,876 (-24.9%), task-clock 534.06ms ->
+  390.83ms (-26.8%). The cycles/wall win exceeding the instruction-count
+  win suggests the table lookup also removes some branch-misprediction or
+  dependent-load latency the `isalnum()`-chain paid on top of raw
+  instruction count, not just fewer instructions.
+- **Full real eval** (`d.nix`, ffmpeg's closure, bytecode cache OFF by
+  default so every one of the 1057 imported files genuinely re-lexes):
+  instructions 10,225,659,332 -> 10,068,970,206 (-1.5%), cycles
+  5,908,661,924 -> 5,802,411,973 (-1.8%), task-clock 1648.35ms ->
+  1610.18ms (-2.3%). Consistent with M123's own breakdown (lex is 10.6%
+  of total cycles in a real eval): a ~25% cycle cut confined to just that
+  slice predicts roughly a 2.6% whole-program cycle cut, matching the
+  observed ~1.8% within the expected noise band for a different host/run.
+
+**Verified**: `make test`/`test-e2e`/`test-conformance` all green.
+`make test-nix-conformance`: `pass=655 fail=3 skip=148` (same 3
+pre-existing pos-tracking failures). `make test-nixpkgs-hash`: `pass=148
+fail=0`. Output hash on `d.nix` (ffmpeg's closure) unchanged:
+`/nix/store/29iacg6h530yx7rxz4k1fhvi0kxxhsam-ffmpeg-9.0.1-bin`.
+
+**A live `refs/stash` collision, hit and recovered mid-milestone**: this
+session's shared-stash hazard (documented by several other agents'
+"RECOVERED" stash messages this session) was hit directly while trying to
+`git stash`/`git stash pop` this very change to get a clean before/after
+binary pair -- a concurrent agent's own M128 allocation-instrumentation
+WIP (`irbuild.c`/`parser.c`) landed in this worktree's working tree via
+the race instead of this milestone's own stashed `lexer.c` change.
+Recovered by: pushing the foreign `irbuild.c`/`parser.c` changes back
+onto the shared stash with a descriptive message (not dropping or
+committing them), then locating this milestone's own entry by content
+(`git stash show -p stash@{N} -- src/c/lexer.c`, checked across every
+entry in `git stash list` until the one touching only `lexer.c` with the
+expected diff turned up) and recovering it with the non-destructive `git
+stash apply` (never `pop`/`drop`, to avoid any further irreversible
+action on a stack several other concurrent agents were actively reading
+and writing). The before/after binaries above were built by manually
+swapping `lexer.c`'s contents between the original (`git show
+HEAD:src/c/lexer.c`) and the edited version saved to a scratch file
+first, specifically to avoid touching the shared stash a second time.
+
+**Follow-on, NOT attempted here -- flagged for its own dedicated
+milestone**: the iets-style guard (skip `try_scan_path`/`try_scan_uri`
+entirely unless a cheap peek suggests a path/URI might follow an
+identifier's own scan, rather than always attempting both scans first)
+is a real, likely-larger win on top of this one -- plausibly removing
+most of the remaining double-scan of every plain identifier/number token
+-- but needs the `uri_scheme_char`-vs-`ident_cont` character-set mismatch
+(schemes containing `.`/`+`) handled correctly, which this milestone
+deliberately left alone rather than rushing. Also not investigated here
+(out of this phase's assigned scope): `asnix_intern` (symtab.c, 3.14%
+self-time) and the scattered growable-buffer `_int_malloc` sites M123's
+own writeup flagged (IrBuilder's ops/pool arrays, parser.c's PartVec-style
+vectors, the AST arena) -- left for whichever milestone picks those up
+next (M128, per the in-flight work recovered above, appears to already be
+claimed for at least the irbuild.c/parser.c allocation sites).
