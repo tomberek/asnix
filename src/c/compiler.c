@@ -552,48 +552,107 @@ static void sort_syms(uint32_t *syms, size_t n) {
  * same boolean real Nix's own operand-swap desugaring produces (see this
  * file's AST_BINOP case's own M51 comment for why the swap exists in the
  * *compiled* form) directly from the source-level operands here, since
- * this function never emits IR, only a final bool/int. `//`/`++` (`'u'`/
- * `'c'`) fall through to `default` and are never folded: those operators
- * are for attrsets/lists, so two *int* literals on either side is always
- * a runtime type error this function must not mask by computing a
- * bogus int/bool result for it. Called both from the AST_BINOP case of
- * `compile_expr` below (to actually fold) and from
+ * this function never emits IR, only a final bool/int/float. `//`/`++`
+ * (`'u'`/`'c'`) fall through to `default` and are never folded: those
+ * operators are for attrsets/lists, so two numeric literals on either
+ * side is always a runtime type error this function must not mask by
+ * computing a bogus int/bool/float result for it. Called both from the
+ * AST_BINOP case of `compile_expr` below (to actually fold) and from
  * `is_thunk_free_literal` immediately below (so a foldable binop is ALSO
  * recognized as thunk-free, exactly like any other literal -- M92's
  * `maybeThunk` reasoning applies identically once this function has
- * reduced the node to a single zero-cost push). */
-static int try_fold_const_binop(Ast *node, int *out_is_bool, int64_t *out_val) {
+ * reduced the node to a single zero-cost push).
+ *
+ * <follow-on to M136>: extended to AST_FLOAT operands (and mixed int/
+ * float pairs), the first of M136's own two explicitly-scoped-out
+ * follow-ons. Int/int (both operands AST_INT) keeps the EXACT path
+ * above unchanged -- a pure-int fold must keep its exact int64 overflow
+ * semantics, not get silently rerouted through double arithmetic (which
+ * would both lose precision for large ints near ASNIX_INT_MAX/MIN and
+ * change the *type* of the result from int to float, a real behavior
+ * change real Nix does not make for `1 + 2`). The float branch only
+ * runs once at least one operand is AST_FLOAT, and mirrors value_util.c's
+ * own int/float-promotion rules exactly: an int operand casts to double
+ * the identical way `as_double()` does there (so a literal fold is
+ * bit-for-bit identical to what the corresponding unfolded runtime op
+ * would have computed, not merely "close"); `+`/`-`/`*` never fail to
+ * fold (real IEEE-754 double arithmetic has no overflow-abort case the
+ * way checked-int arithmetic does -- a too-large result is `inf`, the
+ * exact same `inf` the unfolded op would also produce, see
+ * asnix_add/sub/mul_values, none of which ever call asnix_fatal); `/`
+ * is left unfolded exactly when the (promoted-to-double) divisor is
+ * 0.0, mirroring asnix_div_values's own unconditional "divisor == 0.0"
+ * fatal check (real Nix's own rule: EVERY division by a zero divisor is
+ * a hard error, even `1.0 / 0.0`, never silently IEEE-754 infinity --
+ * see that function's own comment) so the runtime op still reaches the
+ * identical "division by zero" abort. The six comparisons compute a
+ * plain double `<`/`<=`/`>`/`>=`/`==`/`!=`, the same promotion
+ * asnix_cmp_{lt,gt,le,ge}_values / asnix_bshared_value_eq's own
+ * Float-on-either-side branch already use at runtime. */
+static int try_fold_const_binop(Ast *node, int *out_is_bool, int *out_is_float, int64_t *out_val,
+                                 double *out_fval) {
     if (node->kind != AST_BINOP) return 0;
     Ast *lhs = node->as.binop.lhs, *rhs = node->as.binop.rhs;
-    if (lhs->kind != AST_INT || rhs->kind != AST_INT) return 0;
-    int64_t a = lhs->as.int_val, b = rhs->as.int_val, result;
+    int lhs_is_int = (lhs->kind == AST_INT), rhs_is_int = (rhs->kind == AST_INT);
+    int lhs_is_float = (lhs->kind == AST_FLOAT), rhs_is_float = (rhs->kind == AST_FLOAT);
+    if (!(lhs_is_int || lhs_is_float) || !(rhs_is_int || rhs_is_float)) return 0;
+
+    if (lhs_is_int && rhs_is_int) {
+        int64_t a = lhs->as.int_val, b = rhs->as.int_val, result;
+        switch (node->as.binop.op) {
+            case '+':
+                if (__builtin_add_overflow(a, b, &result)) return 0;
+                break;
+            case '-':
+                if (__builtin_sub_overflow(a, b, &result)) return 0;
+                break;
+            case '*':
+                if (__builtin_mul_overflow(a, b, &result)) return 0;
+                break;
+            case '/':
+                if (b == 0) return 0;
+                if (a == INT64_MIN && b == -1) return 0;
+                result = a / b;
+                break;
+            case 'e': *out_is_bool = 1; *out_is_float = 0; *out_val = (a == b); return 1;
+            case 'n': *out_is_bool = 1; *out_is_float = 0; *out_val = (a != b); return 1;
+            case 'l': *out_is_bool = 1; *out_is_float = 0; *out_val = (a < b); return 1;
+            case 'G': *out_is_bool = 1; *out_is_float = 0; *out_val = (a >= b); return 1;
+            case 'g': *out_is_bool = 1; *out_is_float = 0; *out_val = (a > b); return 1;
+            case 'L': *out_is_bool = 1; *out_is_float = 0; *out_val = (a <= b); return 1;
+            default: return 0;
+        }
+        if (result < ASNIX_INT_MIN || result > ASNIX_INT_MAX) return 0;
+        *out_is_bool = 0;
+        *out_is_float = 0;
+        *out_val = result;
+        return 1;
+    }
+
+    /* At least one operand is AST_FLOAT -- promote both to double exactly
+     * like as_double() does (an int operand's cast is the identical C
+     * `(double)` cast, so this is bit-for-bit what the unfolded runtime
+     * op would have computed from the same two literals). */
+    double a = lhs_is_float ? lhs->as.float_val : (double)lhs->as.int_val;
+    double b = rhs_is_float ? rhs->as.float_val : (double)rhs->as.int_val;
     switch (node->as.binop.op) {
-        case '+':
-            if (__builtin_add_overflow(a, b, &result)) return 0;
-            break;
-        case '-':
-            if (__builtin_sub_overflow(a, b, &result)) return 0;
-            break;
-        case '*':
-            if (__builtin_mul_overflow(a, b, &result)) return 0;
-            break;
+        case '+': *out_is_bool = 0; *out_is_float = 1; *out_fval = a + b; return 1;
+        case '-': *out_is_bool = 0; *out_is_float = 1; *out_fval = a - b; return 1;
+        case '*': *out_is_bool = 0; *out_is_float = 1; *out_fval = a * b; return 1;
         case '/':
-            if (b == 0) return 0;
-            if (a == INT64_MIN && b == -1) return 0;
-            result = a / b;
-            break;
-        case 'e': *out_is_bool = 1; *out_val = (a == b); return 1;
-        case 'n': *out_is_bool = 1; *out_val = (a != b); return 1;
-        case 'l': *out_is_bool = 1; *out_val = (a < b); return 1;
-        case 'G': *out_is_bool = 1; *out_val = (a >= b); return 1;
-        case 'g': *out_is_bool = 1; *out_val = (a > b); return 1;
-        case 'L': *out_is_bool = 1; *out_val = (a <= b); return 1;
+            if (b == 0.0) return 0; /* matches asnix_div_values's unconditional divisor-==0.0 fatal */
+            *out_is_bool = 0;
+            *out_is_float = 1;
+            *out_fval = a / b;
+            return 1;
+        case 'e': *out_is_bool = 1; *out_is_float = 0; *out_val = (a == b); return 1;
+        case 'n': *out_is_bool = 1; *out_is_float = 0; *out_val = (a != b); return 1;
+        case 'l': *out_is_bool = 1; *out_is_float = 0; *out_val = (a < b); return 1;
+        case 'G': *out_is_bool = 1; *out_is_float = 0; *out_val = (a >= b); return 1;
+        case 'g': *out_is_bool = 1; *out_is_float = 0; *out_val = (a > b); return 1;
+        case 'L': *out_is_bool = 1; *out_is_float = 0; *out_val = (a <= b); return 1;
         default: return 0;
     }
-    if (result < ASNIX_INT_MIN || result > ASNIX_INT_MAX) return 0;
-    *out_is_bool = 0;
-    *out_val = result;
-    return 1;
 }
 
 static int is_thunk_free_literal(Ast *node) {
@@ -605,9 +664,10 @@ static int is_thunk_free_literal(Ast *node) {
         case AST_CURPOS:
             return 1;
         case AST_BINOP: {
-            int is_bool;
+            int is_bool, is_float;
             int64_t val;
-            return try_fold_const_binop(node, &is_bool, &val);
+            double fval;
+            return try_fold_const_binop(node, &is_bool, &is_float, &val, &fval);
         }
         case AST_STRING:
             for (size_t i = 0; i < node->as.string.count; i++) {
@@ -1180,12 +1240,22 @@ static void compile_expr(IrBuilder *b, Ast *node, ScopeFrame *scope) {
              * operators) must fall through to the ordinary path below
              * unchanged rather than risk silently diverging from the
              * runtime op's own checked behavior. */
-            int fold_is_bool;
+            int fold_is_bool, fold_is_float;
             int64_t fold_val;
-            if (try_fold_const_binop(node, &fold_is_bool, &fold_val)) {
+            double fold_fval;
+            if (try_fold_const_binop(node, &fold_is_bool, &fold_is_float, &fold_val, &fold_fval)) {
                 if (fold_is_bool) {
                     if (fold_val) ib_push_true(b);
                     else ib_push_false(b);
+                } else if (fold_is_float) {
+                    /* Same compile-time-heap-allocate-once rationale as
+                     * AST_FLOAT's own case above -- a folded float result
+                     * is still a genuine 2-word heap box, not an
+                     * immediate, so it's materialized once here and
+                     * pooled via ib_push_const, never re-allocated per
+                     * eval. */
+                    Value fv = asnix_make_float_value(fold_fval);
+                    ib_push_const(b, (int64_t)fv.raw);
                 } else {
                     ib_push_int(b, fold_val);
                 }

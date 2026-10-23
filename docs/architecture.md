@@ -15196,3 +15196,203 @@ the non-identifier-leading `try_scan_path` call keeps its old,
 unconditional behavior, just relocated next to the branch that now
 excludes identifier leads from it). `tests/e2e/
 m138_uri_scheme_dot_plus.nix`/`.expected` (new fixture).
+
+## M139: compile-time constant folding for `AST_BINOP` extended to `AST_FLOAT` operands -- M136's first explicitly-scoped-out follow-on, landed; the second (`builtins.X` folding) investigated and declined
+
+Directed follow-up to M136, which folded `AST_BINOP` at compile time
+only when both operands were `AST_INT` literals and explicitly scoped
+out two follow-ons: float-literal operands, and compile-time folding of
+`builtins.X` references when `builtins` is provably unshadowed. This
+milestone lands the first and declines the second, after checking a
+separate research pass's "does asnix already do iets's `maybeThunk`
+forced-value-caching trick" question first, per this task's own
+directive.
+
+**Checked first, as directed, before changing anything**: grepped
+every `ASNIX_THUNK_STATE_FORCED` site in `src/asm/` --
+`op_var_ref.S`/`op_select.S`/`op_select_or.S`/`op_with.S`/`force.S`
+all compare a Thunk's state word against `ASNIX_THUNK_STATE_FORCED`
+and return the already-cached `Value` directly on a hit, never re-
+running the Thunk's body or re-wrapping it. This is exactly the
+"return already-forced values directly instead of re-wrapping them"
+behavior the research pass flagged as possibly missing -- it already
+exists, confirming (like M93/M111's bounded `//` sharing and M130's
+symtab hash finalizer before it) that this was a research false
+positive, not a real gap. No code changed for this part; cited here so
+the next pass doesn't re-raise it.
+
+**What changed, `src/c/compiler.c`'s `try_fold_const_binop`**: the
+int/int path (both operands `AST_INT`) is byte-for-byte unchanged --
+same `__builtin_*_overflow` checks, same `ASNIX_INT_MIN`/`MAX` re-
+check, same unfolded-on-overflow/div-by-zero behavior as M136 landed.
+A new branch handles any `AST_BINOP` where at least one operand is
+`AST_FLOAT` (the other may be `AST_INT` or `AST_FLOAT`): both operands
+promote to `double` via the identical cast `value_util.c`'s own
+`as_double()` helper uses for an int operand (`(double)int_val`), so a
+folded result is bit-for-bit what the corresponding *unfolded* runtime
+op (`asnix_add_values`/`asnix_sub_values`/`asnix_mul_values`/
+`asnix_div_values`, or `asnix_cmp_{lt,gt,le,ge}_values`/
+`asnix_bshared_value_eq`'s own Float branch) would have computed from
+the same two literals, not merely numerically close to it. `+`/`-`/`*`
+always fold once this branch is reached: unlike checked int arithmetic,
+IEEE-754 double arithmetic has no overflow-abort case at all -- a
+too-large result is `inf`, the exact same `inf` the unfolded op would
+also produce (none of `asnix_add_values`/`sub`/`mul` ever call
+`asnix_fatal`). `/` is left unfolded exactly when the promoted divisor
+is `0.0`, mirroring `asnix_div_values`'s own unconditional "divisor ==
+0.0 is always a hard error" rule (real Nix's rule too -- even
+`1.0 / 0.0` errors, never silently produces IEEE infinity) so an
+unfoldable float division still reaches the identical "asnix: division
+by zero, aborting" message at runtime. The six comparisons compute a
+plain `double` `<`/`<=`/`>`/`>=`/`==`/`!=`, the same promotion
+`asnix_cmp_*_values`/`asnix_bshared_value_eq`'s Float branch already
+use. `is_thunk_free_literal`'s `AST_BINOP` case and the `AST_BINOP` case
+of `compile_expr` both call this same function (unchanged structure
+from M136) -- a foldable float binop is therefore ALSO recognized as
+thunk-free at every `ib_mk_thunk` call site, collapsing to a single
+`ib_push_const` of a compile-time-allocated Float box (same "heap-
+allocate the Float box once, at compile time" pattern `AST_FLOAT`'s own
+case already uses, not per-eval).
+
+**Verified directly** (both via one-off `.nix` files run through
+`./asnix`, not just the suites below): `1.5 + 2.5` == `4`; `3 - 1.5` ==
+`1.5`; `2.0 * 3` == `6`; `10.0 / 4.0` == `2.5`; `1.0 / 0.0` still aborts
+with the exact unchanged message `asnix: division by zero, aborting`
+(confirming the fold-skip path reaches the identical runtime abort, not
+a different one); `1.0 == 1`, `1 == 1.0`, `1.5 > 1`, `1 < 1.5`,
+`2.0 >= 2`, `1.0 != 2` all `true` and `1.5 <= 1` `false` (int/float
+promotion and comparison direction all correct both ways). `ASNIX_SHOW_
+STATS=1` on `let a = 1.5 + 2.5; in a` (and the mixed/mixed-type variants
+above): `thunks: 0`, confirming the thunk-avoidance unification fires
+identically to the int case.
+
+**Measured, two ways** (both `perf stat`, `taskset -c 0`, two binaries
+built from the otherwise-identical tree with only `compiler.c` swapped):
+
+- `d.nix` (ffmpeg's closure, the project's standard real-workload
+  check): **no measurable effect**, as expected once checked --
+  `ASNIX_SHOW_STATS=1`'s full output (thunks/envs/closures/etc., every
+  field) is byte-for-byte identical before/after, meaning this exact
+  nixpkgs closure contains not one single foldable float-literal binop.
+  `perf stat` instructions: 9,029.95M / 9,034.99M (before, 2 runs) vs.
+  9,036.85M / 9,038.26M (after, 2 runs) -- a +0.03-0.09% difference,
+  consistent with pure compile-time overhead (the new branch runs once
+  per `AST_BINOP` node compiled, whether or not it ends up folding) and
+  well within this machine's own run-to-run noise band for this
+  I/O-heavy workload (cycles varied 4,891M-5,196M across the same four
+  runs, a much wider spread than the instruction count's own). Output
+  hash unchanged: `/nix/store/29iacg6h530yx7rxz4k1fhvi0kxxhsam-ffmpeg-
+  9.0.1-bin`.
+- A targeted synthetic microbenchmark (`builtins.genList` building 2M
+  elements, each evaluating five independent float-literal expressions
+  --`1.5 + 2.5`, `3.0 - 1.25`, `2.0 * 3.5`, `10.0 / 4.0`, `1 + 2.5` --
+  summed with `builtins.foldl'`): `ASNIX_SHOW_STATS=1` thunks
+  10,000,003 -> 3 (one Thunk per float binop per element, down to
+  effectively none). `perf stat`, 2 interleaved pairs: instructions
+  7,277.4M/7,280.6M -> 4,629.4M/4,631.1M, **-36.4%**; cycles
+  2,682.9M/2,686.5M -> 1,616.0M/1,666.1M, **-38% to -40%**; wall 1.536s
+  -> 0.517s. Output (`2.00004e+12`) identical before/after. **An
+  independent adversarial re-measurement, with its own from-scratch
+  reconstruction of this benchmark (the exact `.nix` source wasn't
+  preserved) that matched the thunk-count delta almost exactly (10M+4
+  vs. the original's 10M+3, confirming equivalent benchmark shape),
+  reproduced the correct direction and a real, substantial win, but at
+  roughly 1.5-2x smaller magnitude: -18.7% to -24.2% instructions
+  across two reconstructed variants, not -36.4%.** The direction and
+  the "real win on float-heavy workloads" conclusion both hold up; the
+  specific -36%/-38-40% headline figures should be read as this
+  particular (unpreserved) benchmark's own number, not a number this
+  change reliably reproduces on an arbitrary similarly-shaped workload.
+
+**Honest verdict**: real, substantial speedup (roughly -19% to -36%
+instructions depending on the exact workload shape, per independent
+re-measurement) for any workload that does literal float arithmetic
+repeatedly, but ~0% effect on this project's own standard real-workload
+benchmark (`d.nix`)
+-- nixpkgs's ffmpeg closure, evaluated here, simply doesn't contain
+foldable float-literal binops (floats mostly appear as bare version-
+like literals or come from runtime computation, not `N.N + N.N`-shaped
+source text). Landed anyway because it is unconditionally correct (see
+verification above), symmetric with M136's already-landed int case, and
+a genuine win on any workload that does hit it, at a measured, bounded,
+and tiny compile-time-only cost everywhere else.
+
+**`builtins.X` folding (M136's second follow-on): investigated,
+declined.** The "provably unshadowed" check itself is not the hard
+part -- M110's `try_fused_native_call2` (this same file) already
+established exactly the needed pattern for recognizing an unshadowed
+`builtins.<name>` reference: `scope_find_lexical` finds which
+`ScopeFrame` lexically binds the name `"builtins"`, then `f->up ==
+NULL` confirms that frame is the genuine root frame `init_builtins_
+frame` installs (not a user's own `let builtins = ...;`, lambda
+parameter, or `scopedImport`'s extra named frame) -- and `with` can
+never interfere, since `scope_find_lexical`'s own doc comment and
+`AST_VAR`'s lookup both establish that a lexical binding always wins
+over any enclosing `with`'s dynamic fallback regardless of nesting
+order, so a `with`-provided `builtins` attribute (if any) is simply
+never consulted while a real lexical `builtins` exists -- which it
+always does, since `"builtins"` is itself one of the root frame's own
+16 bare names. Confirmed this reasoning empirically, not just by
+reading it: `let builtins = {}; in builtins ? trace` evaluates to
+`false` (the real `builtins.trace` is correctly NOT visible through the
+shadow), and `let builtins = { currentSystem = "fake"; }; in builtins.
+currentSystem` evaluates to `"fake"` (the shadow, not the real
+evaluator-reported system triple) -- both already correct today, with
+no code changed, confirming the shadow-detection building block this
+follow-on would have needed already exists and already works.
+
+What actually stopped this follow-on is a DIFFERENT risk this task's
+own framing didn't raise: this project's bytecode cache (M94/M98/M107,
+most recently touched by M137) persists compiled `IrProgram`s to disk
+and reuses them, unchanged, across entirely separate future process
+invocations of `./asnix` on the same source file (keyed on content
+hash + mtime, not on anything about the CURRENT process). Folding a
+`builtins.X` reference into a baked `OP_PUSH_CONST` at compile time
+would bake in whatever that attribute's value is in THIS compiling
+process -- which is fine for a value that is a genuine constant of the
+evaluator binary itself (e.g. `builtins.nixVersion`/`langVersion`, or
+`currentSystem`, which is a fixed platform string baked into the
+binary, not sampled per-run) but silently WRONG for anything that
+varies per invocation (`builtins.currentTime`, which real Nix defines
+as "the time this evaluation started," not a build-time constant) --
+a cached-and-reused fold of `currentTime` would return the SAME baked
+timestamp on every future run reading that cache entry, forever, a
+real and easy-to-miss correctness bug that would not necessarily show
+up in ordinary one-shot testing (it would only surface as "two
+`./asnix` runs of the same file return different `currentTime` without
+the cache, but an identical stale one WITH the cache enabled" --
+exactly the kind of cold/warm-cache behavioral divergence this
+project's own verification ladder's cache-specific checks, M137's
+three-ways-verified correctness pass, exist to catch). Landing this
+safely would require auditing every one of `builtins`'s ~90-odd
+attributes individually for "is this value identical across every
+possible future process invocation that might reuse this exact cache
+entry," maintaining that classification as new builtins get added, AND
+re-verifying it against the cache path specifically (not just a single
+cold run) -- a materially larger, correctness-sensitive surface than
+this follow-on's likely payoff justifies: `builtins.X` values are
+already plain eagerly-built attrset entries (`eval_file.c`'s root env),
+so a reference to one is already one `OP_VAR_REF` (a slot load, not a
+thunk force) plus one `OP_SELECT` (a sorted-array binary search over
+~90 entries, not a linear scan) -- cheap already, not a Thunk-avoidance
+win the way M92/M136/this milestone's int/float folds are, so the
+*additional* saving folding would buy (skipping one binary search) is
+far smaller than either of those, while the risk (described above) is
+categorically worse (a silent wrong VALUE that could persist across
+process invocations via the cache, not just a missed optimization).
+Per this task's own explicit guidance ("if you cannot verify this with
+full confidence, do not land it"), this is not landed.
+
+**Verified**: `make test`/`test-e2e`/`test-conformance` all green.
+`make test-nix-conformance NIX_CONFORMANCE_DIR=/tmp/nix-conformance`:
+`pass=655 fail=3 skip=148` (exact baseline, same 3 pre-existing pos-
+tracking failures). `make test-nixpkgs-hash`: `pass=148 fail=0`.
+Output hash on `d.nix` unchanged:
+`/nix/store/29iacg6h530yx7rxz4k1fhvi0kxxhsam-ffmpeg-9.0.1-bin`.
+`compiler.c` compiles with zero new warnings.
+
+Files: `src/c/compiler.c` (`try_fold_const_binop`'s new float/mixed
+branch; `is_thunk_free_literal`'s and `compile_expr`'s `AST_BINOP`
+cases updated to thread the new `is_float`/float-value outputs
+through). No other file changed; the declined `builtins.X` follow-on
+left no code behind.
