@@ -210,22 +210,172 @@ static int pattern_rejected_by_real_nix(const char *p, int64_t len) {
     return 0; /* unterminated '[' / unmatched '(' are already glibc's own rejections */
 }
 
+/* M143: a pattern-string-keyed cache for both this file's compiled
+ * regex forms -- glibc's `regex_t` (via `regcomp`) and regex_engine.c's
+ * own `AsnixCustomRegex` -- found via a cross-evaluator profiling pass
+ * (see docs/architecture.md's M143 section for the full writeup):
+ * `regcomp` alone builds a full DFA plus a locale character-class
+ * translation table from scratch on every call, and real nixpkgs calls
+ * `builtins.match`/`builtins.split` with the SAME small set of literal
+ * patterns (lib.versions-style version-parsing helpers) across
+ * thousands of packages in one closure, so recompiling the identical
+ * pattern string thousands of times was pure waste. Entries are never
+ * evicted or freed for the life of the process -- the same unbounded
+ * per-process tradeoff iets's own thread-local `REGEX_CACHE` already
+ * makes; the number of DISTINCT patterns a real eval calls match/split
+ * with is small relative to how many TIMES each one is called, so the
+ * memory cost is negligible next to the win. Same open-addressed,
+ * linear-probe hash-index technique eval_file.c's import cache already
+ * uses (`import_cache_find`/`import_cache_insert`, see its own comment):
+ * a parallel index array mapping each pattern's hash to its slot in
+ * `g_regex_cache`, grown/rehashed at a 75% load factor before each
+ * insert. */
+typedef struct {
+    char *pattern;   /* owned copy, exactly `len` bytes, no NUL terminator */
+    int64_t len;
+
+    int rejected;      /* pattern_rejected_by_real_nix(pattern, len), computed once */
+    int needs_custom;   /* asnix_regex_needs_custom_engine(pattern, len), computed once */
+
+    int have_glibc;       /* glibc_re is a successfully regcomp'd pattern */
+    int glibc_bad;         /* regcomp itself failed -- glibc_err is the message to replay */
+    char *glibc_err;        /* owned (regerror's own buffer is caller-provided/transient) */
+    regex_t glibc_re;
+
+    int custom_attempted;     /* asnix_regex_compile already tried once (success or not) */
+    AsnixCustomRegex *custom_re; /* compiled form, or NULL if the attempt failed */
+    int64_t custom_nsub;
+} RegexCacheEntry;
+
+static RegexCacheEntry **g_regex_cache = NULL;
+static size_t g_regex_cache_count = 0, g_regex_cache_cap = 0;
+static size_t *g_regex_cache_index = NULL;
+static size_t g_regex_cache_index_cap = 0;
+#define REGEX_CACHE_EMPTY_SLOT ((size_t)-1)
+
+/* Same word-at-a-time mixing as eval_file.c's import_cache_hash/
+ * symtab.c's hash_bytes (M130). */
+static uint64_t regex_cache_hash(const char *s, int64_t len) {
+    uint64_t h = 0;
+    for (int64_t i = 0; i < len; i++) {
+        h ^= (uint64_t)(unsigned char)s[i];
+        h *= 0x517cc1b727220a95ULL;
+    }
+    h ^= h >> 30;
+    h *= 0xbf58476d1ce4e5b9ULL;
+    h ^= h >> 27;
+    h *= 0x94d049bb133111ebULL;
+    h ^= h >> 31;
+    return h;
+}
+
+static void regex_cache_index_rehash(size_t new_cap) {
+    size_t *new_table = malloc(new_cap * sizeof(size_t));
+    for (size_t i = 0; i < new_cap; i++) new_table[i] = REGEX_CACHE_EMPTY_SLOT;
+    for (size_t i = 0; i < g_regex_cache_count; i++) {
+        RegexCacheEntry *e = g_regex_cache[i];
+        size_t slot = regex_cache_hash(e->pattern, e->len) & (new_cap - 1);
+        while (new_table[slot] != REGEX_CACHE_EMPTY_SLOT) slot = (slot + 1) & (new_cap - 1);
+        new_table[slot] = i;
+    }
+    free(g_regex_cache_index);
+    g_regex_cache_index = new_table;
+    g_regex_cache_index_cap = new_cap;
+}
+
+static RegexCacheEntry *regex_cache_find(const char *pattern, int64_t len) {
+    if (g_regex_cache_index_cap == 0) return NULL;
+    size_t slot = regex_cache_hash(pattern, len) & (g_regex_cache_index_cap - 1);
+    for (;;) {
+        size_t idx = g_regex_cache_index[slot];
+        if (idx == REGEX_CACHE_EMPTY_SLOT) return NULL;
+        RegexCacheEntry *e = g_regex_cache[idx];
+        if (e->len == len && memcmp(e->pattern, pattern, (size_t)len) == 0) return e;
+        slot = (slot + 1) & (g_regex_cache_index_cap - 1);
+    }
+}
+
+static RegexCacheEntry *regex_cache_insert(const char *pattern, int64_t len) {
+    RegexCacheEntry *e = malloc(sizeof *e);
+    e->pattern = malloc(len > 0 ? (size_t)len : 1);
+    if (len > 0) memcpy(e->pattern, pattern, (size_t)len);
+    e->len = len;
+    e->rejected = pattern_rejected_by_real_nix(pattern, len);
+    e->needs_custom = asnix_regex_needs_custom_engine(pattern, len);
+    e->have_glibc = 0;
+    e->glibc_bad = 0;
+    e->glibc_err = NULL;
+    e->custom_attempted = 0;
+    e->custom_re = NULL;
+    e->custom_nsub = 0;
+
+    if (g_regex_cache_count == g_regex_cache_cap) {
+        g_regex_cache_cap = g_regex_cache_cap ? g_regex_cache_cap * 2 : 32;
+        g_regex_cache = realloc(g_regex_cache, g_regex_cache_cap * sizeof(RegexCacheEntry *));
+    }
+    if (g_regex_cache_index_cap == 0) regex_cache_index_rehash(64);
+    else if ((g_regex_cache_count + 1) * 4 > g_regex_cache_index_cap * 3) regex_cache_index_rehash(g_regex_cache_index_cap * 2);
+    size_t slot = regex_cache_hash(e->pattern, e->len) & (g_regex_cache_index_cap - 1);
+    while (g_regex_cache_index[slot] != REGEX_CACHE_EMPTY_SLOT) slot = (slot + 1) & (g_regex_cache_index_cap - 1);
+    g_regex_cache_index[slot] = g_regex_cache_count;
+    g_regex_cache[g_regex_cache_count] = e;
+    g_regex_cache_count++;
+    return e;
+}
+
+static RegexCacheEntry *regex_cache_get(const char *pattern, int64_t len) {
+    RegexCacheEntry *e = regex_cache_find(pattern, len);
+    if (e) return e;
+    return regex_cache_insert(pattern, len);
+}
+
 /* Fatal on a bad pattern -- matches real Nix's own fatal-on-bad-regcomp
  * behavior (verified: `builtins.match "(" "a"` -> "error: invalid
  * regular expression '('" on real nix-instantiate; exact wording isn't
  * reproduced, just the fatal-not-null outcome, same class of
  * documented-not-exact-wording scope cut every other fatal error in this
- * project already makes). */
-static void compile_or_fatal(regex_t *preg, const char *pattern, int64_t pattern_len, const char *who) {
-    if (pattern_rejected_by_real_nix(pattern, pattern_len)) {
+ * project already makes).
+ *
+ * M143: cache-aware -- `e->rejected` was already computed once at
+ * cache-insert time; a pattern `regcomp` itself rejects caches that
+ * fact too (`glibc_bad`/`glibc_err`), so a repeated bad pattern replays
+ * the exact same fatal message without re-running `regcomp` just to
+ * refail it. `pattern` must still be the caller's own NUL-terminated
+ * scratch copy (`e->pattern` is NOT NUL-terminated -- see above), since
+ * `regcomp` needs a C string. */
+static regex_t *regex_cache_ensure_glibc(RegexCacheEntry *e, const char *pattern, const char *who) {
+    if (e->rejected) {
         asnix_bshared_fatal(who, "invalid regular expression (rejected by real Nix's stricter ERE grammar)");
     }
-    int rc = regcomp(preg, pattern, REG_EXTENDED);
+    if (e->glibc_bad) {
+        asnix_bshared_fatal(who, e->glibc_err);
+    }
+    if (e->have_glibc) return &e->glibc_re;
+    int rc = regcomp(&e->glibc_re, pattern, REG_EXTENDED);
     if (rc != 0) {
         char errbuf[256];
-        regerror(rc, preg, errbuf, sizeof errbuf);
-        asnix_bshared_fatal(who, errbuf);
+        regerror(rc, &e->glibc_re, errbuf, sizeof errbuf);
+        e->glibc_bad = 1;
+        size_t elen = strlen(errbuf);
+        e->glibc_err = malloc(elen + 1);
+        memcpy(e->glibc_err, errbuf, elen + 1);
+        asnix_bshared_fatal(who, e->glibc_err);
     }
+    e->have_glibc = 1;
+    return &e->glibc_re;
+}
+
+/* M143: cache-aware wrapper around regex_engine.c's `asnix_regex_compile`
+ * -- compiled at most once per distinct pattern string, reused by every
+ * later call (both the needs-custom-engine full-bypass route and
+ * `groups_to_list_recomputed`'s per-match capture recompute, which
+ * previously called `asnix_regex_compile` fresh on EVERY match inside a
+ * single `split` call, not just once per distinct pattern). */
+static AsnixCustomRegex *regex_cache_ensure_custom(RegexCacheEntry *e, const char *pattern, int64_t plen) {
+    if (e->custom_attempted) return e->custom_re;
+    e->custom_attempted = 1;
+    e->custom_re = asnix_regex_compile(pattern, plen, &e->custom_nsub);
+    return e->custom_re;
 }
 
 /* Builds the flat list of `nsub` capture-group values from a completed
@@ -320,26 +470,31 @@ static Value custom_groups_to_list(const AsnixRegexGroup *g, int64_t nsub, const
  * defensively means a gap in that parser this project's test suite
  * doesn't happen to exercise would just leave the affected pattern
  * exactly as correct/incorrect as it already was before this milestone,
- * never introduce a NEW regression. */
+ * never introduce a NEW regression.
+ *
+ * M143: `e` is the pattern's cache entry (same one the caller already
+ * resolved via `regex_cache_get`) -- the custom-engine form is compiled
+ * at most once per distinct pattern (`regex_cache_ensure_custom`), not
+ * once per match, which matters a lot here specifically: `split` calls
+ * this function once per match found in the subject, so an N-match
+ * split previously re-ran `asnix_regex_compile` N times for the exact
+ * same pattern string. */
 static Value groups_to_list_recomputed(const regmatch_t *pmatch, size_t nsub, const char *base,
-                                        const char *pattern, int64_t plen, const char *subject,
-                                        int64_t slen, int64_t match_so, int64_t match_eo, int notbol) {
+                                        RegexCacheEntry *e, const char *pattern, int64_t plen,
+                                        const char *subject, int64_t slen, int64_t match_so,
+                                        int64_t match_eo, int notbol) {
     if (nsub == 0) return groups_to_list(pmatch, nsub, base);
     if (match_eo - match_so > ASNIX_REGEX_CUSTOM_MAX_SPAN) return groups_to_list(pmatch, nsub, base);
-    int64_t cnsub;
-    AsnixCustomRegex *cre = asnix_regex_compile(pattern, plen, &cnsub);
-    if (cre && cnsub == (int64_t)nsub) {
+    AsnixCustomRegex *cre = regex_cache_ensure_custom(e, pattern, plen);
+    if (cre && e->custom_nsub == (int64_t)nsub) {
         AsnixRegexGroup *g = malloc(nsub * sizeof *g);
         int ok = asnix_regex_match_anchored(cre, subject, slen, match_so, match_eo, notbol, g);
-        asnix_regex_free(cre);
         if (ok) {
             Value r = custom_groups_to_list(g, (int64_t)nsub, subject);
             free(g);
             return r;
         }
         free(g);
-    } else if (cre) {
-        asnix_regex_free(cre);
     }
     return groups_to_list(pmatch, nsub, base);
 }
@@ -391,19 +546,25 @@ Value asnix_prim_match2_impl(const Value *args, int64_t argc) {
 
     Value result;
 
+    /* M143: resolve (or create) this pattern's cache entry once, up
+     * front -- `needs_custom`/`rejected` were computed at insert time,
+     * so neither branch below re-scans the pattern text on a repeat
+     * call with the same bytes. */
+    RegexCacheEntry *re = regex_cache_get(pattern, plen);
+
     /* Bracket-expression extension (named collating symbol, equivalence
      * class, or non-standard class name) glibc can't be trusted for at
      * all -- bypass it entirely, same leftmost-longest-anchoring trick
      * as the glibc path below, just driven by the custom engine's own
      * from-scratch search instead of regexec. */
-    if (asnix_regex_needs_custom_engine(pattern, plen)) {
-        if (pattern_rejected_by_real_nix(pattern, plen)) {
+    if (re->needs_custom) {
+        if (re->rejected) {
             asnix_bshared_fatal("match", "invalid regular expression (rejected by real Nix's stricter ERE grammar)");
         }
-        int64_t nsub;
-        AsnixCustomRegex *cre = asnix_regex_compile(pattern, plen, &nsub);
+        AsnixCustomRegex *cre = regex_cache_ensure_custom(re, pattern, plen);
         if (!cre) asnix_bshared_fatal("match", "invalid regular expression");
         free(pattern);
+        int64_t nsub = re->custom_nsub;
 
         AsnixRegexGroup *g = nsub > 0 ? malloc((size_t)nsub * sizeof *g) : NULL;
         int64_t mso, meo;
@@ -414,27 +575,24 @@ Value asnix_prim_match2_impl(const Value *args, int64_t argc) {
             result = custom_groups_to_list(g, nsub, subject);
         }
         free(g);
-        asnix_regex_free(cre);
         free(subject);
         return result;
     }
 
-    regex_t preg;
-    compile_or_fatal(&preg, pattern, plen, "match");
+    regex_t *preg = regex_cache_ensure_glibc(re, pattern, "match");
 
-    size_t nsub = preg.re_nsub;
+    size_t nsub = preg->re_nsub;
     regmatch_t *pmatch = malloc((nsub + 1) * sizeof(regmatch_t));
-    int mrc = regexec(&preg, subject, nsub + 1, pmatch, 0);
+    int mrc = regexec(preg, subject, nsub + 1, pmatch, 0);
 
     if (mrc != 0 || pmatch[0].rm_so != 0 || pmatch[0].rm_eo != (regoff_t)slen) {
         result = ASNIX_NULL;
     } else {
-        result = groups_to_list_recomputed(pmatch, nsub, subject, pattern, plen, subject, slen, 0, slen, 0);
+        result = groups_to_list_recomputed(pmatch, nsub, subject, re, pattern, plen, subject, slen, 0, slen, 0);
     }
 
     free(pattern);
     free(pmatch);
-    regfree(&preg);
     free(subject);
     return result;
 }
@@ -528,29 +686,30 @@ static Value split2_impl(const Value *args, int64_t argc) {
     char *pattern = nul_copy(pbytes, plen);
     char *subject = nul_copy(sbytes, slen);
 
+    /* M143: see asnix_prim_match2_impl's own comment -- resolve this
+     * pattern's cache entry once, up front. */
+    RegexCacheEntry *re = regex_cache_get(pattern, plen);
+
     /* Bracket-expression extension glibc can't be trusted for at all --
      * full custom-engine bypass, same as match2_impl's. */
-    if (asnix_regex_needs_custom_engine(pattern, plen)) {
-        if (pattern_rejected_by_real_nix(pattern, plen)) {
+    if (re->needs_custom) {
+        if (re->rejected) {
             asnix_bshared_fatal("split", "invalid regular expression (rejected by real Nix's stricter ERE grammar)");
         }
-        int64_t nsub;
-        AsnixCustomRegex *cre = asnix_regex_compile(pattern, plen, &nsub);
+        AsnixCustomRegex *cre = regex_cache_ensure_custom(re, pattern, plen);
         if (!cre) asnix_bshared_fatal("split", "invalid regular expression");
         free(pattern);
-        Value result = split_via_custom_engine(cre, nsub, subject, slen);
-        asnix_regex_free(cre);
+        Value result = split_via_custom_engine(cre, re->custom_nsub, subject, slen);
         free(subject);
         return result;
     }
 
     /* Still compile+validate via glibc regardless of which engine ends
-     * up actually finding matches below -- compile_or_fatal is also
-     * where pattern_rejected_by_real_nix and regcomp's own syntax
+     * up actually finding matches below -- regex_cache_ensure_glibc is
+     * also where pattern_rejected_by_real_nix and regcomp's own syntax
      * rejections (Class C) happen, unchanged. */
-    regex_t preg;
-    compile_or_fatal(&preg, pattern, plen, "split");
-    size_t nsub = preg.re_nsub;
+    regex_t *preg = regex_cache_ensure_glibc(re, pattern, "split");
+    size_t nsub = preg->re_nsub;
 
     /* Unlike match2_impl (anchored to the whole string, so regexec's
      * own leftmost-longest WHOLE-match-finding -- which is correct --
@@ -578,17 +737,13 @@ static Value split2_impl(const Value *args, int64_t argc) {
      * safely recurse over -- same defensive reasoning as
      * groups_to_list_recomputed. */
     if (nsub > 0 && slen <= ASNIX_REGEX_CUSTOM_MAX_SPAN) {
-        int64_t cnsub;
-        AsnixCustomRegex *cre = asnix_regex_compile(pattern, plen, &cnsub);
-        if (cre && cnsub == (int64_t)nsub) {
-            Value result = split_via_custom_engine(cre, cnsub, subject, slen);
-            asnix_regex_free(cre);
+        AsnixCustomRegex *cre = regex_cache_ensure_custom(re, pattern, plen);
+        if (cre && re->custom_nsub == (int64_t)nsub) {
+            Value result = split_via_custom_engine(cre, re->custom_nsub, subject, slen);
             free(pattern);
-            regfree(&preg);
             free(subject);
             return result;
         }
-        if (cre) asnix_regex_free(cre);
     }
 
     Value *out = NULL;
@@ -598,7 +753,7 @@ static Value split2_impl(const Value *args, int64_t argc) {
 
     while (pos <= slen) {
         int eflags = pos > 0 ? REG_NOTBOL : 0;
-        int mrc = regexec(&preg, subject + pos, nsub + 1, pmatch, eflags);
+        int mrc = regexec(preg, subject + pos, nsub + 1, pmatch, eflags);
         if (mrc != 0) break;
 
         int64_t abs_so = pos + pmatch[0].rm_so;
@@ -609,7 +764,7 @@ static Value split2_impl(const Value *args, int64_t argc) {
             out = realloc(out, (size_t)cap * sizeof(Value));
         }
         out[n++] = asnix_make_string_value(subject + last_end, (size_t)(abs_so - last_end));
-        out[n++] = groups_to_list_recomputed(pmatch, nsub, subject + pos, pattern, plen, subject, slen,
+        out[n++] = groups_to_list_recomputed(pmatch, nsub, subject + pos, re, pattern, plen, subject, slen,
                                               abs_so, abs_eo, pos > 0);
 
         last_end = abs_eo;
@@ -626,7 +781,6 @@ static Value split2_impl(const Value *args, int64_t argc) {
     free(out);
     free(pattern);
     free(pmatch);
-    regfree(&preg);
     free(subject);
     return result;
 }
