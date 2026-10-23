@@ -17223,3 +17223,236 @@ masked/real/cache-hash passes). No test fixture changes needed --
 `tests/c/test_aterm.c` already exercises the unchanged `cache=NULL` path,
 and the full nixpkgs-hash/conformance suites exercise the cached path
 against real derivations.
+
+## M153: `lex_dquote_run`'s own SWAR candidate, correctly implemented and exhaustively proven correct, measured as a real (if small) regression, and declined
+
+A source-level sweep (read-only, no profiling) looking for unexplored
+SWAR/SIMD candidates flagged `lex_dquote_run` (`src/c/lexer.c`, plain
+`"..."` string-content scanning). It has the same byte-at-a-time shape
+M140's `find_escape_aterm`/`find_escape_json` already fixed elsewhere,
+never applied here. `lex_indented_run` (`''...''` content) was flagged as
+a messier sibling with the same shape, plus a harder multi-byte `''$`/
+`'''`/`''\<c>` lookahead. This milestone profiled both for real before
+touching any code, implemented and exhaustively proved correct a SWAR
+fix for the simpler one, measured it on the real eval, and declined to
+ship it. This is a genuine, instructive negative result, in the same tier
+as M127/M135's own honestly-reported declines.
+
+**Profiling, done first.** `perf record -g -e cpu_core/instructions/ -c
+10000`, `taskset -c 0`, cold `d.nix` eval, `ASNIX_BYTECODE_CACHE_DIR`
+pointed at a nonexistent directory. Both scan functions are small
+`static` functions the compiler fully inlines into `lex_until` (`nm`/
+`perf report` show no separate symbol for either). `lex_until` itself is
+5.97-6.43% self-time of the whole eval across two independent captures.
+Neither sub-scan has its own symbol to read a percentage off directly, so
+a small Python script (throwaway, not shipped) walked `perf annotate
+lex_until`'s interleaved source-plus-asm dump. It classified each asm
+line's self-time by the nearest preceding source line's content.
+`TOK_STR_PART`/`TOK_STR_END` text uniquely identifies `lex_dquote_run`'s
+own inlined body; `TOK_ISTR_PART`/`TOK_ISTR_ESC`/`TOK_ISTR_END` identify
+`lex_indented_run`'s. The script resets the classification at every
+backward jump to `lex_until`'s own dispatch-loop head (`jmp ... <lex_until
++0x240>`, the one instruction both inlined scan bodies always return
+through), to stop misattributing the SHARED dispatch code that runs
+between one inlined body's exit and the next classified marker. Two
+captures agreed closely:
+
+| | `lex_until` self-time | `lex_dquote_run` share | `lex_indented_run` share |
+|---|---|---|---|
+| capture 1 | 6.43% | 13.51% -> **0.869%** of whole eval | 1.40% -> **0.090%** of whole eval |
+| capture 2 | 5.97% | 12.23% -> **0.730%** of whole eval | 1.00% -> **0.060%** of whole eval |
+
+So `lex_dquote_run` is real (about 0.80% self-time, averaged) but modest.
+`lex_indented_run` is real but small enough (about 0.075%) that its extra
+multi-byte-lookahead complexity is not worth attempting on its own. It is
+declined without an implementation attempt, consistent with the task's
+own explicitly-sanctioned "legitimate to land only the simpler one" scope
+cut.
+
+**Sized against M140's own CURRENT numbers, not its own writeup's
+pre-fix figures**, per this task's own explicit instruction. The SAME two
+profiling captures show `buf_put_escaped` plus `jb_escape_string`
+(M140's own targets) at a combined 5.52% and 5.82% self-time. That is
+notably HIGHER than M140's own writeup's post-fix 2.85% citation, almost
+certainly because `~/nixpkgs`'s own live checkout (shared, not pinned)
+has drifted since M140 was written, pulling in a larger or different
+dependency closure for `d.nix`'s `ffmpeg.outPath`. This is not evidence
+that M140's own fix regressed, and it is not this milestone's concern to
+chase further, but it is the number actually being compared against, so
+it is cited honestly. Averaging to about 5.67%, `lex_dquote_run`'s own
+0.80% self-time is about 14% the size of M140's own current combined
+target: a real, comparably-shaped but meaningfully smaller opportunity,
+in the same rough tier M130/M145 previously called "a real but small win,
+honestly sized" before measuring confirmed it either way.
+
+**The implementation, and the one real design problem M140's own
+precedent does not solve.** `find_dquote_trigger(s, cap)` ports M140's
+exact bit-twiddling shape (the "has a zero byte" identity, `haszero(x) =
+((x-LO)&~x)&HI`, applied directly for NUL and via XOR for `'"'`/`'$'`/
+`'\\'`) to this file's own trigger-byte set, 8 bytes per SWAR chunk, with
+a scalar fallback for the tail. This is structurally identical to
+`find_escape_aterm`. The real problem is establishing `cap`: the bound
+that makes an 8-byte `memcpy` read inside it provably safe. M140's own
+`find_escape_aterm`/`find_escape_json` both already know their input's
+exact length (`strlen()` on an already-fully-materialized C string)
+before any SWAR chunk is read. `lex_dquote_run` is discovering where a
+string literal ENDS, so there is no such pre-known length to bound it
+with.
+
+Two shortcuts were considered and rejected before settling on a third.
+First: an unconditional 8-byte `memcpy` at an arbitrary offset with no
+bound check at all. This is genuinely unsafe, not just theoretically,
+because `src` is sometimes a bare C string literal with no padding past
+its own NUL (`tests/ir/test_m45_codegen.c`, `bench/microbench_m45.c` both
+call `asnix_parse()` directly on string-literal arguments). This was
+confirmed by deliberately constructing exactly this shape under
+`-fsanitize=address,undefined` in this milestone's own correctness
+harness, before writing a single line of the real fix. Second: a single
+`strlen(src+*i)` call, the way M140's own callers use. This was also
+rejected, for a completely different reason: `src` here is the WHOLE
+FILE's buffer, not just one string literal, so `strlen(src+*i)` would
+scan all the way to the FILE's own trailing NUL, not this string's own
+closing `"`. For a file with many string literals (nixpkgs' own
+`meta.description`-laden package sets are exactly this shape), the SUM of
+those over-long `strlen()` calls is quadratic-ish in the literal count. A
+correctness-preserving but real performance-REGRESSING footgun is the
+opposite of this milestone's entire point.
+
+The fix landed (temporarily, see below): `strnlen(src+*i,
+DQUOTE_SWAR_WINDOW)` with window 64 establishes a safe sub-window bounded
+by a small constant, re-invoked window by window as the scan advances.
+Every byte `strnlen` touches, it already read without fault, so an
+8-byte SWAR chunk read anywhere inside that confirmed window is safe by
+construction. The total `strnlen` cost across a whole string stays
+O(real string length) plus O(1) overshoot, never O(file length). One
+further wrinkle: `'$'` needs a 1-byte lookahead (is the next byte `'{'`?)
+to know whether it is really a trigger. `strnlen` only proves bytes
+`[0,window)` safe when `window == DQUOTE_SWAR_WINDOW` (it stopped at the
+cap without finding a NUL, so it never touched index `window` itself). So
+the scan's own `cap` excludes the last byte of a full window (`cap =
+window - 1`), rather than risk an unverified lookahead read one past it.
+That excluded byte becomes the first byte of the next window's own
+freshly-verified scan instead.
+
+**Correctness, proven before this touched the real lexer, matching
+M140's own exact methodology.** A throwaway standalone harness
+(`/tmp/dquote_swar_test/test.c` this session, not shipped) extracted just
+the "find the next trigger byte, starting at position i0" step from both
+the OLD scalar loop and the NEW windowed-SWAR version, as two
+freestanding functions with identical signatures. It then compared their
+output byte-for-byte under `-fsanitize=address,undefined`:
+2,000,000 random trials (length 0-39, the 4 trigger bytes and non-ASCII
+bytes 0x80-0xff both deliberately over-represented, one in five trials
+also injecting an early truncating NUL to exercise the "file ends
+mid-literal" fatal path); an exhaustive sweep placing every special byte
+at every position for every length 0-30 (explicitly covering both the
+`${` and bare-`$`-not-followed-by-`{` sub-cases); and a dedicated
+multi-window sweep (length 210, every position 0-209, specifically
+covering the window boundary at 64/128/192 and the reserved-last-byte
+edge at 63/64/65, 127/128/129, 191/192/193). Total: **37,166,375 trials,
+zero mismatches, zero ASan/UBSan reports**. The fix was wired into the
+real `lexer.c` only after this came back clean. The full verification
+ladder was green with the fix in place: `make test`/`test-e2e`/
+`test-conformance` (296 e2e checks, all OK); `test-nix-conformance`:
+`pass=655 fail=3 skip=148` (the same 3 pre-existing pos-tracking
+failures); `test-nixpkgs-hash`: `pass=148 fail=0`. The output hash on
+`d.nix` stayed unchanged:
+`/nix/store/29iacg6h530yx7rxz4k1fhvi0kxxhsam-ffmpeg-9.0.1-bin`.
+
+**Measured on the real eval, and declined.** Two full binaries were
+built from the otherwise-identical tree (`git show HEAD:src/c/lexer.c`
+vs. the working tree, only `lexer.c` differing, manual file-swap rather
+than `git stash`, matching M129/M138/M140's own established precedent).
+8 INTERLEAVED trials ran (before, after, before, after, and so on, never
+batched, per this campaign's own standing measurement discipline,
+re-affirmed as necessary by M140's own writeup after a batched
+measurement there gave a false reading), using `taskset -c 0`,
+`cpu_core/instructions/,cpu_core/cycles/`, on a cold `d.nix` eval:
+
+| pair | before (instructions) | after (instructions) | delta |
+|---|---|---|---|
+| 1 | 7,049,497,811 | 7,052,557,721 | +3,059,910 |
+| 2 | 7,046,123,266 | 7,052,723,576 | +6,600,310 |
+| 3 | 7,043,342,890 | 7,062,395,245 | +19,052,355 |
+| 4 | 7,050,487,363 | 7,058,469,114 | +7,981,751 |
+| 5 | 7,047,819,188 | 7,057,733,647 | +9,914,459 |
+| 6 | 7,045,404,494 | 7,054,231,357 | +8,826,863 |
+| 7 | 7,045,599,784 | 7,051,594,756 | +5,994,972 |
+| 8 | 7,050,529,827 | 7,051,896,403 | +1,366,576 |
+
+**8 out of 8 pairs show the SWAR version using MORE instructions, never
+fewer.** The mean is +7,849,650 instructions, **+0.111%** on the whole
+eval. This is small, but completely one-directional. The same "does not
+need statistics to trust, just confirmation it is not a fluke" standard
+M145 used for its own much smaller deterministic WIN applies equally to
+this deterministic LOSS. Cycles were noisier, as usual on this shared
+host (one pair showed a +28% cycle spike unrelated to the instruction
+count, matching this session's own documented concurrent-load contention
+pattern). Excluding that one outlier pair, cycles moved +0.40%,
+directionally consistent with the instruction-count regression rather
+than contradicting it.
+
+**Root cause, reasoned through rather than left as "it just regressed."**
+The correctness fix above is not optional. `lex_dquote_run` cannot
+safely use an unconditional 8-byte read, or a single up-front
+`strlen()`, the way M140's own targets could. So some form of the
+`strnlen`-windowing overhead (a real, non-inlined libc call, plus the
+`window`/`cap` bookkeeping around it) is paid on every single call. That
+means every double-quoted string literal, and every re-entry after an
+interpolation, pays this cost. M140's own targets
+(`buf_put_escaped`/`jb_escape_string`) are called on long-ish derivation
+env/arg strings, where that fixed cost is amortized over genuinely long
+scans. This task's OWN framing predicted real Nix `"..."` literals would
+be "especially...hundreds of bytes" long enough to amortize a SWAR
+setup cost, the way `lex_indented_run`'s multi-line builder scripts
+plausibly are. But the measured regression says plain double-quoted
+literals in this real corpus are apparently mostly too SHORT for that to
+hold. So the fixed per-call overhead this correctness constraint demands
+costs more than the 8-bytes-at-a-time win saves. This is exactly the
+ceiling M142's own insertion-sort-beats-qsort-for-small-N finding warned
+about, just encountered empirically here instead of reasoned out in
+advance.
+
+**Declined and reverted.** `src/c/lexer.c` is back to its pre-milestone
+content, confirmed via `diff` against `git show HEAD:src/c/lexer.c`.
+Nothing shipped. The full ladder was re-run once more on the reverted
+tree, as a sanity check that this milestone leaves no trace: `make
+test`/`test-e2e`/`test-conformance` green, `test-nix-conformance`
+`pass=655 fail=3 skip=148`, `test-nixpkgs-hash` `pass=148 fail=0`,
+`d.nix` output hash unchanged.
+
+**Flagged, NOT attempted: a concrete idea for whoever picks this up
+next.** A hybrid scan could help. Run an inlined scalar fast path,
+identical to the original byte-at-a-time loop, for the first N bytes of
+any run (zero SWAR/`strnlen` call overhead, since it is the exact same
+code as today). Fall through to the windowed-SWAR path only once N
+consecutive plain bytes have been seen without a trigger. This would pay
+the original code's own cost for every SHORT run (the apparent common
+case here), while still capturing the SWAR win for genuinely long runs.
+This was not attempted this milestone: it adds real control-flow
+complexity (the fast path and the windowed path need to hand off cleanly
+mid-scan, including the `'$'`-lookahead and backslash-escape cases) for
+an opportunity already sized at well under 1% before any of this
+milestone's own overhead is counted. This milestone's time was better
+spent confirming the straightforward port's real-world result honestly,
+than iterating on a fancier version without first knowing whether the
+plain version would have been enough. `lex_indented_run` was not
+attempted at all (self-time too small, about 0.075%, to justify its own
+harder multi-byte-lookahead complexity, even before any regression risk
+is counted). Both are left as explicit future work, not silently
+dropped.
+
+**Also noted, out of this milestone's own assigned scope.** The same
+`perf annotate` classification pass incidentally found `lex_path_run`
+(the sibling scan for path-literal content after an interpolation, e.g.
+`./a-${foo}-b`) attributed with a notably LARGER share of `lex_until`'s
+own self-time (31.6-33.1% across the two captures, vs. `lex_dquote_run`'s
+12.2-13.5%). That is roughly **2.0% of the whole eval's own self-time**:
+a meaningfully bigger target than either string-scan function this
+milestone was assigned. It is not yet confirmed via its own dedicated
+correctness or measurement pass, and it was not investigated further
+here (out of scope, flagged for whichever milestone picks it up, same as
+M129's own "not investigated here" footnotes always are).
+
+Files: none shipped (`src/c/lexer.c` reverted to its pre-milestone
+content; this section is the only durable artifact of this milestone).
