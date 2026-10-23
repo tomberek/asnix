@@ -14919,3 +14919,130 @@ surface being audited for correctness in one pass.
 
 Files: `src/c/compiler.c` (`try_fold_const_binop`, `is_thunk_free_
 literal`'s `AST_BINOP` case, `compile_expr`'s `AST_BINOP` case).
+
+## M137: zero-copy mmap for the bytecode-cache READ path, plus exact ops-array presizing on deserialize
+
+Directed follow-up to the M94/M98/M107 bytecode cache and a research
+pass (not a separate milestone) that found `asnix_bytecode_deserialize`/
+`read_program_into`/`read_one_tagged_op` accounted for 17-19% of samples
+on a warm-cache eval, recursing once per nested sub-program. Scoped
+narrowly to "make a cache HIT avoid copying the entry's bytes," not a
+full on-disk format redesign -- see the honest scope note below for why
+a true parse-free mmap format isn't viable without much larger,
+unrelated changes.
+
+**What changed, `src/c/bytecode_cache.c`.** Both `asnix_bytecode_cache_
+lookup_fast` and `asnix_bytecode_cache_lookup_verify` used to `fopen`,
+`fseek`/`ftell` to find the body's length, `malloc` a buffer sized to
+exactly that length, and `fread` the whole body into it before handing
+that heap copy to `asnix_bytecode_deserialize`. Replaced with
+`mmap_whole_file` (`open`+`fstat`+`mmap(..., PROT_READ, MAP_PRIVATE,
+fd, 0)`, mapping from offset 0 -- always page-aligned, unlike the
+header-relative body offset mmap's own `offset` parameter requires to
+be page-aligned -- then `close(fd)`, since a successful mapping keeps
+the pages resident independent of the fd that created it) plus
+`parse_header_from_buf` (reads the fixed 72-byte header directly out of
+the mapped bytes via `memcpy`, not a pointer-cast, to stay correct on
+any platform where the header's own field offsets might not be
+naturally aligned for that field's type -- they happen to be 8-byte-
+aligned today, but the code doesn't rely on that). The deserializer
+itself is handed `map + CACHE_HEADER_LEN` directly -- the only copy left
+anywhere in the HIT path is the deserializer's own construction of the
+OUTPUT `IrProgram` (ops/pool arrays), which this milestone does not
+touch; what's eliminated is the separate, redundant copy of the INPUT
+bytes the old code made on top of that. `lookup_verify`'s self-heal
+rewrite (`write_entry_atomic`) now reads directly from the still-valid
+mapped `body` pointer instead of the old malloc'd copy, since
+`write_entry_atomic` only ever reads via `fwrite`, never retains the
+pointer past its own return.
+
+**What changed, `src/c/bytecode.c`.** `read_program_into` already reads
+`n_ops` as its very first field, and -- verified directly against
+`write_program`'s own counting (`program_op_count`, over the ORIGINAL
+uncollapsed op array before `OP_MK_ATTRS`'s grouped pairs fold into one
+`PTAG_OP_ATTRS` entry) and against this same function's own loop, which
+advances `i` by however many ops a single tagged entry actually emits
+(`PTAG_OP_ATTRS` emits `count+1` for one group entry, every other tag
+emits exactly 1) -- `n_ops` is always this level's EXACT final `d->len`,
+never more or less. Every `DBuilder` reaching `read_program_into` is
+freshly `{0}`-initialized by its one call site (the top-level call in
+`asnix_bytecode_deserialize`, or `PTAG_OP_THUNK`/`PTAG_OP_LAMBDA`'s own
+fresh `child = {0}`), so `d->cap == 0` reliably means "first and only
+time this level's own `ops` array is sized." Presizing `d->ops` to
+exactly `n_ops` up front replaces `db_emit`'s usual start-at-16-and-
+double growth with ONE allocation and ZERO growth-reallocs for `ops` at
+every level -- mirroring M123's lexer `TokVec` precedent (presize when
+the final count is already known, rather than discover it by doubling).
+`pool` has no equivalent exact count (`OP_CHECK_FORMALS`/`OP_REC_
+OVERRIDES_MERGE` can add many pool entries for a single op), so its
+presize to `n_ops` is only a heuristic starting guess -- still correctly
+grows via the ordinary doubling path in `db_pool_add` if exceeded, same
+safety as before, just a smaller or zero chance of ever needing to.
+
+**Measured** (`perf stat`, `taskset -c 0` pinned to a confirmed quiet
+P-core, warm `ASNIX_BYTECODE_CACHE=1` on a real `d.nix`/ffmpeg eval,
+1056 cached imports; two binaries built from the otherwise-identical
+tree with only `bytecode.c`/`bytecode_cache.c` swapped, 3 interleaved
+before/after pairs to rule out host-load confounds rather than trusting
+one measurement):
+- Instructions: 7,072.4M -> 6,918.8M, **-2.17%** (<0.02% noise on every
+  single run -- a hard, repetition-independent fact, not a noisy
+  average: this is exactly the `ops`-array-presizing fix's own effect,
+  since eliminating growth-reallocs removes a fixed, countable number of
+  `realloc`/copy operations regardless of run-to-run timing variance).
+- Cycles: 3,996.7M -> 3,806.7M, **-4.75%** (consistent direction across
+  all 3 pairs: -0.68%/-3.43%/+-noise, -3.71%/+-noise, -5.80%/+-noise --
+  individual-pair deltas vary with host load, but every pair moved the
+  same direction).
+- Wall-clock: 1.185s -> 1.111s, **-6.24%** across the same 3 pairs.
+- Cycles' reduction (4.75%) exceeding instructions' (2.17%) is the same
+  signature M129's `CHAR_CLASS` table found: removing the `malloc`+
+  `fread` copy doesn't just remove instructions, it removes whatever
+  page faults/cache-line touches that copy itself caused, on top of
+  the instructions a disassembly count alone would show.
+
+**Correctness, verified three ways beyond the full suite below**: (1)
+cold-then-warm run on `d.nix` with `ASNIX_BYTECODE_CACHE_STATS=1` --
+identical output hash both runs, 1038/1039 fast-path hits on the warm
+run; (2) `touch`ed every cached source file's mtime without changing
+content, confirming the content-verify + self-heal path (20 content-
+verified hits, then back to 1038 fast-path hits on the NEXT run,
+confirming self-heal actually re-stamps the entry); (3) two full passes
+of `test-nix-conformance` (`NIX_CONFORMANCE_DIR=/tmp/nix-conformance`,
+806-file corpus) with `ASNIX_BYTECODE_CACHE=1` -- cold and warm, both
+`pass=655 fail=3 skip=148`, same 3 pre-existing pos-tracking failures --
+plus two passes of `test-nixpkgs-hash` the same way, both `pass=148
+fail=0`.
+
+**Verified**: `make test`/`test-e2e`/`test-conformance` all green (no
+`ASNIX_BYTECODE_CACHE` set, the default path, confirming this change is
+a true no-op when the cache is disabled). `make test-nix-conformance`:
+`pass=655 fail=3 skip=148` (exact baseline, cache disabled). `make
+test-nixpkgs-hash`: `pass=148 fail=0`. Output hash on `d.nix` unchanged
+across every configuration tested above.
+
+**Honest scope note -- why this is "zero-copy I/O," not "zero-copy
+format"**: the deeper vision implied by "mmap+fixup bytecode cache" --
+mapping the cache file and using its `ops`/`pool` arrays almost as-is,
+with only a cheap relocation pass instead of any real parsing -- is NOT
+what this milestone does, and isn't viable without a much larger,
+separate redesign. The current on-disk format (`bytecode.c`'s varint-
+encoded, per-op-tagged stream) re-interns every symbol name into THIS
+process's own id space on every load (`asnix_intern`, ids are assigned
+by first-seen order and differ run to run), re-sorts `OP_MK_ATTRS`/
+`OP_CHECK_FORMALS`'s symbol lists against those freshly-assigned ids,
+and resolves every op's `handler` field to an actual function pointer
+via `ir_link` (a process's own `.text` addresses, not stable across
+runs) -- none of that work can be skipped by a smarter memory-mapping
+scheme alone; it would need a new wire format that defers symbol
+identity to runtime (storing names, not ids, at every op site, with a
+level of indirection the current ops-execute-directly design doesn't
+have) and a stable index scheme for handler identity, which is a
+materially larger, correctness-sensitive change out of scope here. What
+this milestone removes is strictly the cache LAYER's own copy of the
+file's bytes before handing them to that existing parser -- a real,
+measured, bounded win, not the full "no deserialization at all" vision.
+
+Files: `src/c/bytecode_cache.c` (`mmap_whole_file`, `parse_header_from_
+buf`, both `asnix_bytecode_cache_lookup_fast`/`_verify`), `src/c/
+bytecode.c` (`read_program_into`'s presizing only).

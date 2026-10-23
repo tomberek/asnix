@@ -880,6 +880,38 @@ static int read_one_tagged_op(RCur *r, DBuilder *d) {
 static int read_program_into(RCur *r, DBuilder *d) {
     int64_t n_ops = rcur_i64(r);
     if (r->failed || n_ops <= 0 || n_ops > 10000000) return -1;
+    /* perf (M137): `n_ops` is this level's EXACT final `d->len` -- verified
+     * against write_program's own counting (program_op_count, called on
+     * the ORIGINAL uncollapsed op array before OP_MK_ATTRS's grouped
+     * pairs are folded into one PTAG_OP_ATTRS entry) and against
+     * read_program_into's own loop below, which advances `i` by however
+     * many ops a single tagged entry actually emits (PTAG_OP_ATTRS emits
+     * `count+1` for one group entry, every other tag emits exactly 1) --
+     * so by the time this loop finishes, `d->len` always equals `n_ops`
+     * exactly, never more or less. Presizing `d->ops` to `n_ops` up front
+     * (this DBuilder is always freshly `{0}`-initialized by every call
+     * site -- the top-level call in asnix_bytecode_deserialize and both
+     * PTAG_OP_THUNK/PTAG_OP_LAMBDA's own fresh `child = {0}`) replaces
+     * db_emit's usual start-at-16-and-double growth with a SINGLE
+     * allocation and zero growth-reallocs for `ops` at this level,
+     * mirroring M123's lexer TokVec precedent (presize when the final
+     * count is already known, rather than discover it by doubling).
+     * `pool` has no equivalent exact count (OP_CHECK_FORMALS/
+     * OP_REC_OVERRIDES_MERGE can add many pool entries for a single op),
+     * so it's only a heuristic starting guess here -- still correctly
+     * grows via the ordinary doubling path in db_pool_add if exceeded,
+     * same safety as before this change, just a smaller/zero chance of
+     * ever needing to. */
+    if (d->cap == 0) {
+        d->ops = malloc((size_t)n_ops * sizeof(IrOp));
+        if (!d->ops) return -1;
+        d->cap = (size_t)n_ops;
+    }
+    if (d->pool_cap == 0) {
+        d->pool = malloc((size_t)n_ops * sizeof(int64_t));
+        if (!d->pool) return -1;
+        d->pool_cap = (size_t)n_ops;
+    }
     int64_t emitted_before;
     for (int64_t i = 0; i < n_ops;) {
         emitted_before = (int64_t)d->len;

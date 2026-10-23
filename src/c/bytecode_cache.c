@@ -3,10 +3,12 @@
 #include "bytecode_cache.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -158,17 +160,60 @@ static int write_header(FILE *f, const CacheHeader *h) {
     return 0;
 }
 
-static int read_header(FILE *f, CacheHeader *h) {
-    char magic[8];
-    uint8_t ver, pad[7];
-    if (fread(magic, 1, 8, f) != 8 || memcmp(magic, CACHE_FORMAT_MAGIC, 8) != 0) return -1;
-    if (fread(&ver, 1, 1, f) != 1 || ver != CACHE_FORMAT_VERSION) return -1;
-    if (fread(pad, 1, 7, f) != 7) return -1;
-    if (fread(&h->mtime_sec, sizeof h->mtime_sec, 1, f) != 1) return -1;
-    if (fread(&h->mtime_nsec, sizeof h->mtime_nsec, 1, f) != 1) return -1;
-    if (fread(&h->size, sizeof h->size, 1, f) != 1) return -1;
-    if (fread(h->content_hash, 1, ASNIX_HASH_SHA256_LEN, f) != ASNIX_HASH_SHA256_LEN) return -1;
+/* `write_header` above writes each field with its own `fwrite` call (not
+ * one `fwrite(h, sizeof *h, 1, f)` of the struct), so the on-disk layout
+ * is exactly 8(magic)+1(ver)+7(pad)+8(mtime_sec)+8(mtime_nsec)+8(size)+
+ * 32(content_hash) = 72 bytes, with every multi-byte field falling on an
+ * 8-byte boundary -- fixed and self-contained, independent of this
+ * struct's own in-memory padding on any given platform. */
+#define CACHE_HEADER_LEN 72
+
+/* perf (M137): parses the header directly out of an mmap'd buffer instead
+ * of `fread`ing it field-by-field through a `FILE*` -- paired with
+ * `mmap_whole_file` below, this is the first half of making a cache HIT
+ * avoid ever copying the entry's bytes into a heap buffer at all; see
+ * that function's own comment for the full rationale. `memcpy` (not a
+ * direct pointer-cast read) for the multi-byte fields, since `buf` is
+ * only guaranteed byte-aligned, not aligned to each field's own type --
+ * even though CACHE_HEADER_LEN's own offsets happen to fall on 8-byte
+ * boundaries today, a strict-aliasing/misaligned-access violation is a
+ * real risk on some platforms/compilers if read via `*(int64_t*)`. */
+static int parse_header_from_buf(const uint8_t *buf, size_t len, CacheHeader *h) {
+    if (len < CACHE_HEADER_LEN) return -1;
+    if (memcmp(buf, CACHE_FORMAT_MAGIC, 8) != 0) return -1;
+    if (buf[8] != CACHE_FORMAT_VERSION) return -1;
+    memcpy(&h->mtime_sec, buf + 16, sizeof h->mtime_sec);
+    memcpy(&h->mtime_nsec, buf + 24, sizeof h->mtime_nsec);
+    memcpy(&h->size, buf + 32, sizeof h->size);
+    memcpy(h->content_hash, buf + 40, ASNIX_HASH_SHA256_LEN);
     return 0;
+}
+
+/* perf (M137): the actual zero-copy step -- maps the WHOLE cache-entry
+ * file read-only instead of `fopen`+`fseek`+`malloc`+`fread`ing its body
+ * into a fresh heap buffer. Mapping from offset 0 (always page-aligned,
+ * unlike the header-relative body offset, which mmap's own `offset`
+ * parameter requires to be page-aligned) and returning a pointer into
+ * the mapping lets the caller read the header AND hand the body straight
+ * to `asnix_bytecode_deserialize` with no intervening copy at all -- the
+ * kernel's own page cache becomes the only backing store, demand-paged
+ * exactly like any other read-only mapped file. Returns NULL on any
+ * failure (missing file, empty file, mmap failure); the fd is always
+ * closed before returning, since a successful mapping keeps the pages
+ * resident independent of the fd that created it. */
+static const uint8_t *mmap_whole_file(const char *path, size_t *out_len) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return NULL;
+    struct stat st;
+    if (fstat(fd, &st) != 0 || st.st_size <= 0) {
+        close(fd);
+        return NULL;
+    }
+    void *p = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (p == MAP_FAILED) return NULL;
+    *out_len = (size_t)st.st_size;
+    return (const uint8_t *)p;
 }
 
 /* Visibility: ASNIX_BYTECODE_CACHE_STATS=1 (on top of ASNIX_BYTECODE_CACHE=1)
@@ -255,15 +300,16 @@ IrProgram *asnix_bytecode_cache_lookup_fast(const char *resolved_path, int64_t m
     if (!asnix_bytecode_cache_enabled()) return NULL;
     ensure_stats_atexit();
     char *path = cache_file_path(resolved_path);
-    FILE *f = fopen(path, "rb");
+    size_t total_len;
+    const uint8_t *map = mmap_whole_file(path, &total_len);
     free(path);
-    if (!f) {
+    if (!map) {
         g_stat_misses++;
         return NULL;
     }
     CacheHeader hdr;
-    if (read_header(f, &hdr) != 0) {
-        fclose(f);
+    if (parse_header_from_buf(map, total_len, &hdr) != 0) {
+        munmap((void *)map, total_len);
         g_stat_misses++;
         return NULL;
     }
@@ -273,33 +319,19 @@ IrProgram *asnix_bytecode_cache_lookup_fast(const char *resolved_path, int64_t m
          * touch(1) with unchanged content). Caller should try the
          * content-hash fallback (asnix_bytecode_cache_lookup_verify)
          * rather than treating this as an outright miss yet. */
-        fclose(f);
+        munmap((void *)map, total_len);
         return NULL;
     }
-    long body_start = ftell(f);
-    if (fseek(f, 0, SEEK_END) != 0) {
-        fclose(f);
-        g_stat_misses++;
-        return NULL;
-    }
-    long end = ftell(f);
-    if (body_start < 0 || end < body_start) {
-        fclose(f);
-        g_stat_misses++;
-        return NULL;
-    }
-    fseek(f, body_start, SEEK_SET);
-    size_t body_len = (size_t)(end - body_start);
-    uint8_t *buf = malloc(body_len > 0 ? body_len : 1);
-    size_t got = fread(buf, 1, body_len, f);
-    fclose(f);
-    if (got != body_len) {
-        free(buf);
-        g_stat_misses++;
-        return NULL;
-    }
-    IrProgram *prog = asnix_bytecode_deserialize(buf, body_len);
-    free(buf);
+    /* perf (M137): `asnix_bytecode_deserialize` reads straight out of the
+     * mapped page cache -- no malloc, no fread, no intervening copy of
+     * the entry's body at all (the deserializer itself still walks/
+     * allocates the OUTPUT IrProgram, same as before; what's eliminated
+     * here is the separate, redundant copy of the INPUT bytes this
+     * function used to make before handing them over). */
+    const uint8_t *body = map + CACHE_HEADER_LEN;
+    size_t body_len = total_len - CACHE_HEADER_LEN;
+    IrProgram *prog = asnix_bytecode_deserialize(body, body_len);
+    munmap((void *)map, total_len);
     if (prog) {
         g_stat_hits++;
         g_stat_fast_hits++;
@@ -322,15 +354,16 @@ IrProgram *asnix_bytecode_cache_lookup_verify(const char *resolved_path, const c
     if (!asnix_bytecode_cache_enabled()) return NULL;
     ensure_stats_atexit();
     char *path = cache_file_path(resolved_path);
-    FILE *f = fopen(path, "rb");
-    if (!f) {
+    size_t total_len;
+    const uint8_t *map = mmap_whole_file(path, &total_len);
+    if (!map) {
         free(path);
         g_stat_misses++;
         return NULL;
     }
     CacheHeader hdr;
-    if (read_header(f, &hdr) != 0) {
-        fclose(f);
+    if (parse_header_from_buf(map, total_len, &hdr) != 0) {
+        munmap((void *)map, total_len);
         free(path);
         g_stat_misses++;
         return NULL;
@@ -340,32 +373,14 @@ IrProgram *asnix_bytecode_cache_lookup_verify(const char *resolved_path, const c
         /* Either couldn't hash, or content genuinely differs -- a real
          * miss; the caller will recompile and asnix_bytecode_cache_store
          * will overwrite this stale entry. */
-        fclose(f);
+        munmap((void *)map, total_len);
         free(path);
         g_stat_misses++;
         return NULL;
     }
-    long body_start = ftell(f);
-    fseek(f, 0, SEEK_END);
-    long end = ftell(f);
-    if (body_start < 0 || end < body_start) {
-        fclose(f);
-        free(path);
-        g_stat_misses++;
-        return NULL;
-    }
-    fseek(f, body_start, SEEK_SET);
-    size_t body_len = (size_t)(end - body_start);
-    uint8_t *buf = malloc(body_len > 0 ? body_len : 1);
-    size_t got = fread(buf, 1, body_len, f);
-    fclose(f);
-    if (got != body_len) {
-        free(buf);
-        free(path);
-        g_stat_misses++;
-        return NULL;
-    }
-    IrProgram *prog = asnix_bytecode_deserialize(buf, body_len);
+    const uint8_t *body = map + CACHE_HEADER_LEN;
+    size_t body_len = total_len - CACHE_HEADER_LEN;
+    IrProgram *prog = asnix_bytecode_deserialize(body, body_len);
     if (prog) {
         g_stat_hits++;
         g_stat_verify_hits++;
@@ -373,16 +388,20 @@ IrProgram *asnix_bytecode_cache_lookup_verify(const char *resolved_path, const c
          * entry with the FRESH mtime/size the caller just stat'd --
          * restores the fast path for this exact path on the next
          * lookup, at the one-time cost of rewriting the entry (same
-         * atomic write-temp-then-rename every store already pays). */
+         * atomic write-temp-then-rename every store already pays).
+         * `body` is still a valid pointer into the mapping at this point
+         * (munmap happens below, after this call) -- write_entry_atomic
+         * only ever reads from it (via fwrite), never retains it past
+         * its own return. */
         CacheHeader fresh = hdr;
         fresh.mtime_sec = mtime_sec;
         fresh.mtime_nsec = mtime_nsec;
         fresh.size = size;
-        write_entry_atomic(path, &fresh, buf, body_len);
+        write_entry_atomic(path, &fresh, body, body_len);
     } else {
         g_stat_misses++;
     }
-    free(buf);
+    munmap((void *)map, total_len);
     free(path);
     return prog;
 }
