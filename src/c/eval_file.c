@@ -4,6 +4,7 @@
 
 #include "eval_file.h"
 
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -300,29 +301,84 @@ static Ast *parse_file(const char *path, char **resolved_out, char **base_dir_ou
  * strace's own massive per-syscall overhead -- just a severe, self-
  * inflicted amount of genuinely redundant work).
  *
- * A plain linear-scan array, not a hash table: the number of distinct
- * files a single process imports is small relative to the cost of each
- * entry (a full parse+compile+eval), so a linear strcmp scan's cost is
- * negligible next to what it's saving -- same "simple first" judgment
- * call as symtab.c's own choice to use a real hash table only once
- * *that* linear scan's cost (comparing every interned string) started
- * to matter at a much higher call frequency. Grows by doubling, same
- * convention as every other dynamic array in this codebase. */
+ * Was a plain linear-scan array, not a hash table: the original judgment
+ * ("the number of distinct files a single process imports is small
+ * relative to the cost of each entry, so a linear strcmp scan's cost is
+ * negligible") is now confirmed stale at real nixpkgs scale -- measured
+ * directly (`perf record -g` on a real `d.nix`/ffmpeg eval): this
+ * function's `strcmp` calls are the single largest contributor to
+ * `__strcmp_avx2` being 12.44% of ALL process self-time, because a real
+ * eval imports well over a thousand distinct files (M123's own corpus:
+ * 1057) and calls this on every one of the many thousands of `import`
+ * *expressions* that reference them (not just once per distinct file --
+ * every repeated `import <nix/fetchurl.nix>`-style reference pays a
+ * full linear scan against however many distinct files have been
+ * imported so far). Converted to the same open-addressed, linear-probe
+ * hash-index technique `parser.c`'s `BTVec`/`btvec_index_rehash` and
+ * `symtab.c`'s own table already use: a parallel `size_t` slot table
+ * mapping each path's hash to its index in `g_import_cache`, grown/
+ * rehashed at a 75% load factor BEFORE each insert (so rehash only ever
+ * sees already-inserted entries), `g_import_cache` itself kept exactly
+ * as it was (still the single source of truth for path/Value pairs;
+ * the index is purely an O(1)-average lookup accelerator on top of it,
+ * same relationship `BTVec.index` has to `BTVec.items`). Grows by
+ * doubling, same convention as every other dynamic array in this
+ * codebase. */
 typedef struct {
     char *path;
     Value value;
 } ImportCacheEntry;
 static ImportCacheEntry *g_import_cache = NULL;
 static size_t g_import_cache_count = 0, g_import_cache_cap = 0;
+static size_t *g_import_cache_index = NULL;
+static size_t g_import_cache_index_cap = 0;
+#define IMPORT_CACHE_EMPTY_SLOT ((size_t)-1)
+
+static uint64_t import_cache_hash(const char *s, size_t len) {
+    uint64_t h = 0;
+    for (size_t i = 0; i < len; i++) {
+        h ^= (uint64_t)(unsigned char)s[i];
+        h *= 0x517cc1b727220a95ULL;
+    }
+    h ^= h >> 30;
+    h *= 0xbf58476d1ce4e5b9ULL;
+    h ^= h >> 27;
+    h *= 0x94d049bb133111ebULL;
+    h ^= h >> 31;
+    return h;
+}
+
+/* Rebuilds the index from scratch against `g_import_cache[0..
+ * g_import_cache_count)` -- the entry about to be inserted is NOT yet
+ * in `g_import_cache` when this is called from `import_cache_insert`
+ * (matching `btvec_index_rehash`'s own documented ordering). */
+static void import_cache_index_rehash(size_t new_cap) {
+    size_t *new_table = malloc(new_cap * sizeof(size_t));
+    for (size_t i = 0; i < new_cap; i++) new_table[i] = IMPORT_CACHE_EMPTY_SLOT;
+    for (size_t i = 0; i < g_import_cache_count; i++) {
+        size_t len = strlen(g_import_cache[i].path);
+        size_t slot = import_cache_hash(g_import_cache[i].path, len) & (new_cap - 1);
+        while (new_table[slot] != IMPORT_CACHE_EMPTY_SLOT) slot = (slot + 1) & (new_cap - 1);
+        new_table[slot] = i;
+    }
+    free(g_import_cache_index);
+    g_import_cache_index = new_table;
+    g_import_cache_index_cap = new_cap;
+}
 
 static int import_cache_find(const char *resolved, Value *out) {
-    for (size_t i = 0; i < g_import_cache_count; i++) {
-        if (strcmp(g_import_cache[i].path, resolved) == 0) {
-            *out = g_import_cache[i].value;
+    if (g_import_cache_index_cap == 0) return 0;
+    size_t len = strlen(resolved);
+    size_t slot = import_cache_hash(resolved, len) & (g_import_cache_index_cap - 1);
+    for (;;) {
+        size_t idx = g_import_cache_index[slot];
+        if (idx == IMPORT_CACHE_EMPTY_SLOT) return 0;
+        if (strcmp(g_import_cache[idx].path, resolved) == 0) {
+            *out = g_import_cache[idx].value;
             return 1;
         }
+        slot = (slot + 1) & (g_import_cache_index_cap - 1);
     }
-    return 0;
 }
 
 static void import_cache_insert(const char *resolved, Value v) {
@@ -330,11 +386,21 @@ static void import_cache_insert(const char *resolved, Value v) {
         g_import_cache_cap = g_import_cache_cap ? g_import_cache_cap * 2 : 64;
         g_import_cache = realloc(g_import_cache, g_import_cache_cap * sizeof(ImportCacheEntry));
     }
+    /* Grow/rehash the index BEFORE appending, same ordering as
+     * `btvec_push` -- rehash only ever sees entries already in
+     * `g_import_cache`, so the explicit insert below never collides
+     * with work rehash just did. 75% load factor, matching symtab.c/
+     * derivation.c/parser.c's own tables. */
+    if (g_import_cache_index_cap == 0) import_cache_index_rehash(128);
+    else if ((g_import_cache_count + 1) * 4 > g_import_cache_index_cap * 3) import_cache_index_rehash(g_import_cache_index_cap * 2);
     size_t len = strlen(resolved);
     char *copy = malloc(len + 1);
     memcpy(copy, resolved, len + 1);
     g_import_cache[g_import_cache_count].path = copy;
     g_import_cache[g_import_cache_count].value = v;
+    size_t slot = import_cache_hash(copy, len) & (g_import_cache_index_cap - 1);
+    while (g_import_cache_index[slot] != IMPORT_CACHE_EMPTY_SLOT) slot = (slot + 1) & (g_import_cache_index_cap - 1);
+    g_import_cache_index[slot] = g_import_cache_count;
     g_import_cache_count++;
 }
 
