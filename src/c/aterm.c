@@ -21,18 +21,27 @@ static void buf_putc(Buf *b, char c) {
     b->buf[b->len++] = c;
 }
 
-static void buf_puts(Buf *b, const char *s) {
-    size_t n = strlen(s);
-    buf_reserve(b, n);
-    memcpy(b->buf + b->len, s, n);
-    b->len += n;
-}
-
 static void buf_put_bytes(Buf *b, const char *s, size_t n) {
     buf_reserve(b, n);
     memcpy(b->buf + b->len, s, n);
     b->len += n;
 }
+
+/* M154: every single call site below passes a C STRING LITERAL (the fixed
+ * ATerm structural punctuation, plus the 5 two-byte escape sequences
+ * \n/\r/\t/\"/\\ -- never a `derivation.c`-owned dynamic string; those all
+ * go through `buf_put_escaped`/`buf_put_escaped_raw` instead). A literal's
+ * length is known at compile time via `sizeof`, so there is nothing to
+ * measure with a runtime `strlen()` call -- the previous `buf_puts(Buf*,
+ * const char*)` helper strlen()'d its argument on every call, including
+ * the 5 escape-sequence cases inside `buf_put_escaped_raw`'s hot loop
+ * (one call per actual \n/\r/\t/"/\\ byte escaped -- e.g. every newline in
+ * a multi-line `buildCommand`/env value). `lit` MUST be a string literal
+ * (or other `char[N]`), not a `char *` variable -- `sizeof` on a pointer
+ * would silently compute the wrong (pointer-sized) length instead of
+ * failing loudly, so this is deliberately NOT a general-purpose replacement
+ * for `buf_puts`. */
+#define buf_put_lit(b, lit) buf_put_bytes((b), (lit), sizeof(lit) - 1)
 
 /* perf (M138): SWAR scan for the aterm escape set (\n \r \t \" \\),
  * processing 8 bytes per iteration instead of one branchy compare-chain
@@ -194,11 +203,11 @@ static void buf_put_escaped_raw(Buf *b, const char *s) {
         if (esc != pos) buf_put_bytes(b, (const char *)(p + pos), esc - pos);
         if (esc == len) break;
         switch (p[esc]) {
-            case '\n': buf_puts(b, "\\n"); break;
-            case '\r': buf_puts(b, "\\r"); break;
-            case '\t': buf_puts(b, "\\t"); break;
-            case '"': buf_puts(b, "\\\""); break;
-            case '\\': buf_puts(b, "\\\\"); break;
+            case '\n': buf_put_lit(b, "\\n"); break;
+            case '\r': buf_put_lit(b, "\\r"); break;
+            case '\t': buf_put_lit(b, "\\t"); break;
+            case '"': buf_put_lit(b, "\\\""); break;
+            case '\\': buf_put_lit(b, "\\\\"); break;
         }
         pos = esc + 1;
     }
@@ -239,7 +248,7 @@ char *asnix_build_derivation_aterm_cached(const AtermOutput *outputs, size_t nou
                                            const AtermEnvVar *env, size_t nenv, AtermEscapeCache *cache) {
     Buf b = { 0 };
 
-    buf_puts(&b, "Derive([");
+    buf_put_lit(&b, "Derive([");
     for (size_t i = 0; i < noutputs; i++) {
         if (i > 0) buf_putc(&b, ',');
         buf_putc(&b, '(');
@@ -252,24 +261,24 @@ char *asnix_build_derivation_aterm_cached(const AtermOutput *outputs, size_t nou
         buf_put_escaped(&b, outputs[i].hash ? outputs[i].hash : "", cache);
         buf_putc(&b, ')');
     }
-    buf_puts(&b, "],[");
+    buf_put_lit(&b, "],[");
     for (size_t i = 0; i < ninput_drvs; i++) {
         if (i > 0) buf_putc(&b, ',');
         buf_putc(&b, '(');
         buf_put_escaped(&b, input_drvs[i].drv_path, cache);
-        buf_puts(&b, ",[");
+        buf_put_lit(&b, ",[");
         for (size_t j = 0; j < input_drvs[i].noutput_names; j++) {
             if (j > 0) buf_putc(&b, ',');
             buf_put_escaped(&b, input_drvs[i].output_names[j], cache);
         }
-        buf_puts(&b, "])");
+        buf_put_lit(&b, "])");
     }
-    buf_puts(&b, "],[");
+    buf_put_lit(&b, "],[");
     for (size_t i = 0; i < ninput_srcs; i++) {
         if (i > 0) buf_putc(&b, ',');
         buf_put_escaped(&b, input_srcs[i], cache);
     }
-    buf_puts(&b, "],");
+    buf_put_lit(&b, "],");
     buf_put_escaped(&b, system, cache);
     buf_putc(&b, ',');
     buf_put_escaped(&b, builder, cache);
@@ -280,7 +289,7 @@ char *asnix_build_derivation_aterm_cached(const AtermOutput *outputs, size_t nou
         if (i > 0) buf_putc(&b, ',');
         buf_put_escaped(&b, args[i], cache);
     }
-    buf_puts(&b, "],[");
+    buf_put_lit(&b, "],[");
     for (size_t i = 0; i < nenv; i++) {
         if (i > 0) buf_putc(&b, ',');
         buf_putc(&b, '(');
@@ -289,7 +298,7 @@ char *asnix_build_derivation_aterm_cached(const AtermOutput *outputs, size_t nou
         buf_put_escaped(&b, env[i].value, cache);
         buf_putc(&b, ')');
     }
-    buf_puts(&b, "])");
+    buf_put_lit(&b, "])");
 
     buf_putc(&b, '\0'); /* buf_reserve always keeps +1 slack for this */
     return b.buf;

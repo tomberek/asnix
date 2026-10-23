@@ -17686,3 +17686,134 @@ to happen for phase 2 to run at all.
 Files: `src/asm/ops/op_select.S` (bug fix only -- the probe wiring itself
 is unchanged from M111), `src/asm/ops/op_select_or.S`,
 `src/asm/ops/op_has_attr.S`.
+
+## M156: `aterm.c`'s `buf_puts` strlen()'d every literal it was ever called with, even though all 13 call sites pass a compile-time string literal
+
+A profiling pass named `aterm.c`'s `buf_puts()` as a real, if modest,
+follow-on to M152's own escape cache: on a cache MISS (the real escaping
+work M152 explicitly left un-deduplicated), `buf_put_escaped_raw` calls
+`buf_puts(b, "\\n")`/`"\\r"`/`"\\t"`/`"\\\""`/`"\\\\"` once per actual
+escaped byte, and the file's literal structural punctuation
+(`"Derive(["`, `"],["`, etc.) the same way -- and `buf_puts` computed
+each one's length with a runtime `strlen()` call, despite every single
+one of its 13 call sites (confirmed with `grep -rn buf_puts src/c/*.c`
+across the whole tree, not just this file) passing a literal whose
+length `sizeof` already gives at compile time. The handoff's own
+hypothesis additionally named a second, harder cost: the one genuinely
+dynamic `strlen(s)` inside `buf_put_escaped_raw` itself (computing the
+length of the actual derivation-field string being escaped), and
+proposed threading a `_len` field through `AtermOutput`/`AtermInputDrv`/
+`AtermEnvVar` to avoid it too -- the exact change M147 had already looked
+at and explicitly scoped OUT as "a wider-blast-radius change than this
+milestone's scope."
+
+**What this milestone did.** Fixed the first, bounded half only. Replaced
+`buf_puts(Buf*, const char*)` with a macro,
+`buf_put_lit(b, lit) buf_put_bytes((b), (lit), sizeof(lit) - 1)`, and
+updated all 13 call sites. Every call site was re-verified by `grep` to
+be a string literal before the rename, so `sizeof(lit)-1` is exactly the
+right length at every one of them, computed at compile time with zero
+runtime cost. The macro's own doc comment calls out explicitly that it is
+NOT a drop-in general replacement for a `buf_puts`-shaped helper: passing
+it a `char*` variable instead of a literal would silently compute
+`sizeof(a pointer) - 1` (7) instead of failing loudly, so it is
+deliberately scoped to this file's own literal-only call sites, not
+exported.
+
+**What this milestone declined.** The second half of the handoff's own
+hypothesis -- threading explicit lengths through `AtermOutput`/
+`AtermInputDrv`/`AtermEnvVar` to eliminate `buf_put_escaped_raw`'s one
+remaining genuine `strlen(s)` call on the dynamic derivation-field string
+-- was not attempted. Reading `value_util.c`'s own
+`asnix_string_value_to_cstr` confirms the length IS already known right
+there (`int64_t len = *(const int64_t *)(s + ASNIX_STRING_OFF_LEN);`,
+read straight from the `Value`'s own string header before the `strlen`-
+losing coercion down to a plain `char*`) -- so a length-carrying variant
+is technically straightforward to add at that one call site. But
+`derivation.c` constructs these three structs' fields from a mix of
+sources (`asnix_string_value_to_cstr` results, `dup_cstr`-built strings,
+plain `""` literals, and pointers reused verbatim across the masked/real/
+cache-hash passes per M152's own cache design), and the fields feed
+`strcmp`-based sort/compare calls elsewhere in the same file
+(`aterm_envvar_cmp`/`aterm_output_cmp`) that would need auditing too if
+the fields' meaning changed. That is the same "wider blast radius"
+M147 already weighed and declined, re-confirmed here rather than
+re-litigated, and this milestone's own measured gain (below) did not
+make revisiting that call look newly justified.
+
+**Measured** (`perf stat`, `taskset -c 0`, `cpu_core/instructions/`+
+`cpu_core/cycles/`, 20 interleaved trials (before,after,before,after,...)
+on the real cold `d.nix`/ffmpeg eval, output hash cross-checked
+byte-identical on every single trial, zero mismatches in the reported
+run -- an earlier 20-trial run hit one transient empty-output hiccup on a
+`before`-binary's separate verification invocation, re-run standalone and
+confirmed correct immediately after, consistent with this project's own
+documented occasional flakiness under shared-machine load, not a real
+bug, and excluded from the numbers below):
+
+| | instructions | cycles |
+|---|---|---|
+| before (M153 baseline) | 6,777,522,089 (avg) | 3,865,212,962 (avg) |
+| after (M154) | 6,728,233,859 (avg) | 3,872,852,555 (avg) |
+| delta | **-0.727%** | +0.198% |
+| wins | 20/20 | 11/20 |
+
+Instructions: completely non-overlapping ranges across all 20 trials
+(every BEFORE trial 6,772.7M-6,782.7M, every AFTER trial 6,724.4M-
+6,731.3M) -- the same "hard, repetition-independent fact" character
+this project's measurement culture already established (M129/M130/M146/
+M152). Cycles: not a win this time, noisy and roughly flat (11/20,
++0.198% on average) -- consistent with every prior milestone's own
+finding that cycles are the noisier signal on this shared, contended
+machine, and with this fix's own mechanism being almost entirely about
+removing INSTRUCTIONS (call/ret overhead, register spills around the
+eliminated calls, and the `strlen` loop itself on 2-byte literals) rather
+than anything that would obviously move cycle-level stalls.
+
+A follow-up `perf record -e cpu_core/instructions/ -c 10000 -g`
+comparison confirms the mechanism directly: the separate `buf_puts`
+symbol (0.17% self-time before) disappears entirely from the `after`
+profile (now inlined into `buf_put_escaped` via the macro, confirmed via
+`objdump -dr` showing only ONE remaining `strlen` relocation in
+`aterm.o`, down from six call sites previously), and `asnix`'s own
+`strlen@plt` self-time share drops from 0.07% to 0.04%. `buf_put_escaped`
+itself (`__strlen_avx2`'s self-time via the one remaining, genuinely
+dynamic `strlen(s)` call this milestone deliberately left alone) stays
+essentially flat, 0.90% before vs. 0.93% after -- exactly the expected
+signature of removing the literal-strlen cost while leaving the dynamic
+one, now a slightly larger share of a smaller total, untouched.
+
+**Honest sizing against the gap.** The handoff's own profiling pass sized
+this whole candidate (both the `buf_puts` literal cost AND the dynamic
+`strlen(s)` cost it declined to also fix) at roughly 0.5%/34M
+instructions. This milestone's measured result, -0.727%/~49.3M
+instructions, is bigger than that combined estimate, not smaller --
+plausible because inlining `buf_put_lit` at its 13 call sites removes not
+just the `strlen` call itself but the surrounding `call`/`ret`/
+register-shuffle overhead of a separate `buf_puts` function call, and
+lets the compiler fold each case's fixed 2-8 byte `memcpy` into plain
+`mov`s instead of a real `memcpy` dispatch -- savings the handoff's own
+sampled-profile estimate (self-time attribution across an inlined/
+non-inlined boundary is notoriously lossy, as M153's own writeup already
+noted for a different pair of functions) did not fully capture. The
+genuinely dynamic `strlen(s)` cost (the handoff's own "sibling direct
+strlen call," roughly 0.14% by that estimate) is NOT claimed to be closed
+here -- it remains open, correctly scoped out, same call as M147's.
+
+**Correctness.** No allocation pattern, struct layout, or byte sequence
+written changes -- `buf_put_lit` produces byte-for-byte the same output
+as the old `buf_puts` for every one of its 13 literal call sites (the
+length was always the true length; only how that length gets computed
+changed, compile-time `sizeof` instead of runtime `strlen`). Full ladder
+green: `make test`/`test-e2e`/`test-conformance` all pass, including
+`tests/c/test_aterm.c` (exercising both the `cache=NULL` path and the
+cached path, all through the rewritten literal-append calls). `make
+test-nix-conformance NIX_CONFORMANCE_DIR=/tmp/nix-conformance`:
+`pass=655 fail=3 skip=148` (exact baseline, the same 3 pre-existing
+pos-tracking failures). `make test-nixpkgs-hash`: `pass=148 fail=0`.
+`d.nix` output hash unchanged on every trial:
+`/nix/store/29iacg6h530yx7rxz4k1fhvi0kxxhsam-ffmpeg-9.0.1-bin`.
+
+Files: `src/c/aterm.c` (`buf_puts` replaced by the `buf_put_lit` macro;
+all 13 call sites updated; no other file touched -- `buf_puts` was never
+called outside this file).
