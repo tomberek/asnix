@@ -16996,3 +16996,47 @@ Files: `Makefile` only (`MIMALLOC_LDLIBS`'s own definition, now with an
 `else` branch; `MIMALLOC_PROBE`, new). No change to `flake.nix`/`nix/
 asnix.nix` -- the explicit, static-link devShell/packaged-build path
 they set up is untouched and still takes priority.
+
+## M151: `asnix_regex_search` (the custom ERE engine's unanchored search) -- investigated, found never called on a real eval, declined
+
+Directed follow-up to a SIMD/SWAR source-reading sweep that flagged
+`asnix_regex_search`'s unanchored loop (`regex_engine.c`: retries the
+full matcher at every position in the subject string, with no literal-
+prefix pre-filter) as "architecturally promising but unconfirmed" --
+that sweep explicitly noted it had not profiled whether this path is
+actually hot on real nixpkgs regex usage, and flagged M143's own
+"most real calls use small anchored/literal patterns" finding as a
+reason it might not be.
+
+**Measured directly, not assumed**: instrumented `asnix_regex_search`
+with a call counter and an `atexit` dump (temporary, reverted before
+this commit), rebuilt, and ran the real `d.nix` (nixpkgs/ffmpeg
+closure) eval. Result: **zero calls** -- the `atexit` handler itself
+never registered, confirmed via an explicit stderr capture showing zero
+lines of output. `asnix_regex_search` is only reachable from
+`builtins_regex.c`'s `match`/`split` when `asnix_regex_needs_custom_engine`
+determines a pattern needs the custom ERE engine at all (collating
+symbols `[.name.]`, equivalence classes `[=x=]`, or a non-standard/
+case-variant POSIX character class name) -- real nixpkgs's own regex
+usage (primarily `lib.versions`-style version-parsing helpers, per
+M143's own finding) does not exercise any of these, so the custom
+engine's search path -- not just this one function, but the entire
+backtracking matcher it calls into -- never runs at all on this
+workload.
+
+**Conclusion**: declined. There is no basis to optimize a function that
+measures as never-called on the representative real-workload benchmark
+this whole campaign uses -- any change here would have exactly zero
+measurable effect on `d.nix`, and by extension no basis to claim it
+would help real nixpkgs evaluation generally. This closes out the
+SIMD-sweep's own flagged "needs a dedicated profiling pass before any
+implementation attempt" lead with a clean, conclusive negative, rather
+than leaving it open. The regex compile CACHE (M143) and the bracket-
+expression delimiter-scan candidates the same sweep found remain
+untouched by this finding -- those are on the `asnix_regex_needs_custom_
+engine`/pattern-compilation path, not the search path, and were out of
+this directive's scope.
+
+No source files changed (instrumentation added and fully reverted,
+confirmed via `git status`/`git diff` both clean before this commit).
+Files: `docs/architecture.md` only.
