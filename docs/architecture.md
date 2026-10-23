@@ -13946,3 +13946,131 @@ a trailing `?`) still parses as `(-a) ? "x"`, confirmed directly.
 `make test`/`test-e2e`/`test-conformance`/`test-flake` all green;
 `test-nix-conformance pass=655 fail=3 skip=148` (same 3 pre-existing
 failures); `test-nixpkgs-hash pass=148 fail=0`. Output hash unchanged.
+
+## M127: register-based-VM investigation -- measured and declined, with the deep architectural answer the user asked for
+
+Follow-up to M123's cross-evaluator speed investigation: asnix is ~2.35x
+slower than a sibling evaluator (`iets`) in a fair single-threaded
+comparison, with IPC already close between the two (asnix ~1.76, iets
+~1.91) -- meaning the gap tracks the ~2.07x instruction-count difference,
+not per-instruction inefficiency. The architectural-research thread
+(M123's own follow-ups) identified the leading hypothesis for WHERE that
+extra instruction volume goes: every asnix op handler (`src/asm/ops/
+*.S`) pops operands from and pushes results to a memory-resident
+VALSTACK array via `%r12` -- a real memory store+load round trip for
+every intermediate value, system-wide -- while `iets`'s recursive
+tree-walker keeps intermediates in Rust locals LLVM allocates to real
+registers across the call chain, with no equivalent structure.
+
+This milestone is a deliberate, explicitly-scoped two-step investigation
+into whether that hypothesis is actually the dominant cause, and if so,
+how to close it -- NOT a code change to the production evaluator (no
+op handler, compiler codegen, or dispatch-loop file is touched by this
+milestone; the artifact is a standalone, unlinked microbenchmark at
+`bench/regvm_poc/`, kept for reference, not wired into the build).
+
+### Step 1: stack-top register caching -- no clean fit, found without writing code
+
+The smallest escalation (cache just the top 1-2 VALSTACK slots in spare
+registers instead of a full redesign) was checked against this
+project's own ABI first. Per `docs/abi.md`'s register table, cross-
+checked directly against real usage in all 32 `src/asm/ops/*.S` files:
+EVERY callee-saved register (`%rbx`/`%rbp`/`%r15`) is already in active
+use by the hottest handlers themselves -- `op_call.S` (every function
+application), `op_let.S` (every `let`-binding), `op_frame.S` (every
+`rec {}` literal) -- to hold their OWN internal bookkeeping (saved IP,
+saved ENV, slot counts) across their own nested calls into `asnix_arena_
+alloc`/`asnix_env_arena_alloc`. The ~10 general-purpose registers are
+used even more pervasively as primary working registers inside nearly
+every handler (`op_var_ref.S` especially -- almost certainly the single
+hottest op in the whole evaluator). There is no register sitting idle to
+dedicate to an additive cache without first rewriting the handlers that
+would matter most -- a real, file-level-verifiable blocker, not an
+estimate. No prototype was built; this is a legitimate "don't force it"
+outcome, matching this session's own standing bar for declined ideas.
+
+### Step 2: isolated register-based-VM microbenchmark -- real but small win, discounted twice over
+
+Despite step 1's blocker, a genuine proof-of-concept was built anyway
+(explicitly requested) to get a REAL measured number rather than stop at
+"no clean fit." `bench/regvm_poc/chains.S`/`harness.c` implement the
+exact representative chain `(a+b)*(c-d) < (e+f)*(g-h)` (8 `OP_VAR_REF` +
+6 arithmetic ops + 1 `OP_LT` -- deliberately chosen to have ZERO
+`OP_CALL`/`OP_LET`/`OP_FRAME_*` anywhere in it, i.e. exactly the slice
+where step 1's blocker does not apply) two ways: `run_valstack_chain`
+(every intermediate through real memory via `%r12`, byte-for-byte
+matching `op_arith.S`/`op_cmp.S`/`op_var_ref.S`'s own fast-path
+instruction sequences) and `run_regvm_chain` (the same values held in a
+fixed set of real registers, `%r8`-`%r11`, for the whole chain via
+per-position specialized handler code -- the POC's own README is explicit
+that this measures an OPTIMISTIC CEILING, since x86 can't address a
+register by a runtime index, so a genuinely *generic* register-VM
+dispatch loop would need its own memory-indexed register file anyway,
+which is a different addressing scheme for the same memory traffic, not
+a way around it).
+
+**Measured** (`perf stat -r 7`, pinned to a confirmed P-core, 200M
+iterations/run, cross-run spread <0.2% on cycles):
+
+| metric | VALSTACK | register | delta |
+|---|---|---|---|
+| instructions/iter | 362.1 | 298.1 | **-17.7%** |
+| cycles/iter | 55.39 | 51.77 | **-6.5%** |
+| wall-clock/iter | ~14.95 ns | ~13.38 ns | **-10.5%** |
+| IPC | 6.54 | 5.76 | (VALSTACK is HIGHER) |
+
+Per-iteration instruction counts were independently hand-traced from
+both handler chains and matched `perf`'s measured totals to 2 decimal
+places -- a strong cross-check that the measurement itself isn't
+confused. **The headline finding**: eliminating 100% of this chain's
+VALSTACK memory traffic cuts instructions 17.7% but cycles only 6.5% --
+a real, repeatable win, not a wash, but far smaller than the raw
+instruction delta suggests. VALSTACK's own IPC is actually HIGHER than
+the register version's (6.54 vs 5.76): the extra memory ops are nearly
+free on this core, because store-to-load forwarding on a tight,
+predictable stack access pattern hides most (not all) of the round-trip
+latency, with enough out-of-order window to overlap the rest.
+
+**How much of the real ~2.07x gap could this close, even in the best
+case?** Measured (not guessed) via `irdump` over all 532 real
+`eval-okay-*.nix` fixtures in the nix-conformance corpus (18,064 total op
+records): strictly chain-safe ops (`PUSH_*`/arithmetic/comparison) are
+only 19.9% of real dispatches; even the generous upper bound (counting
+every ambiguous `VAR_REF` as chain-safe, which overstates it) caps the
+share at 32.0% -- the other 68%+ are `CALL`/`MK_THUNK`/`SELECT`/
+`FRAME_*`/`LAMBDA`/`WITH*`/etc., structurally excluded by step 1's own
+blocker. Combining both real measurements: `0.32 x 6.5% ~= 2.1%` plausible
+overall cycle reduction, best case -- against a gap that needs roughly
+50%+ cycle reduction to close (IPC is already close between asnix and
+iets, so there's no slack hiding elsewhere). On the order of 3-4% of the
+real gap, even taking the POC's numbers as a fully-realized, zero-
+overhead ceiling.
+
+### Conclusion -- the deep architectural answer
+
+**VALSTACK memory traffic was never the dominant real bottleneck it
+looked like on paper.** Two independent, compounding, directly-measured
+reasons: (1) a modern out-of-order core already hides most of a
+predictable stack's store/load round trips (verified: only 6.5% cycle
+reduction from removing 100% of the traffic, against a 17.7%
+instruction-count reduction), and (2) only a minority (~20-32%, measured
+via a real IR-dump histogram, not estimated) of real op dispatches are
+even candidates for this treatment in the first place, since every
+`OP_CALL`/`OP_LET`/`OP_FRAME_*`/thunk-force site is structurally excluded
+by step 1's own register-pressure finding, independent of this POC's
+result.
+
+**Register-based VM and full-JIT (the original steps 2/3 of the
+escalation) are NOT the lever for closing the asnix-vs-iets gap, on real
+measured evidence, not intuition.** The actual biggest identified lever
+remains M123's own finding: lex/parse/compile is estimated ~8x slower per
+byte than `iets`'s own pipeline and accounts for roughly HALF of the
+entire cycle gap on its own (`asnix_eval_file`'s own subtree is 43.9% of
+all cycles) -- an order of magnitude bigger than anything available from
+the dispatch loop's own memory-traffic pattern, and the correct target
+for continued investigation.
+
+Files: `bench/regvm_poc/chains.S`, `bench/regvm_poc/harness.c`,
+`bench/regvm_poc/README.md` (full methodology, build/measure commands,
+and the reasoning above in more detail) -- kept for reference, not
+linked into `make`/`make test`/the production binary.
