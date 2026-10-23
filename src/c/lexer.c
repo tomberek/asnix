@@ -662,7 +662,7 @@ static void lex_until(const char *src, size_t *i_inout, ModeStack *modes, TokVec
             continue;
         }
 
-        /* Tried before digit/string/ident/single-char below -- see
+        /* Tried before digit/string/single-char below -- see
          * try_scan_path's comment for why this has to come first. M64:
          * `~`-prefixed home paths are tried alongside (src[i]=='~' is
          * never itself a path_char, so try_scan_path can never fire at
@@ -675,7 +675,13 @@ static void lex_until(const char *src, size_t *i_inout, ModeStack *modes, TokVec
          * expression itself, and emit TOK_DOLLAR_LBRACE -- exactly the
          * same push-two-modes-and-emit-the-boundary-token shape
          * lex_dquote_run/lex_indented_run already use for "${" inside a
-         * string. */
+         * string.
+         *
+         * M138: unlike the general try_scan_path call a few lines below
+         * (kept unconditional, see that call site's own comment),
+         * try_scan_home_path is left unconditional here too -- it's an
+         * instant one-branch bail for any non-'~' leading byte, nothing
+         * to guard. */
         {
             size_t hlen = try_scan_home_path(src, i);
             if (hlen > 0) {
@@ -689,6 +695,120 @@ static void lex_until(const char *src, size_t *i_inout, ModeStack *modes, TokVec
                 }
                 continue;
             }
+        }
+
+        /* M138: identifier-leading tokens get their own guarded path/URI
+         * check instead of falling into the unconditional try_scan_path
+         * (and, for alpha leads, try_scan_uri) calls below -- the second
+         * lexer.c lever flagged as a follow-on in M129 (see that
+         * section's "Checked against iets" paragraph) and in iets's own
+         * `next_token` (~/gnix/iets/src/syntax/lexer.rs, the
+         * `b'a'..=b'z' | b'A'..=b'Z' | b'_'` match arm): scan the
+         * ordinary identifier's own ident_cont run ONCE (needed anyway to
+         * produce a plain TOK_IDENT/keyword), then make the expensive
+         * path_char-run-plus-group scan (try_scan_path) and URI scan
+         * (try_scan_uri) conditional on a cheap single-byte peek at the
+         * character immediately following that run, instead of always
+         * attempting both scans first and then re-walking the exact same
+         * bytes a second time via ident_cont moments later whenever they
+         * fail (which is every time for an ordinary identifier/keyword --
+         * by far the most common token in real Nix source).
+         *
+         * Correctness (the edge case M129 flagged and this milestone's
+         * commit message verifies): ident_cont and path_char/
+         * uri_scheme_char are NOT the same character set. '.' and '+' are
+         * path_char/uri_scheme_char but NOT ident_cont -- e.g. a token
+         * shaped like "a.b:foo" (a URI with a scheme containing '.') or
+         * "foo.bar/baz" (a path literal with '.' in its prefix) needs the
+         * real path_char/uri_scheme_char run, which keeps going past
+         * where ident_cont already stopped, checked -- not just where the
+         * identifier's own run ends. Conversely, '\'' is ident_cont but
+         * NOT path_char/uri_scheme_char.
+         *
+         * The guard below fires the real (expensive) rescan -- from this
+         * token's own start, not from the ident_cont run's end -- whenever
+         * the byte right after the ident_cont run is '/' (direct
+         * path-group signal), ':' (direct URI-colon signal), or '.'/'+'
+         * (the ident_cont run stopped short of where path_char/
+         * uri_scheme_char would keep going -- ambiguous without the real
+         * rescan, exactly the "a.b:foo"/"foo.bar/baz" case above).
+         * Whenever NONE of those four hold, skipping both scans entirely
+         * is PROVABLY equivalent to running them and having them both
+         * fail, not merely a fast-path approximation:
+         *   - Neither '/' nor ':' can appear anywhere strictly before the
+         *     peeked byte: both already stop an ident_cont run outright
+         *     (neither is in CC_IDENT_CONT), so if either had appeared
+         *     earlier, the run would never have reached this far.
+         *   - If the ident_cont run contains no '\'' (the overwhelmingly
+         *     common case), the path_char/uri_scheme_char run from this
+         *     token's start tracks the ident_cont run exactly on their
+         *     shared subset (alnum/'_'/'-') and can only diverge AT the
+         *     peeked byte itself, via '.'/'+' -- already excluded by the
+         *     guard's own condition, so it provably stops at that same
+         *     byte too.
+         *   - If the ident_cont run DOES contain a '\'' before the peeked
+         *     byte (rare -- a primed identifier like `lib'`), the real
+         *     path_char/uri_scheme_char run stops AT that '\'' instead,
+         *     long before the peeked byte -- but scan_path_groups/the
+         *     URI-colon check both require that exact stopping byte to be
+         *     '/' or ':' respectively, and a '\'' is neither, so both
+         *     scans are guaranteed to fail there regardless of what the
+         *     peeked byte is. Skipping is still safe.
+         * Every CC_* set used here is the same table M129 already built;
+         * this milestone reuses it, not a new predicate. */
+        if (ident_start(c)) {
+            size_t j = i + 1;
+            while (ident_cont(src[j])) j++;
+            char nb = src[j];
+            if (nb == '/' || nb == ':' || nb == '.' || nb == '+') {
+                size_t plen = try_scan_path(src, i);
+                if (plen > 0) {
+                    push_tok(v, (Token){ .kind = TOK_PATH, .start = src + i, .len = plen, .pos = src + tok_start });
+                    i += plen;
+                    if (at_dollar_brace(src, i)) {
+                        i += 2;
+                        mode_push(modes, MODE_PATH);
+                        mode_push(modes, MODE_NORMAL);
+                        push_tok(v, (Token){ .kind = TOK_DOLLAR_LBRACE });
+                    }
+                    continue;
+                }
+                size_t ulen = try_scan_uri(src, i);
+                if (ulen > 0) {
+                    push_tok(v, (Token){ .kind = TOK_URI, .start = src + i, .len = ulen, .pos = src + tok_start });
+                    i += ulen;
+                    continue;
+                }
+            }
+            /* Plain identifier or keyword: [i, j), with j already computed
+             * above by the ident_cont scan this guard needed anyway -- no
+             * second ident_cont walk later in this function (see the old
+             * ident_start block this replaced, now removed). */
+            size_t start = i;
+            size_t len = j - start;
+            TokKind kind = TOK_IDENT;
+            for (size_t k = 0; k < sizeof(KEYWORDS) / sizeof(KEYWORDS[0]); k++) {
+                size_t kwlen = strlen(KEYWORDS[k].kw);
+                if (kwlen == len && memcmp(KEYWORDS[k].kw, src + start, len) == 0) {
+                    kind = KEYWORDS[k].kind;
+                    break;
+                }
+            }
+            push_tok(v, (Token){ .kind = kind, .start = src + start, .len = len, .pos = src + tok_start });
+            i = j;
+            continue;
+        }
+
+        /* Not an identifier lead (handled, with its own guard, just above):
+         * digit/'.'/'-'/'+'-led path scanning stays unconditional, exactly
+         * as before this milestone -- iets doesn't bother guarding these
+         * either (see its `or_float_or_path`'s own unconditional
+         * `scan_path_token` call, and the direct `scan_path_token` calls in
+         * its '.'/'-'/'+' match arms), since a digit/operator run is
+         * typically only 1-4 bytes before failing path_char, unlike an
+         * identifier's potentially much longer run -- not worth the extra
+         * branch/complexity for a near-zero win. */
+        {
             size_t plen = try_scan_path(src, i);
             if (plen > 0) {
                 push_tok(v, (Token){ .kind = TOK_PATH, .start = src + i, .len = plen, .pos = src + tok_start });
@@ -699,15 +819,6 @@ static void lex_until(const char *src, size_t *i_inout, ModeStack *modes, TokVec
                     mode_push(modes, MODE_NORMAL);
                     push_tok(v, (Token){ .kind = TOK_DOLLAR_LBRACE });
                 }
-                continue;
-            }
-        }
-
-        if (cc_alpha(c)) {
-            size_t ulen = try_scan_uri(src, i);
-            if (ulen > 0) {
-                push_tok(v, (Token){ .kind = TOK_URI, .start = src + i, .len = ulen, .pos = src + tok_start });
-                i += ulen;
                 continue;
             }
         }
@@ -843,22 +954,11 @@ static void lex_until(const char *src, size_t *i_inout, ModeStack *modes, TokVec
             continue;
         }
 
-        if (ident_start(c)) {
-            size_t start = i;
-            while (ident_cont(src[i])) i++;
-            size_t len = i - start;
-            TokKind kind = TOK_IDENT;
-            for (size_t k = 0; k < sizeof(KEYWORDS) / sizeof(KEYWORDS[0]); k++) {
-                size_t kwlen = strlen(KEYWORDS[k].kw);
-                if (kwlen == len && memcmp(KEYWORDS[k].kw, src + start, len) == 0) {
-                    kind = KEYWORDS[k].kind;
-                    break;
-                }
-            }
-            Token t = { .kind = kind, .start = src + start, .len = len, .pos = src + tok_start };
-            push_tok(v, t);
-            continue;
-        }
+        /* M138: the ident_start(c) branch that used to live here (plain
+         * TOK_IDENT/keyword scanning, re-walking ident_cont from scratch)
+         * was moved up above, merged into the new guarded path/URI check --
+         * ident_start(c) can never reach this point anymore (that earlier
+         * branch always `continue`s). */
 
         /* `...` (lambda-pattern ellipsis) is checked before any single- or
          * double-character operator, same lookahead style as the two-char

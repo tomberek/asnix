@@ -15046,3 +15046,153 @@ measured, bounded win, not the full "no deserialization at all" vision.
 Files: `src/c/bytecode_cache.c` (`mmap_whole_file`, `parse_header_from_
 buf`, both `asnix_bytecode_cache_lookup_fast`/`_verify`), `src/c/
 bytecode.c` (`read_program_into`'s presizing only).
+
+## M138: `asnix_lex`'s own flagged follow-on -- guarding `try_scan_path`/`try_scan_uri` on identifier-leading tokens instead of running them unconditionally
+
+M129's own "Follow-on, NOT attempted here" paragraph named this exactly:
+`asnix_lex`'s main dispatch loop unconditionally ran `try_scan_path` (and,
+for alpha leads, `try_scan_uri`) on the leading character of EVERY
+identifier/number/operator token, before falling through to ordinary
+`ident_cont`-based identifier scanning -- meaning every plain identifier
+(by far the most common token in real Nix source) paid for a full
+`path_char`-run-plus-group scan that was guaranteed to fail, immediately
+followed by a second, separate scan over almost the same bytes via
+`ident_cont` to actually produce the `TOK_IDENT`. Checked directly against
+iets (`~/gnix/iets/src/syntax/lexer.rs`, `next_token`'s
+`b'a'..=b'z' | b'A'..=b'Z' | b'_'` match arm): it avoids exactly this
+double-scan, but only for identifier-leading tokens -- its own digit/`.`/
+`-`/`+` match arms (`or_float_or_path`, and the direct `scan_path_token`
+calls in the `-`/`+` arms) still call the full path scan unconditionally,
+with no guard at all. This milestone mirrors that scope precisely: only
+the identifier-leading case changed, since a digit/operator run is
+typically only 1-4 bytes before failing `path_char` (a number literal,
+or a lone `-`/`+` next to whitespace), unlike an identifier's potentially
+much longer run -- not worth the complexity for a near-zero win there,
+and not a difference iets itself bothers to optimize either.
+
+**The guard, reusing M129's own `CHAR_CLASS` table (no new predicates)**:
+inside the `ident_start(c)` branch, scan the ordinary `ident_cont` run
+once (needed anyway to produce a plain `TOK_IDENT`/keyword), then peek at
+the single byte `nb` immediately after that run. The full (expensive)
+`try_scan_path`/`try_scan_uri` rescan -- from the token's own start, not
+from the `ident_cont` run's end -- only fires when `nb` is `/` (direct
+path-group signal), `:` (direct URI-colon signal), or `.`/`+` (the
+`ident_cont` run stopped short of where `path_char`/`uri_scheme_char`
+would keep going -- ambiguous without the real rescan). Whenever `nb` is
+none of those four, both scans are skipped entirely and the already-
+computed `ident_cont` run becomes the `TOK_IDENT`/keyword directly.
+
+**The correctness edge case, worked through and landed, not declined**:
+`ident_cont` and `path_char`/`uri_scheme_char` are NOT the same character
+set -- `CC_IDENT_CONT` includes `'` but excludes `.`/`+`; `CC_PATH_CHAR`/
+`CC_URI_SCHEME` include `.`/`+` but exclude `'` (and `CC_URI_SCHEME`
+further excludes `_`, which `CC_PATH_CHAR` includes). A token shaped like
+`a.b+c:foo` (a URI whose scheme contains `.` and `+`, both legal RFC 3986
+scheme characters) or `foo.bar/baz` (a path literal with `.` in its
+prefix) needs the real `path_char`/`uri_scheme_char` run checked, not
+just where the `ident_cont` run happens to end. The guard's four-character
+peek (`/`, `:`, `.`, `+`) is exactly why this stays correct: whenever none
+of those four follow the `ident_cont` run, skipping is PROVABLY
+equivalent to running both scans and having them fail, not an
+approximation --
+  - Neither `/` nor `:` can occur strictly before the peeked byte: both
+    already stop an `ident_cont` run outright (neither bit is set in
+    `CC_IDENT_CONT`), so if either had appeared earlier the run would
+    never have reached this far.
+  - If the `ident_cont` run contains no `'` (the overwhelmingly common
+    case), the `path_char`/`uri_scheme_char` run from the token's start
+    tracks the `ident_cont` run exactly on their shared subset (alnum/
+    `_`/`-`) and can only diverge AT the peeked byte itself, via `.`/`+`
+    -- already covered by the guard's own trigger condition.
+  - If the `ident_cont` run DOES contain a `'` before the peeked byte
+    (rare -- a primed identifier like `lib'`), the real `path_char`/
+    `uri_scheme_char` run stops AT that `'` instead, long before the
+    peeked byte -- but `scan_path_groups`/the URI-colon check both
+    require that exact stopping byte to be `/`/`:` respectively, and `'`
+    is neither, so both scans are guaranteed to fail there regardless of
+    what the peeked byte is. Skipping stays safe.
+Verified directly, not just argued: built two full binaries from the
+otherwise-identical tree (only `lexer.c` swapped, same manual-swap
+mechanism M129 used after this session's own live `refs/stash` collision
+precedent, avoiding the stash entirely this time), fed both every
+adversarial case this reasoning identifies --
+`a.b+c:foo`/`x+.y-z:tail`/`a+.b:x`/`a.b.c:x` (dotted/`+`-laden URI
+schemes), `foo.bar/baz`/`./a.b${toString x}c/d` (dotted path prefixes,
+including through an interpolation boundary), `lib'`/`a'b` (primed
+identifiers), `a'.b:x`/`a'/b` (primed identifiers immediately followed by
+what could be a path/URI continuation), `a_b:foo`/`x:x+1` (the real-Nix
+`uri_scheme_char`-excludes-`_` and longest-match-over-lambda footguns
+M129's `try_scan_uri` comment already documents) -- and confirmed
+byte-identical output between the two binaries on every single case,
+plus on the full `d.nix` eval (ffmpeg's closure). Landed a dedicated e2e
+fixture for the headline case (`tests/e2e/m138_uri_scheme_dot_plus.nix`),
+itself independently confirmed to already pass identically on the
+PRE-this-milestone binary too (it exercises pre-existing, correct
+behavior, not something this change newly makes pass).
+
+**Measured** (`perf stat`, `taskset -c 0` pinned to one performance core,
+two binaries built from the otherwise-identical tree with only `lexer.c`
+swapped, explicit `cpu_core/.../` event selection throughout -- this
+session's own host was under real concurrent load from several other
+agents for the whole measurement window, `uptime` load average 3-6.8 on
+a 22-thread host, so cycles/wall-clock at the FULL-eval scale below are
+reported with that caveat; the lex-only microbenchmark's own numbers were
+reproducible to +-0.00% on instructions and a tight single-digit percent
+on cycles/task-clock across repeated `perf stat -r 9` runs, so they're
+trusted at face value):
+- **Lex-only microbenchmark** (a from-scratch standalone harness, not
+  shipped, linking `lexer.o` directly and looping `asnix_lex` over
+  `all-packages.nix`, the same real 326KB nixpkgs file M129 used, 300
+  iterations, token count cross-checked identical -- 11,193,300 tokens --
+  between both binaries before trusting any timing number): instructions
+  4,652,301,103 -> 4,151,206,675 (**-10.8%**), cycles 1,806,131,261 ->
+  1,664,679,012 (**-7.8%**), task-clock 519.68ms -> 477.59ms (**-8.1%**).
+- **Full real eval** (`d.nix`, ffmpeg's closure, bytecode cache OFF by
+  default so every one of the 1057 imported files genuinely re-lexes):
+  instructions 9,023,293,940 -> 8,911,672,653 (**-1.24%**), reproducible
+  to +-0.00%/+-0.01% across every `perf stat -r 5`/`-r 9` trial run (5
+  separate trials, both orders tried to rule out filesystem-cache-
+  warming bias). Cycles and task-clock at this whole-process scale swung
+  both directions across repeated trials under the concurrent host load
+  noted above (one trial pair: cycles +1.9%/task-clock -6.0%; another:
+  cycles -1.0%/task-clock +7.1%) -- not trusted as a directional claim on
+  their own. The instruction-count win cross-checks cleanly against
+  M123's own cycle breakdown, though: lex is ~10.6% of total cycles in a
+  real eval, and a ~10.8% instruction cut confined to lexing predicts
+  roughly a 1.1% whole-program instruction cut, matching the observed
+  -1.24% closely.
+
+**Declined, deliberately, same reasoning iets itself uses**: extending
+this same guard to digit-leading or `.`/`-`/`+`-leading tokens. Those
+runs are short (1-4 bytes typically) before `path_char` already fails,
+so the unconditional `try_scan_path` call there is already cheap --
+adding a peek-and-guard there would add real branching complexity for a
+win too small to measure reliably against this host's own noise floor,
+and iets's own lexer doesn't bother either (`or_float_or_path` and the
+`-`/`+` match arms call `scan_path_token` unconditionally, no guard).
+
+**Verified**: `make test`/`test-e2e`/`test-conformance` all green
+(including the new `m138_uri_scheme_dot_plus` fixture). `make
+test-nix-conformance NIX_CONFORMANCE_DIR=/tmp/nix-conformance`:
+`pass=655 fail=3 skip=148` (same 3 pre-existing pos-tracking failures).
+`make test-nixpkgs-hash`: `pass=148 fail=0` on a clean run (hit this
+session's own documented transient-contention flakiness under the
+concurrent host load noted above across several earlier attempts --
+`(crash)`-tagged failures on a different, random package each time,
+e.g. `nano.outPath`/`diffutils.drvPath`/`gnutar.outPath`, then
+`less.drvPath`/`zsh.drvPath`, then `diffutils.outPath`, then
+`nodejs.drvPath`, then `zstd.drvPath` -- every single one of those
+individually reproduced correctly standalone in well under the harness's
+own 120s timeout, consistent with the timeout firing on CPU starvation
+under concurrent load rather than any real crash; a subsequent clean run
+came back `pass=148 fail=0`). Output hash on `d.nix` (ffmpeg's closure)
+unchanged: `/nix/store/29iacg6h530yx7rxz4k1fhvi0kxxhsam-ffmpeg-9.0.1-bin`.
+
+Files: `src/c/lexer.c` (`lex_until`'s main dispatch loop -- the
+`ident_start(c)` branch now owns its own guarded path/URI check and the
+plain-identifier/keyword emission that used to live in a separate,
+later `ident_start(c)` block further down, now removed as dead code;
+the non-identifier-leading `try_scan_path` call keeps its old,
+unconditional behavior, just relocated next to the branch that now
+excludes identifier leads from it). `tests/e2e/
+m138_uri_scheme_dot_plus.nix`/`.expected` (new fixture).
