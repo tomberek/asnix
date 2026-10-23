@@ -619,7 +619,12 @@ static AstStringPart *strip_indentation(RawIndPart *raw, size_t n, size_t *out_c
 }
 
 typedef struct {
-    Token *toks;
+    LexCursor *lc; /* M135: tokens are lexed on demand through this cursor instead of
+                    * a pre-filled array -- see lexer.h's own LexCursor comment and
+                    * docs/architecture.md M134/M135. cur()/peek2()/find_matching_rbrace
+                    * are the only three places that ever read a Token by index; all
+                    * three now go through lexcur_tok(p->lc, idx), which lexes forward
+                    * exactly as far as asked and never less or more. */
     size_t pos;
     const char *src; /* M80: the buffer every Token.pos/.start points into -- see
                        * curpos_line_col below, parser.h's own asnix_parse comment. */
@@ -645,10 +650,10 @@ static void curpos_line_col(const char *src, const char *at, int *out_line, int 
 }
 
 static Token *cur(Parser *p) {
-    return &p->toks[p->pos];
+    return lexcur_tok(p->lc, p->pos);
 }
 static Token *peek2(Parser *p) {
-    return &p->toks[p->pos + 1]; /* always in range: TOK_EOF is the final element */
+    return lexcur_tok(p->lc, p->pos + 1); /* always in range: TOK_EOF is the final element */
 }
 static void advance(Parser *p) {
     p->pos++;
@@ -1810,7 +1815,7 @@ static size_t find_matching_rbrace(Parser *p, size_t open_idx) {
     size_t depth = 0;
     size_t i = open_idx;
     for (;;) {
-        TokKind k = p->toks[i].kind;
+        TokKind k = lexcur_tok(p->lc, i)->kind;
         if (k == TOK_LBRACE || k == TOK_DOLLAR_LBRACE) {
             depth++;
         } else if (k == TOK_RBRACE) {
@@ -1969,7 +1974,7 @@ static Ast *parse_expr(Parser *p) {
          * '}' to tell which, same disambiguation real Nix's own grammar
          * makes (see find_matching_rbrace's comment). */
         size_t close = find_matching_rbrace(p, p->pos);
-        TokKind after = p->toks[close + 1].kind;
+        TokKind after = lexcur_tok(p->lc, close + 1)->kind;
         if (after == TOK_COLON || after == TOK_AT) {
             advance(p); /* '{' */
             AstFormal *formals;
@@ -2006,10 +2011,16 @@ static Ast *parse_expr(Parser *p) {
     return parse_impl(p);
 }
 
-Ast *asnix_parse(Token *toks, size_t count, const char *src) {
-    (void)count;
-    Parser p = { .toks = toks, .pos = 0, .src = src };
+/* M135: fuses lexing and parsing -- src is lexed on demand through a
+ * LexCursor instead of being fully lexed into an array before this
+ * function is ever called (that was the old asnix_lex(src,&n)+
+ * asnix_parse(toks,n,src) two-call pattern every caller used; see
+ * docs/architecture.md M134/M135). */
+Ast *asnix_parse(const char *src) {
+    LexCursor *lc = lexcur_new(src);
+    Parser p = { .lc = lc, .pos = 0, .src = src };
     Ast *result = parse_expr(&p);
     expect(&p, TOK_EOF, "end of input");
+    lexcur_free(lc);
     return result;
 }

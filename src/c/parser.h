@@ -12,17 +12,21 @@
  * params exactly like real Nix), `let`/`in`, and `if`/`then`/`else`.
  * Aborts the process with a message on a syntax error.
  *
- * `src`: M80 (see docs/architecture.md) -- the SAME source buffer `toks`
- * was lexed from (every `Token.pos`/`.start` is a pointer INTO it), needed
- * ONLY to compute a real line/column for `__curPos` (by counting newlines
- * from `src` up to the token's own `.pos` -- see parser.c's
- * curpos_line_col). Every other token field already carries everything
- * the rest of the parser needs without ever touching `src` directly, so
- * this one extra parameter is the full cost of that one feature -- NOT
- * the start of a broader "thread position through every AST/IR node"
- * change (`builtins.unsafeGetAttrPos`'s real per-ATTRIBUTE position
- * remains the disproportionate, deliberately out-of-scope one -- see
- * builtins_m54.c's own `unsafeGetAttrPos2_impl` comment). */
-Ast *asnix_parse(Token *toks, size_t count, const char *src);
+ * `src`: M80 (see docs/architecture.md) -- the SAME source buffer every
+ * `Token.pos`/`.start` points into, needed ONLY to compute a real
+ * line/column for `__curPos` (by counting newlines from `src` up to the
+ * token's own `.pos` -- see parser.c's curpos_line_col). Every other
+ * token field already carries everything the rest of the parser needs
+ * without ever touching `src` directly, so this one extra parameter is
+ * the full cost of that one feature -- NOT the start of a broader
+ * "thread position through every AST/IR node" change
+ * (`builtins.unsafeGetAttrPos`'s real per-ATTRIBUTE position remains the
+ * disproportionate, deliberately out-of-scope one -- see
+ * builtins_m54.c's own `unsafeGetAttrPos2_impl` comment).
+ *
+ * M135: lexes `src` on demand internally (via a LexCursor, lexer.h) --
+ * callers no longer call asnix_lex() themselves first; see
+ * docs/architecture.md M134/M135. */
+Ast *asnix_parse(const char *src);
 
 #endif /* ASNIX_PARSER_H */

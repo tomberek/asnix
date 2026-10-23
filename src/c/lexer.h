@@ -133,4 +133,50 @@ typedef struct {
  * docs/architecture.md M4 scope notes). */
 Token *asnix_lex(const char *src, size_t *out_count);
 
+/* M135: an incremental, resumable lexer cursor -- used by the parser
+ * (parser.c) to fuse lexing and parsing into one interleaved pass instead
+ * of running asnix_lex to completion before parsing starts (see
+ * docs/architecture.md M134/M135). Tokens are produced on demand, exactly
+ * as far ahead as lexcur_tok() is ever asked for, by the same scanning
+ * logic asnix_lex itself uses -- never re-lexed, never discarded.
+ *
+ * LexMode/ModeStack/TokVec are otherwise lexer.c-private (mirrored here,
+ * not re-exported from there) -- the ONLY reason they're visible in this
+ * header at all is so lexcur_tok's fast path below can be `static inline`
+ * and actually inline at every parser.c call site (cur()/peek2() run on
+ * EVERY token access, many times per token -- measured directly: routing
+ * every single one through a real cross-TU function call into lexer.c's
+ * lex_until, even just to hit its own early-return check, cost a real
+ * +10.5% instruction regression on a full d.nix eval before this fast
+ * path existed). The slow path (lexcur_tok_slow, lexer.c) still owns all
+ * the real lexing logic; this is purely a "is the token already there"
+ * short-circuit, never duplicated scanning logic. */
+typedef enum { MODE_NORMAL, MODE_STRING, MODE_ISTRING, MODE_PATH } LexMode;
+
+typedef struct {
+    LexMode *modes;
+    size_t len, cap;
+} ModeStack;
+
+typedef struct {
+    Token *toks;
+    size_t len, cap;
+} TokVec;
+
+typedef struct LexCursor {
+    const char *src;
+    size_t i;
+    ModeStack modes;
+    TokVec v;
+} LexCursor;
+
+LexCursor *lexcur_new(const char *src);
+Token *lexcur_tok_slow(LexCursor *lc, size_t idx);
+void lexcur_free(LexCursor *lc);
+
+static inline Token *lexcur_tok(LexCursor *lc, size_t idx) {
+    if (idx < lc->v.len) return &lc->v.toks[idx];
+    return lexcur_tok_slow(lc, idx);
+}
+
 #endif /* ASNIX_LEXER_H */

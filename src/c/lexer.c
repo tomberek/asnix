@@ -68,11 +68,6 @@ static int cc_digit(char c) { return (CHAR_CLASS[(unsigned char)c] & CC_DIGIT) !
 static int cc_space(char c) { return (CHAR_CLASS[(unsigned char)c] & CC_SPACE) != 0; }
 static int cc_alpha(char c) { return (CHAR_CLASS[(unsigned char)c] & CC_ALPHA) != 0; }
 
-typedef struct {
-    Token *toks;
-    size_t len, cap;
-} TokVec;
-
 static void push_tok(TokVec *v, Token t) {
     if (v->len == v->cap) {
         v->cap = v->cap ? v->cap * 2 : 64;
@@ -260,13 +255,6 @@ static const Keyword KEYWORDS[] = {
  * STRING/ISTRING underneath does the "}" that closed an interpolation
  * actually mean "resume string-content lexing" -- the asm/dispatch loop
  * terminology doesn't apply here, this is purely a lexer-internal stack. */
-typedef enum { MODE_NORMAL, MODE_STRING, MODE_ISTRING, MODE_PATH } LexMode;
-
-typedef struct {
-    LexMode *modes;
-    size_t len, cap;
-} ModeStack;
-
 static void mode_push(ModeStack *m, LexMode mode) {
     if (m->len == m->cap) {
         m->cap = m->cap ? m->cap * 2 : 16;
@@ -566,6 +554,8 @@ static double scan_float_tail_and_parse(const char *src, size_t tok_start, size_
     return d;
 }
 
+static void lex_until(const char *src, size_t *i_inout, ModeStack *modes, TokVec *v, size_t min_len);
+
 Token *asnix_lex(const char *src, size_t *out_count) {
     /* perf: presize the token array from the source length instead of
      * letting push_tok's cap-doubling start from scratch (0->64->128->...)
@@ -595,20 +585,40 @@ Token *asnix_lex(const char *src, size_t *out_count) {
     ModeStack modes = { 0 };
     mode_push(&modes, MODE_NORMAL);
     size_t i = 0;
+    lex_until(src, &i, &modes, &v, SIZE_MAX);
+    free(modes.modes);
+    *out_count = v.len;
+    return v.toks;
+}
 
+/* M135: fuses lexing and parsing into one interleaved pass instead of two
+ * sequential ones (docs/architecture.md's M134 finding: asnix used to lex
+ * the whole file into an array, THEN hand it to the parser -- a full write
+ * pass followed by a full read pass over every token, with no equivalent
+ * boundary in iets's pull-based lexer/parser). Called with min_len =
+ * SIZE_MAX (asnix_lex above) this behaves exactly as the lexer always did:
+ * run to EOF in one call. Called with a finite min_len (lexcur_tok below,
+ * the parser's own on-demand driver) it stops the instant v->len tokens are
+ * available and picks back up exactly where it left off on the next call,
+ * via the same (i, modes, v) triple threaded through by the caller -- same
+ * per-token scanning code, same output, just possibly paused partway
+ * through. */
+static void lex_until(const char *src, size_t *i_inout, ModeStack *modes, TokVec *v, size_t min_len) {
+    size_t i = *i_inout;
     for (;;) {
-        LexMode mode = mode_top(&modes);
+        if (v->len > min_len) { *i_inout = i; return; }
+        LexMode mode = mode_top(modes);
 
         if (mode == MODE_STRING) {
-            lex_dquote_run(src, &i, &modes, &v);
+            lex_dquote_run(src, &i, modes, v);
             continue;
         }
         if (mode == MODE_ISTRING) {
-            lex_indented_run(src, &i, &modes, &v);
+            lex_indented_run(src, &i, modes, v);
             continue;
         }
         if (mode == MODE_PATH) {
-            lex_path_run(src, &i, &modes, &v);
+            lex_path_run(src, &i, modes, v);
             continue;
         }
 
@@ -617,7 +627,7 @@ Token *asnix_lex(const char *src, size_t *out_count) {
         size_t tok_start = i; /* byte offset of whatever token (if any) starts here */
 
         if (c == '\0') {
-            if (modes.len != 1) {
+            if (modes->len != 1) {
                 fprintf(stderr, "asnix: unexpected end of input inside '${ ... }'\n");
                 exit(1);
             }
@@ -669,25 +679,25 @@ Token *asnix_lex(const char *src, size_t *out_count) {
         {
             size_t hlen = try_scan_home_path(src, i);
             if (hlen > 0) {
-                push_tok(&v, (Token){ .kind = TOK_PATH, .start = src + i, .len = hlen, .pos = src + tok_start, .is_home = 1 });
+                push_tok(v, (Token){ .kind = TOK_PATH, .start = src + i, .len = hlen, .pos = src + tok_start, .is_home = 1 });
                 i += hlen;
                 if (at_dollar_brace(src, i)) {
                     i += 2;
-                    mode_push(&modes, MODE_PATH);
-                    mode_push(&modes, MODE_NORMAL);
-                    push_tok(&v, (Token){ .kind = TOK_DOLLAR_LBRACE });
+                    mode_push(modes, MODE_PATH);
+                    mode_push(modes, MODE_NORMAL);
+                    push_tok(v, (Token){ .kind = TOK_DOLLAR_LBRACE });
                 }
                 continue;
             }
             size_t plen = try_scan_path(src, i);
             if (plen > 0) {
-                push_tok(&v, (Token){ .kind = TOK_PATH, .start = src + i, .len = plen, .pos = src + tok_start });
+                push_tok(v, (Token){ .kind = TOK_PATH, .start = src + i, .len = plen, .pos = src + tok_start });
                 i += plen;
                 if (at_dollar_brace(src, i)) {
                     i += 2;
-                    mode_push(&modes, MODE_PATH);
-                    mode_push(&modes, MODE_NORMAL);
-                    push_tok(&v, (Token){ .kind = TOK_DOLLAR_LBRACE });
+                    mode_push(modes, MODE_PATH);
+                    mode_push(modes, MODE_NORMAL);
+                    push_tok(v, (Token){ .kind = TOK_DOLLAR_LBRACE });
                 }
                 continue;
             }
@@ -696,7 +706,7 @@ Token *asnix_lex(const char *src, size_t *out_count) {
         if (cc_alpha(c)) {
             size_t ulen = try_scan_uri(src, i);
             if (ulen > 0) {
-                push_tok(&v, (Token){ .kind = TOK_URI, .start = src + i, .len = ulen, .pos = src + tok_start });
+                push_tok(v, (Token){ .kind = TOK_URI, .start = src + i, .len = ulen, .pos = src + tok_start });
                 i += ulen;
                 continue;
             }
@@ -713,7 +723,7 @@ Token *asnix_lex(const char *src, size_t *out_count) {
             size_t k = start;
             while (path_char(src[k]) || src[k] == '/') k++;
             if (k > start && src[k] == '>') {
-                push_tok(&v, (Token){ .kind = TOK_SEARCH_PATH, .start = src + start, .len = k - start, .pos = src + tok_start });
+                push_tok(v, (Token){ .kind = TOK_SEARCH_PATH, .start = src + start, .len = k - start, .pos = src + tok_start });
                 i = k + 1;
                 continue;
             }
@@ -753,11 +763,11 @@ Token *asnix_lex(const char *src, size_t *out_count) {
             if (is_float) {
                 i++; /* consume '.' */
                 double d = scan_float_tail_and_parse(src, start, &i);
-                push_tok(&v, (Token){ .kind = TOK_FLOAT, .float_val = d, .pos = src + tok_start });
+                push_tok(v, (Token){ .kind = TOK_FLOAT, .float_val = d, .pos = src + tok_start });
                 continue;
             }
             Token t = { .kind = TOK_INT, .int_val = strtoll(src + start, NULL, 10), .pos = src + tok_start };
-            push_tok(&v, t);
+            push_tok(v, t);
             continue;
         }
 
@@ -771,14 +781,14 @@ Token *asnix_lex(const char *src, size_t *out_count) {
             size_t start = i;
             i++; /* consume '.' */
             double d = scan_float_tail_and_parse(src, start, &i);
-            push_tok(&v, (Token){ .kind = TOK_FLOAT, .float_val = d, .pos = src + tok_start });
+            push_tok(v, (Token){ .kind = TOK_FLOAT, .float_val = d, .pos = src + tok_start });
             continue;
         }
 
         if (c == '"') {
             i++;
-            mode_push(&modes, MODE_STRING);
-            push_tok(&v, (Token){ .kind = TOK_STR_START });
+            mode_push(modes, MODE_STRING);
+            push_tok(v, (Token){ .kind = TOK_STR_START });
             continue;
         }
 
@@ -793,8 +803,8 @@ Token *asnix_lex(const char *src, size_t *out_count) {
             size_t j = i;
             while (src[j] == ' ') j++;
             if (src[j] == '\n') i = j + 1;
-            mode_push(&modes, MODE_ISTRING);
-            push_tok(&v, (Token){ .kind = TOK_ISTR_START });
+            mode_push(modes, MODE_ISTRING);
+            push_tok(v, (Token){ .kind = TOK_ISTR_START });
             continue;
         }
 
@@ -811,25 +821,25 @@ Token *asnix_lex(const char *src, size_t *out_count) {
          * `set.${name}`), see docs/architecture.md's Known Bugs list. */
         if (c == '$' && src[i + 1] == '{') {
             i += 2;
-            mode_push(&modes, MODE_NORMAL);
-            push_tok(&v, (Token){ .kind = TOK_DOLLAR_LBRACE });
+            mode_push(modes, MODE_NORMAL);
+            push_tok(v, (Token){ .kind = TOK_DOLLAR_LBRACE });
             continue;
         }
 
         if (c == '{') {
             i++;
-            mode_push(&modes, MODE_NORMAL);
-            push_tok(&v, (Token){ .kind = TOK_LBRACE });
+            mode_push(modes, MODE_NORMAL);
+            push_tok(v, (Token){ .kind = TOK_LBRACE });
             continue;
         }
         if (c == '}') {
-            if (modes.len == 1) {
+            if (modes->len == 1) {
                 fprintf(stderr, "asnix: unmatched '}'\n");
                 exit(1);
             }
             i++;
-            mode_pop(&modes);
-            push_tok(&v, (Token){ .kind = TOK_RBRACE, .pos = src + tok_start });
+            mode_pop(modes);
+            push_tok(v, (Token){ .kind = TOK_RBRACE, .pos = src + tok_start });
             continue;
         }
 
@@ -846,7 +856,7 @@ Token *asnix_lex(const char *src, size_t *out_count) {
                 }
             }
             Token t = { .kind = kind, .start = src + start, .len = len, .pos = src + tok_start };
-            push_tok(&v, t);
+            push_tok(v, t);
             continue;
         }
 
@@ -854,7 +864,7 @@ Token *asnix_lex(const char *src, size_t *out_count) {
          * double-character operator, same lookahead style as the two-char
          * operators below. */
         if (c == '.' && src[i + 1] == '.' && src[i + 2] == '.') {
-            push_tok(&v, (Token){ .kind = TOK_ELLIPSIS, .pos = src + tok_start });
+            push_tok(v, (Token){ .kind = TOK_ELLIPSIS, .pos = src + tok_start });
             i += 3;
             continue;
         }
@@ -905,12 +915,44 @@ Token *asnix_lex(const char *src, size_t *out_count) {
                     exit(1);
             }
         }
-        push_tok(&v, (Token){ .kind = kind, .pos = src + tok_start });
+        push_tok(v, (Token){ .kind = kind, .pos = src + tok_start });
         i += width;
     }
 
-    push_tok(&v, (Token){ .kind = TOK_EOF, .pos = src + i });
-    free(modes.modes);
-    *out_count = v.len;
-    return v.toks;
+    push_tok(v, (Token){ .kind = TOK_EOF, .pos = src + i });
+    *i_inout = i;
+}
+
+/* M135: the parser's own on-demand lexing driver (see lex_until's comment
+ * above) -- bundles exactly the (src, i, modes, v) state asnix_lex used to
+ * keep as locals into one persistent, heap-allocated cursor so repeated
+ * lexcur_tok() calls can resume lexing across many separate parser calls
+ * instead of running to completion in one shot. */
+LexCursor *lexcur_new(const char *src) {
+    LexCursor *lc = malloc(sizeof(LexCursor));
+    size_t src_len = strlen(src);
+    lc->src = src;
+    lc->i = 0;
+    lc->modes = (ModeStack){ 0 };
+    mode_push(&lc->modes, MODE_NORMAL);
+    lc->v = (TokVec){ .toks = malloc((src_len / 3 + 32) * sizeof(Token)), .len = 0, .cap = src_len / 3 + 32 };
+    return lc;
+}
+
+/* Ensures toks[0..idx] have all been lexed (lexing forward from wherever
+ * the cursor last stopped, never backward, never re-lexing an already-
+ * produced token) and returns a pointer to toks[idx]. idx must be at most
+ * the eventual TOK_EOF's own index -- every caller (parser.c's cur/peek2/
+ * find_matching_rbrace) already only ever asks for indices up to and
+ * including whatever TOK_EOF it has already seen, exactly as it did
+ * against the old eagerly-filled array. */
+Token *lexcur_tok_slow(LexCursor *lc, size_t idx) {
+    lex_until(lc->src, &lc->i, &lc->modes, &lc->v, idx);
+    return &lc->v.toks[idx];
+}
+
+void lexcur_free(LexCursor *lc) {
+    free(lc->modes.modes);
+    free(lc->v.toks);
+    free(lc);
 }

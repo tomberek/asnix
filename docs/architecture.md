@@ -14735,3 +14735,131 @@ currently decodes a literal's value eagerly. Flagged here as a
 candidate future milestone, scoped as its own dedicated pass with a
 correctness audit of every access site, not a one-session bounded fix.
 No files changed, no commits made.
+
+## M135: lex/parse fusion, implemented and measured -- a correct, verified, but honestly negative result
+
+Implements the fusion M134 flagged but didn't attempt: `asnix_lex`
+running to completion over the whole file, handed to `asnix_parse` as a
+pre-filled array, replaced by on-demand lexing interleaved with parsing.
+Scoped deliberately narrower than M134's own "shrink Token to 12 bytes
+with deferred int/float decode" framing -- that half is a separate,
+larger, correctness-risky change (every one of `parser.c`'s 40+ direct
+`Token`-field accesses would need auditing); this milestone fuses the
+CONTROL FLOW only, keeping the existing 56-byte `Token` and its exact
+per-token scanning logic untouched.
+
+**What changed**: `lexer.c`'s `asnix_lex` body (the `for(;;){...}` token-
+producing loop) was extracted into `lex_until(src, i, modes, v,
+min_len)`, identical per-token scanning code, with one added early-exit
+check (`if (v->len > min_len) return;`) so it can stop and resume
+anywhere instead of only running to EOF. `asnix_lex` itself is now a
+thin wrapper (`lex_until(..., SIZE_MAX)`), preserving its existing
+behavior and all existing callers (tests/bench) byte-for-byte. A new
+`LexCursor` (lexer.h/lexer.c) bundles the same `(src, i, modes, v)`
+state persistently; `lexcur_tok(lc, idx)` is the parser's on-demand
+driver -- `static inline`, checking `idx < lc->v.len` first (the common
+case: the token's already there) and falling back to a real call into
+`lexcur_tok_slow` -> `lex_until` only when lexing actually needs to
+advance. `parser.c`'s `Parser` struct now holds a `LexCursor *` instead
+of a pre-filled `Token *`/count pair; `cur()`/`peek2()`/
+`find_matching_rbrace`'s forward-scanning loop (the one place that
+reads arbitrarily far ahead, for `{...}:`-pattern-vs-attrset
+disambiguation -- found to be a hard blocker against a simpler, iets-
+style single-token-lookahead pull design, since it needs true random
+access, not just 1-token peek) all now go through `lexcur_tok` instead
+of indexing a pre-filled array directly. `asnix_parse`'s signature
+dropped its now-unnecessary `(toks, count)` parameters down to just
+`(src)`, creating and freeing its own `LexCursor` internally; all 7
+call sites (`eval_file.c` x4, `irdump.c`, `tests/ir/test_m45_codegen.c`,
+`bench/microbench_m45.c` -- every one previously doing `toks =
+asnix_lex(src,&n); ast = asnix_parse(toks,n,src); free(toks);` back to
+back) collapsed to one `asnix_parse(src)` call.
+
+**Why the `static inline` fast path matters, found by measuring, not
+guessing**: the first working version routed every `cur()`/`peek2()`
+call through a real cross-translation-unit function call into
+`lex_until` just to evaluate its own early-return check, even when the
+requested token was already lexed (the overwhelmingly common case,
+since `cur()` alone is called many times per token position as the
+parser decides which grammar rule applies). Measured directly: this
+cost a **+10.5% instruction regression** on a full `d.nix` eval (9.98B
+-> 11.04B) before any fast path existed. Moving `LexCursor`'s full
+struct definition (plus the previously lexer.c-private `LexMode`/
+`ModeStack`/`TokVec` types) into `lexer.h` so `lexcur_tok`'s "is it
+already there" check could be `static inline` and genuinely inline at
+every parser.c call site cut this down substantially (see below) --
+this is a real, generally-applicable lesson for any "lazy produce on
+demand" refactor: the function boundary SURROUNDING the check matters
+as much as the check's own cost once it's called from a hot, high-
+frequency, deeply-pipelined caller.
+
+**Measured, after the fast-path fix** (`perf stat -r 7`, `taskset -c 0`
+pinned to a confirmed-quiet-relative-to-the-rest-of-this-session P-core,
+two binaries built from the otherwise-identical tree with only this
+milestone's files swapped, `cpu_core/instructions,cycles` -- low noise,
++-0.01%/+-0.54%):
+- Full `d.nix` eval: instructions 9,957,338,035 -> 10,287,423,982
+  (**+3.3%**), cycles 5,519,921,354 -> 5,649,162,933 (**+2.3%**),
+  wall-clock 1.888s -> 1.859s (-1.5%, inside this measurement's own
+  +-1.16%/+-1.17% noise band -- not a confident win).
+
+**Honest verdict: this is a correct, fully-verified fusion that is a
+small net REGRESSION, not an improvement, on real asnix workloads --
+and the reason why is itself the useful finding.** `asnix_parse`
+unconditionally consumes every token up to and including `TOK_EOF`
+before returning (it has to: `expect(&p, TOK_EOF, "end of input")` is
+the very last thing it does, on every successful parse of a whole
+file) -- so for any syntactically valid file, on-demand lexing still
+lexes literally every byte the eager version did, in the exact same
+order, with the exact same total work. The eager array's `cur()` was a
+single pointer-arithmetic load; the on-demand version's `cur()` is that
+same load PLUS one bounds comparison and one conditional branch, paid
+on every single token access rather than once per token produced (and
+`cur()`/`peek2()` are each called several times per token position).
+There is no equivalent `iets`-style payoff here because `iets`'s real
+win (per M134) isn't "lex on demand instead of eagerly" in the abstract
+-- it's a genuinely different Token representation (12 bytes vs. 56)
+AND a true single-token-lookahead pull design with no backing array at
+all, which this milestone deliberately did NOT attempt (that redesign
+is blocked by `find_matching_rbrace`'s need for unbounded forward
+random access, a hard architectural fact discovered while implementing
+this, not assumed). Fusing just the CONTROL FLOW, while keeping the
+same per-token work and the same backing array, trades a free pointer
+index for a cheap-but-nonzero bounds check with nothing on the other
+side of the ledger to pay for it -- a real, if small, loss.
+
+**Verified** (fast-path version): `make test`/`test-e2e`/
+`test-conformance` all green. `make test-nix-conformance`: `pass=655
+fail=3 skip=148` (exact baseline match, same 3 pre-existing pos-
+tracking failures). `make test-nixpkgs-hash`: one run showed `pass=146
+fail=2` (`rustc.drvPath(crash)`, `jq.drvPath(crash)`) under confirmed
+heavy concurrent-agent load (load average 7.59-14.45 on this 22-core
+shared machine during this milestone's measurement window), both
+reproduced clean standalone (`rc=0`, correct output) and on a full
+rerun (`pass=148 fail=0`) -- this session's familiar transient-
+contention-flakiness pattern, not a real regression. Output hash on
+`d.nix` (ffmpeg's closure) unchanged:
+`/nix/store/29iacg6h530yx7rxz4k1fhvi0kxxhsam-ffmpeg-9.0.1-bin`.
+
+**Recommendation: do not build on this as-is.** The two things that
+would actually need to be true for lex/parse fusion to pay off --
+shrinking `Token` so there's real memory-traffic to save, and a true
+pull-based design with no backing array at all -- are exactly the two
+things this milestone deliberately scoped out, and the second is
+architecturally blocked by `find_matching_rbrace` without a design
+change (a backtracking-capable lexer position, or restructuring that
+one disambiguation to not need forward random access). Landed and kept
+anyway, per this session's own M127 precedent for a correct-but-
+declined POC, as real, working reference material for whoever
+eventually tackles the larger Sym-carrying-AST/Token-shrink milestone
+M134 already flagged as the one lever in this area with real headroom
+(~7% of sampled cycles) -- fusing control flow alone, this milestone
+now shows directly, is not that lever on its own.
+
+Files: `src/c/lexer.c`/`lexer.h` (`lex_until`, `LexCursor`/
+`lexcur_new`/`lexcur_tok`/`lexcur_tok_slow`/`lexcur_free`), `src/c/
+parser.c`/`parser.h` (`Parser.lc` replacing `Parser.toks`/`.count`,
+`cur`/`peek2`/`find_matching_rbrace` routed through `lexcur_tok`,
+`asnix_parse`'s signature), `src/c/eval_file.c`, `src/c/irdump.c`,
+`tests/ir/test_m45_codegen.c`, `bench/microbench_m45.c` (all 7
+lex+parse call sites collapsed to one `asnix_parse(src)` call each).

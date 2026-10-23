@@ -245,9 +245,9 @@ static char *resolve_file_path(const char *path, struct stat *out_st) {
  * directory out through `*base_dir_out` (caller-owned, malloc'd -- freed
  * once done with it, which asnix_compile/asnix_compile_scoped only read
  * during the one compile call), and the source-text buffer itself out
- * through `*src_out` (perf: unlike toks below, this function's own AST
- * nodes point directly INTO src -- AstBinding.name/AstFormal.name are not
- * copies -- so src must stay alive through the caller's own subsequent
+ * through `*src_out` (perf: this function's own AST nodes point directly
+ * INTO src -- AstBinding.name/AstFormal.name are not copies -- so src
+ * must stay alive through the caller's own subsequent
  * asnix_compile()/asnix_compile_scoped() call; this function can't free
  * it itself, only hand it back so the caller can free it once that
  * compile call returns, same as asnix_eval_file's own free(src)). */
@@ -255,14 +255,7 @@ static Ast *parse_resolved_file(const char *resolved, char **base_dir_out, char 
     *base_dir_out = dir_of(resolved);
     char *src = read_file(resolved, NULL);
     *src_out = src;
-    size_t ntoks;
-    Token *toks = asnix_lex(src, &ntoks);
-    Ast *ast = asnix_parse(toks, ntoks, src);
-    free(toks); /* M86 perf: asnix_parse copies everything it needs out of
-                  * toks (names/strings point into src, not into this
-                  * array) -- nothing retains it after this call, but it
-                  * was never freed, leaking every file's whole token
-                  * array for the life of the process. */
+    Ast *ast = asnix_parse(src);
     return ast;
 }
 
@@ -533,10 +526,7 @@ Value asnix_eval_file(const char *path) {
             prog = asnix_bytecode_cache_lookup_verify(resolved, src, src_len, mtime_sec, mtime_nsec, fsize);
         }
         if (!prog) {
-            size_t ntoks;
-            Token *toks = asnix_lex(src, &ntoks);
-            Ast *ast = asnix_parse(toks, ntoks, src);
-            free(toks); /* M86 perf: see parse_resolved_file's identical free() comment */
+            Ast *ast = asnix_parse(src);
             prog = asnix_compile(ast, base_dir, resolved);
             asnix_bytecode_cache_store(resolved, src, src_len, mtime_sec, mtime_nsec, fsize, prog);
             asnix_bytecode_prefetch_imports(ast, base_dir);
@@ -578,10 +568,7 @@ void asnix_prefetch_compile_and_cache(const char *path) {
     char *base_dir = dir_of(resolved);
     size_t src_len;
     char *src = read_file(resolved, &src_len);
-    size_t ntoks;
-    Token *toks = asnix_lex(src, &ntoks);
-    Ast *ast = asnix_parse(toks, ntoks, src);
-    free(toks);
+    Ast *ast = asnix_parse(src);
     IrProgram *prog = asnix_compile(ast, base_dir, resolved);
     asnix_bytecode_cache_store(resolved, src, src_len, (int64_t)st.st_mtim.tv_sec, (int64_t)st.st_mtim.tv_nsec,
                                 (int64_t)st.st_size, prog);
@@ -656,10 +643,7 @@ Value asnix_eval_expr_source(const char *src) {
         fprintf(stderr, "asnix: cannot determine the current directory\n");
         exit(1);
     }
-    size_t ntoks;
-    Token *toks = asnix_lex(src, &ntoks);
-    Ast *ast = asnix_parse(toks, ntoks, src);
-    free(toks); /* M86 perf: see parse_resolved_file's identical free() comment */
+    Ast *ast = asnix_parse(src);
     IrProgram *prog = asnix_compile(ast, cwd, NULL);
     asnix_ast_arena_reset(); /* perf: ast is dead past this point -- see ast.c */
     Env *root_env = make_root_env(NULL);

@@ -26,9 +26,7 @@ static int failures = 0;
     } while (0)
 
 static Ast *parse_source(const char *src) {
-    size_t ntoks;
-    Token *toks = asnix_lex(src, &ntoks);
-    return asnix_parse(toks, ntoks, src);
+    return asnix_parse(src);
 }
 
 static void check_fixture(const char *name, const char *src, int64_t expected) {

@@ -274,10 +274,7 @@ static void dump_program(IrProgram *prog, int id, SeenVec *seen, Worklist *work)
  * ib_finish() takes for a real build, same rationale as this file's own
  * top-of-file comment about decoding the real compiled artifact. */
 static void lex_parse_compile_dump(const char *src, const char *path) {
-    size_t ntoks;
-    Token *toks = asnix_lex(src, &ntoks);
-    Ast *ast = asnix_parse(toks, ntoks, src);
-    free(toks);
+    Ast *ast = asnix_parse(src);
 
     /* base_dir only affects relative-import resolution inside the
      * compiled program, not this dump's own op-level output -- "." is
