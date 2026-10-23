@@ -75,11 +75,116 @@ static size_t find_escape_aterm(const unsigned char *s, size_t len) {
     return len;
 }
 
+/* M151: per-derivation escape cache, keyed by SOURCE POINTER (see aterm.h's
+ * own comment on `AtermEscapeCache`/`asnix_build_derivation_aterm_cached`
+ * for why pointer identity, not content, is both correct and exactly what
+ * `derivation.c`'s 3-passes-per-derivation caller needs). Plain open-
+ * addressing table, linear probe, power-of-two capacity -- the per-
+ * derivation entry count is small (roughly 2*nenv + nargs + ninput_srcs +
+ * a handful) and known well enough up front (the caller's own `hint`) that
+ * a simple table comfortably outperforms anything fancier here. */
+typedef struct {
+    const char *key; /* NULL = empty slot */
+    char *val;        /* malloc'd escaped bytes (quotes included), NOT NUL-terminated */
+    size_t len;
+} AtermCacheSlot;
+
+struct AtermEscapeCache {
+    AtermCacheSlot *slots;
+    size_t cap;   /* power of two, > 0 */
+    size_t count; /* occupied slots -- tracked incrementally, NOT rescanned
+                    * per insert (an earlier version of this cache scanned
+                    * the whole table on every single insert to recompute
+                    * this, an O(cap) cost paid once per distinct string;
+                    * measured directly, by itself, to be the dominant cost
+                    * of this whole milestone's fix -- see M151's own
+                    * writeup). */
+};
+
+static size_t aterm_ptr_hash(const char *p) {
+    uint64_t x = (uint64_t)(uintptr_t)p;
+    x ^= x >> 33;
+    x *= 0xff51afd7ed558ccdULL;
+    x ^= x >> 33;
+    x *= 0xc4ceb9fe1a85ec53ULL;
+    x ^= x >> 33;
+    return (size_t)x;
+}
+
+AtermEscapeCache *asnix_aterm_escape_cache_new(size_t hint) {
+    size_t cap = 64;
+    while (cap < hint * 2) cap *= 2;
+    AtermEscapeCache *c = malloc(sizeof(*c));
+    c->slots = calloc(cap, sizeof(AtermCacheSlot));
+    c->cap = cap;
+    c->count = 0;
+    return c;
+}
+
+void asnix_aterm_escape_cache_free(AtermEscapeCache *c) {
+    if (!c) return;
+    for (size_t i = 0; i < c->cap; i++) free(c->slots[i].val);
+    free(c->slots);
+    free(c);
+}
+
+static int aterm_cache_lookup(AtermEscapeCache *c, const char *s, char **out_val, size_t *out_len) {
+    size_t mask = c->cap - 1;
+    size_t i = aterm_ptr_hash(s) & mask;
+    for (;;) {
+        if (c->slots[i].key == NULL) return 0;
+        if (c->slots[i].key == s) {
+            *out_val = c->slots[i].val;
+            *out_len = c->slots[i].len;
+            return 1;
+        }
+        i = (i + 1) & mask;
+    }
+}
+
+/* Every string this cache ever sees comes from one bounded derivation
+ * build (derivation.c's caller creates one cache, uses it for exactly the
+ * masked/real/cache-hash passes of ONE derivation, then frees it) -- the
+ * entry count is known in advance well enough (the `hint` passed to
+ * `asnix_aterm_escape_cache_new`) that growing is a rare safety net, not
+ * the common case; still handled correctly (rehash into a fresh, doubled
+ * table) rather than assumed away. */
+static void aterm_cache_grow(AtermEscapeCache *c) {
+    size_t old_cap = c->cap;
+    AtermCacheSlot *old_slots = c->slots;
+    size_t new_cap = old_cap * 2;
+    AtermCacheSlot *new_slots = calloc(new_cap, sizeof(AtermCacheSlot));
+    size_t mask = new_cap - 1;
+    for (size_t i = 0; i < old_cap; i++) {
+        if (!old_slots[i].key) continue;
+        size_t j = aterm_ptr_hash(old_slots[i].key) & mask;
+        while (new_slots[j].key) j = (j + 1) & mask;
+        new_slots[j] = old_slots[i];
+    }
+    free(old_slots);
+    c->slots = new_slots;
+    c->cap = new_cap;
+}
+
+static void aterm_cache_insert(AtermEscapeCache *c, const char *s, char *val, size_t len) {
+    /* Keep load factor <= ~70% so linear-probe chains stay short. */
+    if ((c->count + 1) * 10 > c->cap * 7) aterm_cache_grow(c);
+    size_t mask = c->cap - 1;
+    size_t i = aterm_ptr_hash(s) & mask;
+    while (c->slots[i].key) i = (i + 1) & mask;
+    c->slots[i].key = s;
+    c->slots[i].val = val;
+    c->slots[i].len = len;
+    c->count++;
+}
+
 /* Nix's ATerm escaping: only \n \r \t \" \\ are ever escaped; every other
  * byte (including non-ASCII/non-UTF-8) is written verbatim. Includes the
  * surrounding quotes. Output is byte-for-byte identical to a plain
- * per-byte scan-and-switch loop. */
-static void buf_put_escaped(Buf *b, const char *s) {
+ * per-byte scan-and-switch loop. Appends directly to *b (does not reset
+ * b->len) so a cache-miss caller can read back the exact span it just
+ * wrote (b->buf[start..b->len)) without a separate scratch buffer. */
+static void buf_put_escaped_raw(Buf *b, const char *s) {
     buf_putc(b, '"');
     size_t len = strlen(s);
     const unsigned char *p = (const unsigned char *)s;
@@ -100,64 +205,100 @@ static void buf_put_escaped(Buf *b, const char *s) {
     buf_putc(b, '"');
 }
 
-char *asnix_build_derivation_aterm(const AtermOutput *outputs, size_t noutputs,
-                                    const AtermInputDrv *input_drvs, size_t ninput_drvs, const char **input_srcs,
-                                    size_t ninput_srcs, const char *system, const char *builder, const char **args,
-                                    size_t nargs, const AtermEnvVar *env, size_t nenv) {
+/* M151: `cache`-aware entry point -- NULL `cache` is exactly the pre-M151
+ * behavior (escape straight into `b`, every call, no memoization). With a
+ * cache, a pointer seen before (within THIS cache's lifetime) is a pure
+ * `buf_put_bytes` memcpy, skipping `find_escape_aterm`'s scan and the
+ * switch-based re-encode entirely; a first-seen pointer pays the normal
+ * cost once, then has its exact output span (read back from `b`, since
+ * `buf_put_escaped_raw` appends in place) copied into the cache for the
+ * next pass to reuse. */
+static void buf_put_escaped(Buf *b, const char *s, AtermEscapeCache *cache) {
+    if (cache) {
+        char *cval;
+        size_t clen;
+        if (aterm_cache_lookup(cache, s, &cval, &clen)) {
+            buf_put_bytes(b, cval, clen);
+            return;
+        }
+    }
+    size_t start = b->len;
+    buf_put_escaped_raw(b, s);
+    if (cache) {
+        size_t clen = b->len - start;
+        char *cval = malloc(clen ? clen : 1);
+        memcpy(cval, b->buf + start, clen);
+        aterm_cache_insert(cache, s, cval, clen);
+    }
+}
+
+char *asnix_build_derivation_aterm_cached(const AtermOutput *outputs, size_t noutputs,
+                                           const AtermInputDrv *input_drvs, size_t ninput_drvs,
+                                           const char **input_srcs, size_t ninput_srcs, const char *system,
+                                           const char *builder, const char **args, size_t nargs,
+                                           const AtermEnvVar *env, size_t nenv, AtermEscapeCache *cache) {
     Buf b = { 0 };
 
     buf_puts(&b, "Derive([");
     for (size_t i = 0; i < noutputs; i++) {
         if (i > 0) buf_putc(&b, ',');
         buf_putc(&b, '(');
-        buf_put_escaped(&b, outputs[i].name);
+        buf_put_escaped(&b, outputs[i].name, cache);
         buf_putc(&b, ',');
-        buf_put_escaped(&b, outputs[i].path);
+        buf_put_escaped(&b, outputs[i].path, cache);
         buf_putc(&b, ',');
-        buf_put_escaped(&b, outputs[i].hash_algo ? outputs[i].hash_algo : "");
+        buf_put_escaped(&b, outputs[i].hash_algo ? outputs[i].hash_algo : "", cache);
         buf_putc(&b, ',');
-        buf_put_escaped(&b, outputs[i].hash ? outputs[i].hash : "");
+        buf_put_escaped(&b, outputs[i].hash ? outputs[i].hash : "", cache);
         buf_putc(&b, ')');
     }
     buf_puts(&b, "],[");
     for (size_t i = 0; i < ninput_drvs; i++) {
         if (i > 0) buf_putc(&b, ',');
         buf_putc(&b, '(');
-        buf_put_escaped(&b, input_drvs[i].drv_path);
+        buf_put_escaped(&b, input_drvs[i].drv_path, cache);
         buf_puts(&b, ",[");
         for (size_t j = 0; j < input_drvs[i].noutput_names; j++) {
             if (j > 0) buf_putc(&b, ',');
-            buf_put_escaped(&b, input_drvs[i].output_names[j]);
+            buf_put_escaped(&b, input_drvs[i].output_names[j], cache);
         }
         buf_puts(&b, "])");
     }
     buf_puts(&b, "],[");
     for (size_t i = 0; i < ninput_srcs; i++) {
         if (i > 0) buf_putc(&b, ',');
-        buf_put_escaped(&b, input_srcs[i]);
+        buf_put_escaped(&b, input_srcs[i], cache);
     }
     buf_puts(&b, "],");
-    buf_put_escaped(&b, system);
+    buf_put_escaped(&b, system, cache);
     buf_putc(&b, ',');
-    buf_put_escaped(&b, builder);
+    buf_put_escaped(&b, builder, cache);
     buf_putc(&b, ',');
 
     buf_putc(&b, '[');
     for (size_t i = 0; i < nargs; i++) {
         if (i > 0) buf_putc(&b, ',');
-        buf_put_escaped(&b, args[i]);
+        buf_put_escaped(&b, args[i], cache);
     }
     buf_puts(&b, "],[");
     for (size_t i = 0; i < nenv; i++) {
         if (i > 0) buf_putc(&b, ',');
         buf_putc(&b, '(');
-        buf_put_escaped(&b, env[i].key);
+        buf_put_escaped(&b, env[i].key, cache);
         buf_putc(&b, ',');
-        buf_put_escaped(&b, env[i].value);
+        buf_put_escaped(&b, env[i].value, cache);
         buf_putc(&b, ')');
     }
     buf_puts(&b, "])");
 
     buf_putc(&b, '\0'); /* buf_reserve always keeps +1 slack for this */
     return b.buf;
+}
+
+char *asnix_build_derivation_aterm(const AtermOutput *outputs, size_t noutputs,
+                                    const AtermInputDrv *input_drvs, size_t ninput_drvs, const char **input_srcs,
+                                    size_t ninput_srcs, const char *system, const char *builder, const char **args,
+                                    size_t nargs, const AtermEnvVar *env, size_t nenv) {
+    return asnix_build_derivation_aterm_cached(outputs, noutputs, input_drvs, ninput_drvs, input_srcs, ninput_srcs,
+                                                system, builder, args, nargs, env, nenv, NULL);
 }

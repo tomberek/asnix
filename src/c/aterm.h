@@ -81,4 +81,38 @@ char *asnix_build_derivation_aterm(const AtermOutput *outputs, size_t noutputs,
                                     size_t ninput_srcs, const char *system, const char *builder, const char **args,
                                     size_t nargs, const AtermEnvVar *env, size_t nenv);
 
+/* M151: a per-derivation escape cache, keyed by the SOURCE POINTER of each
+ * string handed to `asnix_build_derivation_aterm_cached` (not its content --
+ * pointer identity is exactly what the caller already guarantees for the
+ * common case this exists for: `derivation.c` builds up to 3 ATerm texts
+ * per derivation -- masked/real/cache-hash passes -- from the SAME
+ * `system`/`builder`/`args`/`input_srcs`/`env` arrays each time, varying
+ * only the `outputs`/`input_drvs` sections between passes. Caching by
+ * pointer means a string that's merely `strcmp`-equal but a DIFFERENT
+ * buffer (e.g. a freshly computed output path reused as an env value)
+ * correctly misses and gets escaped fresh -- no risk of a stale/wrong
+ * hit from content that only looks the same. */
+typedef struct AtermEscapeCache AtermEscapeCache;
+
+/* `hint` is the caller's best guess at how many distinct strings it will
+ * feed through this cache across all passes (doesn't need to be exact --
+ * just sizes the initial table to avoid a few early growths). */
+AtermEscapeCache *asnix_aterm_escape_cache_new(size_t hint);
+void asnix_aterm_escape_cache_free(AtermEscapeCache *cache);
+
+/* Same as `asnix_build_derivation_aterm`, but every string argument (each
+ * `AtermOutput`/`AtermInputDrv`/`AtermEnvVar` field, `system`, `builder`,
+ * every `args`/`input_srcs` entry) is escaped through `cache`: a string
+ * whose POINTER was already escaped earlier via this same cache is
+ * reused verbatim (skipping the scan-and-copy work entirely), and a
+ * first-seen pointer is escaped normally, then recorded for later reuse.
+ * `cache` may be NULL, in which case this is identical to
+ * `asnix_build_derivation_aterm` (no caching) -- `asnix_build_derivation_
+ * aterm` itself is now just this function called with `cache=NULL`. */
+char *asnix_build_derivation_aterm_cached(const AtermOutput *outputs, size_t noutputs,
+                                           const AtermInputDrv *input_drvs, size_t ninput_drvs,
+                                           const char **input_srcs, size_t ninput_srcs, const char *system,
+                                           const char *builder, const char **args, size_t nargs,
+                                           const AtermEnvVar *env, size_t nenv, AtermEscapeCache *cache);
+
 #endif /* ASNIX_ATERM_H */

@@ -1845,9 +1845,27 @@ Value asnix_prim_derivation(const Value *args, int64_t argc) {
     }
     qsort(masked_outs, noutputs, sizeof(masked_outs[0]), atermoutput_cmp);
 
-    char *masked_aterm = asnix_build_derivation_aterm(masked_outs, noutputs, masked_input_drvs, ngroups,
-                                                       (const char **)refs.srcs, refs.nsrcs, system, builder,
-                                                       arg_strs, nargs, env, nenv);
+    /* M151: `asnix_build_derivation_aterm` runs up to 3 times for this one
+     * derivation below (masked/real/cache-hash passes) over the SAME
+     * `system`/`builder`/`arg_strs`/`refs.srcs`/`env` arrays each time --
+     * only the `outputs`/`input_drvs` sections actually vary between
+     * passes (see this function's own M73/M74 comments above for why all
+     * 3 are needed). A fresh profiling pass found `buf_put_escaped`
+     * (`aterm.c`) re-escaping that unchanged majority of the content from
+     * scratch on every pass -- real, redundant work, not the "unavoidable
+     * per-byte escaping cost" M140 found for the scan itself. `aterm_cache`
+     * memoizes each string's escaped form by POINTER across all 3 calls
+     * below, so only the first pass to see a given `system`/`builder`/
+     * arg/env-key/env-value/src/output-name/masked-input-drv-path pointer
+     * pays the real cost; every later pass that reuses the SAME pointer
+     * (true for nearly everything except the `outputs`/`input_drvs`
+     * sections by construction) gets a plain memcpy instead. Freed once,
+     * right after the LAST of the 3 passes below, whichever branch that is. */
+    AtermEscapeCache *aterm_cache = asnix_aterm_escape_cache_new(2 * nenv + nargs + refs.nsrcs + 2 * ngroups + 8);
+
+    char *masked_aterm = asnix_build_derivation_aterm_cached(masked_outs, noutputs, masked_input_drvs, ngroups,
+                                                              (const char **)refs.srcs, refs.nsrcs, system, builder,
+                                                              arg_strs, nargs, env, nenv, aterm_cache);
     uint8_t masked_digest[32];
     sha256_or_die(masked_aterm, strlen(masked_aterm), masked_digest);
     free(masked_aterm);
@@ -1939,9 +1957,9 @@ Value asnix_prim_derivation(const Value *args, int64_t argc) {
     }
     qsort(real_outs, noutputs, sizeof(real_outs[0]), atermoutput_cmp);
 
-    char *real_aterm = asnix_build_derivation_aterm(real_outs, noutputs, real_input_drvs, ngroups,
-                                                     (const char **)refs.srcs, refs.nsrcs, system, builder, arg_strs,
-                                                     nargs, env, nenv);
+    char *real_aterm = asnix_build_derivation_aterm_cached(real_outs, noutputs, real_input_drvs, ngroups,
+                                                            (const char **)refs.srcs, refs.nsrcs, system, builder,
+                                                            arg_strs, nargs, env, nenv, aterm_cache);
     /* Debugging aid for the standing d.nix/nixpkgs-hash-parity bug-chase
      * (M74-M77+): set ASNIX_DEBUG_DRV=<name> to dump this derivation's
      * own real ATerm text to stderr when its `name` matches, instead of
@@ -2053,14 +2071,15 @@ Value asnix_prim_derivation(const Value *args, int64_t argc) {
         sha256_or_die(fixed_hash_payload, (size_t)pn, fixed_cache_hash);
         masked_hash_cache_insert(drv_path, 1, fixed_cache_hash);
     } else {
-        char *cache_aterm = asnix_build_derivation_aterm(real_outs, noutputs, masked_input_drvs, ngroups,
-                                                           (const char **)refs.srcs, refs.nsrcs, system, builder,
-                                                           arg_strs, nargs, env, nenv);
+        char *cache_aterm = asnix_build_derivation_aterm_cached(real_outs, noutputs, masked_input_drvs, ngroups,
+                                                                  (const char **)refs.srcs, refs.nsrcs, system,
+                                                                  builder, arg_strs, nargs, env, nenv, aterm_cache);
         uint8_t cache_digest[32];
         sha256_or_die(cache_aterm, strlen(cache_aterm), cache_digest);
         free(cache_aterm);
         masked_hash_cache_insert(drv_path, 0, cache_digest);
     }
+    asnix_aterm_escape_cache_free(aterm_cache);
     drv_scratch_release(); /* M143: pool-owned (group_paths/group_outs/group_nouts/
                              * group_order/masked_input_drvs/real_input_drvs/
                              * masked_hash_hex/drv_refs) -- released, not freed. */

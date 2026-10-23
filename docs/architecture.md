@@ -17040,3 +17040,186 @@ this directive's scope.
 No source files changed (instrumentation added and fully reverted,
 confirmed via `git status`/`git diff` both clean before this commit).
 Files: `docs/architecture.md` only.
+
+## M152: re-examining M140's "unavoidable" verdict on `buf_put_escaped` -- the real remaining cost was call VOLUME, not per-byte scan cost, and a per-derivation escape cache fixes it
+
+A fresh instruction-event-sampled profile (post-M146/M150 mimalloc
+adoption, which collapsed the allocator gap from 763M to 227M
+instructions and confirmed that win held) named `string_ops` as the
+single largest remaining categorized gap against `iets`: asnix 679.3M
+instructions vs. `iets`'s 188.6M, a 490.7M-instruction gap, with
+`buf_put_escaped` (`src/c/aterm.c`) alone at 4.96% of asnix's own total
+(~349.6M instructions). M140 had already SWAR-optimized this exact
+function's escape-byte scan and explicitly declared the REMAINING cost
+"the real, unavoidable cost of escaping ... not a measurement artifact."
+This milestone's assignment was to check that verdict against the fresh
+numbers instead of assuming it still holds now that this is the single
+biggest named lever on the board.
+
+**Reading `buf_put_escaped` itself, fresh, with no assumptions carried
+over from M140.** The function (and its 3 callers, all in
+`derivation.c`) is small and fully legible in one sitting. Nothing about
+the scan itself (M140's own SWAR trick) looked newly fixable. What stood
+out instead was `asnix_build_derivation_aterm`'s OWN call pattern,
+documented plainly in `derivation.c`'s surrounding comments (M73/M74):
+it runs **three times per derivation** -- a masked pass (for the
+self-referential output-path hash), a real pass (for this derivation's
+own `drvPath`), and a third "cache" pass (for the `hashDerivationModulo`
+memo a later, dependent derivation can reuse) -- and all three calls
+pass the exact same `system`, `builder`, `args`/`arg_strs`,
+`input_srcs`/`refs.srcs`, and (for everything except the handful of
+output-named keys) `env` arrays, by POINTER, unchanged. Only the
+`outputs`/`input_drvs` sections differ meaningfully between passes. That
+means the overwhelming majority of `buf_put_escaped` calls across the 3
+passes are escaping **the exact same bytes for the second or third time**
+-- a call-volume problem, not a per-byte cost problem, and exactly the
+kind of thing M140's own investigation (scoped to the scan's per-call
+cost in isolation) was never positioned to catch.
+
+**Checked against `iets`, mechanism-for-mechanism, not just "does it
+escape less per byte."** `iets`'s own `store/drv.rs` confirms this
+directly: its `AtermTail` struct and `aterm_tail()`/`unparse_from`
+machinery exist for exactly this reason -- the doc comment on
+`AtermTail` reads verbatim "The end of the ATerm, escaped once for the
+three unparses of a new derivation." `unparse_tail` is called ONCE,
+building a cached byte buffer (`tail.bytes`) covering `input_srcs`
+through `env`, recording "hole" byte offsets wherever an output-named
+env value was masked to `""`; every later unparse (`unparse_from`) then
+just `extend_from_slice`s (a raw memcpy) the cached bytes verbatim,
+splicing in the real, always-escape-free (on Linux; store paths never
+contain `"`/`\`/`\n`/`\r`/`\t`) output path bytes at each hole instead of
+re-running `escape_into`/`find_escape` at all. So the answer to the
+milestone's own framing question is unambiguous: this is a **call-volume
+gap**, not a per-byte-work gap -- `iets` does fundamentally less total
+escaping work for the same logical derivation set, by design, and
+`asnix` was doing 2-3x the necessary work for no corresponding benefit.
+
+**The fix.** Rather than porting `iets`'s exact head/tail-with-byte-
+offset-holes split (a bigger, more invasive rewrite of
+`asnix_build_derivation_aterm`'s internal structure), this lands the same
+effect through a simpler mechanism that fits this project's existing
+call shape: a per-derivation escape cache (`AtermEscapeCache`, `aterm.c`)
+keyed by **source pointer**, not content. `derivation.c` creates one
+cache right before the masked pass, threads it through all 3
+`asnix_build_derivation_aterm_cached` calls (the new cache-aware entry
+point; `asnix_build_derivation_aterm` itself is now a 1-line wrapper
+calling it with `cache=NULL`, preserving the old, uncached behavior
+byte-for-byte for `tests/c/test_aterm.c` and any other caller), and frees
+it right after the last pass. Inside `buf_put_escaped`, a cache hit is a
+plain `buf_put_bytes` memcpy of the previously-escaped span (quotes
+included); a cache miss escapes normally (unchanged logic, `M140`'s SWAR
+scan and all) and then stores a copy of the exact output span it just
+wrote, keyed by the input pointer, for the next pass to reuse. Pointer
+identity is deliberately the correctness invariant here, not string
+content: a string that's merely `strcmp`-equal but a DIFFERENT buffer
+(this happens for output-named env values, which legitimately differ
+between the masked pass's `""` and the real/cache passes' actual output
+path) is a different pointer, so it correctly misses and gets escaped
+fresh -- there is no risk of conflating two logically-different values
+that happen to look the same. Because `derivation.c` already passes the
+SAME `system`/`builder`/`arg_strs`/`refs.srcs`/`env`-key/non-output-
+`env`-value pointers to all 3 calls (and the masked-pass's own
+`masked_input_drvs` pointer is reused again by the 3rd, cache-hash pass),
+this one pointer-identity cache transparently captures essentially the
+same savings `iets`'s explicit head/tail split does, without needing to
+understand or replicate its byte-offset-hole bookkeeping.
+
+**A real bug found and fixed during this milestone's OWN first
+measurement pass, not shipped.** The first working version of
+`aterm_cache_insert` recomputed the table's load factor by scanning
+every slot (`for (i = 0; i < c->cap; i++) used += ...`) on EVERY single
+insert -- an O(cap) cost paid once per distinct string cached, which
+measured as a net REGRESSION (+91M instructions, firmly outside noise)
+against the M150 baseline on the very first interleaved comparison. This
+is exactly the kind of "trust but verify your own fix's measurement, not
+just its intent" discipline this project's own measurement culture
+requires (the same spirit as M140's cycles re-measurement catching a
+sequential-batching artifact) -- caught before anything was declared
+done, fixed by tracking occupied-slot `count` incrementally instead of
+rescanning, and re-measured from scratch. The lesson generalizes: a
+cache's own bookkeeping cost must be checked to actually be cheaper than
+the work it's skipping, not assumed to be, especially for a cache this
+small and this short-lived (a handful to a few hundred entries, freed
+within the same function call that created it).
+
+**Measured** (after the above fix; `perf stat`, `taskset -c 0`,
+`cpu_core/instructions/`+`cpu_core/cycles/`, 20 interleaved trials
+(before,after,before,after,...) on the real cold `d.nix`/ffmpeg eval,
+output hash cross-checked byte-identical on every single trial):
+
+| | instructions | cycles |
+|---|---|---|
+| before (M150 baseline) | 7,135,827,425 (avg) | 4,025,431,959 (avg) |
+| after (M151) | 6,867,912,154 (avg) | 3,974,302,757 (avg) |
+| delta | **-3.75%** | -1.27% |
+| wins | 20/20 | 16/20 |
+
+Instructions: completely non-overlapping ranges across all 20 trials
+(every BEFORE trial 7,132.3M-7,142.1M, every AFTER trial 6,865.5M-
+6,870.8M) -- the same "hard, repetition-independent fact" character this
+project's measurement culture already established for clean instruction
+wins (M129/M130/M146). Cycles: directionally consistent but noisier (as
+every prior milestone on this shared, contended machine has found), won
+16/20 pairs -- real but smaller, consistent with the instruction count
+being the trustworthy signal here.
+
+A follow-up `perf record -e cpu_core/instructions/ -c 10000 -g` comparison
+confirmed the mechanism directly: `buf_put_escaped`'s self-time share
+dropped from 4.02% to 3.13% of each binary's own (now-smaller) total, and
+`find_escape_aterm`'s own inlined scan share (the exact cost M140 found
+"unavoidable") dropped from 2.44% to 1.55% -- both consistent with
+roughly 2 of the 3 passes' worth of scanning being skipped for most
+strings, not a vanished-but-still-real cost showing up disguised
+elsewhere.
+
+**Correctness.** A standalone `valgrind --leak-check=full` run on a
+small single-derivation `d.nix`-equivalent showed byte-identical leak
+accounting before and after this change (1,104 bytes/21 blocks
+"definitely lost," 262/12 "indirectly lost," both pre-existing in
+`parser.c`/`string_context.c`, unrelated to this milestone -- zero new
+leaks attributed to `aterm.c`/the new cache). Full ladder green: `make
+test`/`test-e2e`/`test-conformance` all pass (including
+`tests/c/test_aterm.c`, exercising the unchanged `cache=NULL` path
+directly). `make test-nix-conformance NIX_CONFORMANCE_DIR=/tmp/nix-
+conformance`: `pass=655 fail=3 skip=148` (exact baseline, the same 3
+pre-existing pos-tracking failures). `make test-nixpkgs-hash`: `pass=148
+fail=0` -- 148 real nixpkgs derivations, including large ones with many
+env vars/inputs, all exercising cache growth and hit/miss correctness
+for real, not just the 4 fixture-based cases in `test_aterm.c`. Output
+hash on `d.nix` (ffmpeg's closure) unchanged:
+`/nix/store/29iacg6h530yx7rxz4k1fhvi0kxxhsam-ffmpeg-9.0.1-bin`,
+byte-identical before and after, every trial.
+
+**Honest sizing against the gap.** This closes roughly 267.7M
+instructions, **3.75% of asnix's own whole-program instruction count** on
+this workload -- a bigger single-change win than M140's own 1.9%, and in
+the same tier as M146/M149's allocator-category fixes, though smaller
+than M146 itself. Measured against the handoff's own named categories:
+267.7M is roughly 54.6% of the full `string_ops` 490.7M-instruction gap,
+and roughly 76.6% of `buf_put_escaped`'s own previously-measured 349.6M-
+instruction absolute cost -- consistent with eliminating most, but not
+all, of the function's 3x-redundant work (the `outputs`/`input_drvs`
+sections, and the small number of output-named env values, are NOT
+cacheable by design, so some real escaping work every pass still does
+remains un-deduplicated, correctly). This directly answers the
+milestone's own question: M140's "unavoidable" framing was correct about
+the SCAN itself (nothing new was found there) but incomplete about the
+function's total cost, because it never examined how many times the
+same bytes were being handed to that scan in the first place. The
+honest remaining gap: `string_ops`'s other ~223M instructions (490.7M
+minus this milestone's 267.7M) is NOT claimed to be closed by this fix --
+whatever else populates that category (other string-handling call sites,
+`jb_escape_string`'s own JSON-output path, `string_context.c`'s
+`dup_cstr`, etc.) is still open and was not re-profiled in isolation
+here.
+
+Files: `src/c/aterm.h` (`AtermEscapeCache` opaque type,
+`asnix_aterm_escape_cache_new`/`_free`, `asnix_build_derivation_aterm_
+cached`), `src/c/aterm.c` (`AtermEscapeCache`'s table implementation,
+`buf_put_escaped_raw`/`buf_put_escaped` split, `asnix_build_derivation_
+aterm_cached`; `asnix_build_derivation_aterm` is now a thin wrapper),
+`src/c/derivation.c` (creates/threads/frees one `aterm_cache` across the
+masked/real/cache-hash passes). No test fixture changes needed --
+`tests/c/test_aterm.c` already exercises the unchanged `cache=NULL` path,
+and the full nixpkgs-hash/conformance suites exercise the cached path
+against real derivations.
