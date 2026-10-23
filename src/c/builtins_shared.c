@@ -483,33 +483,76 @@ static int cmp_make_attrs_entry(const void *a, const void *b) {
     return 0;
 }
 
+/* Threshold below which plain insertion sort beats qsort's per-comparison
+ * indirect-call overhead, plus the malloc/free pair qsort's working array
+ * needs -- the exact same tradeoff, and the same constant, as compiler.c's
+ * AST_ATTRSET case uses for its own compile-time sort (see that case's
+ * ASNIX_ATTRSET_SORT_INSERTION_MAX / ASNIX_COMPILE_SCRATCH_MAX comments;
+ * not shared via a header since the two sorts operate on unrelated data
+ * and this file has no other reason to depend on compiler.c). M158:
+ * instrumentation on a full nixpkgs eval (`./asnix d.nix`) showed 93% of
+ * all asnix_bshared_make_attrs calls have count <= 32. */
+#define ASNIX_MAKE_ATTRS_SORT_INSERTION_MAX 32
+
 /* M89 perf: was an insertion sort (O(n^2) worst case) -- measured on a
  * full nixpkgs evaluation (`./asnix d.nix`, ffmpeg.outPath): 52,539
  * calls, up to 5,234 entries in a single call, ~699,000 total swaps.
  * Switched to qsort over (sym, original-index) pairs, same "resolve
  * once into a sortable key, sort that" approach M88 already used for
- * `sorted_name_order` -- see docs/architecture.md's M88/M89 notes. */
+ * `sorted_name_order` -- see docs/architecture.md's M88/M89 notes.
+ *
+ * M158 perf: that switch made EVERY call pay qsort's malloc/free pair
+ * and per-comparison indirect call through cmp_make_attrs_entry, even
+ * though 93% of real-workload calls have count <= 32 (measured above).
+ * Below that threshold, sort a plain index array in place with
+ * insertion sort directly on the stack -- no allocation, no indirect
+ * comparator call. Insertion sort is stable by construction (the
+ * `>` comparison below never swaps equal syms), so it preserves the
+ * same "ties keep original relative order" behavior the old insertion
+ * sort and cmp_make_attrs_entry's explicit idx tie-break both gave,
+ * without needing to track idx as a separate field at all. qsort (with
+ * its own malloc) is kept, unchanged, for count above the threshold. */
 Value asnix_bshared_make_attrs(uint32_t *syms, Value *vals, int64_t count) {
-    MakeAttrsEntry *entries = count > 0 ? malloc((size_t)count * sizeof(MakeAttrsEntry)) : NULL;
-    for (int64_t i = 0; i < count; i++) {
-        entries[i].sym = syms[i];
-        entries[i].idx = i;
-    }
-    if (count > 1) qsort(entries, (size_t)count, sizeof(MakeAttrsEntry), cmp_make_attrs_entry);
-
     void *mem = asnix_arena_alloc(8 + (uint64_t)count * ASNIX_ATTR_SIZE);
     asnix_stats_attrs++;
     asnix_stats_attrs_entries += (uint64_t)count;
     *(int64_t *)((char *)mem + ASNIX_ATTRS_OFF_COUNT) = count;
-    for (int64_t i = 0; i < count; i++) {
-        char *entry = (char *)mem + ASNIX_ATTRS_OFF_ENTRIES + i * ASNIX_ATTR_SIZE;
-        int64_t src = entries[i].idx;
-        /* M103: must be a 4-byte write -- entry's value bytes now start right after sym (no pad),
-         * so an 8-byte write here would clobber them. */
-        *(uint32_t *)(entry + ASNIX_ATTR_OFF_SYM) = entries[i].sym;
-        *(Value *)(entry + ASNIX_ATTR_OFF_VALUE) = vals[src];
+
+    if (count <= ASNIX_MAKE_ATTRS_SORT_INSERTION_MAX) {
+        int64_t order_stack[ASNIX_MAKE_ATTRS_SORT_INSERTION_MAX];
+        for (int64_t i = 0; i < count; i++) order_stack[i] = i;
+        for (int64_t i = 1; i < count; i++) {
+            int64_t j = i;
+            while (j > 0 && syms[order_stack[j - 1]] > syms[order_stack[j]]) {
+                int64_t tmp = order_stack[j - 1];
+                order_stack[j - 1] = order_stack[j];
+                order_stack[j] = tmp;
+                j--;
+            }
+        }
+        for (int64_t i = 0; i < count; i++) {
+            char *entry = (char *)mem + ASNIX_ATTRS_OFF_ENTRIES + i * ASNIX_ATTR_SIZE;
+            int64_t src = order_stack[i];
+            /* M103: must be a 4-byte write -- entry's value bytes now start right after sym (no pad),
+             * so an 8-byte write here would clobber them. */
+            *(uint32_t *)(entry + ASNIX_ATTR_OFF_SYM) = syms[src];
+            *(Value *)(entry + ASNIX_ATTR_OFF_VALUE) = vals[src];
+        }
+    } else {
+        MakeAttrsEntry *entries = malloc((size_t)count * sizeof(MakeAttrsEntry));
+        for (int64_t i = 0; i < count; i++) {
+            entries[i].sym = syms[i];
+            entries[i].idx = i;
+        }
+        qsort(entries, (size_t)count, sizeof(MakeAttrsEntry), cmp_make_attrs_entry);
+        for (int64_t i = 0; i < count; i++) {
+            char *entry = (char *)mem + ASNIX_ATTRS_OFF_ENTRIES + i * ASNIX_ATTR_SIZE;
+            int64_t src = entries[i].idx;
+            *(uint32_t *)(entry + ASNIX_ATTR_OFF_SYM) = entries[i].sym;
+            *(Value *)(entry + ASNIX_ATTR_OFF_VALUE) = vals[src];
+        }
+        free(entries);
     }
-    free(entries);
     return (Value){ .raw = (uint64_t)(uintptr_t)mem | ASNIX_TAG_ATTRS };
 }
 

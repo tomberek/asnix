@@ -18346,3 +18346,99 @@ Files: `src/c/nar.c` (`copy_cache_hash_str`, `COPY_CACHE_EMPTY_SLOT`,
 `g_copy_cache_index`/`copy_cache_index_rehash` added; `copy_cache_find`/
 `copy_cache_insert` rewritten to probe the index instead of scanning
 linearly).
+
+## M161: `asnix_bshared_make_attrs` unconditionally `malloc`+`qsort`ed even for the ~93% of calls that are tiny -- given M142's own small-N stack-insertion-sort hybrid
+
+`builtins_shared.c`'s `asnix_bshared_make_attrs` is the shared dynamic-
+attrset constructor behind `listToAttrs`/`mapAttrs`/`zipAttrsWith`/
+`intersectAttrs`/`fromJSON`/`fromTOML`/`__overrides`-merge and the rest of
+its ~18 call sites. Since M89 it has, unconditionally, for every call
+regardless of `count`: `malloc`'d a `(sym, original-index)` pairs array,
+`qsort`'d it through an indirect comparator (`cmp_make_attrs_entry`),
+copied the result into the real attrs object, then `free`'d the scratch
+array. A fresh instrumentation pass on `d.nix` (reverted after measuring,
+per this project's standing convention) found 52,442 calls averaging 8.1
+entries each, with 93% of them (48,780) at `count <= 32`. This is the
+exact same "qsort's malloc + per-comparison indirect call costs more than
+insertion sort's O(n^2) saves, for the overwhelming majority of small
+inputs" shape M142 already found and fixed for the *compile-time*
+`AST_ATTRSET` sort in `compiler.c` -- `asnix_bshared_make_attrs` is a
+sibling *runtime* sort that was switched straight to unconditional `qsort`
+back in M89, before M142's small-N insight existed, and never got the same
+treatment.
+
+**The fix**, following M142's own hybrid shape: for `count <=
+ASNIX_MAKE_ATTRS_SORT_INSERTION_MAX` (32, the same threshold M142 uses,
+redefined locally in this file rather than shared via a header since the
+two sorts operate on unrelated data), sort a plain `int64_t
+order_stack[32]` index array in place with ordinary insertion sort,
+directly on the stack -- no `malloc`, no `MakeAttrsEntry` struct, no
+indirect comparator call. Above the threshold, the existing `malloc` +
+`MakeAttrsEntry` + `qsort` + `free` path is untouched. Insertion sort is
+stable by construction (the `>` comparison in the inner loop never swaps
+equal syms), so it reproduces `cmp_make_attrs_entry`'s explicit
+`(sym, idx)` tie-break exactly, without needing to track `idx` as a
+separate field at all in the small-N path -- a slightly leaner version of
+M142's own hybrid (which still built a `{sym,idx}` pairs array for its
+large-N qsort branch; this one's small-N branch needs no pairs array
+whatsoever, just the index array).
+
+**Correctness.** `make test`, `make test-e2e` (all OK), `make test-
+conformance` (all OK), `make test-nix-conformance
+NIX_CONFORMANCE_DIR=/tmp/nix-conformance` (`pass=655 fail=3 skip=148`,
+the same 3 pre-existing position-tracking failures), and `make test-
+nixpkgs-hash` (`pass=148 fail=0`) all green. `./asnix d.nix` output
+unchanged: `/nix/store/29iacg6h530yx7rxz4k1fhvi0kxxhsam-ffmpeg-9.0.1-bin`.
+A hand-written differential test against real `nix-instantiate --eval`
+(not part of the permanent suite) exercised `listToAttrs`/`mapAttrs`/
+`zipAttrsWith`/`intersectAttrs` at counts `0, 1, 2, 7, 31, 32, 33, 40, 64,
+100` -- straddling the new threshold on both sides -- plus a
+duplicate-name `listToAttrs` case (`[{name="a";value=1;} {name="b";
+value=2;} {name="a";value=3;}]`, real Nix keeps the FIRST occurrence:
+`{a=1; b=2;}`) to confirm the stable-sort tie-break still matches.
+`nix-instantiate --eval --strict` and `./asnix` on the same file produced
+byte-identical output in every case.
+
+**Measured, interleaved, with a resolved magnitude discrepancy.** The
+implementer's own 10-trial run (`perf stat -e cpu_core/instructions/,
+cpu_core/cycles/`, `taskset -c 0`, before/after/before/after...) found:
+
+| | mean | median | min |
+|---|---|---|---|
+| before | 6,547,773,752.8 | 6,541,445,173 | 6,539,697,414 |
+| after | 6,515,092,092.8 | 6,507,969,369 | 6,506,892,886 |
+
+A -0.50% / ~33M instruction reduction by mean/median/min alike. An
+independent adversarial-verify pass, fetching this commit into its own
+isolated worktree and re-running the full ladder fresh plus its own
+20-trial interleaved measurement, confirmed correctness is fully intact
+and the effect reproduces cleanly in all 20 trials (19 of 20 clustered
+tightly between -0.62% and -0.72%, one early outlier at -0.235% likely a
+cold-cache warm-up effect) -- but found a somewhat LARGER magnitude than
+claimed: mean -0.632% (-41.3M instructions), median -0.647%, min-to-min
+-0.691%, all consistently 25-30% bigger than the implementer's own
+-0.50%. Per this campaign's established practice (M157's own precedent
+for resolving a magnitude discrepancy by trusting the more rigorous
+independent re-measurement), **the number to trust going forward is
+-0.63% (~41M instructions), not -0.50%** -- a favorable correction, not
+an overstatement: the fix is real and somewhat better than first
+reported, not a case of a self-measurement failing to reproduce.
+
+This still lands smaller than the handoff's own estimate (1.2% / 80M
+instructions) -- the flat-profile `msort_with_tmp` self-time figure that
+estimate was built from was explicitly called out as a floor, excluding
+`qsort_r`'s own dispatch, the comparator's indirect-call overhead, and
+the malloc/free pair, but evidently those excluded costs were smaller in
+practice than the floor itself suggested, or GCC's `-O2` inlining made
+the small-N insertion sort's own ~8-entry average case cheaper than the
+fixed 32-slot stack array's zeroing/loop overhead would suggest. Shipped
+anyway: the measured effect is real, in the right direction on every
+trial batch, strictly simpler than what it replaces for the common case
+(same stable-sort semantics, zero new allocation), and a direct
+structural match for the already-proven M142 pattern -- not a
+speculative rewrite needing a bigger win to justify its own risk.
+
+Files: `src/c/builtins_shared.c` (`asnix_bshared_make_attrs` given a
+small-N stack-insertion-sort fast path below the new
+`ASNIX_MAKE_ATTRS_SORT_INSERTION_MAX` threshold; the existing `malloc` +
+`qsort` path unchanged above it).
