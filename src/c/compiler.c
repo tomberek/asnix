@@ -522,6 +522,37 @@ static void sort_syms(uint32_t *syms, size_t n) {
     }
 }
 
+/* perf (M142): AST_ATTRSET's own binding-sort (unlike sort_syms above,
+ * whose call sites really are tiny lambda-formals counts) cannot assume
+ * "always tiny" -- a single top-level rec {} literal in real nixpkgs
+ * (pkgs/top-level/all-packages.nix) has thousands of bindings. qsort
+ * gives O(n log n) instead of insertion sort's O(n^2). */
+typedef struct {
+    uint32_t sym;
+    size_t idx;
+} SymIdxPair;
+static int symidxpair_cmp(const void *a, const void *b) {
+    uint32_t sa = ((const SymIdxPair *)a)->sym, sb = ((const SymIdxPair *)b)->sym;
+    return (sa > sb) - (sa < sb);
+}
+/* Threshold below which plain insertion sort beats qsort's per-comparison
+ * indirect-call overhead -- tuned empirically against the real d.nix eval,
+ * see the AST_ATTRSET case's own comment. */
+#define ASNIX_ATTRSET_SORT_INSERTION_MAX 32
+/* Factored out of compile_expr's AST_ATTRSET case so the (astronomically
+ * rare -- only literals bigger than the threshold above ever reach this)
+ * qsort path doesn't grow compile_expr's own code size/layout for the
+ * common case it's never taken in -- an earlier version inlined this
+ * directly into the switch and measured a small but real regression on
+ * the COMMON (small-n) path purely from compile_expr growing larger. */
+static void sort_attrset_bindings_large(uint32_t *syms, size_t *order, size_t n) {
+    SymIdxPair *pairs = malloc(n * sizeof(SymIdxPair));
+    for (size_t i = 0; i < n; i++) { pairs[i].sym = syms[i]; pairs[i].idx = i; }
+    qsort(pairs, n, sizeof(SymIdxPair), symidxpair_cmp);
+    for (size_t i = 0; i < n; i++) order[i] = pairs[i].idx;
+    free(pairs);
+}
+
 /* perf: these expression kinds already compile to a single zero-cost
  * compile-time push (ib_push_int/true/false/null, or ib_push_const for a
  * pooled constant) -- no captured scope, no deferred work, no runtime
@@ -1504,16 +1535,39 @@ static void compile_expr(IrBuilder *b, Ast *node, ScopeFrame *scope) {
                 syms[i] = asnix_intern(node->as.attrset.bindings[i].name, node->as.attrset.bindings[i].name_len);
                 order[i] = i;
             }
-            /* Insertion sort `order` by symbol id -- n is a source-level
-             * binding count, always tiny. */
-            for (size_t i = 1; i < n; i++) {
-                size_t j = i;
-                while (j > 0 && syms[order[j - 1]] > syms[order[j]]) {
-                    size_t tmp = order[j - 1];
-                    order[j - 1] = order[j];
-                    order[j] = tmp;
-                    j--;
+            /* perf (M142): was an unconditional O(n^2) insertion sort on the
+             * claim "n is a source-level binding count, always tiny" --
+             * false for real nixpkgs (pkgs/top-level/all-packages.nix is a
+             * single ~4,280-binding rec {} literal). A naive global switch
+             * to qsort for every n REGRESSED (+0.65% instructions on the
+             * real d.nix eval, measured directly): qsort's per-comparison
+             * indirect-call overhead costs more than insertion sort's
+             * O(n^2) saves across the overwhelming majority of small
+             * literals, and even a second attempt that built a {sym,idx}
+             * pairs array unconditionally (to make insertion sort's own
+             * comparisons branch-direct instead of double-indirected
+             * through order[]/syms[]) still regressed (+0.24%), from the
+             * extra malloc/free pair that version paid on every single
+             * call regardless of n. Hybrid, below: insertion sort directly
+             * on order[]/syms[] (byte-for-byte the original, zero-extra-
+             * allocation algorithm) below the threshold; a {sym,idx} pairs
+             * array + qsort, built and freed ONLY on this branch, for the
+             * rare large literal. Names are already unique here (duplicate-
+             * key literals are merged earlier via reopen_attrset_into), so
+             * no two syms ever compare equal and stability is a non-issue
+             * either way. */
+            if (n <= ASNIX_ATTRSET_SORT_INSERTION_MAX) {
+                for (size_t i = 1; i < n; i++) {
+                    size_t j = i;
+                    while (j > 0 && syms[order[j - 1]] > syms[order[j]]) {
+                        size_t tmp = order[j - 1];
+                        order[j - 1] = order[j];
+                        order[j] = tmp;
+                        j--;
+                    }
                 }
+            } else {
+                sort_attrset_bindings_large(syms, order, n);
             }
             uint32_t *sorted_syms = malloc(n * sizeof(uint32_t));
             for (size_t i = 0; i < n; i++) sorted_syms[i] = syms[order[i]];

@@ -15848,3 +15848,134 @@ helpers; every `Token`-field access site in `parse_attr_segment`/
 `parse_path_literal_interp`/`parse_dquote_string`/`parse_indented_string`/
 `parse_atom`/`parse_formals`/`parse_expr`'s lambda-param/assert/`@`-alias
 cases converted to the new span-plus-decode shape).
+
+## M142: profiling iets directly (not just reading its source) found AST_ATTRSET's own compile-time binding sort was O(n^2) -- real for pkgs/top-level/all-packages.nix's ~4,280-binding literal
+
+Directed follow-up after a user asked why asnix was still slower than iets
+"for the same work," having already ruled out redundant computation (file-
+level compile dedup exactly 1:1, identifier interning unchanged at its own
+long-established baseline, attrset-union materialization correctly cached).
+This milestone took a different, previously-unused approach: profiling
+`iets`'s own binary directly with `perf record`/`perf report` (cold,
+`--impure --no-cache --workers 1`, same `d.nix` workload), not just reading
+its Rust source and inferring. Nobody had done this yet this session --
+every prior comparison either profiled asnix alone or compared against
+iets's source code.
+
+**What direct profiling of both sides, call-graph-categorized, found**:
+asnix's lex+parse+compile subtree is 35.65% of its own total cycles (down
+from M123's 43.9% after M129-M141); iets's equivalent (lexer + parser +
+`Compiler::expr` + `Interner::intern`/hashmap scope lookup) is only 23.3%
+of ITS own total cycles. Converting both to absolute cycles (using each
+side's own measured total) shows the front end alone accounts for roughly
+55% of the ENTIRE absolute cycle gap between the two evaluators, despite
+being only about a third of either evaluator's own total work -- a far
+more concentrated, more actionable finding than "lex/parse/compile is
+~40% of cycles on both sides," which undersells how disproportionate this
+slice of the gap actually is.
+
+**Two specific pieces turned out NOT to explain the disproportion, measured
+directly rather than assumed**: identifier interning + scope resolution
+costs almost identical RELATIVE shares on both sides (asnix: `asnix_intern`
++ `hash_bytes` + `scope_find_lexical` = 4.08% of its own total cycles;
+iets: `Interner::intern` + `HashMap::get_key_value` = 4.16% of its own) --
+directly explaining, with hard data for the first time, why the two
+separate full attempts at Sym-carrying-AST-plus-hashmap-scope (M133 item
+6+7's original flag, and the just-declined M141-adjacent re-attempt) both
+regressed: that mechanism was never actually where iets's advantage lived,
+on this workload. Raw lexing is also now close to proportionate post-M141
+(asnix's `lex_until`: 4.48% of its own total; iets's `next_token`: 4.27%).
+
+**What DID turn out disproportionate, isolated after ruling out the above**:
+asnix's `compile_expr` costs 5.44% of its own total cycles; iets's
+`Compiler::expr` costs only 2.60% of its own -- more than 2x the relative
+share, over 3x in absolute terms. `perf annotate` on `compile_expr`
+(address-level, not just function-level) found the reason: two insertion-
+sort blocks (`AST_ATTRSET`'s own binding-key sort, by interned symbol id)
+account for 47.88% of `compile_expr`'s OWN sampled self-time -- roughly
+2.6% of asnix's total process cycles, on this one data structure's compile-
+time preparation alone. The code's own comment claimed "n is a source-level
+binding count, always tiny" -- false for real nixpkgs:
+`pkgs/top-level/all-packages.nix` is confirmed (directly, `grep -c`) to be
+a single `rec {}` literal with roughly 4,280 top-level bindings.
+
+**The fix, and an honest account of two failed attempts before landing the
+right one** -- all three measured directly on the real `d.nix` eval, not
+assumed:
+1. First attempt: replace the O(n^2) insertion-sort-by-index with
+   `qsort` unconditionally, for every attrset literal regardless of size.
+   REGRESSED (+0.65% instructions, interleaved-verified): `qsort`'s per-
+   comparison indirect function-pointer call costs more than insertion
+   sort's own O(n^2) saves across the overwhelming majority of small
+   literals (most attrset literals in real code have a handful of keys,
+   where insertion sort's low constant factor wins outright).
+2. Second attempt: keep insertion sort for all sizes, but make its own
+   comparisons branch-direct (a contiguous `{sym,idx}` pairs array instead
+   of the original's `order[]`-then-`syms[]` double indirection), falling
+   back to `qsort` only above a size threshold. STILL regressed (+0.24%):
+   this version paid an extra `malloc`/`free` pair building the pairs array
+   on EVERY call regardless of size, even though insertion sort ran on the
+   common small-n path -- the extra allocation alone outweighed the direct-
+   comparison saving.
+3. Third attempt, landed: a true hybrid -- below `ASNIX_ATTRSET_SORT_
+   INSERTION_MAX` (32, chosen as a reasonable threshold matching this
+   project's own precedent for small-vs-large thresholds elsewhere, e.g.
+   `SCRATCH_VEC`'s cap tuning), run the ORIGINAL insertion-sort algorithm
+   on `order[]`/`syms[]` completely unchanged -- byte-for-byte the pre-
+   existing code, zero extra allocation, zero extra cost on the common
+   path. Above the threshold, call a newly-factored-out `static` helper,
+   `sort_attrset_bindings_large`, which builds a `{sym,idx}` pairs array
+   and calls `qsort` -- isolated into its own function specifically so the
+   rare branch's extra code doesn't grow `compile_expr`'s own size/layout
+   (an EARLIER version of this same hybrid, inlined directly into the
+   switch statement, measured a small but real regression purely from
+   `compile_expr` becoming a larger function -- factoring the rare branch
+   into a separate function recovered it).
+
+**A measurement trap hit and corrected during this work, worth recording**:
+an early measurement of attempt 3 against a `baseline` number from several
+steps earlier in this same session appeared to show a regression. Rebuilding
+and re-measuring the TRUE baseline fresh, at the same moment, under the
+SAME (contended, multi-agent) machine load, showed the baseline itself had
+drifted upward by over 2% since that earlier number was taken -- the
+"regression" was comparing against a stale reference point measured under
+different load, not a real effect. Properly interleaved (alternating
+before/after binaries every single trial, 8 pairs) resolved this cleanly:
+a real, consistent, reproducible win. This is the exact load-drift trap
+M138's own verification pass already documented and warned about;
+repeating it here anyway, and correctly diagnosing it via interleaving
+rather than trusting a sequential before/after number, is recorded as its
+own lesson.
+
+**Correctness, verified three ways**: (1) a 50-binding literal with
+shuffled key order, output compared byte-for-byte against `nix-instantiate
+--eval --strict` -- identical. (2) The exact threshold boundary, n=31/32/33
+(straddling `ASNIX_ATTRSET_SORT_INSERTION_MAX`), each compared against
+`nix-instantiate` -- identical in all three. (3) A genuinely adversarial
+worst-case construction (4,280 names first interned in ascending order via
+a throwaway literal, then declared in a SEPARATE attrset in fully-reversed
+order, forcing insertion sort's true O(n^2) worst case) -- output identical
+to `nix-instantiate` both before and after, confirming the fix changes
+performance, not behavior.
+
+**Measured, interleaved (8 alternating before/after trials on the real
+`d.nix` eval, to cancel load drift)**: instructions -1.99% (8,730.3M ->
+8,556.6M, tight variance across all 8 pairs); cycles roughly -3.9% (noisier,
+as always on this metric, but one-directional in 3 of 4 pairs and flat,
+not reversed, on the fourth). On the isolated adversarial worst-case
+construction specifically: instructions 132,250,811 -> 43,590,543, a 67%
+reduction -- confirming the complexity fix delivers exactly the kind of
+win the diagnosis predicted when the pathological shape is actually hit,
+not just in the diffuse real-workload average.
+
+**Verified**: `make test`/`test-e2e`/`test-conformance` all green.
+`make test-nix-conformance NIX_CONFORMANCE_DIR=/tmp/nix-conformance`:
+`pass=655 fail=3 skip=148` (exact baseline, same 3 pre-existing pos-
+tracking failures). `make test-nixpkgs-hash`: `pass=148 fail=0`. Output
+hash on `d.nix` (ffmpeg's closure) unchanged:
+`/nix/store/29iacg6h530yx7rxz4k1fhvi0kxxhsam-ffmpeg-9.0.1-bin`.
+`compiler.c` compiles with zero new warnings.
+
+Files: `src/c/compiler.c` only (`sort_syms`'s own call sites, lambda
+formals, were already genuinely tiny and left untouched; only
+`AST_ATTRSET`'s separate, previously-undiagnosed binding-key sort changed).
