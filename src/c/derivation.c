@@ -356,10 +356,44 @@ void asnix_compute_fixed_output_path(const char *output_hash_mode, const uint8_t
  * below can ever actually produce a reference for in the first place
  * (it can only find a reference to a derivation Value that was already
  * forced, which only happens after that derivation was already
- * evaluated). A linear-scan array, same "simple, small N" judgment as
- * M65's import-value cache (`eval_file.c`'s `g_import_cache`) -- the
- * number of distinct derivations one process constructs is nowhere
- * near large enough for this to matter. */
+ * evaluated). Append-only across the WHOLE run (one entry per
+ * derivation built) -- same shape as g_drv_outputs_cache/
+ * g_drv_closure_cache below, so it gets the same open-addressing-index
+ * fix those two received (see dcc_hash_str/DCC_EMPTY_SLOT just below,
+ * moved up from their original spot further down this file since this
+ * cache now needs them too). */
+
+/* perf: widened from a byte-at-a-time multiply chain to 8 bytes/step --
+ * up to ~8x fewer dependent-multiply steps for the ~60-100 byte store-path
+ * strings this hashes (store paths dominate this file's hash-table keys).
+ * Pure internal bucket-placement hash (never persisted/shared across
+ * processes), so changing its byte-grouping only changes bucket
+ * distribution, not correctness -- find/insert both go through this same
+ * function. memcpy (not a cast) avoids unaligned-load UB on the tail
+ * bytes of a buffer that isn't 8-byte-aligned. */
+static uint64_t dcc_hash_str(const char *s, size_t len) {
+    uint64_t h = 0;
+    size_t i = 0;
+    for (; i + 8 <= len; i += 8) {
+        uint64_t word;
+        memcpy(&word, s + i, 8);
+        h ^= word;
+        h *= 0x517cc1b727220a95ULL;
+    }
+    for (; i < len; i++) {
+        h ^= (uint64_t)(unsigned char)s[i];
+        h *= 0x517cc1b727220a95ULL;
+    }
+    h ^= h >> 30;
+    h *= 0xbf58476d1ce4e5b9ULL;
+    h ^= h >> 27;
+    h *= 0x94d049bb133111ebULL;
+    h ^= h >> 31;
+    return h;
+}
+
+#define DCC_EMPTY_SLOT SIZE_MAX
+
 typedef struct {
     char *drv_path;
     int is_fixed_output;
@@ -367,15 +401,42 @@ typedef struct {
 } MaskedHashCacheEntry;
 static MaskedHashCacheEntry *g_masked_hash_cache = NULL;
 static size_t g_masked_hash_cache_count = 0, g_masked_hash_cache_cap = 0;
+/* perf: this cache is append-only across the WHOLE run (one entry per
+ * derivation built), so a linear-scan `find` is O(total derivations
+ * built so far) -- the exact same anti-pattern already found and fixed
+ * for g_drv_outputs_cache/g_drv_closure_cache above (see the perf note
+ * on this page). Fixed the same way: an open-addressing index table,
+ * keyed by drv_path's own hash via this file's existing dcc_hash_str. */
+static size_t *g_masked_hash_index = NULL;
+static size_t g_masked_hash_index_cap = 0;
+
+static void masked_hash_index_rehash(size_t new_cap) {
+    size_t *new_table = malloc(new_cap * sizeof(size_t));
+    for (size_t i = 0; i < new_cap; i++) new_table[i] = DCC_EMPTY_SLOT;
+    for (size_t i = 0; i < g_masked_hash_cache_count; i++) {
+        const char *dp = g_masked_hash_cache[i].drv_path;
+        size_t slot = dcc_hash_str(dp, strlen(dp)) & (new_cap - 1);
+        while (new_table[slot] != DCC_EMPTY_SLOT) slot = (slot + 1) & (new_cap - 1);
+        new_table[slot] = i;
+    }
+    free(g_masked_hash_index);
+    g_masked_hash_index = new_table;
+    g_masked_hash_index_cap = new_cap;
+}
 
 static int masked_hash_cache_find(const char *drv_path, MaskedHashCacheEntry *out) {
-    for (size_t i = 0; i < g_masked_hash_cache_count; i++) {
-        if (strcmp(g_masked_hash_cache[i].drv_path, drv_path) == 0) {
-            *out = g_masked_hash_cache[i];
+    if (g_masked_hash_index_cap == 0) return 0;
+    size_t len = strlen(drv_path);
+    size_t slot = dcc_hash_str(drv_path, len) & (g_masked_hash_index_cap - 1);
+    for (;;) {
+        size_t idx = g_masked_hash_index[slot];
+        if (idx == DCC_EMPTY_SLOT) return 0;
+        if (strcmp(g_masked_hash_cache[idx].drv_path, drv_path) == 0) {
+            *out = g_masked_hash_cache[idx];
             return 1;
         }
+        slot = (slot + 1) & (g_masked_hash_index_cap - 1);
     }
-    return 0;
 }
 
 static void masked_hash_cache_insert(const char *drv_path, int is_fixed_output, const uint8_t hash[32]) {
@@ -383,13 +444,22 @@ static void masked_hash_cache_insert(const char *drv_path, int is_fixed_output, 
         g_masked_hash_cache_cap = g_masked_hash_cache_cap ? g_masked_hash_cache_cap * 2 : 64;
         g_masked_hash_cache = realloc(g_masked_hash_cache, g_masked_hash_cache_cap * sizeof(*g_masked_hash_cache));
     }
+    if (g_masked_hash_index_cap == 0) {
+        masked_hash_index_rehash(128);
+    } else if ((g_masked_hash_cache_count + 1) * 4 > g_masked_hash_index_cap * 3) {
+        masked_hash_index_rehash(g_masked_hash_index_cap * 2);
+    }
     size_t len = strlen(drv_path);
     char *copy = malloc(len + 1);
     memcpy(copy, drv_path, len + 1);
-    g_masked_hash_cache[g_masked_hash_cache_count].drv_path = copy;
-    g_masked_hash_cache[g_masked_hash_cache_count].is_fixed_output = is_fixed_output;
-    memcpy(g_masked_hash_cache[g_masked_hash_cache_count].hash, hash, 32);
+    size_t idx = g_masked_hash_cache_count;
+    g_masked_hash_cache[idx].drv_path = copy;
+    g_masked_hash_cache[idx].is_fixed_output = is_fixed_output;
+    memcpy(g_masked_hash_cache[idx].hash, hash, 32);
     g_masked_hash_cache_count++;
+    size_t slot = dcc_hash_str(drv_path, len) & (g_masked_hash_index_cap - 1);
+    while (g_masked_hash_index[slot] != DCC_EMPTY_SLOT) slot = (slot + 1) & (g_masked_hash_index_cap - 1);
+    g_masked_hash_index[slot] = idx;
 }
 
 /* M74: a narrow, CALL-SCOPED collector of "which attribute values of
@@ -432,6 +502,14 @@ typedef struct {
     size_t ndrvs, drvs_cap;
     char **srcs;
     size_t nsrcs, srcs_cap;
+    /* perf: open-addressing dedup indexes for add_built/add_src below,
+     * parallel to drvs/srcs -- see those functions' own header comments
+     * for why a linear scan here is the same anti-pattern this file's
+     * DrvClosureStrSet fix already addressed elsewhere on this page. */
+    size_t *drvs_index;
+    size_t drvs_index_cap;
+    size_t *srcs_index;
+    size_t srcs_index_cap;
 } InputRefSet;
 
 static void input_ref_set_init(InputRefSet *s) {
@@ -445,28 +523,87 @@ static char *dup_cstr(const char *s, size_t len) {
     return out;
 }
 
-static void input_ref_add_built(InputRefSet *s, const char *drv_path, const char *output_name) {
+static void input_ref_drvs_index_rehash(InputRefSet *s, size_t new_cap) {
+    size_t *new_table = malloc(new_cap * sizeof(size_t));
+    for (size_t i = 0; i < new_cap; i++) new_table[i] = DCC_EMPTY_SLOT;
     for (size_t i = 0; i < s->ndrvs; i++) {
-        if (strcmp(s->drvs[i].drv_path, drv_path) == 0 && strcmp(s->drvs[i].output_name, output_name) == 0) return;
+        const char *dp = s->drvs[i].drv_path, *on = s->drvs[i].output_name;
+        uint64_t h = dcc_hash_str(dp, strlen(dp)) ^ (dcc_hash_str(on, strlen(on)) * 0x9e3779b97f4a7c15ULL);
+        size_t slot = h & (new_cap - 1);
+        while (new_table[slot] != DCC_EMPTY_SLOT) slot = (slot + 1) & (new_cap - 1);
+        new_table[slot] = i;
+    }
+    free(s->drvs_index);
+    s->drvs_index = new_table;
+    s->drvs_index_cap = new_cap;
+}
+
+/* perf: `asnix_collect_input_refs` below calls this once per referenced
+ * derivation output, including once per member of a `DrvDeep` closure
+ * expansion (potentially hundreds for a real nixpkgs derivation) -- a
+ * linear strcmp-pair scan here is O(refs_so_far) per call, O(n^2) total
+ * for one derivation's own input set, the same shape of anti-pattern
+ * this file's dcc_hash_str/DrvClosureStrSet fix already addressed for
+ * cache_own_drv_closure. Fixed the same way: an open-addressing index
+ * keyed by a combined hash of both fields -- a hash collision between
+ * differently-matched (drv_path, output_name) pairs is possible and
+ * harmless, since every probe step still does an exact strcmp of both
+ * fields before accepting a match. */
+static void input_ref_add_built(InputRefSet *s, const char *drv_path, const char *output_name) {
+    size_t dp_len = strlen(drv_path), on_len = strlen(output_name);
+    if (s->drvs_index_cap == 0) input_ref_drvs_index_rehash(s, 16);
+    else if ((s->ndrvs + 1) * 4 > s->drvs_index_cap * 3) input_ref_drvs_index_rehash(s, s->drvs_index_cap * 2);
+    uint64_t h = dcc_hash_str(drv_path, dp_len) ^ (dcc_hash_str(output_name, on_len) * 0x9e3779b97f4a7c15ULL);
+    size_t slot = h & (s->drvs_index_cap - 1);
+    for (;;) {
+        size_t idx = s->drvs_index[slot];
+        if (idx == DCC_EMPTY_SLOT) break;
+        if (strcmp(s->drvs[idx].drv_path, drv_path) == 0 && strcmp(s->drvs[idx].output_name, output_name) == 0) return;
+        slot = (slot + 1) & (s->drvs_index_cap - 1);
     }
     if (s->ndrvs == s->drvs_cap) {
         s->drvs_cap = s->drvs_cap ? s->drvs_cap * 2 : 8;
         s->drvs = realloc(s->drvs, s->drvs_cap * sizeof(*s->drvs));
     }
-    s->drvs[s->ndrvs].drv_path = dup_cstr(drv_path, strlen(drv_path));
-    s->drvs[s->ndrvs].output_name = dup_cstr(output_name, strlen(output_name));
+    s->drvs[s->ndrvs].drv_path = dup_cstr(drv_path, dp_len);
+    s->drvs[s->ndrvs].output_name = dup_cstr(output_name, on_len);
+    s->drvs_index[slot] = s->ndrvs;
     s->ndrvs++;
 }
 
-static void input_ref_add_src(InputRefSet *s, const char *path) {
+static void input_ref_srcs_index_rehash(InputRefSet *s, size_t new_cap) {
+    size_t *new_table = malloc(new_cap * sizeof(size_t));
+    for (size_t i = 0; i < new_cap; i++) new_table[i] = DCC_EMPTY_SLOT;
     for (size_t i = 0; i < s->nsrcs; i++) {
-        if (strcmp(s->srcs[i], path) == 0) return;
+        size_t slot = dcc_hash_str(s->srcs[i], strlen(s->srcs[i])) & (new_cap - 1);
+        while (new_table[slot] != DCC_EMPTY_SLOT) slot = (slot + 1) & (new_cap - 1);
+        new_table[slot] = i;
+    }
+    free(s->srcs_index);
+    s->srcs_index = new_table;
+    s->srcs_index_cap = new_cap;
+}
+
+/* perf: same anti-pattern/fix as input_ref_add_built above, single-
+ * string key this time (just the path). */
+static void input_ref_add_src(InputRefSet *s, const char *path) {
+    size_t len = strlen(path);
+    if (s->srcs_index_cap == 0) input_ref_srcs_index_rehash(s, 16);
+    else if ((s->nsrcs + 1) * 4 > s->srcs_index_cap * 3) input_ref_srcs_index_rehash(s, s->srcs_index_cap * 2);
+    size_t slot = dcc_hash_str(path, len) & (s->srcs_index_cap - 1);
+    for (;;) {
+        size_t idx = s->srcs_index[slot];
+        if (idx == DCC_EMPTY_SLOT) break;
+        if (strcmp(s->srcs[idx], path) == 0) return;
+        slot = (slot + 1) & (s->srcs_index_cap - 1);
     }
     if (s->nsrcs == s->srcs_cap) {
         s->srcs_cap = s->srcs_cap ? s->srcs_cap * 2 : 8;
         s->srcs = realloc(s->srcs, s->srcs_cap * sizeof(*s->srcs));
     }
-    s->srcs[s->nsrcs++] = dup_cstr(path, strlen(path));
+    s->srcs[s->nsrcs] = dup_cstr(path, len);
+    s->srcs_index[slot] = s->nsrcs;
+    s->nsrcs++;
 }
 
 /* M86: real Nix's `NixStringContextElem::DrvDeep` ("this string refers to
@@ -513,37 +650,9 @@ static void input_ref_add_src(InputRefSet *s, const char *path) {
  * (ptr-keyed) and `intersectAttrs2_impl` (builtins_m23.c) -- here fixed
  * the same way: open-addressing hash tables/sets, keyed by the drv_path
  * (or member-path) string's own hash, FxHash-style mix matching
- * `symtab.c`'s `hash_bytes`. */
-/* perf: widened from a byte-at-a-time multiply chain to 8 bytes/step --
- * up to ~8x fewer dependent-multiply steps for the ~60-100 byte store-path
- * strings this hashes (store paths dominate this file's hash-table keys).
- * Pure internal bucket-placement hash (never persisted/shared across
- * processes), so changing its byte-grouping only changes bucket
- * distribution, not correctness -- find/insert both go through this same
- * function. memcpy (not a cast) avoids unaligned-load UB on the tail
- * bytes of a buffer that isn't 8-byte-aligned. */
-static uint64_t dcc_hash_str(const char *s, size_t len) {
-    uint64_t h = 0;
-    size_t i = 0;
-    for (; i + 8 <= len; i += 8) {
-        uint64_t word;
-        memcpy(&word, s + i, 8);
-        h ^= word;
-        h *= 0x517cc1b727220a95ULL;
-    }
-    for (; i < len; i++) {
-        h ^= (uint64_t)(unsigned char)s[i];
-        h *= 0x517cc1b727220a95ULL;
-    }
-    h ^= h >> 30;
-    h *= 0xbf58476d1ce4e5b9ULL;
-    h ^= h >> 27;
-    h *= 0x94d049bb133111ebULL;
-    h ^= h >> 31;
-    return h;
-}
-
-#define DCC_EMPTY_SLOT SIZE_MAX
+ * `symtab.c`'s `hash_bytes`. dcc_hash_str/DCC_EMPTY_SLOT (used by this
+ * cache and the two below) now live above MaskedHashCacheEntry further
+ * up this file, since that cache needs them too -- see there. */
 
 typedef struct {
     char *drv_path;
