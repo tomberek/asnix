@@ -18147,3 +18147,103 @@ MAGNITUDE; only a real interleaved measurement settles the latter.
 
 Files: `src/c/parser.c` (`find_matching_rbrace` replaced by
 `is_formals_pattern`; one call site updated).
+
+## M159: `asnix_bshared_attrs_find`'s binary search re-resolved its loop-invariant `attrs` argument on every iteration via `attrs_sym`/`attrs_count`
+
+M155's own `attrs_find_flat_noresolve` comment explicitly flagged this as
+its follow-up and declared it out of scope at the time: `attrs_find`
+(`src/c/builtins_shared.c`) called `asnix_bshared_attrs_resolve(attrs)`
+once up front, then `asnix_bshared_attrs_count(attrs)` to get `hi`
+(another internal resolve), then `asnix_bshared_attrs_sym(attrs, mid)`
+once per binary-search iteration -- and `attrs_sym` ALSO calls
+`asnix_bshared_attrs_resolve(attrs)` internally on every single call,
+even though `attrs` never changes across the loop and was already
+resolved by the first line of `find()` itself. For a typical
+nixpkgs-sized attrset that is roughly `1 (direct) + 1 (via count) +
+log2(n) (via sym)` wasted `resolve()` calls per `find()`, where exactly
+one `resolve()` call suffices, since the function's own first line
+already guarantees `attrs` is flat (`count >= 0`) for the rest of the
+function body.
+
+**The fix.** `attrs_find_flat_noresolve` (added by M155 for a different
+call path, `asnix_bshared_attrs_probe`'s leaf-walk) already implements
+exactly the needed shape: given a value ALREADY known to be flat, binary-
+search its raw `ASNIX_ATTRS_OFF_ENTRIES` array directly, with no further
+resolve/wrapper calls inside the loop. `asnix_bshared_attrs_find` now
+does one `asnix_bshared_attrs_resolve(attrs)` call and then delegates the
+entire search to `attrs_find_flat_noresolve(attrs, sym)`, which was moved
+above `find()` in the file (it has no other dependency on ordering) so
+it could be called without a forward declaration. `attrs_count`/
+`attrs_sym`/`attrs_value` themselves were deliberately left untouched --
+each is a tiny standalone public wrapper used directly by many call
+sites that pass values NOT already known to be resolved (e.g. iterating
+a lazy union's attrset directly), so collapsing their own internal
+resolve would require auditing all 35+ of those call sites individually,
+same "out of scope" boundary M155's own comment already drew; only
+`find()`'s own internal loop, which uniquely has the invariant-resolve
+information available for free, changes here.
+
+**Measured** (`perf stat`, `taskset -c 0`,
+`cpu_core/instructions/`+`cpu_core/cycles/`, 10 interleaved trials
+(before,after,before,after,...) on the real cold `d.nix`/ffmpeg eval,
+both binaries built from a clean `make` at this milestone's parent
+commit (M157, `4c663df`) and at this fix, output hash cross-checked
+byte-identical on every trial):
+
+| | instructions | cycles |
+|---|---|---|
+| before (M157) | 6,537,248,409 (avg) | 3,840,689,997 (avg) |
+| after (M158) | 6,459,331,154 (avg) | 3,832,132,689 (avg) |
+| delta | **-1.192%** | -0.223% |
+| wins | 10/10 | 5/10 |
+
+Instructions: completely non-overlapping ranges across all 10 trials
+(every BEFORE trial 6,536.1M-6,540.8M, every AFTER trial 6,458.0M-
+6,461.1M) -- the same "hard, repetition-independent fact" character this
+project's measurement culture already established for a real win
+(M129/M130/M146/M152/M156/M157). Cycles: weak/noisy as usual on this
+shared machine (5/10 wins, -0.223% on average), consistent with every
+prior milestone's finding that cycles are the noisier signal and
+instructions are the one to trust.
+
+**Honest sizing against the gap.** The handoff's own estimate was
+0.7%/50,000,000 instructions. The measured result, -1.192%/~77.9M
+instructions, is noticeably bigger than that estimate -- plausible
+because the handoff's own per-call-count arithmetic (`~7.2 resolve()
+calls where 1 would suffice`) only counted `resolve()`'s own measured
+~24-instruction self-cost, not the additional call/ret and argument-
+marshalling overhead of the now-eliminated `attrs_sym`/`attrs_count`
+wrapper calls themselves (each one a real function call, not inlined,
+across translation units), nor the loop-body register pressure those
+calls previously forced.
+
+**Correctness.** `find()`'s observable behavior is unchanged: it still
+returns the same positional index into `attrs`'s own flat form for a
+present `sym`, or `-1` for a missing one, with the one resolve happening
+up front (correct) rather than redundantly inside the loop (also
+correct, just wasteful) -- `attrs` is immutable for the duration of the
+call, so caching the resolved pointer across the loop iterations changes
+no semantics. Full ladder green: `make test`/`test-e2e`/
+`test-conformance` all pass. `make test-nix-conformance
+NIX_CONFORMANCE_DIR=/tmp/nix-conformance`: `pass=655 fail=3 skip=148`
+(exact baseline, the same 3 pre-existing position-tracking failures).
+`make test-nixpkgs-hash`: `pass=148 fail=0`. `d.nix` output hash
+unchanged on every trial:
+`/nix/store/29iacg6h530yx7rxz4k1fhvi0kxxhsam-ffmpeg-9.0.1-bin`.
+
+**Independent verification.** A separate adversarial-verify pass fetched
+this commit into its own isolated worktree, confirmed the diff's logic
+directly (delegating to `attrs_find_flat_noresolve` after exactly one
+`resolve()` call is semantically equivalent, since `attrs` is immutable
+across the loop), re-ran the full correctness ladder fresh (not trusted
+from this writeup) with identical results, and ran its OWN independent
+20-trial interleaved measurement: instructions before (4c663df) avg
+6,535,864,027, after (this fix) avg 6,458,737,528, delta **-1.180%**
+(~77.1M instructions), 20/20 wins, completely non-overlapping ranges --
+closely matching the -1.192% reported above (well within normal
+trial-to-trial variance, same hard-win signature). Verdict: CONFIRMED.
+
+Files: `src/c/builtins_shared.c` (`attrs_find_flat_noresolve` moved
+above `asnix_bshared_attrs_find`; `asnix_bshared_attrs_find` rewritten to
+resolve once and delegate to `attrs_find_flat_noresolve`; no other
+function touched).

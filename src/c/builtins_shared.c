@@ -358,24 +358,14 @@ Value asnix_bshared_attrs_value(Value v, int64_t i) {
     return *(const Value *)(entry + ASNIX_ATTR_OFF_VALUE);
 }
 
-int64_t asnix_bshared_attrs_find(Value attrs, uint32_t sym) {
-    attrs = asnix_bshared_attrs_resolve(attrs);
-    int64_t lo = 0, hi = asnix_bshared_attrs_count(attrs);
-    while (lo < hi) {
-        int64_t mid = lo + (hi - lo) / 2;
-        uint32_t s = asnix_bshared_attrs_sym(attrs, mid);
-        if (s == sym) return mid;
-        if (s < sym) lo = mid + 1; else hi = mid;
-    }
-    return -1;
-}
-
 /* fork (unionhdr-probe): binary search on a value ALREADY KNOWN to be
- * flat (count >= 0) -- shared by asnix_bshared_attrs_probe below, raw-
- * layout version of the lo/hi loop above without the resolve call,
- * since every leaf of a union is already guaranteed flat by construction
- * (asnix_attrs_update always resolves a would-be leaf before storing
- * it). */
+ * flat (count >= 0) -- shared by asnix_bshared_attrs_probe and (M114)
+ * asnix_bshared_attrs_find below, raw-layout version of a lo/hi binary
+ * search without any resolve call, since every leaf of a union is
+ * already guaranteed flat by construction (asnix_attrs_update always
+ * resolves a would-be leaf before storing it), and a caller that has
+ * already resolved its own `attrs` argument once knows the result is
+ * flat too. */
 static int64_t attrs_find_flat_noresolve(Value flat, uint32_t sym) {
     const char *base = (const char *)(uintptr_t)(flat.raw & ~(uint64_t)ASNIX_TAG_MASK);
     int64_t lo = 0, hi = *(const int64_t *)(base + ASNIX_ATTRS_OFF_COUNT);
@@ -387,6 +377,25 @@ static int64_t attrs_find_flat_noresolve(Value flat, uint32_t sym) {
         if (s < sym) lo = mid + 1; else hi = mid;
     }
     return -1;
+}
+
+/* M114 perf: was `resolve(attrs)` once + `attrs_count(attrs)` (another
+ * internal resolve) to get `hi`, then `attrs_sym(attrs, mid)` per binary-
+ * search iteration (which ALSO internally resolves `attrs` on every
+ * call, even though `attrs` is loop-invariant and was already resolved
+ * on the line above). For a typical nixpkgs-sized attrset that's
+ * 1 (direct) + 1 (via count) + ~log2(n) (via sym) resolve() calls per
+ * find(), where exactly one suffices: `attrs` is already flat (count >=
+ * 0) immediately after the one resolve() call below, so the rest of the
+ * search can walk the raw entry array directly via
+ * attrs_find_flat_noresolve, exactly like M93's attrs_probe/
+ * attrs_find_flat_noresolve pairing already does for the op_select.S
+ * fast path (see that function's comment -- this was its flagged,
+ * explicitly-out-of-scope-at-the-time follow-up for attrs_find/_count/
+ * _sym/_value). */
+int64_t asnix_bshared_attrs_find(Value attrs, uint32_t sym) {
+    attrs = asnix_bshared_attrs_resolve(attrs);
+    return attrs_find_flat_noresolve(attrs, sym);
 }
 
 /* fork (unionhdr-probe): bounded multi-leaf probe for a SINGLE-KEY
