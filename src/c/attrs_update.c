@@ -75,35 +75,54 @@ Value asnix_attrs_eager_merge(Value lhs, Value rhs) {
     void *mem = asnix_arena_alloc(8 + (uint64_t)(acount + bcount) * ASNIX_ATTR_SIZE);
     char *out_entries = (char *)mem + ASNIX_ATTRS_OFF_ENTRIES;
 
-    int64_t i = 0, j = 0, k = 0;
-    while (i < acount && j < bcount) {
-        uint32_t asym = *(const uint32_t *)(aentries + i * ASNIX_ATTR_SIZE + ASNIX_ATTR_OFF_SYM);
-        uint32_t bsym = *(const uint32_t *)(bentries + j * ASNIX_ATTR_SIZE + ASNIX_ATTR_OFF_SYM);
+    /* M143: walk with running byte pointers instead of `i`/`j`/`k` indices
+     * recomputed via `idx * ASNIX_ATTR_SIZE` every iteration. The index
+     * form looked equivalent to the compiler but wasn't: GCC couldn't
+     * prove it could hoist the index->address multiply out of the loop
+     * (ASNIX_ATTR_SIZE=12 isn't a shift), so the main merge loop's -O2
+     * codegen recomputed `base + idx*12` from scratch (two extra `lea`s
+     * per side, confirmed via `objdump -d` before this change) on EVERY
+     * iteration, while the tail loops below (which this file already
+     * wrote with a plain incrementing index multiplied once per access)
+     * got the same treatment. Advancing plain `const char *` pointers by
+     * a constant 12 each step needs no per-iteration multiply at all --
+     * same two-pointer merge, same memcpy-per-entry, fewer retired
+     * instructions in the loop iets's own `update_attrs` (see
+     * docs/architecture.md's M143) also has to run. */
+    const char *pa = aentries;
+    const char *pb = bentries;
+    const char *aend = aentries + acount * ASNIX_ATTR_SIZE;
+    const char *bend = bentries + bcount * ASNIX_ATTR_SIZE;
+    char *pout = out_entries;
+    while (pa < aend && pb < bend) {
+        uint32_t asym = *(const uint32_t *)(pa + ASNIX_ATTR_OFF_SYM);
+        uint32_t bsym = *(const uint32_t *)(pb + ASNIX_ATTR_OFF_SYM);
         if (asym < bsym) {
-            memcpy(out_entries + k * ASNIX_ATTR_SIZE, aentries + i * ASNIX_ATTR_SIZE, ASNIX_ATTR_SIZE);
-            i++;
+            memcpy(pout, pa, ASNIX_ATTR_SIZE);
+            pa += ASNIX_ATTR_SIZE;
         } else if (bsym < asym) {
-            memcpy(out_entries + k * ASNIX_ATTR_SIZE, bentries + j * ASNIX_ATTR_SIZE, ASNIX_ATTR_SIZE);
-            j++;
+            memcpy(pout, pb, ASNIX_ATTR_SIZE);
+            pb += ASNIX_ATTR_SIZE;
         } else {
             /* duplicate key: rhs (b) wins, matching `//`'s right-biased semantics */
-            memcpy(out_entries + k * ASNIX_ATTR_SIZE, bentries + j * ASNIX_ATTR_SIZE, ASNIX_ATTR_SIZE);
-            i++;
-            j++;
+            memcpy(pout, pb, ASNIX_ATTR_SIZE);
+            pa += ASNIX_ATTR_SIZE;
+            pb += ASNIX_ATTR_SIZE;
         }
-        k++;
+        pout += ASNIX_ATTR_SIZE;
     }
-    while (i < acount) {
-        memcpy(out_entries + k * ASNIX_ATTR_SIZE, aentries + i * ASNIX_ATTR_SIZE, ASNIX_ATTR_SIZE);
-        i++;
-        k++;
+    while (pa < aend) {
+        memcpy(pout, pa, ASNIX_ATTR_SIZE);
+        pa += ASNIX_ATTR_SIZE;
+        pout += ASNIX_ATTR_SIZE;
     }
-    while (j < bcount) {
-        memcpy(out_entries + k * ASNIX_ATTR_SIZE, bentries + j * ASNIX_ATTR_SIZE, ASNIX_ATTR_SIZE);
-        j++;
-        k++;
+    while (pb < bend) {
+        memcpy(pout, pb, ASNIX_ATTR_SIZE);
+        pb += ASNIX_ATTR_SIZE;
+        pout += ASNIX_ATTR_SIZE;
     }
 
+    int64_t k = (pout - out_entries) / ASNIX_ATTR_SIZE;
     *(int64_t *)((char *)mem + ASNIX_ATTRS_OFF_COUNT) = k;
     asnix_stats_attrs++;
     asnix_stats_attrs_entries += (uint64_t)k;

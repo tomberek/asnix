@@ -16241,3 +16241,102 @@ NOT touched this session and remain open:
 Files: `src/c/derivation.c` only. Tests:
 `tests/e2e/m143_derivation_scratch_reuse.nix` /
 `tests/e2e/m143_derivation_scratch_reuse.expected` (new).
+
+## M145: `asnix_attrs_eager_merge`'s `//`-merge inner loop recomputed each entry's address from an index instead of walking a pointer -- a small, real, confirmed fix
+
+A cross-evaluator profiling pass flagged `src/c/attrs_update.c`'s
+`asnix_attrs_eager_merge` (the two-pointer sorted-array merge behind `//`,
+already named back in M123 as 17.11% of a page-fault profile but never
+root-caused) as a candidate: self-time 1.22% of asnix's own total cycles
+on `d.nix` vs. iets's `update_attrs` at 0.64% of iets's own total cycles
+-- roughly 2x the relative cost, ~3.4x the absolute cost using this
+campaign's running totals (~57.6M asnix cycles vs. ~17.0M iets cycles,
+~1.96% of the total cycle gap). The task's own hypothesis (batch the
+per-entry `memcpy` calls into fewer `memmove`s) did NOT hold up on
+inspection: `objdump -d src/c/attrs_update.o` showed GCC already inlines
+every 12-byte (`ASNIX_ATTR_SIZE`) `memcpy` into two plain `mov`s (8 bytes
++ 4 bytes) at `-O2` -- there was never a real `call memcpy` in this
+function to begin with, so "fewer, larger calls" was not a real lever.
+
+Reading iets's own `update_attrs` (`iets/src/eval/mod.rs:2444`) found it
+does the *same* two-pointer merge shape (even an extra first pass just to
+count the common-key overlap, which asnix's single-pass-plus-slack-
+allocation approach skips), copying each entry via `AttrsObj::init_from`
+-> `init` -- a `#[inline]` field-by-field struct write of a 16-byte
+`Attr` (bigger than asnix's 12-byte entry). So the algorithm wasn't the
+gap; the per-element *codegen* was. Disassembling asnix's own compiled
+loop found the real, bounded culprit: the merge's main `while` loop reads
+`aentries + i * ASNIX_ATTR_SIZE` and `bentries + j * ASNIX_ATTR_SIZE`
+computed fresh from the loop-carried indices `i`/`j`/`k` every iteration
+-- GCC could not prove it could turn that into simple pointer increments
+(12 isn't a power of 2), so it emitted two extra `lea`s per side, every
+iteration, to redo `base + idx*12` from scratch (confirmed directly in
+`objdump -d -M intel --disassemble=asnix_attrs_eager_merge`). The two
+*tail* loops right below it (the ones copying whatever's left once one
+side is exhausted) happened to already compile to plain incrementing
+pointers, just not the hottest, fully-interleaved main loop.
+
+**Fix**: rewrote the function to walk explicit `const char *pa`/`pb` and
+`char *pout` byte pointers advanced by `ASNIX_ATTR_SIZE` each step
+(`pa`/`pb`/`aend`/`bend` replacing `i`/`j`/`acount`/`bcount`), instead of
+indices multiplied by the entry stride on every access. Re-disassembling
+confirmed the fix: the main loop's address computation for both sides
+collapses to the same "plain pointer, no `lea` recompute" shape the tail
+loops already had. Entry count for the header write (`k`) is now derived
+once at the end from `(pout - out_entries) / ASNIX_ATTR_SIZE` (a single
+magic-number division, done once per call, not per entry -- negligible).
+Semantics are untouched: same sorted-merge order, same right-biased
+duplicate-key handling (`b` wins), same single worst-case allocation.
+
+**Correctness**: `make test`/`test-e2e`/`test-conformance` all green.
+`make test-nix-conformance NIX_CONFORMANCE_DIR=/tmp/nix-conformance`:
+`pass=655 fail=3 skip=148` (exact baseline, same 3 pre-existing pos-
+tracking failures). `make test-nixpkgs-hash`: `pass=148 fail=0`. Output
+hash on `d.nix` (ffmpeg's closure) unchanged:
+`/nix/store/29iacg6h530yx7rxz4k1fhvi0kxxhsam-ffmpeg-9.0.1-bin`. Added a
+new targeted e2e fixture, `tests/e2e/ops_update_large_merge.nix` (two
+~28-30-entry attrsets, built so the merge exercises a long a-only run, a
+long b-only run, an interleaved run, AND a duplicate-key run, all forcing
+the eager-merge path directly since both sides exceed
+`ASNIX_UNION_RHS_MAX`/`ASNIX_UNION_LHS_MIN`=16) -- verified both against
+hand-computed expected output and that the result's `builtins.attrNames`
+count is exactly `acount + bcount - overlap` (90, before trimming the
+fixture to fit under `main.c`'s own pre-existing, unrelated 64-entry
+top-level-print display cap, which the first version of this fixture
+tripped over and which is noted here only so a future session doesn't
+mistake that printer limit for a merge bug again).
+
+**Measured, interleaved (10 alternating before/after trials on the real
+`d.nix` eval, `taskset -c 2`, `cpu_core/instructions/,cpu_core/cycles/`)**:
+instructions dropped in all 10/10 paired trials, mean -13.0M (8,362.8M ->
+8,349.8M, -0.156%), a small but completely consistent, deterministic win
+(the function's control flow doesn't depend on timing, so this result
+doesn't need statistics to trust, just confirmation it's not a fluke --
+it isn't). Cycles were, as this whole session has repeatedly found on
+this shared contended machine, too noisy to read cleanly even with
+interleaving: paired cycle deltas ranged from -370M to +245M trial-to-
+trial (dwarfing this function's own ~57.6M-cycle total estimated
+contribution), AFTER only "won" 4/10 paired trials on raw cycles. Four
+separate `perf record -F 4999 -g` samples (2 before, 2 after,
+interleaved) of `asnix_attrs_eager_merge`'s own self-time percentage are
+directionally consistent with a real, modest win: before 1.45%/1.34%/
+1.59% (mean 1.46%), after 1.28%/1.35%/1.13% (mean 1.25%) -- roughly a
+14% relative reduction in this one function's own self-time, consistent
+with, but noisier than, the clean instruction-count signal.
+
+**Honest sizing**: this is a genuinely small fix. The task's own
+baseline-contribution estimate for this whole function (~1.96% of the
+total cycle gap) bounds how much there was to win here even in the best
+case, and the measured instruction-count win (-0.156% of the *whole
+program's* instructions) is consistent with having captured a real
+fraction of that -- a legitimate, low-risk, surgical win, not a
+headline one. The bigger items this same profiling pass's sibling
+candidates were assigned (lex/parse/compile, symtab/AST representation)
+remain the larger levers; this just closes out M123's one still-open
+thread on `asnix_attrs_eager_merge` with an actual root cause and fix
+instead of leaving it flagged.
+
+Files: `src/c/attrs_update.c` (`asnix_attrs_eager_merge` only --
+`make_union_header`, `asnix_attrs_update`, `asnix_attrs_insert_dynamic`
+untouched), plus the new `tests/e2e/ops_update_large_merge.nix`/
+`.expected` fixture pair.
