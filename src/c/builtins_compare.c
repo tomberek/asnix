@@ -402,28 +402,49 @@ static void jb_puts(JsonBuf *b, const char *s, size_t n) {
     b->len += n;
 }
 
-/* perf: same bulk-run-copy technique as aterm.c's buf_put_escaped --
- * scan ahead to the next byte that actually needs escaping and copy
- * the whole safe run in one jb_puts call, instead of paying a
- * jb_putc->jb_ensure call (a branch plus bookkeeping) for every single
- * byte. Output is byte-for-byte identical to the original per-byte
- * loop. */
+/* perf (M138): SWAR scan for the JSON escape set -- the original
+ * per-byte condition (`rc=='"' || rc=='\\' || rc=='\b' || rc=='\f' ||
+ * rc=='\n' || rc=='\r' || rc=='\t' || rc<0x20`) is redundant: \b(0x08)/
+ * \f(0x0c)/\n(0x0a)/\r(0x0d)/\t(0x09) are already covered by `rc<0x20`,
+ * so this simplifies to exactly the same shape as aterm.c's
+ * `find_escape_aterm` (see its own comment for the two underlying bit-
+ * twiddling identities and how they were verified), just with n=0x20
+ * instead of n=0x0e and no '\\'-vs-'"' asymmetry. Output is byte-for-
+ * byte identical to a plain per-byte scan-and-switch loop. */
+static int64_t find_escape_json(const unsigned char *s, int64_t len) {
+    static const uint64_t LO = 0x0101010101010101ULL;
+    static const uint64_t HI = 0x8080808080808080ULL;
+    int64_t i = 0;
+    for (; i + 8 <= len; i += 8) {
+        uint64_t x;
+        memcpy(&x, s + i, 8);
+        uint64_t q = x ^ (LO * (uint64_t)'"');
+        uint64_t bs = x ^ (LO * (uint64_t)'\\');
+        uint64_t any = ((x - LO * 0x20) & ~x) | ((q - LO) & ~q) | ((bs - LO) & ~bs);
+        if (any & HI) {
+            for (int64_t j = i; j < i + 8; j++) {
+                unsigned char c = s[j];
+                if (c == '"' || c == '\\' || c < 0x20) return j;
+            }
+        }
+    }
+    for (; i < len; i++) {
+        unsigned char c = s[i];
+        if (c == '"' || c == '\\' || c < 0x20) return i;
+    }
+    return len;
+}
+
 static void jb_escape_string(JsonBuf *out, const char *bytes, int64_t len) {
     jb_putc(out, '"');
-    int64_t i = 0;
-    while (i < len) {
-        int64_t run_start = i;
-        while (i < len) {
-            unsigned char rc = (unsigned char)bytes[i];
-            if (rc == '"' || rc == '\\' || rc == '\b' || rc == '\f' || rc == '\n' || rc == '\r' || rc == '\t' ||
-                rc < 0x20) {
-                break;
-            }
-            i++;
-        }
-        if (i != run_start) jb_puts(out, bytes + run_start, (size_t)(i - run_start));
+    const unsigned char *p = (const unsigned char *)bytes;
+    int64_t pos = 0;
+    for (;;) {
+        int64_t i = pos + find_escape_json(p + pos, len - pos);
+        if (i != pos) jb_puts(out, bytes + pos, (size_t)(i - pos));
         if (i == len) break;
-        unsigned char c = (unsigned char)bytes[i];
+        pos = i + 1;
+        unsigned char c = p[i];
         switch (c) {
             case '"': jb_puts(out, "\\\"", 2); break;
             case '\\': jb_puts(out, "\\\\", 2); break;
@@ -439,7 +460,6 @@ static void jb_escape_string(JsonBuf *out, const char *bytes, int64_t len) {
                 break;
             }
         }
-        i++;
     }
     jb_putc(out, '"');
 }

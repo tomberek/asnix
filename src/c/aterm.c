@@ -1,5 +1,6 @@
 #include "aterm.h"
 
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -33,33 +34,68 @@ static void buf_put_bytes(Buf *b, const char *s, size_t n) {
     b->len += n;
 }
 
+/* perf (M138): SWAR scan for the aterm escape set (\n \r \t \" \\),
+ * processing 8 bytes per iteration instead of one branchy compare-chain
+ * per byte. Ported from iets's own `find_escape` (~/gnix/iets/src/store/
+ * drv.rs) -- confirmed via its own exhaustive-fuzz unit test
+ * (`find_escape_finds_the_first_byte_to_escape`) and re-derived here
+ * against the two underlying bit-twiddling identities independently
+ * (Sean Eron Anderson's "bit twiddling hacks": "determine if a word has
+ * a byte less than n" -- correct for ANY byte value 0-255, not just
+ * ASCII, as long as n<=128; and the companion "has a zero byte" trick
+ * used here to detect an exact byte match via XOR-then-haszero). Pure
+ * filter: a chunk flagged "maybe" is re-scanned byte-by-byte to find the
+ * real position (handles the trick's rare false positives); a chunk
+ * flagged "no" is trusted outright (the identities have no false
+ * negatives), so output is byte-for-byte identical to a plain scalar
+ * scan for every input, including non-ASCII/non-UTF-8 bytes. */
+static size_t find_escape_aterm(const unsigned char *s, size_t len) {
+    static const uint64_t LO = 0x0101010101010101ULL;
+    static const uint64_t HI = 0x8080808080808080ULL;
+    size_t i = 0;
+    for (; i + 8 <= len; i += 8) {
+        uint64_t x;
+        memcpy(&x, s + i, 8);
+        uint64_t q = x ^ (LO * (uint64_t)'"');
+        uint64_t bs = x ^ (LO * (uint64_t)'\\');
+        /* any byte < 0x0e (covers \t=0x09,\n=0x0a,\r=0x0d) OR any byte
+         * == '"' OR any byte == '\\'. */
+        uint64_t any = ((x - LO * 0x0e) & ~x) | ((q - LO) & ~q) | ((bs - LO) & ~bs);
+        if (any & HI) {
+            for (size_t j = i; j < i + 8; j++) {
+                unsigned char c = s[j];
+                if (c == '\n' || c == '\r' || c == '\t' || c == '"' || c == '\\') return j;
+            }
+        }
+    }
+    for (; i < len; i++) {
+        unsigned char c = s[i];
+        if (c == '\n' || c == '\r' || c == '\t' || c == '"' || c == '\\') return i;
+    }
+    return len;
+}
+
 /* Nix's ATerm escaping: only \n \r \t \" \\ are ever escaped; every other
  * byte (including non-ASCII/non-UTF-8) is written verbatim. Includes the
- * surrounding quotes.
- *
- * perf: scans ahead to the next byte that actually needs escaping and
- * bulk-copies the whole safe run in one memcpy, instead of paying a
- * buf_putc->buf_reserve call (a branch plus bookkeeping) for every
- * single byte -- the overwhelming majority of bytes in a real path/
- * hash/name never hit the switch below at all, so most calls now do
- * one bulk copy of the entire string instead of N per-byte calls.
- * Output is byte-for-byte identical to the original loop. */
+ * surrounding quotes. Output is byte-for-byte identical to a plain
+ * per-byte scan-and-switch loop. */
 static void buf_put_escaped(Buf *b, const char *s) {
     buf_putc(b, '"');
+    size_t len = strlen(s);
     const unsigned char *p = (const unsigned char *)s;
+    size_t pos = 0;
     for (;;) {
-        const unsigned char *run_start = p;
-        while (*p && *p != '\n' && *p != '\r' && *p != '\t' && *p != '"' && *p != '\\') p++;
-        if (p != run_start) buf_put_bytes(b, (const char *)run_start, (size_t)(p - run_start));
-        if (!*p) break;
-        switch (*p) {
+        size_t esc = pos + find_escape_aterm(p + pos, len - pos);
+        if (esc != pos) buf_put_bytes(b, (const char *)(p + pos), esc - pos);
+        if (esc == len) break;
+        switch (p[esc]) {
             case '\n': buf_puts(b, "\\n"); break;
             case '\r': buf_puts(b, "\\r"); break;
             case '\t': buf_puts(b, "\\t"); break;
             case '"': buf_puts(b, "\\\""); break;
             case '\\': buf_puts(b, "\\\\"); break;
         }
-        p++;
+        pos = esc + 1;
     }
     buf_putc(b, '"');
 }

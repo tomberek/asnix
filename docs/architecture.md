@@ -15396,3 +15396,181 @@ branch; `is_thunk_free_literal`'s and `compile_expr`'s `AST_BINOP`
 cases updated to thread the new `is_float`/float-value outputs
 through). No other file changed; the declined `builtins.X` follow-on
 left no code behind.
+
+## M140: SWAR (8-bytes-at-a-time) escape scanning for `aterm.c`'s derivation
+serializer and `builtins_compare.c`'s `toJSON` -- a fresh instruction-level
+sweep of the eval/dispatch phase against `iets`
+
+A directed follow-up assigned specifically to the part of asnix that had
+NOT yet had a dedicated instruction-level comparison against `iets`:
+lex/parse/compile (M123, M129-M134, M136) already got one; the
+eval/dispatch phase (`src/asm/ops/*.S`, `apply.S`, `force.S`, `env.S`/
+`env_arena.S`, `dispatch.S`, the C-side `builtins*.c`) had only M127's
+narrow VALSTACK POC (ruled out, 2-4% ceiling) and a general architectural
+review. This milestone did the SAME `perf record -F 999 -g` + `perf
+annotate` methodology M129 used for the lexer, applied here instead.
+
+**Methodology**: `perf record -F 4999 -g`, `taskset -c 0` (a confirmed
+P-core), `cpu_core/cycles/` event, on a genuinely cold `d.nix` (ffmpeg's
+closure) eval with `ASNIX_BYTECODE_CACHE_DIR` pointed at a nonexistent
+directory (every one of the 1057 imported files re-lexes/parses/compiles,
+matching this project's own standing cold-path convention). 7,793 samples
+at 4999 Hz (the earlier default 999 Hz run only got 1,436 samples --
+clean 1000+ data points matter for ranking anything below the top 2-3
+hottest symbols). Ranked self-time with lex/parse/compile's own files
+(`lexer.c`/`parser.c`/`compiler.c`/`irbuild.c`/`ast.c`/`symtab.c`)
+excluded, per this milestone's own assignment.
+
+**What the flat self-time ranking found, outside lex/parse/compile**: the
+single biggest surprise was `buf_put_escaped` (`src/c/aterm.c`) at
+**3.68% self-time of the WHOLE eval** -- bigger than `asnix_op_var_ref`
+(2.88%, already flagged in M127 as "almost certainly the single hottest
+op handler"), bigger than `asnix_intern` (2.42%, already tuned in M130),
+bigger than `asnix_attrs_eager_merge`'s `//`-merge memcpy (1.34%, flagged
+but not root-caused in M123). `perf annotate` pinpointed the cost
+precisely: the function's byte-at-a-time scan loop (`while (*p && *p !=
+'\n' && *p != '\r' && *p != '\t' && *p != '"' && *p != '\\') p++;`) --
+21.92%+29.61%+5.25%+3.82%+2.81%+3.16%+2.46% of the FUNCTION's own samples
+sit on that one compare chain alone. A smaller sibling, `jb_escape_string`
+(`src/c/builtins_compare.c`, `toJSON`'s escaper), showed the identical
+pattern at a combined ~1.1% (`json_encode_ctx` 0.68% + `jb_escape_string`
+0.44%).
+
+**Why this exists and why it's hot**: `asnix_build_derivation_aterm`
+serializes a derivation to Nix's ATerm wire format (`Derive([...],[...],
+...)`) -- called **three times per derivation** (`derivation.c`: once for
+the masked/content-addressed-safe ATerm, once for the real one, once for
+the cache-key ATerm), each call re-escaping every output name/path, every
+input-drv path and output-name list, every arg, and every env key/value
+string. A real nixpkgs closure's derivations routinely carry long env
+values (concatenated `buildInputs` path lists, multi-line builder
+scripts, structured `configureFlags`) -- exactly the strings this scan
+walks one byte at a time, each byte paying up to 5 compares before the
+scan can even conclude "this byte is safe, keep going."
+
+**Checked against `iets`** (`~/gnix/iets/src/store/drv.rs`, confirmed via
+its own doc comment "Mirrors derivations.cc:printString"): `escape_into`/
+`find_escape` do the SAME escaping (`"` `\` `\n` `\r` `\t`, this project's
+own `buf_put_escaped` comment already documents this is Nix's exact ATerm
+escape set) but scan 8 bytes at a time via a classic SWAR bit trick
+(`find_escape`'s own comment: "nonzero iff a byte is '\"', '\\' or below
+0x0e, the range of '\t', '\n', '\r'"), independently fuzz-tested in
+`iets`'s own `find_escape_finds_the_first_byte_to_escape` unit test.
+
+**The fix**: `find_escape_aterm(s, len)` (`aterm.c`) ports the same
+technique -- for each 8-byte chunk (`memcpy`'d to avoid unaligned-access
+UB, matching M130's `hash_bytes` convention), compute `((x - LO*0x0e) &
+~x) | ((x^LO*'"') - LO) & ~(x^LO*'"')) | (((x^LO*'\\') - LO) &
+~(x^LO*'\\'))` and test the high bit of every byte lane (`& HI`); a
+nonzero result means "this chunk MAYBE has an escape-needing byte," which
+only then triggers a cheap byte-by-byte scan confined to that one 8-byte
+chunk to find the exact position -- a chunk the trick clears is trusted
+outright and skipped entirely. Both bit identities used here ("has a byte
+less than N, correct for N<=128" and "has a byte equal to N," built from
+the standard "has a zero byte" identity via XOR) are well-known,
+proven-correct-for-arbitrary-byte-values (not just ASCII) techniques from
+Sean Eron Anderson's "Bit Twiddling Hacks," independently re-derived and
+cross-checked against `iets`'s own working Rust implementation before
+being ported. `buf_put_escaped` itself now calls `strlen` once up front
+(needed as the scan's own length bound) and loops `find_escape_aterm`
+over the remaining tail instead of a bare pointer-walk to the NUL byte --
+functionally identical, since these are the same ordinary C strings as
+before (no embedded NULs anywhere in this call chain).
+
+The same simplification applies to `jb_escape_string`'s JSON escape set:
+its 8-condition per-byte check (`rc=='"' || rc=='\\' || rc=='\b' ||
+rc=='\f' || rc=='\n' || rc=='\r' || rc=='\t' || rc<0x20`) is provably
+redundant -- `\b`(0x08)/`\f`(0x0c)/`\n`(0x0a)/`\r`(0x0d)/`\t`(0x09` are
+all already covered by `rc<0x20`, so the real condition is just `rc=='"'
+|| rc=='\\' || rc<0x20`, the exact same shape as `find_escape_aterm` with
+`n=0x20` instead of `n=0x0e`. `find_escape_json(s, len)` (`builtins_
+compare.c`) is the direct analog, taking an explicit `int64_t len` rather
+than relying on a NUL terminator (this function's own input can
+legitimately contain embedded NUL bytes, since arbitrary Nix strings can
+-- verified by including embedded `0x00` explicitly in this fix's own
+correctness fuzzing, see below).
+
+**Correctness verification, done BEFORE wiring either fix into the real
+build** (neither `aterm.c` nor `builtins_compare.c` has a dedicated unit
+test harness exercising arbitrary byte content, so this needed its own
+standalone proof): two throwaway harnesses (`/tmp/aterm_test/test.c`,
+`test_json.c`, not shipped) linked the OLD scalar implementation
+side-by-side with the NEW SWAR one and compared byte-for-byte output
+across (a) 2,000,000 random trials, length 0-39, with escape characters,
+non-ASCII bytes (0x80-0xff), and (for the JSON variant) embedded NUL
+bytes all deliberately over-represented vs. plain ASCII, and (b) an
+EXHAUSTIVE sweep placing every single byte value (1-255 for the ATerm
+variant, which never sees embedded NUL; the full 0-255 range for the JSON
+variant, which does) at every position for every string length 0-24 --
+specifically chosen to exercise every chunk-boundary case the 8-byte
+SWAR loop can hit. All 2,076,800 (JSON) and ~2,076,500 (ATerm) trials
+matched exactly, zero mismatches, before either fix touched the real
+source tree.
+
+**Measured** (`perf stat -r 15`, `taskset -c 0`, `cpu_core/instructions/`
++ `cpu_core/cycles/`, cold `d.nix` eval, three binaries built from the
+otherwise-identical tree -- M137 baseline, `aterm.c`-only, both fixes
+combined):
+
+| build | instructions | cycles |
+|---|---|---|
+| M137 baseline | 9,027,941,882 (+-0.01%) | 5,038,119,555 (+-2.25%) |
+| + `aterm.c` fix only | 8,883,898,810 (+-0.01%) | 4,910,836,045 (+-0.40%) |
+| + `builtins_compare.c` fix too | 8,853,645,161 (+-0.01%) | 4,891,418,933 (+-0.50%) |
+
+Combined: **instructions -1.93%**, essentially noise-free (+-0.01%
+across all three builds) and independently reproduced to within 0.01
+percentage points (an adversarial re-measurement using interleaved
+trials, to cancel out this machine's concurrent-agent load drift,
+pooled 35 trials per binary and got -1.90%). The cycles figure above
+(-2.91%) does **not** hold up at that magnitude under the same
+interleaving discipline: measuring M137-vs-M138 trials back-to-back in
+sequential batches (as the original measurement did) absorbs real
+load-drift between batches on this shared, contended machine -- a
+non-interleaved sanity check reproduced this directly, showing cycles
+going the WRONG direction (+1.17%) purely from drift between two
+sequential batches. Interleaving every trial (baseline, final,
+baseline, final, ...) isolates a real, reproducible, one-directional
+cycles win, but roughly a third the originally claimed size: **-0.9%**,
+sitting within about 2 standard errors of zero even pooled across 35
+trials. Wall-clock was too noisy to cite a specific number under
+concurrent load in both the original and the independent measurement
+(10-17% run-to-run spread), matching this project's own M125 precedent
+for falling back to the low-noise instruction counter instead of
+forcing a wall-clock number. A post-fix `perf annotate` confirmed the mechanism
+directly: `buf_put_escaped`'s share of total eval self-time dropped from
+3.68% to 2.85%, and its SWAR fast path (the `je` back to the chunk-loop
+head, taken whenever a whole 8-byte chunk is clear) correctly never
+false-positives on ordinary ASCII content (independently spot-checked
+with a Python re-derivation of the bit identity against representative
+store-path-shaped strings) -- the remaining self-time is the real,
+unavoidable cost of escaping the substantial fraction of real derivation
+env/arg content that genuinely does contain `"`/`\n`/`\\` (multi-line
+builder scripts, quoted shell arguments), not a measurement artifact.
+
+**Honest sizing against the ~2.07x gap**: this closes roughly 1.9% of
+the instruction-count gap on its own (the cycles win, once correctly
+measured with interleaved trials, is smaller still at ~0.9%) -- a real,
+bounded, fully-verified win in the same tier as M129/M130's
+lexer/symtab fixes, not a gap-closing silver bullet. The `op_var_ref`/env-chain-walk cost seen in the same
+profile (`asnix_op_var_ref` 2.88% self-time, split almost evenly between
+the `ENV->up` pointer-chase and the thunk-state load, both genuine
+memory-latency-bound pointer chases) was deliberately NOT pursued further
+here: it is exactly the territory M127's own architectural investigation
+already covered (env-chain design and VALSTACK traffic both independently
+confirmed near-optimal, with no idle register available to cache a hop
+without first rewriting the very handlers that would benefit) -- nothing
+new was found there this pass to justify reopening it.
+
+**Verified**: `make test`/`test-e2e`/`test-conformance` all green.
+`make test-nix-conformance`: `pass=655 fail=3 skip=148` (same 3
+pre-existing pos-tracking failures; one run under heavy concurrent
+machine load showed a 4th, unrelated failure -- `eval-okay-regex-088.nix`
+-- reproduced clean standalone and on a full rerun, this session's
+familiar contention-flakiness pattern, not a real regression). `make
+test-nixpkgs-hash`: `pass=148 fail=0`. Output hash on `d.nix` (ffmpeg's
+closure) unchanged: `/nix/store/29iacg6h530yx7rxz4k1fhvi0kxxhsam-
+ffmpeg-9.0.1-bin`, byte-identical before and after.
+
+Files: `src/c/aterm.c` (`find_escape_aterm`, `buf_put_escaped`), `src/c/
+builtins_compare.c` (`find_escape_json`, `jb_escape_string`).
