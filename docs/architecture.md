@@ -16122,3 +16122,122 @@ milestone's change and should be checked/reset by a human (or another
 agent with access) before being trusted. This worktree's own copy (where
 all the verification above was actually run, after the mistake was
 caught) is unaffected and correct.
+
+## M144: `asnix_prim_derivation`'s own fixed-size scratch arrays pooled by recursion depth instead of malloc'd/free'd on every single derivation
+
+A profiling pass against iets's mimalloc hypothesized that glibc's
+ptmalloc (`_int_malloc`/`_int_realloc`/`unlink_chunk`/`cfree`) costs asnix
+roughly 2x the relative self-time share, and ~3.6x the absolute cycles,
+that mimalloc costs iets -- estimated (via `perf record`'s own
+self-time-plus-whole-call-stack accounting, since `kptr_restrict=1` on
+this shared machine hides the actual kernel routines underneath) at
+~13.66% of asnix's own cycles vs. iets's ~6.85%, a ~463.5M-cycle (~22.4%
+of the whole asnix-vs-iets gap) contribution if true. The hypothesis
+named several call sites spanning the whole C tree (`string_context.c`'s
+`dup_cstr`, `aterm.c`'s `buf_grow`, `derivation.c`'s many `malloc`'d
+per-derivation tables, `builtins_compare.c`'s growable `Buf`/order
+arrays) as the likely sources, but -- because `kptr_restrict=1` also
+defeats call-graph attribution past the syscall boundary -- could not
+rank which one actually drove the volume. This milestone reads
+`derivation.c` directly to find out.
+
+**What's actually there.** `asnix_prim_derivation` (the `derivation {}`
+builtin -- called once per derivation forced, and a real nixpkgs eval
+forces thousands) used to `malloc` SEVEN fixed-size scratch arrays on
+every single call and `free` all seven again before returning:
+`group_paths`/`group_outs`/`group_nouts` (grouping referenced input
+derivations by `drv_path`), `group_order` (a sort-index array over the
+same), `masked_input_drvs`/`real_input_drvs`/`masked_hash_hex` (the
+masked- and real-ATerm-pass input-derivation lists), all sized
+`ASNIX_DRV_MAX_INPUT_DRVS` (1024) -- plus `drv_refs`, sized dynamically
+per call. `group_outs` alone is `1024 * ASNIX_DRV_MAX_OUTPUTS *
+sizeof(char *)` = 131,072 bytes -- exactly glibc's default
+`mmap_threshold` (128 KiB) -- so that ONE same-sized allocation went
+through a real `mmap`/`munmap` syscall round-trip, not just ptmalloc's
+ordinary bin machinery, on every derivation. This exactly matches the
+profiling pass's own suspicion that hidden kernel-side time (page
+faults, `mmap`/`munmap`) was being charged to malloc's name.
+
+Why heap-, not stack-allocated in the first place (M74): forcing one
+derivation's own attribute values can recursively force a nested
+`derivation {}` call several levels deep in nixpkgs's own dependency
+graph -- stack-allocating 1024-entry arrays per level overflowed the
+real stack chasing `d.nix` once already. But the recursion is a plain,
+synchronous call stack: a call at depth D always fully returns before
+another call at the SAME depth D starts. That makes a small pool of
+these buffer sets, indexed by recursion depth and allocated once (the
+FIRST time each depth is ever reached) instead of once per call, safe
+and correct -- real nixpkgs dependency chains are shallow, so this
+allocates these buffers a handful of times total for the whole eval
+instead of once per derivation. Implemented as `DrvScratchFrame` / a
+`g_drv_scratch_frames` array indexed by `g_drv_scratch_depth`
+(incremented/decremented across `drv_scratch_acquire`/`_release`, which
+bracket the single return path), following this file's own established
+"grow a cache, never shrink it" convention (`g_masked_hash_cache`/
+`g_drv_outputs_cache`/`g_drv_closure_cache`, all above this in the same
+file). `drv_refs` (whose size varies per call, since `refs.nsrcs` isn't
+bounded by `ASNIX_DRV_MAX_INPUT_DRVS`) is pooled the same way with a
+grow-never-shrink capacity per frame.
+
+**Correctness of the pooling itself**: no call in `asnix_prim_derivation`
+between the acquire point and the single return path forces/coerces any
+`Value` (confirmed by reading that whole span -- only cache lookups,
+`sha256_or_die`, `snprintf`, `qsort`), so recursion genuinely cannot
+happen while a frame is held, which is the one invariant the whole
+scheme depends on.
+
+**Verified correctness**: added `tests/e2e/m143_derivation_scratch_reuse.nix`
+-- a 3-level derivation chain (`top` -> `mid1`/`mid2`, each with TWO
+distinct input derivations -> `x1`/`x2`/`x3`) specifically shaped to
+exercise (a) real recursion depth 0/1/2, (b) SIBLING reuse of the SAME
+depth-1 pool frame across two sequential, non-nested calls (`mid1`
+fully returns before `mid2` is forced) with different-but-overlapping
+(`x2` shared) group contents each time, and (c) `ngroups > 1` so
+`group_paths`/`group_outs`/`group_order` are exercised past index 0 --
+output confirmed byte-identical to real `nix-instantiate --eval
+--strict` on the same expression. `make test`/`test-e2e`/
+`test-conformance` all green. `make test-nix-conformance
+NIX_CONFORMANCE_DIR=/tmp/nix-conformance`: `pass=655 fail=3 skip=148`
+(exact baseline). `make test-nixpkgs-hash`: `pass=148 fail=0`. `./asnix
+d.nix` unchanged: `/nix/store/29iacg6h530yx7rxz4k1fhvi0kxxhsam-ffmpeg-9.0.1-bin`.
+
+**Measured, interleaved (16 alternating before/after trials total, two
+separate batches of 6 and 10, on the real `d.nix` eval, `taskset -c 0`
+pinned, `cpu_core/instructions/,cpu_core/cycles/`, to cancel this shared
+machine's load drift)**: instructions -0.22% (8,362.4M -> 8,343.8M,
+consistent in direction across EVERY SINGLE one of the 16 trials,
+~18-25M fewer every time -- the cleanest possible signal that the
+fix removes real, fixed per-call work); cycles -1.15% on average
+(4,882.5M -> 4,826.5M), directionally consistent across both batches
+but noisier trial-to-trial than instructions (as this session's own
+established measurement discipline predicts for cycles on a shared,
+contended machine) -- real and positive, but modest.
+
+**Honest verdict on the hypothesis**: confirmed real, but only a SMALL
+slice of the ~22.4%/463.5M-cycle figure the profiling pass estimated
+for the whole ptmalloc-vs-mimalloc gap. This milestone's fix removes
+exactly the fixed-size, same-shape-every-time malloc/free churn for ONE
+named call site (`derivation.c`'s own `ASNIX_DRV_MAX_INPUT_DRVS`-sized
+scratch arrays) -- real, measured (~0.22% instructions / ~1.15% cycles
+on the whole eval), but far short of even half the hypothesized total.
+The other named call sites in the original hypothesis were deliberately
+NOT touched this session and remain open:
+- `derivation.c`'s own `InputRefSet` (`input_ref_add_built`/
+  `input_ref_add_src`) -- an UNBOUNDED, per-referenced-(drv,output)-pair
+  `dup_cstr` (one `malloc` per entry, never freed -- a genuine, if
+  small, per-call leak, not just transient churn) plus two independently
+  growable open-addressing index tables, scaling with the total number
+  of references across the WHOLE eval (likely far larger in aggregate
+  than the sum of the fixed 1024-sized arrays this milestone pooled,
+  since a real nixpkgs closure's total (drv,output) reference count is
+  easily in the hundreds of thousands). The most promising next
+  candidate by raw volume, not attempted here for lack of session time
+  to design and verify a pooling/arena scheme for it specifically.
+- `string_context.c`'s `dup_cstr`, `aterm.c`'s `buf_grow` (realloc-
+  doubling from a 256-byte start), and `builtins_compare.c`'s growable
+  `Buf`/order arrays -- all named in the original hypothesis, all still
+  unexamined.
+
+Files: `src/c/derivation.c` only. Tests:
+`tests/e2e/m143_derivation_scratch_reuse.nix` /
+`tests/e2e/m143_derivation_scratch_reuse.expected` (new).

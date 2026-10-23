@@ -38,6 +38,14 @@
  * generous cap matching this file's existing "small bounded arrays,
  * fatal if exceeded" convention (see ASNIX_DRV_MAX_ARGS/ENV above). */
 #define ASNIX_DRV_MAX_OUTPUTS 16
+/* M74: bound for the number of distinct input derivations one
+ * `derivation {}` call can reference -- moved up here (from its
+ * original spot right before its own first use, deep inside
+ * `asnix_prim_derivation`) by M143 so the depth-indexed scratch-pool
+ * types above that same function can use it too; see that function's
+ * own `group_paths` comment for why this one is heap-, not
+ * stack-allocated. */
+#define ASNIX_DRV_MAX_INPUT_DRVS 1024
 
 static void sha256_or_die(const char *s, size_t len, uint8_t out[32]) {
     int64_t rc = asnix_hash_sha256(s, len, out);
@@ -1170,6 +1178,93 @@ static char *normalize_json_attr(const char *raw_json) {
     return normalized;
 }
 
+/* perf (M143): `asnix_prim_derivation`'s own `ASNIX_DRV_MAX_INPUT_DRVS`
+ * (1024)-sized scratch arrays below (group_paths/group_outs/group_nouts/
+ * group_order/masked_input_drvs/real_input_drvs/masked_hash_hex, plus
+ * drv_refs) used to be malloc'd fresh and free'd again at the end of
+ * EVERY single call to this function -- one derivation, one round-trip.
+ * `group_outs` alone is `1024 * ASNIX_DRV_MAX_OUTPUTS * sizeof(char *)` =
+ * 131072 bytes, exactly glibc's default `mmap_threshold` (128 KiB), so
+ * that one malloc/free pair went through a real `mmap`/`munmap` syscall
+ * round-trip on every derivation forced -- and a full nixpkgs eval
+ * forces thousands. Found profiling asnix against iets's mimalloc (see
+ * docs/architecture.md's M143 entry): ptmalloc's `_int_malloc`/
+ * `unlink_chunk`/`cfree` family cost asnix a disproportionate, diffuse
+ * share of cycles relative to iets's allocator, and this call site's
+ * same-size-every-time malloc/free churn is one of the few NAMEABLE,
+ * targetable pieces of that cost (unlike the generic small-string
+ * churn spread across the whole C tree).
+ *
+ * This function is genuinely recursive -- forcing one derivation's own
+ * attribute values (the per-attribute loop above, `asnix_force_for_print`)
+ * can force a nested `derivation {...}` thunk several levels deep in
+ * nixpkgs's own dependency graph, which calls this very function again
+ * before the outer call ever reaches this scratch-buffer block (see the
+ * ASNIX_DRV_MAX_INPUT_DRVS comment below for the historical stack-overflow
+ * this already caused once). So a single global buffer isn't safe. But
+ * the recursion is a plain, synchronous call stack -- a call at depth D
+ * fully returns before another call at the SAME depth D ever starts --
+ * so a small pool of buffer sets indexed by recursion depth, allocated
+ * once the first time each depth is ever reached and reused forever
+ * after (never freed, same "grow a cache, don't shrink it" convention as
+ * this file's own g_masked_hash_cache/g_drv_outputs_cache/
+ * g_drv_closure_cache above), is: real nixpkgs dependency chains are not
+ * deep (a handful of levels), so this allocates these buffers a handful
+ * of times total instead of once per derivation. */
+typedef struct {
+    const char **group_paths;
+    const char *(*group_outs)[ASNIX_DRV_MAX_OUTPUTS];
+    size_t *group_nouts;
+    size_t *group_order;
+    AtermInputDrv *masked_input_drvs;
+    AtermInputDrv *real_input_drvs;
+    char (*masked_hash_hex)[65];
+    const char **drv_refs;
+    size_t drv_refs_cap;
+} DrvScratchFrame;
+
+static DrvScratchFrame *g_drv_scratch_frames = NULL;
+static size_t g_drv_scratch_frames_cap = 0;
+static size_t g_drv_scratch_depth = 0;
+
+static DrvScratchFrame *drv_scratch_acquire(void) {
+    size_t d = g_drv_scratch_depth++;
+    if (d >= g_drv_scratch_frames_cap) {
+        size_t new_cap = d + 1;
+        g_drv_scratch_frames = realloc(g_drv_scratch_frames, new_cap * sizeof(*g_drv_scratch_frames));
+        memset(g_drv_scratch_frames + g_drv_scratch_frames_cap, 0,
+               (new_cap - g_drv_scratch_frames_cap) * sizeof(*g_drv_scratch_frames));
+        g_drv_scratch_frames_cap = new_cap;
+    }
+    DrvScratchFrame *f = &g_drv_scratch_frames[d];
+    if (!f->group_paths) {
+        f->group_paths = malloc(ASNIX_DRV_MAX_INPUT_DRVS * sizeof(const char *));
+        f->group_outs = malloc(ASNIX_DRV_MAX_INPUT_DRVS * sizeof(*f->group_outs));
+        f->group_nouts = malloc(ASNIX_DRV_MAX_INPUT_DRVS * sizeof(size_t));
+        f->group_order = malloc(ASNIX_DRV_MAX_INPUT_DRVS * sizeof(size_t));
+        f->masked_input_drvs = malloc(ASNIX_DRV_MAX_INPUT_DRVS * sizeof(AtermInputDrv));
+        f->real_input_drvs = malloc(ASNIX_DRV_MAX_INPUT_DRVS * sizeof(AtermInputDrv));
+        f->masked_hash_hex = malloc(ASNIX_DRV_MAX_INPUT_DRVS * sizeof(*f->masked_hash_hex));
+    }
+    return f;
+}
+
+static void drv_scratch_release(void) { g_drv_scratch_depth--; }
+
+/* `drv_refs`'s own size (`ngroups + refs.nsrcs`) varies per call since
+ * `refs.nsrcs` isn't bounded by ASNIX_DRV_MAX_INPUT_DRVS -- grown (never
+ * shrunk) the same way, reused across calls at this depth. */
+static const char **drv_scratch_refs(DrvScratchFrame *f, size_t need) {
+    if (need > f->drv_refs_cap) {
+        size_t new_cap = f->drv_refs_cap ? f->drv_refs_cap * 2 : 64;
+        while (new_cap < need) new_cap *= 2;
+        free(f->drv_refs);
+        f->drv_refs = malloc(new_cap * sizeof(const char *));
+        f->drv_refs_cap = new_cap;
+    }
+    return f->drv_refs;
+}
+
 Value asnix_prim_derivation(const Value *args, int64_t argc) {
     (void)argc;
     Value attrs_val = args[0];
@@ -1600,11 +1695,19 @@ Value asnix_prim_derivation(const Value *args, int64_t argc) {
      * for) a dependency several levels deep in nixpkgs's own
      * derivation graph, and 1024 entries' worth of these arrays on the
      * stack per nested call overflowed the real stack chasing d.nix
-     * past this exact point. */
-#define ASNIX_DRV_MAX_INPUT_DRVS 1024
-    const char **group_paths = malloc(ASNIX_DRV_MAX_INPUT_DRVS * sizeof(const char *));
-    const char *(*group_outs)[ASNIX_DRV_MAX_OUTPUTS] = malloc(ASNIX_DRV_MAX_INPUT_DRVS * sizeof(*group_outs));
-    size_t *group_nouts = malloc(ASNIX_DRV_MAX_INPUT_DRVS * sizeof(size_t));
+     * past this exact point (`ASNIX_DRV_MAX_INPUT_DRVS` itself now lives
+     * up near `ASNIX_DRV_MAX_ARGS`/`ENV`/`OUTPUTS`, see M143). M143:
+     * these arrays (plus `group_order`/`masked_input_drvs`/
+     * `real_input_drvs`/`masked_hash_hex`/`drv_refs` further down) are
+     * now a depth-indexed REUSED pool (`drv_scratch_acquire`/
+     * `_release`, above) instead of a fresh malloc/free pair every
+     * call -- recursion-safe for the same reason the comment above
+     * explains (a call at depth D never overlaps another call at the
+     * SAME depth D), see that function's own header comment. */
+    DrvScratchFrame *scratch = drv_scratch_acquire();
+    const char **group_paths = scratch->group_paths;
+    const char *(*group_outs)[ASNIX_DRV_MAX_OUTPUTS] = scratch->group_outs;
+    size_t *group_nouts = scratch->group_nouts;
     size_t ngroups = 0;
     for (size_t i = 0; i < refs.ndrvs; i++) {
         const char *dp = refs.drvs[i].drv_path;
@@ -1636,7 +1739,7 @@ Value asnix_prim_derivation(const Value *args, int64_t argc) {
      * `group_outs`/`group_nouts` are three separate parallel arrays);
      * each group's own output-name list sorted too -- both required by
      * `asnix_build_derivation_aterm`'s own sorting contract. */
-    size_t *group_order = malloc(ASNIX_DRV_MAX_INPUT_DRVS * sizeof(size_t));
+    size_t *group_order = scratch->group_order;
     for (size_t g = 0; g < ngroups; g++) group_order[g] = g;
     for (size_t i = 1; i < ngroups; i++) {
         size_t j = i;
@@ -1659,9 +1762,9 @@ Value asnix_prim_derivation(const Value *args, int64_t argc) {
         }
     }
 
-    AtermInputDrv *masked_input_drvs = malloc(ASNIX_DRV_MAX_INPUT_DRVS * sizeof(AtermInputDrv));
-    AtermInputDrv *real_input_drvs = malloc(ASNIX_DRV_MAX_INPUT_DRVS * sizeof(AtermInputDrv));
-    char (*masked_hash_hex)[65] = malloc(ASNIX_DRV_MAX_INPUT_DRVS * sizeof(*masked_hash_hex));
+    AtermInputDrv *masked_input_drvs = scratch->masked_input_drvs;
+    AtermInputDrv *real_input_drvs = scratch->real_input_drvs;
+    char (*masked_hash_hex)[65] = scratch->masked_hash_hex;
     for (size_t gi = 0; gi < ngroups; gi++) {
         size_t g = group_order[gi];
         MaskedHashCacheEntry entry;
@@ -1877,7 +1980,7 @@ Value asnix_prim_derivation(const Value *args, int64_t argc) {
      * legitimately appear in both arrays. `references` is a real
      * `StorePathSet` (deduped) in real Nix, so the union below must be
      * deduped too, not just concatenated. */
-    const char **drv_refs = malloc((ngroups + refs.nsrcs) * sizeof(const char *));
+    const char **drv_refs = drv_scratch_refs(scratch, ngroups + refs.nsrcs);
     size_t ndrv_refs = 0;
     for (size_t gi = 0; gi < ngroups; gi++) drv_refs[ndrv_refs++] = group_paths[group_order[gi]];
     for (size_t i = 0; i < refs.nsrcs; i++) drv_refs[ndrv_refs++] = refs.srcs[i];
@@ -1889,9 +1992,6 @@ Value asnix_prim_derivation(const Value *args, int64_t argc) {
         }
         ndrv_refs = w;
     }
-    free(group_paths);
-    free(group_order);
-    free(group_nouts);
 
     /* A fixed-size buffer here overflowed for real stdenv derivations
      * with many direct inputs (found chasing d.nix past M74's own small
@@ -1905,8 +2005,6 @@ Value asnix_prim_derivation(const Value *args, int64_t argc) {
     for (size_t i = 0; i < ndrv_refs; i++) {
         drv_type_len += (size_t)snprintf(drv_type + drv_type_len, drv_type_cap - drv_type_len, ":%s", drv_refs[i]);
     }
-    free(drv_refs);
-
     char drv_name[256];
     snprintf(drv_name, sizeof(drv_name), "%s.drv", name);
     char drv_path[300];
@@ -1963,10 +2061,9 @@ Value asnix_prim_derivation(const Value *args, int64_t argc) {
         free(cache_aterm);
         masked_hash_cache_insert(drv_path, 0, cache_digest);
     }
-    free(group_outs);
-    free(masked_input_drvs);
-    free(real_input_drvs);
-    free(masked_hash_hex);
+    drv_scratch_release(); /* M143: pool-owned (group_paths/group_outs/group_nouts/
+                             * group_order/masked_input_drvs/real_input_drvs/
+                             * masked_hash_hex/drv_refs) -- released, not freed. */
 
     /* M86: cache THIS derivation's own transitive-closure membership
      * (`drv_path` -> every other drv/src path reachable from it, plus its
