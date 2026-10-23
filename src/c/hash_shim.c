@@ -3,9 +3,41 @@
 #include <dlfcn.h>
 #include <stdlib.h>
 
-/* Matches OpenSSL's legacy one-shot digest signature exactly (see
- * hash_shim.h's header comment for which API/why). */
-typedef unsigned char *(*asnix_hash_fn)(const unsigned char *d, size_t n, unsigned char *md);
+/* M146: the legacy one-shot wrappers (MD5()/SHA1()/SHA256()/SHA512(),
+ * what this file used to call exclusively) still work under OpenSSL 3.x,
+ * but internally they're now reimplemented as a full EVP_Digest() call --
+ * fetch an EVP_MD from the provider registry, init, update, final, free
+ * the fetched EVP_MD -- repeated on EVERY call, not just once. Measured in
+ * isolation against a from-scratch microbenchmark (docs/architecture.md
+ * M146): for d.nix/ffmpeg's real derivation-hashing workload (34,988
+ * `asnix_hash_sha256` calls, avg 1649.5 bytes), that provider-fetch
+ * machinery costs a ~3,122-instruction FIXED tax per call, independent of
+ * input size -- about half of asnix's own total hashing instruction
+ * budget, and a cost iets's `sha2` Rust crate (no provider abstraction at
+ * all) never pays.
+ *
+ * The classic streaming triplet -- `MD5_Init`/`_Update`/`_Final` and its
+ * SHA1/SHA256/SHA512 siblings -- bypasses the provider-fetch path
+ * entirely and computes the exact same digest. Confirmed still exported
+ * in both this machine's system libcrypto and the nixpkgs-resolved one
+ * (`nm -D`, same discipline M8 used to confirm the one-shot symbols).
+ * Byte-identical output is covered by tests/c/test_hash_shim.c's existing
+ * oracle values (md5sum/sha1sum/sha256sum/openssl-dgst-transcribed, not
+ * re-derived here) -- any mismatch from this change would fail there. */
+typedef void *(*asnix_hash_init_fn)(void *ctx);
+typedef void *(*asnix_hash_update_fn)(void *ctx, const void *data, size_t len);
+typedef void *(*asnix_hash_final_fn)(unsigned char *md, void *ctx);
+
+/* Generously oversized, 8-byte-aligned scratch for OpenSSL's own *_CTX
+ * structs -- the largest in play here is SHA512_CTX (8 uint64 state + 2
+ * uint64 length counters + a 128-byte block buffer + 2 uint32, ~216 bytes
+ * on every LP64 target this runs on). 256 bytes leaves headroom without
+ * this file ever needing to include OpenSSL's own headers (see
+ * hash_shim.h's header comment on why dlopen/dlsym instead of linking). */
+typedef union {
+    unsigned char raw[256];
+    uint64_t align_marker;
+} asnix_hash_ctx;
 
 static void *asnix_libcrypto_handle = 0;
 
@@ -47,26 +79,33 @@ static void *asnix_load_libcrypto(void) {
     return 0;
 }
 
-static int64_t asnix_hash_one(const char *symbol, const void *input, size_t input_len, unsigned char *out) {
+static int64_t asnix_hash_one(const char *init_sym, const char *update_sym,
+                               const char *final_sym, const void *input,
+                               size_t input_len, unsigned char *out) {
     void *h = asnix_load_libcrypto();
     if (!h) return -1;
-    asnix_hash_fn fn = (asnix_hash_fn)dlsym(h, symbol);
-    if (!fn) return -2;
-    fn((const unsigned char *)input, input_len, out);
+    asnix_hash_init_fn init = (asnix_hash_init_fn)dlsym(h, init_sym);
+    asnix_hash_update_fn update = (asnix_hash_update_fn)dlsym(h, update_sym);
+    asnix_hash_final_fn final_fn = (asnix_hash_final_fn)dlsym(h, final_sym);
+    if (!init || !update || !final_fn) return -2;
+    asnix_hash_ctx ctx;
+    init(&ctx);
+    update(&ctx, input, input_len);
+    final_fn(out, &ctx);
     return 0;
 }
 
 int64_t asnix_hash_md5(const void *input, size_t input_len, unsigned char *out) {
-    return asnix_hash_one("MD5", input, input_len, out);
+    return asnix_hash_one("MD5_Init", "MD5_Update", "MD5_Final", input, input_len, out);
 }
 int64_t asnix_hash_sha1(const void *input, size_t input_len, unsigned char *out) {
-    return asnix_hash_one("SHA1", input, input_len, out);
+    return asnix_hash_one("SHA1_Init", "SHA1_Update", "SHA1_Final", input, input_len, out);
 }
 int64_t asnix_hash_sha256(const void *input, size_t input_len, unsigned char *out) {
-    return asnix_hash_one("SHA256", input, input_len, out);
+    return asnix_hash_one("SHA256_Init", "SHA256_Update", "SHA256_Final", input, input_len, out);
 }
 int64_t asnix_hash_sha512(const void *input, size_t input_len, unsigned char *out) {
-    return asnix_hash_one("SHA512", input, input_len, out);
+    return asnix_hash_one("SHA512_Init", "SHA512_Update", "SHA512_Final", input, input_len, out);
 }
 
 void asnix_hash_to_hex(const unsigned char *bytes, size_t n, char *out_hex) {

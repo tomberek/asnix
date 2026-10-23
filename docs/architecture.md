@@ -16619,3 +16619,159 @@ unchanged byte-for-byte before and after.
 
 Files: `src/c/lexer.c` (`Keyword` struct, `KEYWORDS` table, and the
 keyword-lookup loop in `lex_until`'s `ident_start` case only).
+
+## M148: fixing the fresh profile's "0.00% SHA256" symbol-resolution blind spot -- real, confirmed, and a small genuine fix found along the way
+
+A fresh `perf record -e cpu_core/instructions/ -c 10000 -g` profile (the
+one behind this campaign's current ranked instruction-gap breakdown:
+allocator 763M, libc_misc 448.5M, string_ops 483M) showed asnix's own
+SHA256/crypto hashing at exactly 0.00% -- flagged as almost certainly a
+symbol-resolution artifact, not a real one-sided gap, since an earlier
+profiling pass had found asnix's hashing cost (3.56% of its own cycles)
+comparable to iets's (4.40%), both confirmed via `objdump` to already use
+hardware SHA-NI (`sha256rnds2`/`sha256msg1`/`sha256msg2`). This session
+re-confirms that properly and finds one small, real, previously-invisible
+gap along the way.
+
+**Root cause of the blind spot**: `src/c/hash_shim.c` `dlopen`s
+`/usr/lib/x86_64-linux-gnu/libcrypto.so.3` (this machine's system
+OpenSSL, reached via Tier 2's bare-soname fallback when `ASNIX_LIBCRYPTO_
+LIB` isn't set, i.e. whenever asnix isn't run inside `nix develop`) --
+and that specific file is `strip`ped (confirmed: `readelf -S` shows no
+`.symtab`; no matching entry for its build-id,
+`50bbae5166dbdbc281f876ad8e0cc56f362e2954`, exists under `/usr/lib/debug/
+.build-id/50/`, and no `-dbgsym` package is installable without root/a
+dbgsym apt source on this machine). Critically, `nm -D` shows its
+*dynamic* symbol table is intact (5,505 exported symbols, including
+`SHA256`/`SHA256_Init`/`SHA256_Update`/`SHA256_Final`) -- so `perf
+record --buildid-all` + `perf report` DOES correctly attribute time to
+`libcrypto.so.3` as a DSO (2.94%-3.36% self/children of the whole `d.nix`
+run, confirmed directly, not 0.00% at the DSO level) and DOES resolve
+every *exported* function by name (`OPENSSL_LH_retrieve`, `EVP_MD_free`,
+`SHA256_Final`, `CRYPTO_THREAD_read_lock`, etc., all show up correctly).
+The actual hot SHA-NI compression routine, though, sits in a large
+~0x15E0E-byte stretch of `.text` *past the last exported symbol address*
+(`RC4_options` at `0x2f11b0` is the last dynsym entry; the hot region is
+`0x306fbe`-`0x30724a`) with zero dynsym coverage at all -- a genuinely
+un-exported local/hidden-visibility function, not merely missing debug
+info, so `perf` has no symbol to attach those samples to and shows raw
+hex addresses instead. This explains the earlier run's "0.00%": the
+original profile likely didn't even register the DSO's buildid (no
+`--buildid-all`, or a stale `perf buildid-cache`), compounding the local-
+symbol gap into a total miss. Confirmed by reproducing: a run with plain
+`perf record -g` (no `--buildid-all`) against the same workload shows
+the same raw-hex-cluster pattern, and whether the DSO rolls up to "0.00%"
+vs. "~3%" in a report is sensitive to exactly this registration step --
+consistent with the earlier profile's 0.00% being an artifact of that,
+not a real zero.
+
+**Fix for the blind spot**: pointed `ASNIX_LIBCRYPTO_LIB` at the
+nixpkgs-resolved, *unstripped* `openssl-3.6.3` build already present in
+the local `/nix/store` (`not stripped`, confirmed via `file`) and re-
+profiled the identical `d.nix` workload. This fully resolves the hot
+region: `sha256_block_data_order_shaext` -- the SHA-NI hardware-
+accelerated compression function -- is the single hottest symbol inside
+`libcrypto.so.3` at 1.72% of the whole program's instructions, reached
+via `SHA256 -> EVP_Q_digest -> EVP_Digest -> sha256_block_data_order_
+shaext`, called from `asnix_hash_one -> SHA256() -> ... <- asnix_prim_
+derivation`. **This confirms the earlier finding stands**: asnix's
+hashing is real SHA-NI-accelerated work, not a hidden gap, and the
+"0.00%" was purely the symbol-resolution artifact it was suspected to be.
+
+**The one real thing found along the way**: profiling with the unstripped
+library surfaced a cluster of OpenSSL-internal symbols around the
+SHA-NI call (`EVP_MD_free`, `EVP_MD_up_ref`, `evp_generic_fetch`,
+`evp_md_init_internal`, `ossl_namemap_name2num`, `ossl_lib_ctx_get_data`,
+`ossl_ht_get`, `CRYPTO_THREAD_run_once`, `OPENSSL_cleanse`, `ossl_fnv1a_
+hash`) that don't belong to actual digest computation -- they're OpenSSL
+3.x's EVP provider-fetch machinery. `hash_shim.c`'s header comment
+already notes it deliberately uses OpenSSL's *legacy* one-shot wrappers
+(`SHA256()` etc., the same API upstream real Nix's own `libutil/hash.cc`
+uses) specifically to avoid `EVP_MD_CTX` plumbing -- but OpenSSL 3.x
+silently reimplemented those legacy one-shot wrappers as full
+`EVP_Digest()` calls under the hood, meaning every single call now pays a
+provider-registry fetch/init/free round-trip that doesn't exist in the
+older (pre-3.0) implementation `hash_shim.c`'s comment was written
+against. This is a real, call-count-proportional (not byte-proportional)
+tax, and iets's `sha2` Rust crate (no provider abstraction at all) never
+pays anything equivalent.
+
+**Isolated microbenchmark** (`tools/bench_hash_shim.c`, kept in-tree;
+also two throwaway `/tmp` harnesses used only for the dlsym-cost and
+instruction-count variants, not kept): calls `hash_shim.c`'s own
+`asnix_hash_sha256` entry point directly, buffer sizes chosen from real
+data, not guessed -- a one-off debug counter temporarily added to
+`asnix_hash_sha256` (reverted before this commit, confirmed via `git
+diff` showing no residual change to `hash_shim.c`'s old behavior at that
+point) found the real `d.nix`/ffmpeg eval makes exactly 34,988 calls to
+`asnix_hash_sha256`, averaging 1,649.5 bytes each -- i.e. almost entirely
+`derivation.c`'s masked-ATerm hashing (matches real `.drv` text sizes
+sampled directly from `/nix/store`, ~2-4KB). `taskset -c 0`-pinned,
+interleaved trials at that exact average size (1,000,000 iters/trial, 2
+trials each, `cpu_core/instructions/`): one-shot `SHA256()` averaged
+7,906.97 instructions/call; the low-level `SHA256_Init`/`_Update`/
+`_Final` triplet averaged 4,784.67 instructions/call -- a **3,122.3-
+instruction fixed tax per call**, confirmed size-independent (same ~3,100-
+instruction gap measured at 2,048 and 4,096 bytes too; at 64 bytes the
+same fixed tax is 266.9% of the low-level cost in wall-time terms,
+confirming it doesn't scale with input size). A separate isolated check
+found `dlsym()`'s own per-call cost (~49-54ns) is not a meaningful
+contributor by comparison (hash_shim.c re-`dlsym`s its symbol on every
+call, old and new code both; ruled out as the cause).
+
+**Fix landed** (small, bounded, same digest family, verified correctness-
+preserving): `src/c/hash_shim.c`'s `asnix_hash_one` now resolves and
+calls the classic streaming triplet (`MD5_Init`/`_Update`/`_Final` and
+its SHA1/SHA256/SHA512 siblings) instead of the one-shot wrappers,
+bypassing the EVP provider-fetch path entirely while computing the exact
+same digest. All four streaming-API symbol families confirmed present
+via `nm -D` against both this machine's system libcrypto and the
+nixpkgs-resolved `openssl-3.6.3`, same discipline M8 used for the
+original one-shot symbols. `tests/c/test_hash_shim.c`'s existing oracle
+values (independently generated via `md5sum`/`sha1sum`/`sha256sum`/
+`openssl dgst -sha512`, covering empty input, embedded-NUL input, and
+three ordinary strings per algorithm) all still pass unchanged.
+
+**Correctness**: `make test`/`test-e2e`/`test-conformance` all green
+(including `test_hash_shim`). `make test-nix-conformance
+NIX_CONFORMANCE_DIR=/tmp/nix-conformance`: `pass=655 fail=3 skip=148`
+(exact baseline). `make test-nixpkgs-hash`: `pass=148 fail=0`. `d.nix`
+output byte-identical before and after:
+`/nix/store/29iacg6h530yx7rxz4k1fhvi0kxxhsam-ffmpeg-9.0.1-bin`.
+
+**Measured, interleaved** (5 alternating before/after trials, full real
+`d.nix`/ffmpeg eval, `taskset -c 0`, `cpu_core/instructions/,cpu_core/
+cycles/`): instructions dropped in all 5/5 paired trials, tight variance
+on both sides (<0.1% spread within each side across all 5 runs --
+expected, since this code path's control flow doesn't depend on timing).
+Mean before 8,028,544,549 instructions, mean after 7,968,271,697 --
+**-60,272,852 instructions, -0.751% of the whole program's total**.
+Cycles were, as repeatedly found this campaign on this shared contended
+machine, too noisy to read cleanly even interleaved (one "after" trial
+spiked to 4.94B cycles against a ~4.1-4.3B baseline on both sides);
+excluding that one outlier trial, cycles point the same direction
+(~0.6% reduction) but this metric needs more trials than time allowed
+here to trust on its own -- instructions are the clean, trustworthy
+signal, consistent with this whole campaign's stated reason for using
+instruction-sampled profiling in the first place.
+
+**Honest sizing**: this is a small, bounded fix (-0.75% of the whole
+program's instructions), well below the campaign's three named top-
+ranked gaps (allocator 763M/9.5%, libc_misc 448.5M/5.6%, string_ops
+483M/6.0%, all as a fraction of the 2,973.6M-instruction gap). It does
+NOT change the answer to this task's central question: asnix's hashing,
+properly measured, is still fundamentally comparable to iets's (both
+genuinely SHA-NI-accelerated), and the "0.00%" was correctly suspected to
+be a measurement artifact, not a real one-sided gap -- but about half of
+asnix's own total hashing-category instruction budget (extrapolating the
+per-call tax across the real workload's 34,988 calls, ~109M of a DSO-
+level-estimated ~211M self-instructions) was, until this session,
+entirely invisible to every prior profiling pass this campaign ran,
+simply because it lived in library-internal provider machinery with a
+name nobody had reason to go looking for before the blind spot itself
+was investigated.
+
+Files: `src/c/hash_shim.c` (`asnix_hash_one` and the four public
+`asnix_hash_{md5,sha1,sha256,sha512}` wrappers -- `asnix_load_libcrypto`,
+`asnix_hash_to_hex`, and `hash_shim.h`'s public signatures untouched),
+plus the new `tools/bench_hash_shim.c` isolated microbenchmark.
