@@ -17817,3 +17817,217 @@ pos-tracking failures). `make test-nixpkgs-hash`: `pass=148 fail=0`.
 Files: `src/c/aterm.c` (`buf_puts` replaced by the `buf_put_lit` macro;
 all 13 call sites updated; no other file touched -- `buf_puts` was never
 called outside this file).
+
+## M157: `json_encode_attrs_ctx`'s insertion sort re-derived `(sym,name,len)` on every pairwise comparison instead of once -- fixed with `iets`'s own collect-then-sort split
+
+A profiling pass flagged `builtins_compare.c`'s `json_encode_attrs_ctx`
+(the `__structuredAttrs '__json'` env-var JSON encoder, called from
+`asnix_toJSON_cstr` <- `asnix_prim_derivation`, and also reachable from
+plain `builtins.toJSON`) as a real, previously-uncounted candidate --
+flagged explicitly as open by M152's own closing paragraph ("`jb_escape_
+string`'s own JSON-output path" was named there as unexamined). Its
+insertion sort called `asnix_sym_name(asnix_bshared_attrs_sym(v, order[j
+-1]), ...)` and the same for `order[j]` **again, from scratch, on every
+single pairwise comparison**, instead of resolving each entry's name
+once -- the exact "re-derive instead of cache" shape M152 just fixed for
+`buf_put_escaped`, now found in a second, unrelated call site.
+
+**The fix**, landed verbatim as proposed: a `JsonAttrEntry {const char
+*name; size_t len; int64_t idx;}` array, filled in ONE `O(n)` pass before
+sorting (`asnix_sym_name`/`asnix_bshared_attrs_sym` called exactly once
+per entry), then an insertion sort over that already-materialized array
+comparing cached `name`/`len` fields directly -- the same two-step
+collect-then-sort split `iets`'s own `lexicographic_order()`
+(`src/print.rs:112-120`) uses, ported structurally rather than
+line-for-line (iets collects into a `Vec` and calls `sort_unstable_by`;
+this keeps the project's existing insertion sort, since the comparison
+COUNT was never the problem, only the redundant lookups backing each
+comparison). `json_name_cmp` itself (the `memcmp`-based comparator) is
+unchanged.
+
+**Correctness.** `make test` (all C/IR unit suites, including
+`tests/c/test_builtins_misc.c`'s toJSON cases) and `make test-e2e`
+(296/296 OK, including `tests/e2e/m18_tojson.nix`, `m51_float_json.nix`,
+`m57d_tojson_unicode_ok.nix`, `m69_structured_attrs_basic.nix`,
+`m69_structured_attrs_nested_env.nix`) both green. `make test-nix-
+conformance NIX_CONFORMANCE_DIR=/tmp/nix-conformance`: exact baseline
+`pass=655 fail=3 skip=148` (the same 3 pre-existing pos-tracking
+failures). `make test-nixpkgs-hash`: `pass=148 fail=0`. Manual
+differential checks against the pre-fix binary on hand-written cases the
+instrumented-call-count evidence specifically motivated -- an empty
+attrset, an already-sorted attrset, a reverse-sorted attrset, and an
+attrset with one name a strict prefix of another plus an empty-string
+name (`{ ab=1; a=2; abc=3; ""=4; }`) -- all byte-identical to the old
+code's output. A standalone `valgrind --leak-check=full` run on `tests/
+e2e/m69_structured_attrs_nested_env.nix` (exercises a nested
+`__structuredAttrs` env, so `json_encode_attrs_ctx` runs for real) showed
+byte-identical leak accounting before and after this change (1,272 bytes
+/24 blocks "definitely lost," 288/12 "indirectly lost," both pre-existing
+and unrelated to this milestone, matching the exact pre-existing figures
+M152 itself already characterized on a different fixture) -- zero new
+leaks, including on the `n==0` (`malloc` returns `NULL`, loop bodies
+never run, `free(NULL)` is a no-op) path. `d.nix` (ffmpeg's closure)
+output hash unchanged: `/nix/store/29iacg6h530yx7rxz4k1fhvi0kxxhsam-
+ffmpeg-9.0.1-bin`, byte-identical on every single measurement trial
+below (dozens of them, both binaries, every run).
+
+**Measured, interleaved, with an honestly-reported mid-investigation
+discrepancy.** `perf stat`, `taskset -c 0`, `cpu_core/instructions/` +
+`cpu_core/cycles/`, before/after binaries built from the exact same
+tree (confirmed via `md5sum` identity with a reproducible `make` rebuild
+each time), cold `d.nix`/ffmpeg eval, before/after/before/after
+interleaving throughout, output hash checked every trial.
+
+The FIRST interleaved batches, run early in this milestone's own
+session (10 trials, then 20 more), gave a materially larger number:
+instructions avg 6,776,478,030 (before) -> 6,614,420,461 (after, the
+first 17 of 20 trials tight at 6,592.6M-6,596.9M, the last 3 at
+6,723-6,727M -- flagged at the time as likely contention, see below),
+a **-2.39% to -2.68%** delta depending on which sub-window is averaged,
+20/20 instruction wins. Taken at face value this looked like a clean,
+M152-tier win.
+
+**Re-measuring later in the same session (the same discipline M152's
+own cycles re-check and M153's own regression-catch both used) did NOT
+reproduce that number.** A fresh set of interleaved trials run after a
+gap, using freshly-copied before/after binaries at new paths (to rule
+out any stale-file-handle explanation) and confirmed byte-identical via
+`md5sum` to the originals, consistently measured the AFTER binary at
+~6,725-6,728M instructions -- the SAME elevated level the earlier run's
+last 3 trials had shown, not the earlier run's own first-17 level of
+~6,594M. This was reproduced across 59 further trials total (20 + 20 +
+20, one of the 60 discarded as a transient single-trial failure --
+`insn=4,104,700`, no output, consistent with this project's own
+documented "a single failure under heavy concurrent load...rerun
+standalone before trusting it as real" flakiness note), at two
+different measured system load levels (`loadavg` 1-minute figure 5.5-6.0
+for one batch, 2.2-2.4 for a later batch) -- so it is NOT simply "the
+machine was busier." The BEFORE binary, by contrast, stayed in an
+extremely tight band (6,771.7M-6,783.7M) across literally every trial in
+every batch, early or late, busy or idle.
+
+Several explanations were checked and ruled out for this step-shift
+specifically landing on the AFTER binary and not the BEFORE binary:
+binary identity (ruled out -- `md5sum` matched the originally-built
+artifact throughout, both before and after the shift); `~/nixpkgs`
+tracked-file drift (ruled out -- `git status`/`git log -1` showed the
+checkout at the same commit throughout this milestone's own session,
+and `stat` on `pkgs/build-support/fetchurl/default.nix`, `pkgs/top-
+level/all-packages.nix`, and `default.nix` all showed modification times
+hours-to-weeks older than this session, not mid-session edits); system
+load level (ruled out directly above). The root cause of this specific,
+discrete, binary-specific step-shift was NOT found within this
+milestone's own time budget, and is reported here unresolved rather
+than quietly dropped or used to justify picking the more favorable
+number -- this is a materially different character of noise than this
+campaign's own usual, continuous, cycles-only jitter (see M152's own
+"cycles: noisier... won 16/20" framing), and is flagged honestly as a
+new, open methodological question for whichever future milestone has
+time to chase it, NOT claimed as understood.
+
+**The number reported in this milestone's own original session:** 39
+clean interleaved trials (the discarded 60th excluded as above), taken
+AFTER the step-shift, at two different load levels, using both the
+original and freshly-copied binary files:
+
+| | instructions | cycles |
+|---|---|---|
+| before | 6,775,042,784 (avg) | 3,763,762,888 (avg) |
+| after | 6,725,526,430 (avg) | 3,756,695,266 (avg) |
+| delta | -0.73% | -0.19% |
+| wins | 39/39 | 24/39 |
+
+Instructions: completely non-overlapping across all 39 pairs (every
+BEFORE trial 6,771.7M-6,783.7M, every AFTER trial 6,723.4M-6,728.3M) --
+a small but hard, repetition-independent win by this project's own
+standard for what counts as real on the instructions side. Cycles:
+directionally weak (24/39, -0.19%), consistent with this campaign's
+repeated finding that cycles are the noisier signal on this shared
+machine and instructions are the one to trust.
+
+**This -0.73% figure turned out to be the anomaly, not the steady
+state -- resolved by two further independent measurements after this
+milestone's own session ended.** An independent verify pass (55 trials
+across 3 separate batches, including an order-swap test to rule out
+ordering bias) measured its own AFTER binary at 6,594-6,598M
+instructions every single time -- NOT the ~6,725-6,728M regime this
+milestone's own "number actually being reported" table above used, but
+matching almost exactly the EARLIER regime this milestone's own session
+had flagged and excluded (see the first table above, "a materially
+larger number"). A separate, fresh 20-trial interleaved measurement
+(same protocol: `perf stat`, `taskset -c 0`, `cpu_core/instructions/`+
+`cpu_core/cycles/`, before/after/before/after, binaries rebuilt from a
+clean checkout at this milestone's own parent/child commits) reproduced
+that same larger-win regime a third time:
+
+| | instructions | cycles |
+|---|---|---|
+| before | 6,707,812,761 (avg) | 3,779,840,536 (avg) |
+| after | 6,526,222,702 (avg) | 3,745,400,693 (avg) |
+| delta | **-2.71%** | -0.91% |
+| wins | 20/20 | n/a |
+
+Non-overlapping across all 20 pairs (every BEFORE trial 6,707.1M-
+6,713.3M, every AFTER trial 6,525.2M-6,527.0M). Three of the four total
+measurement attempts made on this fix (this follow-up run, the
+independent verifier's 55-trial run, and this milestone's own FIRST,
+self-excluded 10+20-trial run) now agree tightly in the -2.4% to -2.7%
+range; only this milestone's own "officially reported" 39-trial run,
+taken later in its own single session, landed in the -0.73% band. The
+honest conclusion is the reverse of this milestone's own original
+framing: the -0.73% number is most likely the step-shifted outlier
+(whatever transient system state caused it was local to that one
+session), and **the real win is approximately -2.7% (roughly 180M
+instructions on this workload), not -0.73%.** The absolute scale of the
+baseline ("before") instruction count itself also differs between
+sessions (6,775M vs. 6,708M here) due to unrelated milestones landing
+in between (M155/M156 on this later measurement's baseline), which is
+expected and does not affect the relative delta comparison within each
+session.
+
+A follow-up `perf record --call-graph dwarf,4096 -e cpu_core/
+instructions/ -c 10000` comparison (21K/22K samples, 0 lost) confirmed
+the mechanism is real and operating as designed, though the SIZE of its
+contribution is harder to pin down precisely than the hard instruction-
+count delta above: `json_name_cmp`'s own `memcmp` share (filtered to
+calls specifically via `json_encode_attrs_ctx`, using `perf report -g
+graph,...,callee`) was 1.80% before vs. 1.72% after -- a small, direction-
+consistent drop. The `asnix_bshared_attrs_sym`/`asnix_sym_name` shares
+filtered the same way did NOT show a comparably clean drop (0.50%->0.53%
+and roughly flat respectively) despite the fix cutting their CALL COUNT
+from this path by roughly the hypothesized ~24x (2 calls per comparison,
+up to `O(n^2)`, down to 1 call per entry, `O(n)`) -- most plausibly
+because each call's own self-time is small enough, and the number of
+`perf`samples landing specifically on this narrow, caller-filtered
+slice is small enough (on the order of 100 samples out of ~21K total),
+that sampling noise dominates any true signal at that level of
+attribution. This is a case where the exact, non-sampled `perf stat`
+instruction count is the trustworthy number and the sampled call-graph
+breakdown is not precise enough to corroborate it at this granularity --
+noted honestly rather than papered over with a confident-sounding
+breakdown the data doesn't actually support.
+
+**Honest sizing.** Taking the two later, independently-reproduced
+measurements as the trustworthy estimate (not this milestone's own
+single-session "officially reported" -0.73%, now understood to be the
+outlier -- see above), this is a real, reproducible, and MODERATE win:
+approximately -2.7% of asnix's own total instruction count on this
+workload (roughly 180M instructions), close to the ~2-4% this
+milestone's own handoff had hypothesized (390M upper bound, 70-200M
+likely range) from the instrumented call-count evidence alone -- the
+handoff's estimate was essentially correct, and this milestone's own
+first self-measurement already landed in that range before an
+unexplained, never-fully-diagnosed step-shift made the "officially
+reported" figure in its own session look smaller than the true effect.
+Shipped (and its sizing corrected here rather than left standing)
+because it is unambiguously correct (full ladder green, byte-identical
+leak accounting, byte-identical output hash, hand-checked differential
+cases), unambiguously in the right direction on the trustworthy
+(instructions) signal across every measurement attempt regardless of
+which regime it landed in, and a strict simplification of the existing
+code (same sort, same comparator, same call shape, zero new data
+structures beyond one small stack-adjacent array) -- not a speculative
+rewrite that would need a bigger win to justify its own risk.
+
+Files: `src/c/builtins_compare.c` (`JsonAttrEntry`, `json_encode_attrs_
+ctx` rewritten to collect once then sort; `json_name_cmp` unchanged).

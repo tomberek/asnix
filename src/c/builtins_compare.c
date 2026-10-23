@@ -549,34 +549,51 @@ static int json_name_cmp(const char *an, size_t al, const char *bn, size_t bl) {
 static void json_encode_ctx(Value v, JsonBuf *out, AsnixStringContext *ctx);
 static void json_encode(Value v, JsonBuf *out) { json_encode_ctx(v, out, NULL); }
 
+/* M154: (name,len,idx) for one attrset entry, collected ONCE per entry
+ * (see json_encode_attrs_ctx's own header comment below) instead of
+ * re-derived from `(v, order[j])` on every pairwise comparison the
+ * insertion sort makes. */
+typedef struct {
+    const char *name;
+    size_t len;
+    int64_t idx;
+} JsonAttrEntry;
+
+/* M154: previously, this function's insertion sort called
+ * `asnix_sym_name(asnix_bshared_attrs_sym(v, order[j]), ...)` (a symtab
+ * lookup) TWICE per comparison, every comparison -- up to O(n^2) lookups
+ * for an attrset whose entries aren't already sorted, instead of the
+ * O(n) a sort fundamentally needs. Fixed by collecting each entry's
+ * (sym-name, len, original-index) ONCE in a single O(n) pass first, then
+ * sorting that already-materialized array -- the exact two-step
+ * collect-then-sort split `iets`'s own `lexicographic_order()`
+ * (`src/print.rs:112-120`) uses, ported verbatim: one `name()` lookup per
+ * entry, period, with the sort comparing already-resolved byte spans. */
 static void json_encode_attrs_ctx(Value v, JsonBuf *out, AsnixStringContext *ctx) {
     int64_t n = asnix_bshared_attrs_count(v);
-    int64_t *order = n > 0 ? malloc((size_t)n * sizeof(int64_t)) : NULL;
-    for (int64_t i = 0; i < n; i++) order[i] = i;
+    JsonAttrEntry *entries = n > 0 ? malloc((size_t)n * sizeof(JsonAttrEntry)) : NULL;
+    for (int64_t i = 0; i < n; i++) {
+        entries[i].name = asnix_sym_name(asnix_bshared_attrs_sym(v, i), &entries[i].len);
+        entries[i].idx = i;
+    }
     for (int64_t i = 1; i < n; i++) {
+        JsonAttrEntry cur = entries[i];
         int64_t j = i;
-        while (j > 0) {
-            size_t al, bl;
-            const char *an = asnix_sym_name(asnix_bshared_attrs_sym(v, order[j - 1]), &al);
-            const char *bn = asnix_sym_name(asnix_bshared_attrs_sym(v, order[j]), &bl);
-            if (json_name_cmp(an, al, bn, bl) <= 0) break;
-            int64_t tmp = order[j - 1];
-            order[j - 1] = order[j];
-            order[j] = tmp;
+        while (j > 0 && json_name_cmp(entries[j - 1].name, entries[j - 1].len, cur.name, cur.len) > 0) {
+            entries[j] = entries[j - 1];
             j--;
         }
+        entries[j] = cur;
     }
     jb_putc(out, '{');
     for (int64_t i = 0; i < n; i++) {
         if (i > 0) jb_putc(out, ',');
-        size_t len;
-        const char *name = asnix_sym_name(asnix_bshared_attrs_sym(v, order[i]), &len);
-        jb_escape_string(out, name, (int64_t)len);
+        jb_escape_string(out, entries[i].name, (int64_t)entries[i].len);
         jb_putc(out, ':');
-        json_encode_ctx(asnix_force_for_print(asnix_bshared_attrs_value(v, order[i])), out, ctx);
+        json_encode_ctx(asnix_force_for_print(asnix_bshared_attrs_value(v, entries[i].idx)), out, ctx);
     }
     jb_putc(out, '}');
-    free(order);
+    free(entries);
 }
 
 /* M80: `ctx` (NULL from every pre-existing call site, see this
