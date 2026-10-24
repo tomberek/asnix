@@ -19908,3 +19908,135 @@ chasing for asnix either.
 
 Files: none changed (investigation and cross-reference only; the
 bytecode cache feature itself already exists, unmodified, since M94).
+
+## M174: `aterm.c`'s per-call `Buf` (malloc-to-free every time) replaced with one persistent, capacity-preserving buffer reused across the whole eval
+
+M152's per-derivation `AtermEscapeCache` (keyed by source pointer) only
+deduped the re-ESCAPING *work* -- the character-by-character scan and
+switch-based re-encode -- across the 3 ATerm passes `derivation.c` runs
+per derivation build (masked/real/cache-hash, see that milestone's own
+comment above `aterm_cache` and `derivation.c:1848-1864`). It left a
+different, underlying cost completely untouched: `asnix_build_
+derivation_aterm_cached` started every single call from `Buf b = { 0 }`
+-- NULL pointer, zero capacity -- then grew it by doubling via `realloc`
+in `buf_reserve` as bytes were appended, and returned `b.buf` straight to
+the caller to `free()`. That is a fresh malloc-to-free lifecycle on every
+call, independent of whether the cache made the actual byte-production
+work cheap or not.
+
+A cross-reference against `iets` (a sibling hand-written evaluator)
+found it fixed exactly this shape of cost in its own derivation-ATerm
+serialization: `iets` also unparses each derivation 3 times (the same
+masked/real/cache-hash shape this project has), and also used to
+allocate a fresh, growing buffer per unparse pass -- replaced with ONE
+buffer per thread that keeps its allocated capacity across calls instead
+of being freed and regrown each time, measured by `iets` at -3.4% to
+-3.9% instructions on its own workload.
+
+Reverted instrumentation on the real `d.nix`/ffmpeg eval confirmed the
+same anti-pattern's real call volume here: 5,229 `asnix_prim_derivation`
+calls (distinct derivation builds), 64,274 `realloc` calls inside
+`buf_reserve` in total (13,427 of them the very first cap-0-to-256
+allocation), roughly 12.3 reallocs per derivation build, and on the
+order of 60MB of worst-case copy-on-grow data movement across the whole
+eval.
+
+**The fix.** `src/c/aterm.c` now keeps one process-global `Buf`
+(`g_aterm_buf`) that is reset (`len = 0`, `cap` untouched) at the start of
+every call into `asnix_build_derivation_aterm_cached`, instead of being
+freed by the caller and rebuilt from `{ 0 }` next time. Safe as a single
+global for two independent reasons, both confirmed by reading the actual
+code (not assumed from the prior milestone's summary): (1) asnix is
+single-threaded -- the one place this project forks work out uses a
+forked PROCESS, never a pthread (`bytecode_cache.h`'s own comment); and
+(2) this function is a pure string serializer over already-fully-
+evaluated C strings -- every function it calls (`buf_reserve`,
+`buf_putc`, `buf_put_bytes`, `buf_put_escaped`, `buf_put_escaped_raw`,
+`find_escape_aterm`, the `AtermEscapeCache` lookup/insert/grow helpers)
+touches nothing in the evaluator, so there is no path by which a call
+into this function could recurse into itself, or into another call that
+wants the same buffer, while the first call is still in progress. (A
+derivation whose own env/args reference ANOTHER derivation's output
+already has that nested `asnix_prim_derivation` call -- and hence its 3
+nested `asnix_build_derivation_aterm_cached` calls -- run to completion
+and return, well before the outer derivation's own first call into this
+function, since the outer call needs those already-resolved strings as
+plain `const char *` arguments.)
+
+The existing API contract is unchanged: every caller still gets back a
+`malloc`'d, independently-owned, NUL-terminated buffer it `free()`s on
+its own schedule (confirmed directly: all 3 call sites in `derivation.c`
+-- lines 1866, 1960, 2074 -- immediately `sha256_or_die` the result then
+`free()` it before the next call runs; none holds on to a returned
+pointer across a later call into this function). Rather than handing
+`g_aterm_buf`'s own backing storage to the caller (which would leave
+nothing for the next call to reuse, defeating the whole fix), the
+function now writes the final `Buf` state back into `g_aterm_buf` (so
+the next call inherits whatever capacity this call grew to), then copies
+the finished text out into ONE freshly `malloc`'d, exactly-sized buffer
+and returns that -- one allocation, sized precisely, in place of the
+~12-reallocs-per-call doubling/copy churn measured above.
+
+**(a) `AtermEscapeCache` interaction, checked directly.** A cache entry's
+`val` (`buf_put_escaped`'s cache-miss path) is always its OWN separate
+`malloc`'d copy, `memcpy`'d out of `b->buf[start..b->len)` at insert
+time -- never a pointer into `b->buf` itself. That was already true
+before this milestone and is unaffected by it: the cache stays correct
+whether the underlying `Buf` is a fresh allocation every call (the old
+behavior) or a long-lived buffer whose backing storage can get
+`realloc`'d to a new address by a LATER call (this fix's new behavior),
+because nothing outside `aterm.c` ever sees or holds a raw pointer into
+`g_aterm_buf`'s storage. `AtermEscapeCache` itself is untouched by this
+milestone -- it is still created fresh and freed per-derivation by
+`derivation.c`, with no lifetime tied to `g_aterm_buf`.
+
+**(b) Reentrancy, checked directly** -- see above: not possible, by
+construction, since nothing this function calls can call back into the
+evaluator.
+
+**(c) No caller depends on a long-lived returned buffer** -- checked
+directly against all 3 `derivation.c` call sites (see above): each one
+frees its result immediately after a single `strlen`+`sha256_or_die`
+pass, so the fixed-size copy-out this fix performs is pure overhead
+reduction (replacing ~12 reallocs with 1 exact-size malloc), not a cost
+relocation that secretly keeps the old allocation pattern alive
+somewhere else.
+
+**Correctness.** `make test`, `make test-e2e`, `make test-conformance`
+all green (`test_aterm` specifically covered). `make test-nix-
+conformance NIX_CONFORMANCE_DIR=/tmp/nix-conformance`: `pass=655 fail=3
+skip=148`, the same 3 pre-existing position-tracking failures
+(`eval-okay-getattrpos-functionargs.nix`, `eval-okay-getattrpos.nix`,
+`eval-okay-inherit-attr-pos.nix`). `make test-nixpkgs-hash`: `pass=148
+fail=0`. `./asnix d.nix` output byte-identical before and after this
+change, and matching the known-correct value:
+`/nix/store/29iacg6h530yx7rxz4k1fhvi0kxxhsam-ffmpeg-9.0.1-bin`.
+
+**Measured, interleaved, 15 trials** (`perf stat -e cpu_core/
+instructions/,cpu_core/cycles/`, `taskset -c 0`, strict before/after
+alternation -- more trials than usual since this reproduces a specific
+prior prototype measurement):
+
+| | mean |
+|---|---|
+| instructions before | 6,144,465,169 |
+| instructions after | 6,125,113,109 |
+
+Instructions: **-0.315% mean**, matching the throwaway prototype's own
+earlier-measured -0.31% almost exactly. Every one of the 15 individual
+before/after pairs moved in the same (improving) direction -- no mixed
+signal, no need to fall back to a weaker median/min-to-min claim.
+Smaller than `iets`'s own 3.4-3.9%, as expected: M152's escape cache
+already ate most of the redundant-WORK cost in this same code path; what
+remains here is just the allocator-churn residue on top of that, not the
+full original cost `iets` was fixing.
+
+Shipped: a real, consistently-reproducing, correctly-isolated effect,
+directly ported from a sibling evaluator's own proven fix for the exact
+same code shape, with zero correctness risk (every caller's
+ownership/lifetime contract preserved exactly, verified against all 3
+real call sites rather than assumed) and no new abstraction (one static
+`Buf` plus a writeback and a copy-out, nothing else).
+
+Files: `src/c/aterm.c` (`g_aterm_buf`; `asnix_build_derivation_aterm_
+cached` reset/writeback/copy-out).

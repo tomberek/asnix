@@ -9,6 +9,60 @@ typedef struct {
     size_t len, cap;
 } Buf;
 
+/* M174: `asnix_build_derivation_aterm_cached` used to start every single
+ * call from a fresh `Buf b = { 0 }` (NULL, zero-capacity), growing it by
+ * doubling via `realloc` as bytes were appended, then handing the final
+ * `b.buf` straight to the caller to `free()`. derivation.c calls this up
+ * to 3 times PER DERIVATION (masked/real/cache-hash passes, M151's own
+ * comment above `aterm_cache`), and on the real d.nix/ffmpeg eval that is
+ * 5,229 derivation builds -- 64,274 `realloc` calls inside `buf_reserve`
+ * total, ~13,427 of them the very first cap-0-to-256 allocation, for a
+ * fresh malloc-to-free lifecycle every single call. M151 already deduped
+ * the redundant re-ESCAPING *work* across those 3 passes (the character-
+ * by-character scan); it left this allocation/growth/free churn
+ * completely untouched -- that's what this milestone fixes, the same
+ * anti-pattern `iets` found and fixed in its own derivation-ATerm
+ * serialization (replacing a fresh growing buffer per unparse with one
+ * buffer per thread that keeps its capacity across calls).
+ *
+ * Fix: one process-global `Buf` (`g_aterm_buf` below) that keeps its
+ * allocated capacity across EVERY call across the whole eval, reset
+ * (`len = 0`, `cap` untouched) at the start of each call instead of
+ * being freed and started fresh. Safe as a single global precisely
+ * because asnix is single-threaded (see `bytecode_cache.h`'s own note:
+ * the one place this project forks work out, it uses a forked PROCESS,
+ * never a pthread) AND because this function is a pure string
+ * serializer over already-fully-evaluated C strings -- it calls nothing
+ * that evaluates Nix code or could call back into this function while a
+ * call is already in progress, so there is no reentrancy/nesting case
+ * where two live calls could want the same buffer at once (confirmed by
+ * reading every function this file calls: `buf_reserve`/`buf_putc`/
+ * `buf_put_bytes`/`buf_put_escaped`/`buf_put_escaped_raw`/
+ * `find_escape_aterm`/the `AtermEscapeCache` lookup/insert helpers --
+ * none of them touch the evaluator).
+ *
+ * The existing API contract still hands every caller a malloc'd,
+ * independently-owned, NUL-terminated buffer it `free()`s itself
+ * (`derivation.c`'s 3 call sites each `sha256_or_die` the result then
+ * `free()` it immediately -- none holds on to it past the next call
+ * into this function, confirmed by reading every call site, but the
+ * contract is honored unconditionally regardless) -- so the final
+ * `asnix_build_derivation_aterm_cached` step below copies the finished
+ * text out of `g_aterm_buf` into a fresh, exactly-sized `malloc`
+ * (ONE allocation, sized precisely, instead of ~12 doubling reallocs
+ * worth of copy-on-grow churn) and returns THAT, leaving `g_aterm_buf`
+ * itself untouched (still allocated, ready for the next call to reset
+ * and reuse) rather than handing its own backing storage to the caller.
+ * `AtermEscapeCache`'s cached byte spans are unaffected either way: a
+ * cache entry's `val` is always ITS OWN separate `malloc`'d copy (see
+ * `buf_put_escaped` below), copied out of `b->buf[start..b->len)` at
+ * insert time, never a pointer into `b->buf` itself -- so it stays
+ * correct whether `b->buf` is a fresh allocation every call (the old
+ * behavior) or a long-lived buffer that gets `realloc`'d out from under
+ * a previous call's pointer (this fix's new behavior); nothing outside
+ * this file ever sees or holds a raw pointer into `g_aterm_buf`. */
+static Buf g_aterm_buf = { 0 };
+
 static void buf_reserve(Buf *b, size_t extra) {
     if (b->len + extra + 1 <= b->cap) return;
     b->cap = b->cap ? b->cap * 2 : 256;
@@ -246,7 +300,9 @@ char *asnix_build_derivation_aterm_cached(const AtermOutput *outputs, size_t nou
                                            const char **input_srcs, size_t ninput_srcs, const char *system,
                                            const char *builder, const char **args, size_t nargs,
                                            const AtermEnvVar *env, size_t nenv, AtermEscapeCache *cache) {
-    Buf b = { 0 };
+    Buf *bp = &g_aterm_buf;
+    bp->len = 0; /* reuse the persistent allocation; capacity untouched */
+    Buf b = *bp;
 
     buf_put_lit(&b, "Derive([");
     for (size_t i = 0; i < noutputs; i++) {
@@ -301,7 +357,24 @@ char *asnix_build_derivation_aterm_cached(const AtermOutput *outputs, size_t nou
     buf_put_lit(&b, "])");
 
     buf_putc(&b, '\0'); /* buf_reserve always keeps +1 slack for this */
-    return b.buf;
+
+    /* Write the (possibly grown/reallocated) buffer state back into the
+     * persistent slot before this function returns, so the NEXT call
+     * reuses whatever capacity this call ended up needing -- `b` above
+     * is a local-by-value copy of `*bp` (not an alias), so `buf_reserve`'s
+     * mutations of `b.buf`/`b.cap` only land in `*bp` via this explicit
+     * writeback, not automatically. */
+    *bp = b;
+
+    /* Copy out into a fresh, EXACTLY-sized allocation (one malloc, no
+     * doubling/over-allocation) rather than returning `bp->buf` itself --
+     * `bp->buf` must stay alive and owned by this file for the next
+     * call to reuse; every existing caller still gets back a malloc'd,
+     * independently-owned, NUL-terminated buffer it can `free()` on its
+     * own schedule, exactly as before this milestone. */
+    char *out = malloc(b.len);
+    memcpy(out, b.buf, b.len);
+    return out;
 }
 
 char *asnix_build_derivation_aterm(const AtermOutput *outputs, size_t noutputs,
