@@ -101,6 +101,83 @@ target metric, not the cached-eval path.
    question) that an instruction-count win can come with a memory cost
    that needs its own separate check, not an assumption.
 
+## Recommended sequencing: a narrower first step
+
+A follow-on pass on this proposal recommends starting smaller than the
+general `OP_LAZY_THUNK_BODY` stub above, in order of surgical-ness:
+
+1. **Fuse the `callPackage`-idiom shape at compile time, before touching
+   AST/scope lifetimes at all.** A large share of nixpkgs's never-forced
+   bindings are almost certainly the plain `name = callPackage path {};`
+   idiom -- a fixed three-piece shape: a function value, one small
+   override attrset, and a call. This project already has precedent for
+   recognizing a specific call shape at compile time and emitting a
+   cheaper fused form instead of generic bytecode: M112's peephole fusion
+   of `builtins.elem`/`any`/`all`/`match`/`intersectAttrs`, and M113's
+   `LazyApp` kind for `map`/`mapAttrs`/`zipAttrsWith`. The same move
+   applies here -- recognize the `callPackage`-shaped binding and store
+   it as plain data (a path pointer and an override-attrset thunk), zero
+   compiled IR, instead of running `compile_expr` on it; the force path
+   interprets that data directly. This has none of the general design's
+   lifetime problems (no `Ast` node or scope chain to keep alive, nothing
+   to free later, no bytecode-cache interaction to design around), at
+   the cost of covering only one recognized shape rather than every
+   attrset field. Given how much of real nixpkgs is this one shape, it
+   could capture a large fraction of the measured 62% for a fraction of
+   the risk, and should be measured BEFORE deciding whether the general
+   opcode design is still worth its added risk.
+2. **Push deferral down past compile into parse itself** (phase 2, once
+   stage 1 above is measured and proven): right now an unforced thunk
+   still costs a full parse into `Ast` nodes even if its IR never gets
+   built. V8 and other JavaScript engines solve the equivalent problem
+   with lazy inner-function parsing -- a cheap pre-scan that only finds
+   the matching closing delimiter of a function body, skipping full
+   parsing until the function is actually called. The same trick applies
+   to an attrset field's value: a fast bracket-and-string-aware scan
+   records just the byte range and enough lexer state to resume later,
+   and the real parse-plus-compile only happens on first force. This
+   compounds with the general opcode idea (saving `Ast`-node allocation
+   too, not just the IR-compile step) and actually helps M109's
+   free-after-compile work rather than fighting it, since there is no
+   `Ast` node to free at all for a field never forced. More invasive
+   than stage 1 (touches `parser.c`, not just `compiler.c`).
+3. **Generalize the stub beyond attrset fields to lambda bodies**: a
+   lambda defined in a library file (common in nixpkgs's `lib/` tree) but
+   never called in a given eval pays the same eager-compile cost as an
+   unforced attrset field. The same lazy-stub mechanism applies to
+   `OP_LAMBDA`'s body, deferred to first call instead of first force,
+   reusing the same bridge function and arena-lifetime fix. A cheap
+   add-on once the attrset-field version exists, not a separate design.
+4. **A narrower, `iets`-inspired per-entry descriptor for the
+   `callPackage` idiom specifically**, addressing a case the stub/opcode
+   plan does not help at all: a field that genuinely does get forced
+   still pays the cost of allocating a distinct 16-or-24-byte thunk
+   object -- the same problem `iets` found for `mapAttrs` and fixed with
+   `THUNK_MAP`. `iets`'s fix only works because `mapAttrs` entries share
+   ONE callback body across every entry; the nixpkgs-style attrset case
+   does not share a body across bindings, so `THUNK_MAP` itself does not
+   transfer directly. But a narrower version might: for the recognized
+   `callPackage` idiom from stage 1, the per-entry data is already small
+   and uniform (a path plus one override attrset), so it could live in a
+   shared descriptor with an 8-byte per-entry cell instead of a full
+   generic thunk object -- cutting memory for the ~9% of bindings that DO
+   get forced, as well as compile cost for the ~91% that don't.
+
+Checked directly against `iets`'s own architecture (`~/gnix/iets/
+ARCHITECTURE.md`, `docs/explanation/evaluation.md`): `iets` has the same
+two-stage `parse -> compile -> eval` shape as asnix and pays the same
+per-binding eager-compile cost -- its own measured number on a comparable
+workload is almost identical to this proposal's (22M `mapAttrs` thunks,
+93% never forced). Its `THUNK_MAP` fix targets a different part of the
+problem (per-instance thunk *allocation* for a shape that shares one
+compiled body across all instances), not the per-binding compile cost
+this proposal targets (textually distinct bodies, each needing its own
+compile). So this is a genuinely open opportunity, not a case of asnix
+catching up to something `iets` already solved -- there is no existing
+design to borrow wholesale, only the shared precedent that both
+evaluators have independently measured "most thunks are never forced"
+as real and worth designing around.
+
 ## Open risks
 
 - **Scope correctness.** `let`'s self/sibling visibility, `inherit`
