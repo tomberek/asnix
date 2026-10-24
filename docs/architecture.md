@@ -21138,3 +21138,75 @@ before/after pair was measured cleanly before the load spike.
 Files: `src/c/compiler.c` (`symidxpair_cmp` removed;
 `merge_sort_symidxpairs` added; `sort_attrset_bindings_large` uses it
 with two arena-allocated scratch buffers instead of `malloc`+`qsort`).
+
+## M187: stage-1 `callPackage`-idiom fusion (`CallPkgThunk`) -- implemented in full, verified correct, measured as NOT a win: instructions a wash, peak RSS +1.5%, declined
+
+`docs/lazy-thunk-compile-proposal.md`'s "Recommended sequencing"
+section proposed a narrower first step before the general lazy-compile
+opcode: fuse the common `name = callPackage path {...};` idiom at
+compile time into plain data instead of running `compile_expr` on it.
+This milestone did the measurement the doc called for, then built and
+measured the fusion for real.
+
+**Corrected measurement, confirming a prior fork's number was wrong.**
+A previous measurement attempt reported "31,103 of 147,642 (21.07%)"
+but used an undercounted denominator (missing 5 of 14 real
+`ib_mk_thunk` call sites -- a separate reconciliation investigation
+already caught this). Re-derived from scratch here, instrumenting all
+14 sites (confirmed via `grep -n 'ib_mk_thunk(' src/c/compiler.c`):
+total thunk bodies compiled is **469,859**, exactly matching M180. The
+bare `callPackage` idiom matches **31,011** of those (**6.6%**, close
+to the prior fork's unverified numerator). Of those, **97.7%**
+(30,303) are never forced -- HIGHER than the 90.7% population-wide
+never-forced rate, meaning this idiom is an especially good candidate
+by the proposal's own logic, even at a smaller overall share than
+first (incorrectly) reported.
+
+**Implementation.** A new `CallPkgThunk` heap kind (`heap.h`), a new
+`OP_MK_CALLPKG_THUNK` op, wired into all 5 real force-entry sites
+(`op_var_ref.S`, `op_select.S`, `op_select_or.S`, `op_with.S`,
+`force.S`) -- precedented by M113's `LazyApp`. Fully verified correct:
+`make test`, `test-e2e` 296/296, `test-conformance`,
+`test-nix-conformance` (`pass=655 fail=3 skip=148`, unchanged),
+`test-nixpkgs-hash` (`pass=148 fail=0`), `d.nix` output hash unchanged,
+plus 12 hand-written correctness fixtures.
+
+**Two real mistakes found and fixed during implementation, by
+measurement, not assumption** (both a useful reminder of this
+project's own "measure, don't assume" discipline paying off even on a
+declined result):
+1. Resolving a deferred `callPackage` thunk via `asnix_apply`'s
+   heavyweight nested-dispatch-context entry point (necessary to call
+   an arbitrary `Closure` from outside the active bytecode loop) costs
+   MORE at force time than the compile-time savings recover.
+2. Real nixpkgs's dominant `callPackage` call shape passes an INLINE
+   LAMBDA as the package argument, not a bare file path -- discovered
+   via a real `path->kind` sample dump, not assumed. An early version
+   of this fusion compiled that lambda eagerly, silently erasing
+   laziness for the ~98% of matches that are never forced -- exactly
+   the kind of bug this project's own correctness-first culture exists
+   to catch before it ships.
+
+**Measured: not a win.** 10 interleaved `perf stat` trials against an
+unmodified master baseline on the real `d.nix`/ffmpeg eval: instructions
+a statistical wash (ranges overlap), peak RSS a consistent **+1.5%
+regression**. This is the second time this session a candidate
+instruction-count idea has needed a real memory check (after the
+IrOp-compaction lookup-table question) to catch a cost that an
+instructions-only measurement would have missed entirely.
+
+**Conclusion: declined, correctly attributed as a real design cost, not
+a bug.** The `asnix_apply` out-of-line call overhead is the honest price
+of this specific design, not a mistake to fix. A real fix would need an
+inline trampoline reusing the ALREADY-active dispatch context instead
+of an out-of-line `asnix_apply` call -- which would reintroduce much of
+the `RetFrame`-chaining complexity this narrow stage-1 approach was
+explicitly chosen to avoid (see the proposal doc's own appeal: "no
+AST/scope-lifetime problems ... since nothing needs to be deferred").
+Not pursued further this shot. The corrected 6.6%-share/97.7%-never-
+forced numbers remain useful context for whether a different
+implementation strategy is worth trying later.
+
+Files: none on master (the implementation lived on a disposable branch,
+not merged, per this project's established "measure, don't assume"
+practice of only merging genuine wins).
