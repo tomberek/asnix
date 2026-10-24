@@ -18530,3 +18530,71 @@ asnix_resolve_cell_chain` replaced with an inline `.Lforce_cell_loop`),
 `src/c/value_util.c` (comment update only -- `asnix_resolve_cell_chain`
 itself is unchanged, still the reference implementation for
 `op_select.S`/`op_select_or.S`/`op_with.S`).
+
+## M163: `asnix_bshared_attrs_resolve` on `op_with.S`'s lazy-union fallback -- investigated, confirmed real work not call overhead, AND confirmed the call site itself is nearly unreachable on the real workload, declined
+
+Directed candidate (same family as the `attrs_probe` case a prior
+milestone examined): `asnix_bshared_attrs_resolve` (`builtins_shared.c`)
+shows up at ~0.5% self-time on `d.nix`, called from `op_with.S`'s
+`OP_WITH_TRY` handler only on the lazy-union (negative-count) branch --
+the common already-flat case is handled entirely inline by
+`op_with_try`'s own binary search, no call at all.
+
+**Read the implementation first.** `asnix_bshared_attrs_resolve`
+(`builtins_shared.c`) does three things when it actually has work to do:
+check a one-word flat-cache, then a bottom-up *pairwise* merge across the
+union's leaves (not a left-to-right fold -- that shape was itself a
+deliberate M88 fix, per the function's own comment, to avoid
+O(total_size * nleaves) re-copying), calling `asnix_attrs_eager_merge`
+(`attrs_update.c`) per pair. `asnix_attrs_eager_merge` itself is a
+two-pointer sorted merge of `Attr` entries with a `memcpy` per entry and
+one `asnix_arena_alloc` for the output -- genuine data-copying work, not
+dispatch filler.
+
+**Measured via `perf record --call-graph dwarf,4096` on `d.nix`** (real
+nixpkgs/ffmpeg eval): `asnix_bshared_attrs_resolve` is 2.34% of samples
+with children, but only **0.51% self** -- the other ~1.83% is time spent
+*inside* `asnix_attrs_eager_merge` (3.35% w/ children, **1.58% self**,
+mostly in its `memcpy` calls) that `resolve` calls into. This directly
+confirms the hypothesis: resolving a union is dominated by the actual
+merge/copy work, not by `resolve`'s own dispatch/branch/call overhead --
+hand-writing `resolve` itself in asm would at best shave the ~0.5%
+self-time's call/ret and flat-cache-check overhead, while leaving the
+real cost (the merge's allocation + memcpys, which stay in C regardless)
+untouched.
+
+**Then checked how much of that cost is even reachable from the
+assigned call site specifically**, via temporary call-counter
+instrumentation (a `uint64_t` global incremented at the top of
+`asnix_bshared_attrs_resolve`, another incremented only on its real-merge
+path past the flat-cache check, and a third incremented in `op_with.S`
+right before its `call asnix_bshared_attrs_resolve`, all dumped via an
+`__attribute__((destructor))` printer -- reverted before this commit,
+confirmed via `git status`/`git diff` both clean). Result on the full
+`d.nix` eval:
+
+```
+resolve_calls=2009207 real_merge=21343 with_try_calls=1568
+```
+
+`op_with.S`'s lazy-union branch fires **1,568 times** out of 2,009,207
+total `asnix_bshared_attrs_resolve` calls (0.08%) and 21,343 real merges
+(7.3%) -- i.e. even among the already-rare "a union actually needs
+resolving" cases, the vast majority are reached from other call sites
+(`OP_SELECT`/`OP_SELECT_OR`/`OP_HAS_ATTR`'s own `attrs_probe`-style
+callers, `builtins_attrs.c`, `derivation.c`, `main.c`, etc.), not
+`op_with`. Against a 6.3-billion-instruction eval, even a
+(unrealistically optimistic) zero-cost hand-asm `resolve` saving 10-20
+instructions of call/ret+register-save overhead per call on only 1,568
+calls is on the order of 15,000-30,000 instructions -- roughly
+0.0002%-0.0005% of the total, two to three orders of magnitude below
+this campaign's noise floor on interleaved `d.nix` trials.
+
+**Conclusion**: declined. The candidate's own hypothesis holds up on
+inspection (this *is* genuine copying/merging work, not call-overhead
+filler), and is further undercut by the call site in question being
+almost never taken at all on the representative real-workload benchmark.
+Either finding alone would be enough to decline; together they leave no
+plausible path to a measurable win here. No source files changed
+(temporary instrumentation added and fully reverted). Files:
+`docs/architecture.md` only.
