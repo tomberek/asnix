@@ -1,5 +1,6 @@
 #include "lexer.h"
 
+#include <assert.h>
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -257,6 +258,82 @@ static const Keyword KEYWORDS[] = {
     KW("assert", TOK_ASSERT),   KW("with", TOK_WITH),
     KW("or", TOK_OR),
 };
+
+/* perf: the identifier-vs-keyword check below used to scan all 13
+ * `KEYWORDS` entries, in declaration order, for EVERY identifier-shaped
+ * token in the source -- by far the most common token shape in any real
+ * Nix file, and one whose volume scales with a file's own identifier
+ * count, not its keyword count (keywords are always a small, bounded
+ * fraction). On a file with an unusually large identifier volume (e.g.
+ * `hackage-packages.nix`'s ~19,261 inline `callPackage` lambdas, each
+ * with its own handful of dependency-name formals -- "aeson", "base",
+ * "bytestring", etc., none of them keywords), that 13-entry scan runs in
+ * full (minus whatever early-outs the length check buys) on every single
+ * one of them. iets's own equivalent (`Lexer::keyword`, a Rust `match` on
+ * byte-string literals) compiles to a length-first dispatch, not a linear
+ * scan -- this mirrors that shape by hand: switch on `len` first (every
+ * `KEYWORDS` entry has a fixed, small length, 2 through 7), so an
+ * identifier whose length isn't one of those six values short-circuits to
+ * TOK_IDENT with zero comparisons at all, and one whose length DOES match
+ * only compares against the (always small, 1-5-entry) subset of keywords
+ * sharing that length -- never all 13.
+ *
+ * Correctness: exhaustively mirrors `KEYWORDS` above (same 13 literals,
+ * same TokKind mapping, same "first match wins" semantics, which happens
+ * to be moot here since no two keywords share both length AND content).
+ * This table is small and stable enough that keeping the two in sync by
+ * hand (instead of generating this switch from KEYWORDS at compile time)
+ * is the simpler-to-verify option -- any future edit to KEYWORDS must
+ * mirror it here, and the existing keyword-coverage tests (every keyword
+ * token already exercised by tests/e2e and tests/conformance) catch a
+ * drift immediately: an un-mirrored new keyword lexes as TOK_IDENT, a
+ * mismatched TokKind mis-parses, either way a test fails loudly. */
+static TokKind keyword_lookup(const char *s, size_t len) {
+    switch (len) {
+    case 2:
+        if (memcmp(s, "in", 2) == 0) return TOK_IN;
+        if (memcmp(s, "if", 2) == 0) return TOK_IF;
+        if (memcmp(s, "or", 2) == 0) return TOK_OR;
+        return TOK_IDENT;
+    case 3:
+        if (memcmp(s, "let", 3) == 0) return TOK_LET;
+        if (memcmp(s, "rec", 3) == 0) return TOK_REC;
+        return TOK_IDENT;
+    case 4:
+        if (memcmp(s, "then", 4) == 0) return TOK_THEN;
+        if (memcmp(s, "else", 4) == 0) return TOK_ELSE;
+        if (memcmp(s, "true", 4) == 0) return TOK_TRUE;
+        if (memcmp(s, "null", 4) == 0) return TOK_NULL;
+        if (memcmp(s, "with", 4) == 0) return TOK_WITH;
+        return TOK_IDENT;
+    case 5:
+        if (memcmp(s, "false", 5) == 0) return TOK_FALSE;
+        return TOK_IDENT;
+    case 6:
+        if (memcmp(s, "assert", 6) == 0) return TOK_ASSERT;
+        return TOK_IDENT;
+    case 7:
+        if (memcmp(s, "inherit", 7) == 0) return TOK_INHERIT;
+        return TOK_IDENT;
+    default:
+        return TOK_IDENT;
+    }
+}
+
+/* Runs once per process (not once per file/call): verifies `keyword_lookup`
+ * agrees with `KEYWORDS` on every entry, so the hand-mirrored switch above
+ * can never silently drift from the canonical table -- cheap enough (13
+ * entries) to just always run, same "verify, don't just assert by
+ * comment" spirit as this project's own M142/M138 correctness passes. */
+static void keyword_lookup_selfcheck(void) {
+    static int checked = 0;
+    if (checked) return;
+    checked = 1;
+    for (size_t k = 0; k < sizeof(KEYWORDS) / sizeof(KEYWORDS[0]); k++) {
+        TokKind got = keyword_lookup(KEYWORDS[k].kw, KEYWORDS[k].kwlen);
+        assert(got == KEYWORDS[k].kind);
+    }
+}
 
 #undef KW
 
@@ -547,6 +624,7 @@ static void scan_float_tail(const char *src, size_t *i) {
 static void lex_until(const char *src, size_t *i_inout, ModeStack *modes, TokVec *v, size_t min_len);
 
 Token *asnix_lex(const char *src, size_t *out_count) {
+    keyword_lookup_selfcheck();
     /* perf: presize the token array from the source length instead of
      * letting push_tok's cap-doubling start from scratch (0->64->128->...)
      * on every single file -- see this project's own M123 writeup for the
@@ -740,13 +818,7 @@ static void lex_until(const char *src, size_t *i_inout, ModeStack *modes, TokVec
              * ident_start block this replaced, now removed). */
             size_t start = i;
             size_t len = j - start;
-            TokKind kind = TOK_IDENT;
-            for (size_t k = 0; k < sizeof(KEYWORDS) / sizeof(KEYWORDS[0]); k++) {
-                if (KEYWORDS[k].kwlen == len && memcmp(KEYWORDS[k].kw, src + start, len) == 0) {
-                    kind = KEYWORDS[k].kind;
-                    break;
-                }
-            }
+            TokKind kind = keyword_lookup(src + start, len);
             push_tok(v, (Token){ .kind = kind, .start = (uint32_t)start, .end = (uint32_t)j });
             i = j;
             continue;

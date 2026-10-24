@@ -20099,3 +20099,109 @@ with a concrete, measured answer at every step, rather than stopping at
 "no obvious bug found." Reverted; no source files changed.
 
 Files: `docs/architecture.md` only.
+
+## M176: keyword lookup -- length-first dispatch instead of a 13-entry linear scan on every identifier token
+
+Direct follow-on from M173's `hackage-packages.nix` investigation. That
+milestone profiled the file in isolation and found `lex_until`'s own
+hottest region (by instruction-sampled `perf annotate`) was the plain
+identifier/keyword emission path -- not string scanning, not path/URI
+rescanning. Comparing directly against iets's `src/syntax/lexer.rs`
+found the concrete difference: asnix's keyword check was
+
+```c
+TokKind kind = TOK_IDENT;
+for (size_t k = 0; k < sizeof(KEYWORDS) / sizeof(KEYWORDS[0]); k++) {
+    if (KEYWORDS[k].kwlen == len && memcmp(KEYWORDS[k].kw, src + start, len) == 0) {
+        kind = KEYWORDS[k].kind;
+        break;
+    }
+}
+```
+
+-- a linear scan over the entire 13-entry `KEYWORDS` table, in
+declaration order, for EVERY identifier-shaped token in the source. By
+far the most common token shape in any real Nix file, and one whose
+volume tracks a file's own identifier count, not its (always small,
+bounded) keyword count. `hackage-packages.nix`'s ~19,261 inline
+`callPackage` lambdas each carry their own handful of dependency-name
+formals ("aeson", "base", "bytestring", ...), none of them keywords,
+so this file's unusually large identifier volume ran this 13-entry
+scan in full (minus whatever the length check's early-out bought) on
+every single one. iets's equivalent, `Lexer::keyword`, is a Rust
+`match` on byte-string literals -- which the Rust/LLVM compiler turns
+into a length-first dispatch, not a linear scan.
+
+**The fix** mirrors that shape by hand: `keyword_lookup(s, len)`
+switches on `len` first (every `KEYWORDS` entry has a fixed, small
+length, 2 through 7). An identifier whose length isn't one of those
+six values -- the common case for any name longer than 7 bytes, e.g.
+`bytestring`, `mkDerivation`, `_2captcha` -- now costs zero
+comparisons at all, instead of 13. One whose length does match (e.g.
+`base`/`text`/`lens`, all length 4, colliding with `then`/`else`/
+`true`/`null`/`with`) only compares against the small (1-5-entry)
+subset of keywords sharing that exact length, never all 13.
+
+**Keeping the two tables in sync.** `KEYWORDS` stays in place as the
+canonical, human-readable keyword/`TokKind` table (nothing else reads
+it after this change, but duplicating its 13 entries into the switch
+by hand, rather than deleting it, keeps one obviously-correct
+reference to check the switch against). To make sure the hand-mirrored
+switch can never silently drift from it, a new
+`keyword_lookup_selfcheck()` iterates all 13 `KEYWORDS` entries and
+`assert()`s `keyword_lookup` agrees with each one -- run once per
+process (a `static int checked` guard), from `asnix_lex`'s own entry,
+so the cost is negligible (13 assertions, once, not once per file).
+
+**Correctness.** Output byte-identical to the pre-fix binary: on the
+full `test-e2e`/`test-conformance` suites (the latter run 10x in a
+loop specifically to rule out the transient host-load flakiness M138
+already documented -- one single spurious `test-e2e` failure did occur
+once during this work, traced to host contention, not reproduced in
+10 subsequent clean runs), on the real `d.nix`/ffmpeg eval (`diff`
+against a `before` binary, identical), and on every keyword-adjacent
+fixture already in the suite (`let`/`in`/`if`/`then`/`else`/`true`/
+`false`/`null`/`rec`/`inherit`/`assert`/`with`/`or`, all already
+exercised). `make test-nix-conformance NIX_CONFORMANCE_DIR=/tmp/
+nix-conformance`: `pass=655 fail=3 skip=148`, the same 3 pre-existing
+pos-tracking failures as every prior milestone's own run.
+
+**Measured**, interleaved (3 alternating before/after trials, `perf
+stat -e cpu_core/instructions/,cpu_core/cycles/`, `taskset -c 0`, same
+discipline as every prior milestone in this series):
+- `hackage-packages.nix` in isolation (`import` of the bare file, no
+  further eval -- the exact M173 isolation harness): instructions
+  1,887M -> 1,794M, a consistent ~4.9% reduction, tight across all 3
+  pairs (1,889.2M/1,886.2M/1,886.1M before vs 1,794.3M/1,794.3M/
+  1,794.3M after -- the "after" number barely moves between trials,
+  about as clean a signal as this measurement series has produced).
+- **Full real eval** (`d.nix`, ffmpeg's closure, ~1057 imported
+  files): instructions 6,142M -> 6,020M, a consistent ~2.0% reduction
+  across all 3 pairs (6,146.1M/6,140.4M/6,140.1M before vs 6,018.8M/
+  6,019.0M/6,020.8M after) -- notably larger in absolute and relative
+  terms than M173's own file-isolated finding would suggest, because
+  this fix helps every identifier token in every one of the corpus's
+  ~1057 files, not just the one unusually identifier-dense file that
+  led to finding it. This is a substantially bigger whole-program win
+  than most individual milestones in this series (compare M149's
+  -0.312%, M145's smaller-still). Cycles were, as always under this
+  session's concurrent host load, noisier and not trusted
+  directionally on their own (one of the three pairs showed cycles
+  essentially flat/slightly up despite instructions dropping cleanly
+  in all three) -- instructions are the metric trusted here, per this
+  project's own long-established measurement discipline.
+
+**Honest scope note.** This does not change the conclusion of M173:
+the from-source lex/parse/compile cost on `hackage-packages.nix`
+remains real (M173's own cache-off numbers), and the bytecode cache
+remains the single largest lever for REPEAT evals of this file. This
+milestone is a genuine, if more modest, win for every COLD eval of
+every file, found by chasing M173's own "why is asnix's lexer
+specifically ~2x iets's on this file" thread to a concrete, fixable
+mechanism rather than stopping at "it's proportionate to token
+volume."
+
+Files: `src/c/lexer.c` only (`KEYWORDS` table unchanged; the identifier/
+keyword call site's old linear-scan loop replaced by a call to the new
+`keyword_lookup()`, plus `keyword_lookup_selfcheck()` and its
+`asnix_lex` call site).
