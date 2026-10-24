@@ -19450,3 +19450,133 @@ explanation.
 `src/c/bytecode.c`, `src/c/irbuild.c`, `src/c/irdump.c`,
 `src/c/irpass_cfold.c`, `tests/c/test_bytecode.c`,
 `tests/ir/test_irpass_dce.c`.
+
+## M170: `docs/irop-compaction-proposal.md`'s "Proposal B, lookup-table variant" -- implemented in full, measured at +0.616% instructions (not the hand-estimated +14,656,701/+0.237%), consistently regressed in all 15 interleaved trials, declined
+
+Directed candidate: Proposal B itself (`docs/irop-compaction-proposal.md`,
+written against M169's then-still-24-byte `IrOp` and later updated once
+M169 landed) -- stop having `ir_link()` bake a real handler *address*
+into every `IrOp.handler` at link time; leave `handler` holding the
+small op-id the builder emitted for the op's entire lifetime, and have
+every dispatch tail do `asnix_handler_table[op_id]` itself, at run time,
+on every single dispatch. The proposal's own "review finding" argued
+this should cost a deterministic **+1 instruction per dispatch**
+(`+14,656,701` total on this eval, `+0.237%` against this session's
+baseline instruction count) -- at or below the rejected bucketed-stride
+alternative's own 14.7-29.3M estimate, and the better starting candidate
+of the two. This milestone built it and measured it, rather than taking
+that estimate on faith.
+
+**Implemented in full**, not a partial prototype: every op handler's
+dispatch tail (all 31 files under `src/asm/ops/*.S` with a `jmp *%rax`
+tail, 66 call sites total), `src/asm/dispatch.S`'s `asnix_eval` entry
+dispatch, and -- found only by tracing every consumer of `IrOp.handler`,
+not just the obvious per-op tails -- `src/asm/force.S`/`apply.S`'s own
+synthetic sentinel-`IrOp` return dispatch (`.Lforce_sentinel_ir`/
+`.Lapply_sentinel_ir`, used as a `RetFrame.IP` so `OP_RET`'s ordinary
+jmp-chain lands back in native-callable C-entry code instead of another
+real op). That last site was the one real correctness trap in this
+change: pre-M170, a sentinel could simply stash `asnix_force_epilogue`'s/
+`asnix_apply_epilogue`'s *real address* directly in its `handler` field,
+since by the time anything dispatched to it every `handler` field
+everywhere was already a real address and `OP_RET`'s generic tail had no
+way to (and no need to) tell a sentinel apart from an ordinary op. Once
+`OP_RET`'s tail becomes "treat `handler` as a small op-id and look it up
+in `asnix_handler_table`", a sentinel holding a real code address instead
+would be interpreted as a wild out-of-bounds table index -- a correctness
+bug, not just a missed optimization, that a change scoped to "the obvious
+per-op handler files" alone would have shipped with a latent crash the
+first time a thunk forced via `asnix_force_for_print` (the printer path)
+or a closure/primop applied via `asnix_apply` (`map`/`filter`/`foldl'`
+and friends) actually returned. Fixed by reserving two extra slots at the
+end of `asnix_handler_table` (`ASNIX_SENTINEL_FORCE_EPILOGUE`/
+`ASNIX_SENTINEL_APPLY_EPILOGUE`, `ir.h`, kept in sync with `OP_COUNT` via
+a `_Static_assert` since the sentinel constants have to be plain
+`#define`s outside the `__ASSEMBLER__` guard to be usable from
+`force.S`/`apply.S` directly) and giving each sentinel its own reserved
+op-id instead of a bare address. `ir_link()` itself (`dispatch_table.c`)
+became what the proposal document itself predicted it could become: a
+one-time **validation** pass (every op-id must be in `[0, OP_COUNT)`,
+loud `abort()` otherwise) instead of an address-rewrite, since there is
+no more address-baking left for it to do. `bytecode.c`'s
+`handler_to_op_id`/`irdump.c`'s `op_id_of` (both used to reverse
+ir_link()'s address back to an op-id by linear-scanning
+`asnix_handler_table` for a pointer match) needed the identical fix in
+the other direction -- post-M170 that scan would never match anything
+(`handler` holds a tiny integer; every real table entry is a large code
+address), silently breaking bytecode-cache serialization and `irdump`
+both. Simplified to a direct cast-plus-range-check instead, which is
+also strictly simpler than the scan it replaced.
+
+Built clean; `make test`, `make test-e2e`, `make test-conformance` all
+green; `make test-nix-conformance NIX_CONFORMANCE_DIR=/tmp/nix-conformance`
+reported `pass=655 fail=3 skip=148` (the 3 known pre-existing
+position-tracking gaps, unchanged); `make test-nixpkgs-hash` reported
+`pass=148 fail=0`; `./asnix d.nix` stayed byte-identical to the expected
+store path. Manually re-verified the sentinel-dispatch fix specifically
+(not just relying on the test suite having happened to exercise it):
+`builtins.map`/`builtins.foldl'` (exercises `apply.S`'s sentinel return)
+and printing a result containing nested lists/attrsets/thunks (exercises
+`force.S`'s) both still produce correct output.
+
+**Measured it anyway before trusting the "at or below the bucketed
+scheme" framing**, via **15** interleaved `perf stat -e
+cpu_core/instructions/,cpu_core/cycles/` trials (more than this
+session's usual 10, per this milestone's own brief, since the open
+design question here mattered more than most) on `d.nix` (real
+nixpkgs/ffmpeg eval), `taskset -c 0`, alternating before/after (M169,
+pre-M170, as "before"; this milestone as "after"), never batched:
+
+```
+instructions: before avg 6,191,083,515.3   after avg 6,229,226,672.4   (+38,143,157.1, +0.616%)
+cycles:       before avg 3,490,727,044.1   after avg 3,506,297,371.6   (+15,570,327.5, +0.446%)
+```
+
+Both metrics regressed, consistently, in literally every one of the 15
+interleaved pairs for instructions (range +0.517% to +0.666%, no
+exceptions either direction) -- a clean, one-directional signal, not
+noise. This is **2.6x worse than the document's own prediction**
+(+0.616% measured vs. +0.237% predicted), for a reason the prediction
+explicitly didn't account for: `asnix` builds as a PIE executable
+(confirmed via `file ./asnix`: `ELF ... pie executable`), and this
+project's own existing asm consistently uses RIP-relative addressing for
+every global (`leaq foo(%rip), %reg` / `movq foo(%rip), %reg`) -- there
+is no form of `movq table(%rip,%rax,8), %rax` in x86-64 (RIP-relative
+addressing cannot itself carry a scaled index), so the table lookup the
+proposal costed at "+1 instruction" (`load index, load table[index]`)
+actually needs **two** instructions in this binary (`leaq
+asnix_handler_table(%rip), %rcx` to materialize the table's base address,
+*then* `movq (%rcx,%rax,8), %rax` to index into it) -- `+2` per dispatch,
+not `+1`, before even accounting for whether the real measured dispatch
+volume on current nixpkgs still matches the `14,656,701` figure the
+proposal's own op-pair histogram instrumentation found in an earlier
+session (not re-verified directly here; the gap between a predicted
+`2 x 14,656,701 = 29,313,402` and the actually-measured `~38,143,157`
+average delta suggests it's somewhat higher now, consistent with
+nixpkgs itself having grown in the interim, but this milestone didn't
+re-run that specific instrumentation to confirm it precisely -- the
+`perf stat` instruction-count delta is the number that actually matters
+for the ship/no-ship call, and it was measured directly, not inferred).
+A non-PIE build (`-no-pie`) would close most of this specific gap (one
+`movq` with an absolute base + scaled index, same `+1` the proposal
+assumed), but changing the whole binary's PIE-ness is well outside this
+milestone's scope and has its own independent security/ASLR tradeoffs
+not evaluated here.
+
+**Conclusion**: declined. The core design-document claim this milestone
+was built to test -- that the lookup-table variant's dispatch-time cost
+is "at or below" the rejected bucketed-stride alternative's -- doesn't
+survive contact with this binary's actual PIE addressing constraints;
+real cost is roughly double the naive estimate, and the result is a
+real, consistently-reproduced regression on this project's own trusted
+metric (instruction count), not a wash. `docs/irop-compaction-proposal.md`
+updated with this real measured result in place of the hand-estimated
+one, explicitly marked measured vs. predicted, and Proposal B's status
+updated from "design exploration" to "implemented, measured, declined".
+Change fully reverted (`git diff` against the pre-change tree is empty
+for every file except the two listed below); no source files modified,
+including `docs/ir-format.md`/`docs/abi.md`, both briefly updated while
+the implementation existed in the tree and reverted along with it, since
+describing dispatch machinery that no longer exists would be actively
+misleading rather than merely stale. Files: `docs/architecture.md`,
+`docs/irop-compaction-proposal.md` only.

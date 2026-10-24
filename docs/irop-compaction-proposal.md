@@ -3,11 +3,77 @@
 Status: Proposal A has LANDED, as `docs/architecture.md`'s M169 section
 (`IrOp` 24 -> 16 bytes), confirmed by independent verify at -0.537%
 instructions on the real `d.nix` eval. Proposal B (replacing the handler
-pointer with a small index) is still a design exploration only, not a
-milestone, and nothing about it should be treated as decided until the
-measurements it calls for actually happen. The rest of this document
-below was written before M169 landed; treat "Proposal A... in flight"
-language as historical.
+pointer with a small index, "lookup-table variant") has been
+**implemented in full, measured, and DECLINED** -- see
+`docs/architecture.md`'s M170 section for the complete writeup. The
+"Real handler size data"/"Addressing schemes considered" sections below
+are kept as originally written (the design-exploration analysis they
+contain is still accurate background), but the "lookup-table variant is
+the better starting candidate" conclusion they build toward did NOT
+survive contact with real measurement -- see "M170: real measured
+result" right below for why, before reading the rest of this document.
+The rest of this document below was written before M169 landed; treat
+"Proposal A... in flight" language as historical.
+
+## M170: real measured result (supersedes this document's own `+14,656,701`/`+1 instruction per dispatch` prediction below)
+
+The lookup-table variant described below was built in full (every op
+handler's dispatch tail, `dispatch.S`'s entry dispatch, and -- a
+correctness subtlety this document didn't anticipate --
+`force.S`/`apply.S`'s synthetic sentinel-return dispatch, which needed
+two new reserved op-ids of its own; see `docs/architecture.md`'s M170
+section for the full correctness story) and measured with 15 interleaved
+`perf stat` trials on the real `d.nix`/ffmpeg eval, `taskset -c 0`,
+alternating before/after:
+
+```
+PREDICTED (this document, below): +1 instruction/dispatch, +14,656,701 total, +0.237%
+MEASURED  (M170, 15 interleaved trials): instructions +38,143,157.1 avg, +0.616%
+                                         cycles       +15,570,327.5 avg, +0.446%
+```
+
+The measured regression is **~2.6x the predicted one**, and it is
+consistent -- every one of the 15 interleaved instruction-count pairs
+regressed (range +0.517% to +0.666%, no exceptions). Root cause: this
+document's "+1 instruction per dispatch" arithmetic implicitly assumed a
+single-instruction table load (`load index, load table[index]`), but
+`asnix` builds as a PIE executable, and this codebase's existing asm
+uses RIP-relative addressing for every global throughout -- there is no
+`movq table(%rip,%rax,8), %rax` form in x86-64 (RIP-relative addressing
+can't itself carry a scaled index), so the lookup actually costs **two**
+instructions (`leaq asnix_handler_table(%rip), %rcx` to materialize the
+table's base address, then `movq (%rcx,%rax,8), %rax`), not one. That
+alone predicts roughly `2 x 14,656,701 = 29,313,402` (+0.473%) -- still
+short of the measured `+38,143,157` (+0.616%), suggesting the real
+per-dispatch volume on current nixpkgs is somewhat higher than the
+`14,656,701` figure this document's own op-pair histogram instrumentation
+found in an earlier session (plausible given nixpkgs itself grows over
+time; not independently re-confirmed by re-running that specific
+instrumentation in M170, since the direct `perf stat` measurement already
+answered the ship/no-ship question on its own). A non-PIE build would
+close most of the PIE-specific half of this gap, but changing the whole
+binary's PIE-ness is a separate, independent decision with its own
+security/ASLR tradeoffs, well outside a dispatch-mechanism change's scope.
+
+**This resolves the open question "What needs to happen before any of
+Proposal B ships" (below) raises**: step 3's conditional ("if real
+measurement shows the lookup table's dependent load is NOT well-hidden
+...") has been answered directly by measurement, not by the M127/M154
+latency-hiding prior it hypothesized about -- the measured cost here is
+dominated by raw instruction *count* (a real, retired, every-dispatch
+`leaq`+`movq` pair), not by the dependent-load *latency* those priors
+were about, so the "probably hidden by OoO execution" reasoning this
+document used to prefer the lookup table over the bucketed scheme was
+answering a question that turned out not to be the deciding one. Given
+this, the bucketed scheme's own cost was never actually measured either
+-- it remains exactly as speculative as before, and there's no
+indication left in this document that it would actually do better once
+someone sits down and builds and measures ITS real generated code too,
+rather than reasoning about it in the abstract the way both schemes were
+reasoned about before this milestone. Proposal B is DECLINED in its
+lookup-table form; the codebase was left unchanged (M169's address-baking
+`ir_link()` is still exactly what runs today) rather than carrying this
+forward speculatively.
 
 ## Motivation
 
