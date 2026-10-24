@@ -18930,3 +18930,84 @@ Files: `src/asm/ops/op_arith.S`, `src/asm/ops/op_cmp.S`,
 `src/asm/ops/op_has_attr_dynamic.S`, `src/asm/ops/op_select_dynamic.S`,
 `src/asm/ops/op_select_dynamic_or.S`,
 `src/asm/ops/op_insert_dynamic_attr.S`, `docs/architecture.md`.
+
+## M166: `op_has_attr.S`'s union-probe result branch (`testl`/`jnz`/`jmp` into `.Lhas_attr_true`/`.Lhas_attr_false`) -- investigated the same cmov conversion `op_cmp.S` already uses, measured a net regression, declined
+
+Directed candidate: `asnix_op_has_attr`'s lazy-union probe path (the
+`asnix_bshared_attrs_probe` call on the negative-count/union-header
+branch, see M154) ends with
+
+```
+testl %eax, %eax
+jnz .Lhas_attr_true
+jmp .Lhas_attr_false
+```
+
+falling into `.Lhas_attr_true`/`.Lhas_attr_false`, each of which just
+loads a different `TRUE`/`FALSE` tagged immediate before falling
+through to the shared push epilogue. This is superficially the same
+shape `op_cmp.S`'s `asnix_op_eq`/`asnix_op_neq` already converted to a
+single `cmov` between two pre-loaded constants (M-numbered earlier,
+see `op_cmp.S`'s own `testl %eax, %eax` / `cmoveq %rdx, %rax` pair).
+
+**Read `op_cmp.S`'s existing conversion first**, then **all** of
+`op_has_attr.S`'s control flow (not just the three lines above) before
+touching anything, per this milestone's own briefing -- `.Lhas_attr_true`
+has a *second* caller: the binary-search loop's own `je .Lhas_attr_true`
+(around line 79), which must keep working as a plain `jmp` target
+regardless of what the probe-result branch above it is rewritten to.
+Converting only the probe-result branch to a `cmov` (leaving
+`.Lhas_attr_true`/`.Lhas_attr_false` as-is for the binary-search loop's
+`je`/`jge` to keep targeting) composes fine: the probe path would
+compute the result directly and jump straight to the shared push point,
+bypassing the two labels entirely, without disturbing the other caller.
+Implemented and built clean; `make test`, `make test-e2e`,
+`make test-conformance` all green;
+`make test-nix-conformance NIX_CONFORMANCE_DIR=/tmp/nix-conformance`
+reported `pass=655 fail=3 skip=148` (the 3 known pre-existing
+position-tracking gaps, unchanged); `make test-nixpkgs-hash` reported
+`pass=148 fail=0`; `./asnix d.nix` stayed byte-identical to the expected
+store path.
+
+**But measured it anyway before trusting the shape-match**, via 10
+interleaved `perf stat -e cpu_core/instructions/,cpu_core/cycles/`
+trials on `d.nix` (real nixpkgs/ffmpeg eval), `taskset -c 0`, alternating
+before/after:
+
+```
+instructions: before avg 6,236,260,470   after avg 6,240,328,225   (+4,067,755, +0.065%)
+cycles:       before avg 3,538,790,432   after avg 3,551,341,952   (+12,551,520, +0.35%)
+```
+
+Both metrics regressed, consistently, in essentially every one of the
+10 interleaved trials (not just on average) -- the opposite of the
+hypothesis. `objdump -d` on the built `.o` explains why: unlike
+`op_cmp.S`'s `asnix_op_eq`/`asnix_op_neq`, where the pre-`cmov` sequence
+already sits inline right before the shared store (no extra control
+transfer needed either way), `op_has_attr.S`'s probe-result branch sits
+*in the middle* of the function, ahead of the binary-search block --
+the old `jnz`/`jmp` pair reaches the shared push epilogue by falling
+into one of the two existing labels (`.Lhas_attr_true`: `mov`+`jmp`;
+`.Lhas_attr_false`: `mov`, falls straight into the push with no `jmp`
+needed), for **4 retired instructions total either way**
+(`test`+`jnz`+`mov`+`jmp` taken, or `test`+`jnz`+`jmp`+`mov` not taken).
+The `cmov` version needs both constants preloaded into registers *before*
+the `cmov` can pick between them (`movq $FALSE,%rdx` / `movq $TRUE,%rax`
+/ `cmoveq` -- 3 instructions, not fewer than the 2 branches it replaces),
+**plus** its own explicit `jmp` to skip the still-present binary-search
+block and reach the shared push point, since the `cmov` site itself is
+no longer adjacent to it -- 5 retired instructions total, every time,
+not 4. The `op_cmp.S` win came from the branch *and* the constant-load
+already being on the only path to the store with nothing to jump over;
+here there's a binary-search block in between that something always has
+to jump past, and the pre-existing two-label `jnz`/`jmp` shape already
+paid for that jump as part of reaching one of two single-`mov` targets,
+for free. The one subtlety flagged going in (two call sites composing
+correctly into the same labels) was real and was resolved correctly;
+the actual blocker was a different, non-obvious asymmetry between this
+call site and `op_cmp.S`'s that only showed up by reading the generated
+machine code and measuring, not by pattern-matching the source shape.
+
+**Conclusion**: declined. Change fully reverted (`git diff` against the
+pre-change tree is empty); no source files modified. Files:
+`docs/architecture.md` only.
