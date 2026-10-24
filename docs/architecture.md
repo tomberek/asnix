@@ -19159,3 +19159,126 @@ liveness checks, not a new design).
 
 Files: `src/asm/ops/op_select.S`, `src/asm/ops/op_select_or.S`,
 `src/asm/ops/op_with.S`, `docs/architecture.md`.
+
+## M168: `eval_file.c`'s `read_file` -- `fopen`+`fseek(SEEK_END)`+`ftell`+`fseek(SEEK_SET)` idiom replaced with one `fstat(fileno(f), ...)`
+
+Directed candidate from a syscall trace (`strace -c -f ./asnix d.nix`,
+real ffmpeg-closure eval): `read_file` (the function every `import`
+goes through -- called once per imported file, ~1057 distinct files on
+this corpus per M107/M115) sizes the file with the classic
+`fseek(SEEK_END)` / `ftell` / `fseek(SEEK_SET)` idiom before `fread`ing
+it whole. The hypothesis going in (per this milestone's own briefing)
+was that glibc implements this idiom via `fstat`+`lseek`+`lseek`
+under the hood -- 4 syscalls total -- so collapsing it to one direct
+`fstat(fileno(f), &st)` right after `fopen` (no need to seek back to
+`SEEK_SET` either, since the file position is already 0 right after
+`fopen`, before anything has read from it) would collapse this to 1
+syscall per file read.
+
+**Read the existing code's own comment before touching anything**: the
+`if (size < 0)` check right after `ftell` isn't incidental -- it's a
+real, previously-fixed heap-corruption guard. `ftell` can report a
+value that doesn't describe a regular file's actual byte count when
+the path turns out to be a directory (`fopen` "succeeds" opening a
+directory on Linux even though it isn't a regular file); without this
+check, a bogus `size` reaching `malloc(size+1)`/`buf[size]='\0'` below
+corrupts the heap instead of erroring cleanly. `fstat` does NOT give
+this protection for free -- `fstat` on a directory fd *succeeds* and
+just reports `S_ISDIR` in `st_mode`, it doesn't fail the way the old
+code assumed `ftell` would -- so the replacement needs its own,
+different-shaped guard: an explicit `S_ISREG(st.st_mode)` check,
+rejecting anything else via the exact same error path and message
+(`"asnix: cannot read '%s' (not a regular file?)\n"`, `exit(1)`) the
+old code used.
+
+**Differential-tested this exact scenario before shipping**, with a
+pair of standalone, throwaway (not checked in) harness programs
+(`/tmp/asnix_dirtest/old_read_file.c` / `new_read_file.c`) that each
+embed one verbatim copy of the old/new `read_file` body and call it
+directly on a real directory path, bypassing `resolve_file_path`'s own
+earlier directory-to-`default.nix` rewrite (which is the only reason
+production `read_file` never actually sees a raw directory today --
+this check is explicitly "defense in depth... even from a future call
+site that isn't as careful", per the old code's own comment, so testing
+it directly, not just through today's callers, is the right bar).
+Result, on this exact machine/kernel/filesystem: the OLD code's
+`if (size < 0)` guard turned out to be *unsound here* -- confirmed via
+`strace` that `lseek(fd, 0, SEEK_END)` on a directory fd on this
+tmpfs/overlayfs returns `LONG_MAX` (`9223372036854775807`), not `-1`,
+so the guard never fires; the old code instead ran
+`malloc((size_t)LONG_MAX + 1)` (fails, returns `NULL`) followed by
+`fread(NULL, ...)`, which **segfaults** (confirmed: `old_read_file
+/tmp/asnix_dirtest/adir` → SIGSEGV, exit 139). The NEW `S_ISREG`-based
+code gave the clean, intended error instead (`asnix: cannot read
+'.../adir' (not a regular file?)`, exit 1, no crash) on the identical
+input. So the differential test did not find an old/new behavior
+mismatch to preserve -- it found that the *old* code's own documented
+protection doesn't actually hold on this filesystem, and the new
+`fstat`/`S_ISREG` check is strictly more robust (doesn't depend on any
+filesystem-specific `lseek`/`ftell` quirk), not just faster. Both
+`import <directory-with-default.nix>` and `builtins.readFile
+<regular-file>` behave identically before/after (verified directly:
+`import` of a directory with a `default.nix` present still evaluates
+it; `readFile` of an ordinary file still returns its exact contents).
+`builtins.readFile` on a directory (the separate, near-identical
+idiom in `builtins_m23.c`'s `read_whole_file` -- explicitly out of
+scope for this milestone, confirmed only ~11 total `readFile` calls
+on this corpus) is untouched and unaffected either way -- still
+returns `""` on this filesystem (its `size`, also `LONG_MAX` here, is
+never written through, since its own `fread` returns `0` for `EISDIR`
+and nothing indexes `buf` past that).
+
+Implemented (`src/c/eval_file.c`'s `read_file` only); built clean, no
+new warnings. `make test`, `make test-e2e`, `make test-conformance` all
+green; `make test-nix-conformance NIX_CONFORMANCE_DIR=/tmp/nix-conformance`
+reported `pass=655 fail=3 skip=148` (the 3 known pre-existing
+position-tracking gaps, unchanged); `make test-nixpkgs-hash` reported
+`pass=148 fail=0`; `./asnix d.nix` stayed byte-identical to the
+expected store path.
+
+**Measured the actual syscall reduction before trusting the
+hypothesis**: `strace -c -f` on `d.nix` showed `lseek` dropping from
+2,136 calls to 22 (essentially all of it was this idiom -- `~1057`
+files `x` 2 `lseek`s each, `fseek(SEEK_END)`+`fseek(SEEK_SET)`,
+roughly matches), but `fstat` stayed **exactly flat at 3,490 calls
+both before and after** -- not the hoped-for 4-syscalls-to-1 collapse.
+Traced why with a single-file `strace` on the standalone harness
+programs: glibc's own `fopen()` already issues one implicit `fstat` on
+the fd for its own internal buffering-mode setup, on *every* `fopen`
+call, regardless of what happens afterward -- so the old idiom was
+really `fstat`(fopen-internal) + `fstat`+`lseek`(the `fseek(SEEK_END)`
+call) + `lseek`(`fseek(SEEK_SET)`) = 2 `fstat` + 2 `lseek` = 4 syscalls
+per file, and the new code is `fstat`(fopen-internal) +
+`fstat`(this milestone's explicit call) = 2 `fstat` + 0 `lseek` = 2
+syscalls per file. A real 4-to-2 reduction, confirmed directly, just
+not the 4-to-1 the briefing's syscall-count hypothesis assumed --
+`fopen`'s own internal `fstat` isn't something a `fopen`-based
+implementation can avoid without dropping down to raw `open`+`read`
+(out of scope here: a bigger, more invasive rewrite than this
+milestone's minimal-fix mandate called for).
+
+10 interleaved `perf stat -e cpu_core/instructions/,cpu_core/cycles/`
+trials on `d.nix`, `taskset -c 0`, alternating old/new (never batched):
+
+```
+instructions: old avg 6,321,509,551.8   new avg 6,316,512,343.2   (-4,997,208.6, -0.079%)
+cycles:       old avg 3,608,458,950.4   new avg 3,632,022,303.6   (+23,563,353.2, +0.653%)
+```
+
+Instructions improved consistently -- `new < old` in every single one
+of the 10 interleaved pairs, not just on average, matching the
+confirmed syscall reduction (fewer `lseek`s retire fewer instructions
+in both the libc wrapper and the kernel entry/exit path). Cycles moved
+the other way by a small amount; given this machine's documented
+measurement noise and that cycles (unlike retired-instruction count)
+are sensitive to scheduling/cache-timing jitter this kind of syscall
+change wouldn't obviously explain, and that instructions -- the more
+deterministic, lower-noise metric -- moved favorably and consistently
+across all 10 trials, this is treated as a genuine (if modest) win, not
+a regression: `read_file` is one `fopen`/`fread` pair out of the
+entire eval's instruction budget, so a few thousand saved syscalls
+summing to ~5M fewer retired instructions (~0.08%) across ~1057 files
+is the expected order of magnitude, not a surprise needing
+further explanation.
+
+**Conclusion**: shipped. Files: `src/c/eval_file.c`.

@@ -38,27 +38,44 @@ static char *read_file(const char *path, size_t *out_len) {
         fprintf(stderr, "asnix: cannot open '%s'\n", path);
         exit(1);
     }
-    fseek(f, 0, SEEK_END);
-    long size = ftell(f);
-    /* ftell returns -1 on a stream that doesn't support seeking (e.g. a
-     * directory opened via fopen, which "succeeds" on Linux but isn't a
-     * regular file) -- (size_t)(-1)+1 wraps to 0, and the subsequent
-     * `buf[size] = '\0'` with size still -1 writes one byte *before* a
-     * ~0-byte allocation, corrupting the heap instead of erroring (found
-     * importing a directory path with no default.nix handling -- see
-     * asnix_eval_file's own fix for the real cause; this check is defense
-     * in depth so a bad path can never reach this corruption again, even
-     * from a future call site that isn't as careful). */
-    if (size < 0) {
+    /* M167: one fstat(fileno(f), ...) right after fopen replaces the
+     * classic fseek(SEEK_END)+ftell+fseek(SEEK_SET) idiom -- glibc
+     * implements that idiom via fstat+lseek+lseek under the hood (confirmed
+     * via strace: 2 fstat + 2 lseek per call, one of the two fstats coming
+     * from fseek(SEEK_END) itself, the other from fopen()'s own internal
+     * buffering-mode setup -- that second one is unavoidable with a
+     * fopen()-based implementation, so this collapses the total from 4
+     * syscalls to 2, not to 1; see docs/architecture.md's M167 section for
+     * the full measurement). No seek-back to SEEK_SET is needed either:
+     * the file position is already 0 right after fopen, since nothing has
+     * read from `f` yet.
+     *
+     * This does NOT get the old code's directory protection for free --
+     * fstat on a directory fd SUCCEEDS (unlike ftell, which the old code
+     * relied on returning -1 for a directory stream) and just reports
+     * S_ISDIR in st_mode, so the explicit S_ISREG check below is
+     * required, not optional. Confirmed empirically on this exact
+     * filesystem (a differential standalone-harness test, not shipped)
+     * that the OLD ftell-based check is actually unsound here anyway:
+     * `lseek(fd, 0, SEEK_END)` on a directory fd returns LONG_MAX on
+     * this kernel/fs, not -1 (`strace` confirmed it directly), so the
+     * old `if (size < 0)` guard never even fired for a real directory
+     * path on this machine -- the old code instead ran
+     * `malloc((size_t)LONG_MAX + 1)` (fails, returns NULL) followed by
+     * `fread(NULL, ...)`, which segfaults. The new S_ISREG check below
+     * doesn't depend on any such filesystem-specific lseek/ftell
+     * behavior, so it's strictly more robust, not just faster. */
+    struct stat st;
+    if (fstat(fileno(f), &st) != 0 || !S_ISREG(st.st_mode)) {
         fprintf(stderr, "asnix: cannot read '%s' (not a regular file?)\n", path);
         exit(1);
     }
-    fseek(f, 0, SEEK_SET);
-    char *buf = malloc((size_t)size + 1);
-    fread(buf, 1, (size_t)size, f);
-    buf[size] = '\0';
+    size_t size = (size_t)st.st_size;
+    char *buf = malloc(size + 1);
+    size_t n = fread(buf, 1, size, f);
+    buf[n] = '\0';
     fclose(f);
-    if (out_len) *out_len = (size_t)size;
+    if (out_len) *out_len = n;
     return buf;
 }
 
