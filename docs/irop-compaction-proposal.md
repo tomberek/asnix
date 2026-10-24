@@ -15,6 +15,15 @@ result" right below for why, before reading the rest of this document.
 The rest of this document below was written before M169 landed; treat
 "Proposal A... in flight" language as historical.
 
+A later follow-up -- "does `b`'s real skew toward small/zero values open
+a sub-16-byte `IrOp`?" -- was also investigated directly (a real
+candidate was built in full this time, not just reasoned about: a packed
+12-byte `IrOp` with the global-symbol-id-carrying ops' operand rerouted
+through the pool) and **declined**, for the same real-measured-
+instruction-count-regression reason M170 was -- see "Follow-up: does
+`b`'s real skew... open a sub-16-byte `IrOp`?" below for the complete
+writeup, including the real `perf stat`/RSS numbers.
+
 ## M170: real measured result (supersedes this document's own `+14,656,701`/`+1 instruction per dispatch` prediction below)
 
 The lookup-table variant described below was built in full (every op
@@ -74,6 +83,219 @@ reasoned about before this milestone. Proposal B is DECLINED in its
 lookup-table form; the codebase was left unchanged (M169's address-baking
 `ir_link()` is still exactly what runs today) rather than carrying this
 forward speculatively.
+
+## Follow-up: does `b`'s real skew (mostly small/zero) open a sub-16-byte `IrOp`?
+
+A later question, asked after M170's decline: nearly all `IrOp.b` values
+*look* small or zero by inspection -- does that observation open some
+angle M170 didn't consider, e.g. narrowing just `b`, or packing `a`+`b`
+jointly? This was investigated in two passes within the same session: a
+first pass (arithmetic + a real measured value-distribution survey, no
+code built) that looked promising enough to justify a second pass
+(an actual full implementation, built and measured with the real
+perf-stat ladder). The second pass's real measurement is the one that
+matters for the ship/no-ship call; the first pass's analysis is kept
+below because the arithmetic it establishes is still correct and
+relevant background, with one correction noted where the second pass
+found it was reasoning about the wrong case.
+
+### Pass 1: arithmetic + real distribution survey (no code built)
+
+**A naturally-aligned `IrOp` cannot shrink below 16 bytes no matter how
+narrow `a`/`b` get**, independent of what values they actually hold:
+`IrOp` contains a pointer, so its *struct* alignment is 8 (the pointer's
+own alignment), meaning `sizeof(IrOp)` must be a multiple of 8. With
+`handler` occupying the first 8 bytes, the struct's total raw size is `8
++ X` where `X` is whatever `a`/`b` occupy combined. For *any* `X` with `0
+< X <= 8` -- whether `X` is today's 8 (two `int32_t`), or 4 (one packed
+`int32_t` holding two 16-bit halves), or even 1 (a single packed byte) --
+`8 + X` lands in `(8, 16]`, which rounds up to exactly 16 either way.
+**Correction from pass 2**: this arithmetic is only true for a
+*naturally-aligned* layout (the compiler inserting no padding but still
+rounding the whole struct up to its strongest member's alignment). An
+EXPLICIT `__attribute__((packed))` layout sidesteps this entirely --
+confirmed directly by compiling `{void *handler; int16_t a; int16_t b;}
+__attribute__((packed))` and checking `sizeof()`: 12 bytes, not 16, because
+`packed` suppresses the whole-struct alignment rounding, not just
+inter-member padding. Pass 1 did not consider this (it reasoned only
+about natural alignment); pass 2 did, and it is the one real way to get
+below 16 bytes with a pointer-containing struct. The real constraint is
+instead the one SoA reasoning below (pass 1) already found: whether `a`/
+`b` can actually be narrowed at all.
+
+**Real measured value distribution.** A temporary `ir_link()`-site
+instrumentation (every op, every compiled program, including bytecode-
+cache deserialization -- the same universal choke point M169's own
+survey used) was built, run against the real `d.nix`/ffmpeg eval, and
+reverted (same "measure, don't ship the probe" discipline M169's own
+original operand-width survey used): 3,116,004 ops tallied (matching
+M169's own "3.1 million" figure almost exactly -- a good cross-check that
+this instrumentation and M169's counted the same thing). Per-opcode joint
+`(a,b)` ranges, `OP_COUNT=57` enum order, selected rows:
+
+| op | count | a range | b range | a fits u16 | both fit u12 |
+|---|---|---|---|---|---|
+| `OP_SELECT` | 316,410 | 0..77,229 (symbol id) | always 0 | 70.1% | 35.0% |
+| `OP_HAS_ATTR` | 284 | 1..77,113 (symbol id) | always 0 | 96.8% | 69.7% |
+| `OP_WITH_TRY` | 32,688 | always 32 (jump delta) | 0..58,021 (symbol id) | 100%(b) | 40.9% |
+| `OP_SELECT_OR` | 1,136 | 32..96 (jump delta) | 1..76,860 (symbol id) | 95.2%(b) | 65.1% |
+| `OP_HAS_ATTR_IF` | 2,083 | 48..1,184 (jump delta) | 1..77,229 (symbol id) | 95.0%(b) | 25.3% |
+| everything else (pushes, frame ops, calls, plain jumps, pool indices, etc.) | ~2.76M | mostly 0, max seen 19,437 | mostly 0, max seen 77,229\* | 100% | 94.9%-100% |
+
+\* `OP_MK_ATTRS`'s pool-index `b` tops out at 19,437 (the largest single
+compiled program's own op count, same figure M169's survey found), not
+a symbol id.
+
+The non-symbol-carrying majority of ops (pushes, frame alloc/set/get,
+calls, plain `if`/`jmp`, pool indices) genuinely are tiny -- every one of
+them fits a plain `int16_t` with real margin (max observed 31,152 for a
+jump byte-delta, 19,437 for a pool index/count, both comfortably under
+`INT16_MAX`=32,767), confirming the original "`b` is mostly small or
+zero" observation *for those op kinds*. But every op that carries a
+**global symbol id directly as a plain immediate** (`OP_SELECT.a`,
+`OP_HAS_ATTR.a`, `OP_WITH_TRY.b`, `OP_SELECT_OR.b`, `OP_HAS_ATTR_IF.b`)
+tells a different story: the real eval interns at least 77,230 distinct
+identifiers (attribute names, `let`/lambda binding names) across the full
+nixpkgs/ffmpeg closure -- comfortably past any 16-bit ceiling, and the
+single hottest, highest-volume symbol-carrying op in the entire table,
+`OP_SELECT` (316,410 compiled occurrences -- about 1 in 10 of all ops in
+this eval, and already one of the largest hand-inlined handlers per the
+"Real handler size data" table above), has a symbol id exceeding 16 bits
+in **almost 30% of its real occurrences**, and exceeding 12 bits in
+**65% of them**.
+
+This directly kills the pure-narrowing and 16-bit-common-case-plus-
+escape-hatch candidates:
+
+- **"Both `a` and `b` fit in ~12 bits, pack them into a smaller word"**:
+  false for `OP_SELECT`'s `a` field specifically -- the single highest-
+  volume symbol-bearing op only has *35%* joint-12-bit coverage, not the
+  "nearly all" the premise assumed.
+- **"16-bit common case + rare escape hatch for outliers"**: an escape
+  hatch only pays off when escapes are rare (the same logic that made
+  M169's `OP_PUSH_INT` pool-reroute a clean win: 64-bit literals are a
+  genuine, tiny minority of all ops). Here the "outlier" case -- a symbol
+  id over 12 or even 16 bits -- is 30-65% of `OP_SELECT`'s own real
+  occurrences, not an edge case by compiled-op count.
+
+But it leaves one real candidate standing, which pass 1 under-explored:
+route *only* the 5 symbol-id-carrying op/field slots through the constant
+pool (mirroring `OP_PUSH_INT`'s own M169 escape hatch exactly: `a`/`b`
+becomes a pool index -- bounded by the compiled program's own size, same
+~19,437 ceiling as every other pool index, safely inside `int16_t` --
+with `pool[index]` holding the real, full-width symbol id), while an
+EXPLICIT `__attribute__((packed))` layout (not naturally-aligned, see the
+correction above) lets every OTHER op/field stay a plain `int16_t`
+immediate. This looked, on paper, like a real candidate: the escape only
+costs one extra dependent load on the 5 ops' own occurrences (352,601 of
+the 3.1M total *compiled* ops, ~0.01%, by this pass's own count), far
+cheaper than M170's declined every-dispatch lookup-table cost. Promising
+enough on paper to build and measure for real -- see pass 2.
+
+### Pass 2: built in full, measured, declined
+
+Built the candidate pass 1 identified in full: `IrOp` as `{void *handler;
+int16_t a; int16_t b;} __attribute__((packed))` (12 bytes, confirmed via
+`sizeof()`), `OP_SELECT`/`OP_HAS_ATTR`/`OP_WITH_TRY`/`OP_SELECT_OR`/
+`OP_HAS_ATTR_IF` rerouting their symbol id through the pool exactly as
+described above, a loud-abort range check in `ib_emit`/`ib_patch_delta`
+(irbuild.c) guarding every OTHER op's `a`/`b` against ever exceeding
+`int16_t` (mirroring `OP_PUSH_INT`'s own `ASNIX_INT_MIN`/`MAX` precedent --
+loud failure, not silent truncation, if a future program's operand ever
+grows past this), every `src/asm/ops/*.S` handler's load width narrowed
+from `movl`/`movslq` to `movswl`/`movswq` (mechanical, all values are
+non-negative and fit 16 bits so sign- vs zero-extend are bit-identical
+once extended), the 10 real symbol-read call sites across those 5 files
+given the extra `pool[idx]` resolve load, `bytecode.c`'s wire format
+updated (`PTAG_OP_SYM_A`/`PTAG_OP_SYM_B` now read/write a pool index, not
+a bare id; magic bumped `ASNXBC03` -> `ASNXBC04`), `irdump.c`'s
+disassembly updated to resolve the new pool indirection, and three
+existing hand-built `IrOp[]` test fixtures (`tests/ir/test_backward_jump.c`,
+`tests/asm/test_stacklimits.c`, `tests/c/test_bytecode.c`) fixed where
+they either hardcoded a now-stale stride-dependent byte-delta constant or
+needed >32,767 pool/operand entries in a single builder purely to drive
+an unrelated runtime buffer (VALSTACK/RETSP) past its own, much larger
+cap -- rebuilt those two specifically to reach the same runtime depth via
+an actual loop/recursion construct instead of a one-pool-entry-per-level
+unrolled builder, plus one new genuine `OP_SELECT` bytecode-cache round-
+trip fixture (the riskiest untested path: a pool index that must be
+re-pointed at a freshly re-interned symbol id on the read side).
+
+**Full verification ladder, all green**: `make test`, `make test-e2e`
+(300/300), `make test-conformance`, `make test-nix-conformance
+NIX_CONFORMANCE_DIR=/tmp/nix-conformance` (`pass=655 fail=3 skip=148`,
+the same 3 known pre-existing position-tracking gaps), `make
+test-nixpkgs-hash` (`pass=148 fail=0`). `./asnix d.nix` byte-identical to
+the expected store path throughout.
+
+**Measured both axes this candidate's own risk profile demanded** --
+15 interleaved `perf stat -e cpu_core/instructions/,cpu_core/cycles/`
+trials (instructions/cycles) plus 3 interleaved `/usr/bin/time -v`
+trials (peak RSS), `taskset -c 0`, alternating before (master, 16-byte
+`IrOp`)/after (this candidate, 12-byte packed `IrOp`), never batched, on
+the real `d.nix`/ffmpeg eval:
+
+```
+instructions: before avg 5,440,541,479.4   after avg 5,487,274,922.5   (+46,733,443.1, +0.859%)
+cycles:       before avg 3,347,265,623.0   after avg 3,347,812,393.0   (+546,770.0, +0.016%)
+peak RSS:     before 512,160 KB            after 503,712 KB            (-8,448 KB, -1.65%)
+```
+
+Instructions regressed **consistently, in every single one of the 15
+interleaved pairs**, same one-directional signal M170's own measurement
+had (no exceptions either way). Cycles are flat (within this project's
+own documented noise band for this metric). Peak RSS is a real,
+deterministic win (identical across all 3 trials), roughly a third of
+the size of M169's own 24->16 shrink, as expected from a smaller (16->12,
+25%) further reduction -- confirming the memory side of this candidate's
+premise was correct.
+
+**But the instruction-count regression is real, consistent, and -- by
+this project's own standing practice of trusting instruction count over
+cycles on this shared, contended machine -- bigger than the win is worth,
+almost exactly reproducing M170's own outcome at a slightly larger
+magnitude (+0.859% here vs M170's +0.616%).** Root cause is not fully
+resolved to the instruction, but a real contributing factor was directly
+measured rather than assumed: pass 1's `+0.01%` escape-hatch cost estimate
+used each symbol-id op's STATIC compiled-op count, not its DYNAMIC
+dispatch count -- precisely the distinction M170's own writeup flagged as
+a risk ("the real measured dispatch volume... may be higher") and which
+this pass 1 analysis repeated instead of heeding. A temporary dispatch
+counter (reverted after this one measurement) found `OP_HAS_ATTR`,
+`OP_SELECT_OR`, and `OP_HAS_ATTR_IF` all dispatch at RUNTIME far more
+often than their static compiled-op count suggested (e.g. `OP_HAS_ATTR`:
+284 compiled occurrences vs 156,956 real dispatches -- these three ops
+evidently live inside commonly-reused `lib`-style helper functions called
+across many packages, not used once each): 890,309 total dynamic
+dispatches across the 5 rerouted ops, ~2.5x pass 1's static-count-based
+352,601 estimate. That alone doesn't fully account for the measured
++46.7M-instruction gap, though -- the loud-abort range check added to
+`ib_emit`/`ib_patch_delta` (irbuild.c's own new compile-time safety net,
+called once per compiled op and once per patched jump respectively, a
+combined ~3.2M calls on this eval) and the extra `ib_pool_add` call now
+made for each of the 352,601 statically-compiled symbol-id sites are both
+real, plausible contributors to the remainder, but this was not
+partitioned further once the `perf stat` instruction-count delta alone
+already answered the ship/no-ship question -- consistent with this
+project's standing practice (M170: "the `perf stat` instruction-count
+delta is the number that actually matters for the ship/no-ship call, and
+it was measured directly, not inferred").
+
+**Conclusion: declined.** Fully reverted: `git diff` against the
+pre-change tree is empty for every file except this document (no source
+files modified) -- `include/asnix/ir.h`, `src/c/irbuild.c`,
+`src/c/bytecode.c`, `src/c/irdump.c`, all 29 touched `src/asm/ops/*.S`
+files, and the three test-fixture files are all back to their pre-change
+state. `IrOp` stays the 16-byte, no-padding layout M169 shipped. This
+closes the "`b` looks mostly small" angle the same way M170 closed the
+lookup-table angle: a real candidate was identified, built in full,
+verified correct against the full ladder, and measured with real
+interleaved trials rather than trusted on arithmetic or a static-count
+estimate alone -- and the real measurement, not the paper estimate, is
+what settled it. The memory win was real (-1.65%) but, exactly as this
+project's own standing practice already decided once before (M170), a
+consistent real instruction-count regression on this project's primary
+trusted metric is not a trade this project is taking.
 
 ## Motivation
 
