@@ -21500,3 +21500,54 @@ M170's own writeup flagged. Fully reverted: no source files changed,
 `IrOp` stays the 16-byte layout M169 shipped.
 
 Files: `docs/irop-compaction-proposal.md` only (no source changed).
+
+## M193: `irdump`'s leading row columns (op index, `lineno:count`, mnemonic, `b=`) tightened to give the trailing source-snippet column more room
+
+The M191 follow-up moved the source snippet to a trailing `| <snippet>`
+column capped at `SNIPPET_CAP = 48` chars, estimating the row ahead of
+it (index/`lineno:count`/mnemonic/`b=`/the `;`-annotation/any `<<<`
+markers) at "60-100+ chars." A directive asked for the four leading
+columns to be tightened based on *measured* real field widths, not
+guesses, freeing more room for the snippet before it needs truncating.
+
+**Measurement, not guesswork.** Dumped `lib/*.nix` (`strings.nix`,
+`attrsets.nix`, `modules.nix`, `types.nix`, `lists.nix`),
+`pkgs/top-level/all-packages.nix` (10,801 lines, 8,274 programs), and
+the largest real `.nix` file in nixpkgs, the generated 783,197-line
+`pkgs/development/haskell-modules/hackage-packages.nix` (366,623
+distinct programs) -- across this corpus:
+- op index: real per-program op counts commonly reach 4 digits (5,235
+  in `maintainers/maintainer-list.nix`'s one giant attrset); only
+  `hackage-packages.nix`'s single largest program exceeds the existing
+  `%4lld` width (19,438) -- left unchanged, since 4 digits is already
+  the right size for everything else and `printf` never truncates, it
+  just loses alignment on that one outlier (same as before this
+  change).
+- `lineno:count`: observed combined width tops out at 8-9 chars across
+  the same corpus (`"10779:13"`, `"139703:15"`) -- the existing `%-8s`
+  is already essentially the real minimum; left unchanged.
+- mnemonic: `op_names[]`'s three longest entries
+  (`RESOLVE_SEARCH_PATH`, `REC_OVERRIDES_MERGE`, `INSERT_DYNAMIC_ATTR`
+  -- the last confirmed appearing in real dumps of `attrsets.nix`/
+  `modules.nix`/`types.nix`/`lists.nix`/`all-packages.nix`) are all
+  exactly 19 chars. `%-20s` always had one dead column; a hard bound
+  over the fixed `op_names[]` set, not a probabilistic one -- tightened
+  to `%-19s`.
+- `b=`: `op->b`'s real observed ceiling across the whole corpus (pool
+  indices, frame slots, symbol ids) is 19,437, in
+  `hackage-packages.nix`'s single largest program -- 5 digits with
+  comfortable headroom to 99,999. `b=%-8lld` tightened to `b=%-5lld`.
+
+The 4 chars freed (mnemonic's 1 + `b=`'s 3) go straight to
+`SNIPPET_CAP`, raised from 48 to 52 -- the column this tool exists to
+show gets the room, rather than it sitting unused as padding in columns
+that didn't need it.
+
+**Correctness.** Full ladder green: `make test`, `make test-e2e`
+(300/300), `make test-conformance`, `make test-nix-conformance`
+(`pass=655 fail=3 skip=148`, same 3 known pre-existing failures), `make
+test-nixpkgs-hash` (`pass=148 fail=0`). `./asnix d.nix` output hash
+unchanged; diff touches only `src/c/irdump.c`.
+
+Files: `src/c/irdump.c` (`dump_program`'s row-prefix `printf` format
+string, `SNIPPET_CAP`).

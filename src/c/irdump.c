@@ -191,8 +191,15 @@ static int byte_pos_to_line(uint32_t pos) {
  * `;`-annotation/any `<<<` pass-firing markers) is already variable
  * and can run 60-100+ chars on its own, so a long snippet needs a
  * short leash to keep the combined line within a normal terminal's
- * width instead of wrapping. */
-enum { SNIPPET_CAP = 48 };
+ * width instead of wrapping.
+ *
+ * M192: bumped 48 -> 52, exactly the width dump_program's row-prefix
+ * fields gave up (mnemonic 20->19, b= 8->5 -- see that commit's
+ * rationale) -- measured real nixpkgs source (lib/<name>.nix files,
+ * pkgs/top-level/all-packages.nix, the generated 783K-line
+ * hackage-packages.nix) rather than guessed, so the freed columns go
+ * straight to the column this tool actually exists to show. */
+enum { SNIPPET_CAP = 52 };
 static void format_source_snippet(uint32_t pos, char *buf, size_t bufsz) {
     const char *s = g_dump_src;
     uint32_t start = pos;
@@ -286,7 +293,36 @@ static void dump_program(IrProgram *prog, int id, SeenVec *seen, Worklist *work)
         if (i < n_ops && line_no[i] != 0 && (i == 0 || line_no[i] != line_no[i - 1])) {
             format_source_snippet(prog_lines[i], snippet_buf, sizeof snippet_buf);
         }
-        printf("  [%4lld] %-8s %-20s b=%-8lld", (long long)i, lc_buf, op_names[id_of], (long long)op->b);
+        /* M192: leading-column widths tightened to free horizontal
+         * room for the trailing source-snippet column (SNIPPET_CAP
+         * above), based on real measurement rather than a guess --
+         * dumped lib/<name>.nix files, pkgs/top-level/all-packages.nix (10.8K
+         * lines, 8274 programs), and the largest real .nix file in
+         * nixpkgs, the generated 783K-line hackage-packages.nix
+         * (366623 programs):
+         *   - op index [%4lld]: unchanged. Real per-program op counts
+         *     commonly reach 4 digits (5235 in maintainer-list.nix's
+         *     one giant attrset); only hackage-packages.nix's single
+         *     largest program exceeds it (19438) -- 4 stays the right
+         *     size for everything else, and printf doesn't truncate,
+         *     it just loses alignment on that one outlier, same as
+         *     before this change.
+         *   - lineno:count %-8s: unchanged. Observed combined width
+         *     maxes out at 8-9 chars across the same corpus
+         *     ("10779:13", "139703:15") -- already essentially the
+         *     real minimum, nothing to trim.
+         *   - mnemonic %-20s -> %-19s: op_names[]'s longest entries
+         *     (RESOLVE_SEARCH_PATH, REC_OVERRIDES_MERGE,
+         *     INSERT_DYNAMIC_ATTR -- the latter confirmed appearing in
+         *     real nixpkgs dumps) are all exactly 19 chars; the 20th
+         *     column was always dead padding. This is a hard bound
+         *     over the fixed op_names[] set, not a probabilistic one.
+         *   - b=%-8lld -> b=%-5lld: op->b's real observed ceiling
+         *     across the entire corpus above (pool indices, frame
+         *     slots, symbol ids) is 19437 (hackage-packages.nix's
+         *     largest program) -- 5 digits, with comfortable headroom
+         *     to 99999. */
+        printf("  [%4lld] %-8s %-19s b=%-5lld", (long long)i, lc_buf, op_names[id_of], (long long)op->b);
 
         switch (id_of) {
             case OP_PUSH_INT: /* M169: literal lives in the pool now, not inline in `a` */
