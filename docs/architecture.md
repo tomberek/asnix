@@ -21108,3 +21108,33 @@ Files: `src/c/builtins_shared.c` (`cmp_make_attrs_entry` removed;
 `merge_sort_make_attrs_entries` added; `asnix_bshared_make_attrs`'s
 above-threshold path uses it with two arena-allocated scratch buffers
 instead of `malloc`+`qsort`+`free`).
+
+## M186: `compiler.c`'s `AST_ATTRSET` large-literal `qsort` (`sort_attrset_bindings_large`) given the same specialized-merge-sort treatment as M185
+
+A sibling compile-time `qsort` to M185's: `sort_attrset_bindings_large`
+(the `AST_ATTRSET` large-literal case, exercised by `all-packages.nix`-
+style ~4,280-binding literals) paid the identical indirect-comparator-
+call tax via `symidxpair_cmp`. Given the identical fix: `malloc`+`qsort`
+replaced with two `asnix_arena_alloc` scratch buffers plus a
+specialized `merge_sort_symidxpairs`. Names are already unique by the
+time this runs (this case's own existing comment), so there is no
+tie-break to preserve either way.
+
+**Correctness.** Full ladder green, same suite as M185: `make test`,
+`make test-e2e` (296/296), `make test-conformance`, `make
+test-nix-conformance` (`pass=655 fail=3 skip=148`), `make
+test-nixpkgs-hash` (`pass=148 fail=0`), `./asnix d.nix` output hash
+unchanged.
+
+**Measured** (`perf stat -e cpu_core/instructions/`, `taskset -c 0`, 12
+interleaved trials, on top of M185): **-0.169% instructions, 12/12
+wins, non-overlapping ranges.**
+
+Combined M182→M186 delta measured at -0.26% to -0.35% across two
+attempts by the implementer (noisier due to rising machine load during
+that specific combined measurement); each individual commit's own
+before/after pair was measured cleanly before the load spike.
+
+Files: `src/c/compiler.c` (`symidxpair_cmp` removed;
+`merge_sort_symidxpairs` added; `sort_attrset_bindings_large` uses it
+with two arena-allocated scratch buffers instead of `malloc`+`qsort`).

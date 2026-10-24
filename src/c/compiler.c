@@ -531,9 +531,35 @@ typedef struct {
     uint32_t sym;
     size_t idx;
 } SymIdxPair;
-static int symidxpair_cmp(const void *a, const void *b) {
-    uint32_t sa = ((const SymIdxPair *)a)->sym, sb = ((const SymIdxPair *)b)->sym;
-    return (sa > sb) - (sa < sb);
+
+/* perf (M183): bottom-up merge sort over `.sym` alone, specialized for
+ * `SymIdxPair` -- same fix, same rationale, as builtins_shared.c's
+ * sibling `merge_sort_make_attrs_entries` (not shared via a header since
+ * the two sorts operate on unrelated data, matching this file's own
+ * existing convention for `ASNIX_ATTRSET_SORT_INSERTION_MAX`/
+ * `ASNIX_MAKE_ATTRS_SORT_INSERTION_MAX`). Removes the indirect call
+ * through `symidxpair_cmp` that `qsort` paid once per comparison. Names
+ * are already unique by the time this runs (this case's own comment,
+ * below) so there is no tie-break to preserve either way -- any stable
+ * sort (this one included: ties, if they ever occurred, resolve to the
+ * left run) reproduces `symidxpair_cmp`'s behavior exactly. */
+static SymIdxPair *merge_sort_symidxpairs(SymIdxPair *a, SymIdxPair *tmp, size_t n) {
+    SymIdxPair *src = a, *dst = tmp;
+    for (size_t width = 1; width < n; width *= 2) {
+        for (size_t i = 0; i < n; i += 2 * width) {
+            size_t mid = i + width < n ? i + width : n;
+            size_t end = i + 2 * width < n ? i + 2 * width : n;
+            size_t l = i, r = mid, k = i;
+            while (l < mid && r < end) {
+                if (src[l].sym <= src[r].sym) dst[k++] = src[l++];
+                else dst[k++] = src[r++];
+            }
+            while (l < mid) dst[k++] = src[l++];
+            while (r < end) dst[k++] = src[r++];
+        }
+        SymIdxPair *t = src; src = dst; dst = t;
+    }
+    return src;
 }
 /* M146: compile_expr's AST_LET/AST_LAMBDA(pattern)/AST_ATTRSET cases each
  * malloc a handful of small scratch arrays -- sized by a purely
@@ -576,11 +602,11 @@ static int symidxpair_cmp(const void *a, const void *b) {
  * directly into the switch and measured a small but real regression on
  * the COMMON (small-n) path purely from compile_expr growing larger. */
 static void sort_attrset_bindings_large(uint32_t *syms, size_t *order, size_t n) {
-    SymIdxPair *pairs = malloc(n * sizeof(SymIdxPair));
+    SymIdxPair *pairs = asnix_arena_alloc(n * sizeof(SymIdxPair));
+    SymIdxPair *scratch = asnix_arena_alloc(n * sizeof(SymIdxPair));
     for (size_t i = 0; i < n; i++) { pairs[i].sym = syms[i]; pairs[i].idx = i; }
-    qsort(pairs, n, sizeof(SymIdxPair), symidxpair_cmp);
-    for (size_t i = 0; i < n; i++) order[i] = pairs[i].idx;
-    free(pairs);
+    SymIdxPair *sorted = merge_sort_symidxpairs(pairs, scratch, n);
+    for (size_t i = 0; i < n; i++) order[i] = sorted[i].idx;
 }
 
 /* perf: these expression kinds already compile to a single zero-cost
