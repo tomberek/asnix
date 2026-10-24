@@ -18442,3 +18442,91 @@ Files: `src/c/builtins_shared.c` (`asnix_bshared_make_attrs` given a
 small-N stack-insertion-sort fast path below the new
 `ASNIX_MAKE_ATTRS_SORT_INSERTION_MAX` threshold; the existing `malloc` +
 `qsort` path unchanged above it).
+
+## M162: hand-inlining the Cell-chain dereference (`asnix_resolve_cell_chain`/`asnix_value_is_cell`/`asnix_cell_target`) into `op_var_ref.S` and `force.S`
+
+`value_util.c`'s `asnix_resolve_cell_chain` is the shared "unwrap however
+many `Cell`s are chained together" loop for a bare-variable alias (`let y
+= x; in y`) -- called from `op_var_ref.S` (the hottest variable-lookup
+op) and `force.S`'s `asnix_force_for_print`. It's built from three tiny
+C helpers (`asnix_value_is_cell`, `asnix_cell_target`, plus
+`asnix_tag_of`) that GCC never inlined into each other or into their one
+caller, despite all being one-liners in the same TU: disassembly showed
+`asnix_resolve_cell_chain`'s loop body as `call asnix_cell_target` then,
+on the next iteration's test, `call asnix_value_is_cell` (which itself
+`call`ed `asnix_tag_of`) -- up to three nested out-of-line calls, each
+paying a full prologue/epilogue, just to answer "is this a tagged
+pointer whose pointee's first qword equals the Cell marker". 834,237
+Cell objects are created on `d.nix`, each read at least once.
+
+**The fix.** Hand-rolled the identical loop directly at both call sites
+-- mask the tag bits, compare against `ASNIX_TAG_PTR`, mask+load the
+base pointer (clearing both the low 3 tag bits and, for M118
+compatibility, the high 16 ThunkMap-index bits), compare the leading
+qword against `ASNIX_CELL_MARKER`, and either loop (on a chained alias)
+or fall through to the existing resolve loop (on a non-Cell result,
+which may itself still be an unforced Thunk/LazyApp/ThunkMap -- handled
+exactly as before). The chase-limit constant (`ASNIX_CELL_CHASE_LIMIT`,
+guarding against a genuine `let x = y; y = x; in x` alias cycle with no
+Thunk anywhere in it to catch it via the ordinary blackhole check) moved
+from `value_util.c` into `include/asnix/heap.h` so all three copies of
+the bound (the original C reference implementation, still used by
+`op_select.S`/`op_select_or.S`/`op_with.S`, which weren't hot enough on
+`d.nix` to be worth inlining too, plus the two new hand-inlined copies)
+stay in lock-step rather than risking silent drift.
+
+Register use was checked carefully for the flags-clobbering hazard this
+campaign has twice found before (M111/M155): in both `op_var_ref.S`'s
+`.Lvar_ref_cell_loop` and `force.S`'s `.Lforce_cell_loop`, every `cmp`
+is followed immediately by its own conditional jump with no
+flag-touching instruction in between, and all scratch registers used
+(`%r8`-`%r10` in `op_var_ref.S`, `%rax`/`%rcx`/`%rdx`/`%r8`/`%r9` in
+`force.S`) are confirmed dead/free at that point in each function (the
+callee-saved registers `%r12`-`%r15`/`%rbx`/`%rbp` aren't pushed/
+repurposed until further down, past a confirmed Thunk, in both
+functions).
+
+**Correctness.** `make test`, `make test-e2e`, `make test-conformance`
+all green. `make test-nix-conformance NIX_CONFORMANCE_DIR=/tmp/
+nix-conformance` reports `pass=655 fail=3 skip=148`, the same 3
+pre-existing position-tracking gaps (`eval-okay-getattrpos-
+functionargs.nix`, `eval-okay-getattrpos.nix`, `eval-okay-inherit-attr-
+pos.nix`), including `eval-fail-blackhole.nix` passing (the legacy-`let`
+mutual-alias-cycle case, exercised through `op_var_ref.S`'s new inline
+loop). `make test-nixpkgs-hash` reports `pass=148 fail=0`. `./asnix
+d.nix` output byte-identical:
+`/nix/store/29iacg6h530yx7rxz4k1fhvi0kxxhsam-ffmpeg-9.0.1-bin`. Hand-
+written differential tests against real `nix-instantiate --eval` (not
+part of the permanent suite): a simple alias chain (`let a=1; b=a; c=b;
+d=c; e=d; in d+e`), a chain through an attrset selection, a chain
+through a curried function application, and a legitimately deep
+(2000-hop) non-cyclic alias chain -- all four matched `nix-instantiate`
+exactly, confirming both the chained-Cell loop and its chase-limit
+termination behave correctly on both the common (0-1 hop) and
+chained/deep cases.
+
+**Measured, interleaved, 10 trials each** (`perf stat -e
+cpu_core/instructions/,cpu_core/cycles/`, `taskset -c 0`,
+before/after/before/after...):
+
+| | mean | stdev |
+|---|---|---|
+| before | 6,321,864,051.8 | 1,959,820.6 |
+| after | 6,243,035,227.6 | 1,101,697.2 |
+
+A -1.25% / ~78.8M instruction reduction, with the delta roughly 40x
+either side's stdev -- comfortably exceeding noise, and somewhat larger
+than the handoff's own 0.9-1.0% estimate (the three collapsed call/ret
+pairs' ABI prologue/epilogue overhead was evidently worth slightly more
+than the flat-profile self-time figures alone suggested, consistent
+with this campaign's repeated finding that call/dispatch overhead, not
+the underlying algorithm, is the real cost at these hot sites). Shipped.
+
+Files: `include/asnix/heap.h` (`ASNIX_CELL_CHASE_LIMIT` moved here from
+`value_util.c`), `src/asm/ops/op_var_ref.S` (`.Lvar_ref_check_cell`'s
+`call asnix_resolve_cell_chain` replaced with an inline
+`.Lvar_ref_cell_loop`), `src/asm/force.S` (`.Lforce_check_cell`'s `call
+asnix_resolve_cell_chain` replaced with an inline `.Lforce_cell_loop`),
+`src/c/value_util.c` (comment update only -- `asnix_resolve_cell_chain`
+itself is unchanged, still the reference implementation for
+`op_select.S`/`op_select_or.S`/`op_with.S`).

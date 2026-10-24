@@ -90,6 +90,18 @@
 #define ASNIX_CELL_OFF_MARKER 0
 #define ASNIX_CELL_OFF_TARGET 8
 
+/* M162: generous above any legitimate chain of bare-variable aliases a
+ * real program could write -- chosen to abort in well under a second
+ * even on a genuine cycle (e.g. `let x = y; y = x; in x`, a real
+ * user-writable mutual alias with no Thunk involved to catch it via the
+ * ordinary IN_PROGRESS blackhole check), not tuned against any specific
+ * fixture's depth. Shared between value_util.c's asnix_resolve_cell_chain
+ * (the out-of-line reference implementation, still used by op_select.S/
+ * op_select_or.S/op_with.S) and the hand-inlined copies of the same loop
+ * in op_var_ref.S/force.S -- defined once here so the three copies can
+ * never drift apart on the bound. */
+#define ASNIX_CELL_CHASE_LIMIT 1000000
+
 /* LazyApp (M113): a FIFTH `ASNIX_TAG_PTR` kind, alongside String/Path/
  * Float/Cell above -- same "reserved negative marker in the leading
  * word" precedent, but (unlike those four, which are all fixed-shape)

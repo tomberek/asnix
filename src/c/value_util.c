@@ -96,13 +96,13 @@ Value *asnix_cell_target(Value v) {
     return *(Value **)(base + ASNIX_CELL_OFF_TARGET);
 }
 
-/* M92: generous above any legitimate chain of bare-variable aliases a
- * real program could write (see this function's own declaration,
- * value_util.h, for the full rationale) -- chosen to abort in well under
- * a second even on a genuine cycle, not tuned against any specific
- * fixture's depth. */
-#define ASNIX_CELL_CHASE_LIMIT 1000000
-
+/* M92/M162: ASNIX_CELL_CHASE_LIMIT now lives in heap.h -- shared with the
+ * hand-inlined copies of this exact loop in op_var_ref.S/force.S so all
+ * three stay in lock-step (see heap.h's own comment for the full
+ * rationale). This out-of-line version remains the reference
+ * implementation and is still called directly from op_select.S/
+ * op_select_or.S/op_with.S, none of which were hot enough on d.nix to be
+ * worth hand-inlining too. */
 Value asnix_resolve_cell_chain(Value v) {
     int64_t i = 0;
     while (asnix_value_is_cell(v)) {

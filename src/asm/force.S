@@ -224,19 +224,35 @@ asnix_force_epilogue:
     cmpq $ASNIX_CELL_MARKER, %rcx
     jne .Lforce_check_lazyapp            // PTR but not a Cell -- maybe a LazyApp instead
 
-    // It's a Cell -- see op_var_ref.S's matching comment on
-    // asnix_resolve_cell_chain (value_util.c). asnix_force_for_print is
-    // a plain C-callable function (not a dispatch-loop op handler), so
-    // its entry rsp parity is the ordinary post-`call` one (8 mod 16)
-    // rather than the dispatch loop's always-16-aligned invariant --
-    // .Lforce_check_cell is always reached on that same fast,
-    // nothing-pushed-yet path (.Lforce_top's own entry, or
-    // asnix_force_epilogue's "already fully unwound" tail-loop), so a
-    // single 8-byte pad is enough to make this call ABI-compliant.
-    movq %rax, %rdi                      // arg1 = the Cell value
-    subq $8, %rsp
-    call asnix_resolve_cell_chain
-    addq $8, %rsp
+    // It's a Cell -- M162: inline Cell-chain walk, same hand-rolled loop
+    // as op_var_ref.S's matching .Lvar_ref_cell_loop (see that file's
+    // comment for the full rationale/measurement). %rdx already holds
+    // the masked base pointer of a CONFIRMED Cell (the check just
+    // above); none of %r12/%r13/%r14/%rbx/%rbp/%r15 have been
+    // pushed/repurposed yet at this point in the function (that only
+    // happens once a Thunk is confirmed, further down in .Lforce_top),
+    // so %r8/%r9 are free scratch here exactly like %rdx/%rcx already
+    // are. This also drops the old call's `subq/addq $8,%rsp` alignment
+    // pad entirely, since there's no `call` left to align for.
+    movq $ASNIX_CELL_CHASE_LIMIT, %r8
+.Lforce_cell_loop:
+    movq ASNIX_CELL_OFF_TARGET(%rdx), %r9 // r9 = target pointer (Value* into an Env's values[])
+    movq (%r9), %rax                      // rax = *target -- the actual next raw Value
+    movq %rax, %rcx
+    andq $ASNIX_TAG_MASK, %rcx
+    cmpq $ASNIX_TAG_PTR, %rcx
+    jne .Lforce_cell_done                // not even a PTR -- can't be a Cell, done chasing
+    movq %rax, %rdx
+    andq $-8, %rdx
+    shlq $16, %rdx
+    shrq $16, %rdx                       // rdx = masked base pointer of the new value
+    movq ASNIX_CELL_OFF_MARKER(%rdx), %rcx
+    cmpq $ASNIX_CELL_MARKER, %rcx
+    jne .Lforce_cell_done                // PTR but not a Cell -- done, re-dispatch on %rax
+    decq %r8
+    jnz .Lforce_cell_loop
+    jmp .Lforce_blackhole                // chase limit exceeded -- a genuine alias cycle
+.Lforce_cell_done:
     movq %rax, %rdi
     jmp .Lforce_top
 

@@ -124,18 +124,48 @@ asnix_op_var_ref:                       // a = depth, b = slot
     cmpq $ASNIX_CELL_MARKER, %r9
     jne .Lvar_ref_check_lazyapp          // PTR but not a Cell -- maybe a LazyApp instead
 
-    // It's a Cell -- asnix_resolve_cell_chain (value_util.c) unwraps
-    // however many are chained together (bounded -- see its own
-    // comment for why that bound matters) and hands back the first
-    // non-Cell Value, which may still be an unforced Thunk; re-enter
-    // the resolve loop above to handle that.
-    pushq %rsi                           // save IP
-    pushq %rdi                           // save ENV (2 pushes, stays 16-byte aligned)
-    movq %rax, %rdi                      // arg1 = the Cell value
-    call asnix_resolve_cell_chain
-    popq %rdi                            // restore ENV
-    popq %rsi                            // restore IP
-    jmp .Lvar_ref_resolve
+    // It's a Cell -- M162: inline Cell-chain walk, hand-rolled directly
+    // from asnix_resolve_cell_chain/asnix_value_is_cell/asnix_cell_target
+    // (value_util.c) instead of `call`ing out to them. Those three tiny
+    // functions were never inlined into each other by GCC (confirmed via
+    // objdump -- asnix_resolve_cell_chain's loop body was `call
+    // asnix_cell_target` then, on the next iteration test, `call
+    // asnix_value_is_cell`, which ITSELF did `call asnix_tag_of`), so
+    // every chase of a bare-variable alias paid 1-3 nested out-of-line
+    // calls for what's really just "mask the tag bits, load, compare,
+    // branch" -- 834,237 Cells created on this project's own d.nix
+    // workload, each read at least once. %r8 already holds the masked
+    // base pointer of a CONFIRMED Cell (the check just above), so the
+    // first dereference below needs no re-verification; the loop only
+    // re-checks "is the new value ALSO a Cell" for the (rare) chained-
+    // alias case (`let y = x; z = y;`). Unwraps to the first non-Cell
+    // Value, which may still be an unforced Thunk/LazyApp/ThunkMap; falls
+    // back into .Lvar_ref_resolve to handle that, exactly like the old
+    // call-based version did.
+    //
+    // %rdx is free here (last written by .Lvar_ref_done's slot
+    // computation, dead ever since) -- used as the chase-limit counter,
+    // matching ASNIX_CELL_CHASE_LIMIT (heap.h) so a genuine alias cycle
+    // (`let x = y; y = x; in x` -- a real user-writable program, not a
+    // hypothetical) still aborts loudly instead of hanging forever.
+    movq $ASNIX_CELL_CHASE_LIMIT, %rdx
+.Lvar_ref_cell_loop:
+    movq ASNIX_CELL_OFF_TARGET(%r8), %r10 // r10 = target pointer (Value* into an Env's values[])
+    movq (%r10), %rax                     // rax = *target -- the actual next raw Value
+    movq %rax, %rcx
+    andq $ASNIX_TAG_MASK, %rcx
+    cmpq $ASNIX_TAG_PTR, %rcx
+    jne .Lvar_ref_resolve                 // not even a PTR -- can't be a Cell, done chasing
+    movq %rax, %r8
+    andq $-8, %r8
+    shlq $16, %r8
+    shrq $16, %r8                         // r8 = masked base pointer of the new value
+    movq ASNIX_CELL_OFF_MARKER(%r8), %r9
+    cmpq $ASNIX_CELL_MARKER, %r9
+    jne .Lvar_ref_resolve                 // PTR but not a Cell -- done, re-dispatch on %rax
+    decq %rdx
+    jnz .Lvar_ref_cell_loop
+    jmp .Lvar_ref_blackhole               // chase limit exceeded -- a genuine alias cycle
 
     // M113: not a Cell either -- maybe a LazyApp (heap.h's
     // ASNIX_LAZYAPP_MARKER comment). %r9 already holds the marker value
