@@ -21063,3 +21063,48 @@ Files: `src/c/builtins_regex.c` (`RegexCacheEntry` gained `span_trusted`/
 trust fast path; `regex_engine.c`/`.h` untouched). New:
 `tests/c/test_regex_span_authoritative.c`; four `tests/e2e/m183_match_
 span_*.nix`/`.expected` fixture pairs.
+
+## M185: `asnix_bshared_make_attrs`'s above-threshold path called `qsort` -- M161 left this branch unmeasured; replaced with a specialized merge sort
+
+A fresh, broad profiling pass (deliberately avoiding `lexer_next` and
+the regex engine, both being worked by other agents concurrently)
+found `asnix_bshared_make_attrs`'s above-`ASNIX_MAKE_ATTRS_SORT_
+INSERTION_MAX`-threshold path real: `qsort`+`cmp_make_attrs_entry` --
+M161 explicitly left this branch unmeasured/unchanged when it added the
+below-threshold insertion-sort fast path. On the real `d.nix`/ffmpeg
+eval: 3,662 calls (7% of all `asnix_bshared_make_attrs` calls), 171,246
+total entries sorted (avg ~47/call, max 5,234), `msort_with_tmp`/
+`qsort_r` self-time ~0.8% of the whole eval's instructions.
+
+**Fix.** Replaced `malloc`+`qsort`+`free` with a hand-written,
+specialized bottom-up (iterative) merge sort over `.sym` alone, using
+two `asnix_arena_alloc` scratch buffers (never individually freed --
+the same "leak it into the never-free bump arena" tradeoff M171 already
+made for `IrBuilder`'s `ops`/`pool` arrays; ~47 entries x 16 bytes x 2
+buffers x 3,662 calls ≈ 5.5 MB total over the whole eval, trivial
+against baseline RSS). Same O(n log n) algorithm `qsort_r` already ran
+internally -- the win isn't algorithmic, it's removing what a
+type-erased C library sort can't avoid: an indirect call to
+`cmp_make_attrs_entry` for every comparison, and generic byte-range
+element moves instead of a direct 16-byte struct copy. `iets`'s
+equivalent (`sort_by_key`/`Vec::sort`) pays neither cost -- Rust
+monomorphizes and inlines the key-extraction closure directly into the
+sort. Naturally stable by construction (ties resolve to the left run,
+i.e. earlier original index), reproducing the old `cmp_make_attrs_
+entry`'s explicit `(sym, idx)` tie-break exactly without ever comparing
+`.idx`.
+
+**Correctness.** Full ladder green: `make test`, `make test-e2e`
+(296/296), `make test-conformance`, `make test-nix-conformance`
+(`pass=655 fail=3 skip=148`, same 3 known pre-existing failures), `make
+test-nixpkgs-hash` (`pass=148 fail=0`), `./asnix d.nix` output hash
+unchanged.
+
+**Measured** (`perf stat -e cpu_core/instructions/`, `taskset -c 0`, 12
+interleaved trials against a from-scratch M182 baseline): **-0.197%
+instructions, 12/12 wins, non-overlapping ranges.**
+
+Files: `src/c/builtins_shared.c` (`cmp_make_attrs_entry` removed;
+`merge_sort_make_attrs_entries` added; `asnix_bshared_make_attrs`'s
+above-threshold path uses it with two arena-allocated scratch buffers
+instead of `malloc`+`qsort`+`free`).

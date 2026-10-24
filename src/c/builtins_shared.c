@@ -466,33 +466,55 @@ typedef struct {
     int64_t idx;
 } MakeAttrsEntry;
 
-/* Tie-break by original index, not just `sym` -- matches the insertion
- * sort this replaced (which stopped swapping once `syms[j-1] <=
- * syms[j]`, so equal-sym runs kept their original relative order). Some
- * callers rely on `asnix_bshared_make_attrs` NOT deduping duplicate
- * syms at all (e.g. a caller that already dedupes before calling this
- * passes a genuinely unique set, but nothing here enforces that), so
- * preserving the old stable-sort behavior exactly, rather than letting
- * qsort's unspecified tie order change which of two equal-sym entries
- * ends up first, avoids silently changing behavior for any caller that
- * does pass duplicates. */
-static int cmp_make_attrs_entry(const void *a, const void *b) {
-    const MakeAttrsEntry *ea = a, *eb = b;
-    if (ea->sym != eb->sym) return ea->sym < eb->sym ? -1 : 1;
-    if (ea->idx != eb->idx) return ea->idx < eb->idx ? -1 : 1;
-    return 0;
-}
-
-/* Threshold below which plain insertion sort beats qsort's per-comparison
- * indirect-call overhead, plus the malloc/free pair qsort's working array
- * needs -- the exact same tradeoff, and the same constant, as compiler.c's
- * AST_ATTRSET case uses for its own compile-time sort (see that case's
+/* Threshold below which plain insertion sort beats a merge sort's loop/
+ * merge overhead, plus any scratch allocation at all -- the exact same
+ * tradeoff, and the same constant, as compiler.c's AST_ATTRSET case uses
+ * for its own compile-time sort (see that case's
  * ASNIX_ATTRSET_SORT_INSERTION_MAX / ASNIX_COMPILE_SCRATCH_MAX comments;
  * not shared via a header since the two sorts operate on unrelated data
  * and this file has no other reason to depend on compiler.c). M158:
  * instrumentation on a full nixpkgs eval (`./asnix d.nix`) showed 93% of
  * all asnix_bshared_make_attrs calls have count <= 32. */
 #define ASNIX_MAKE_ATTRS_SORT_INSERTION_MAX 32
+
+/* perf: bottom-up (iterative) merge sort over `.sym` alone, specialized
+ * for `MakeAttrsEntry` -- replaces a `qsort`+indirect-comparator call for
+ * the above-threshold path. Same O(n log n) algorithm `qsort_r` already
+ * ran internally (glibc's own `msort_with_tmp`); the win here is not
+ * algorithmic, it's removing the two things a type-erased C library sort
+ * cannot avoid: an indirect call to `cmp_make_attrs_entry` for every
+ * single comparison, and generic byte-range (`memmove`-style) element
+ * moves instead of a direct 16-byte struct copy. `iets`'s equivalent
+ * (`sort_by_key`/`Vec::sort`, src/runtime/value.rs) pays neither cost --
+ * Rust monomorphizes and inlines the key-extraction closure directly into
+ * the sort, with no indirection -- so this closes exactly that gap, not a
+ * new algorithmic idea. Naturally stable (ties always resolved in favor
+ * of the left run, i.e. the earlier original index) by construction, so
+ * it reproduces the old `cmp_make_attrs_entry`'s explicit `(sym, idx)`
+ * tie-break exactly without ever comparing `.idx` at all -- a duplicate
+ * sym's earlier occurrence always stays first, same as insertion sort's
+ * `>` (never swaps equal syms) and the same as `iets`'s own `sort_by_key`
+ * (also stable). `tmp` must be a second buffer of the same size as `a`;
+ * returns whichever of `a`/`tmp` ends up holding the fully-sorted result
+ * (alternates each pass, so for odd counts of passes it is `tmp`). */
+static MakeAttrsEntry *merge_sort_make_attrs_entries(MakeAttrsEntry *a, MakeAttrsEntry *tmp, int64_t n) {
+    MakeAttrsEntry *src = a, *dst = tmp;
+    for (int64_t width = 1; width < n; width *= 2) {
+        for (int64_t i = 0; i < n; i += 2 * width) {
+            int64_t mid = i + width < n ? i + width : n;
+            int64_t end = i + 2 * width < n ? i + 2 * width : n;
+            int64_t l = i, r = mid, k = i;
+            while (l < mid && r < end) {
+                if (src[l].sym <= src[r].sym) dst[k++] = src[l++];
+                else dst[k++] = src[r++];
+            }
+            while (l < mid) dst[k++] = src[l++];
+            while (r < end) dst[k++] = src[r++];
+        }
+        MakeAttrsEntry *t = src; src = dst; dst = t;
+    }
+    return src;
+}
 
 /* M89 perf: was an insertion sort (O(n^2) worst case) -- measured on a
  * full nixpkgs evaluation (`./asnix d.nix`, ffmpeg.outPath): 52,539
@@ -510,8 +532,19 @@ static int cmp_make_attrs_entry(const void *a, const void *b) {
  * `>` comparison below never swaps equal syms), so it preserves the
  * same "ties keep original relative order" behavior the old insertion
  * sort and cmp_make_attrs_entry's explicit idx tie-break both gave,
- * without needing to track idx as a separate field at all. qsort (with
- * its own malloc) is kept, unchanged, for count above the threshold. */
+ * without needing to track idx as a separate field at all.
+ *
+ * perf (this milestone): a fresh profile found the ABOVE-threshold path
+ * still real: 3,662 calls on the real d.nix/ffmpeg eval (7% of all
+ * calls, M161 left this branch unchanged), 171,246 total entries sorted
+ * (avg ~47/call, max 5,234), `msort_with_tmp`/`qsort_r` self-time ~0.8%
+ * of the whole eval's instructions. Replaced `malloc`+`qsort`+`free`
+ * with two `asnix_arena_alloc` scratch buffers (never individually
+ * freed -- same "leak it into the never-free bump arena, it's cheap and
+ * short-lived" tradeoff M171 already made for IrBuilder's `ops`/`pool`
+ * arrays; ~47 entries * 16 bytes * 2 buffers * 3,662 calls ~= 5.5 MB
+ * total over the whole eval, trivial against this process's baseline
+ * RSS) plus the hand-written `merge_sort_make_attrs_entries` above. */
 Value asnix_bshared_make_attrs(uint32_t *syms, Value *vals, int64_t count) {
     void *mem = asnix_arena_alloc(8 + (uint64_t)count * ASNIX_ATTR_SIZE);
     asnix_stats_attrs++;
@@ -539,19 +572,19 @@ Value asnix_bshared_make_attrs(uint32_t *syms, Value *vals, int64_t count) {
             *(Value *)(entry + ASNIX_ATTR_OFF_VALUE) = vals[src];
         }
     } else {
-        MakeAttrsEntry *entries = malloc((size_t)count * sizeof(MakeAttrsEntry));
+        MakeAttrsEntry *entries = asnix_arena_alloc((uint64_t)count * sizeof(MakeAttrsEntry));
+        MakeAttrsEntry *scratch = asnix_arena_alloc((uint64_t)count * sizeof(MakeAttrsEntry));
         for (int64_t i = 0; i < count; i++) {
             entries[i].sym = syms[i];
             entries[i].idx = i;
         }
-        qsort(entries, (size_t)count, sizeof(MakeAttrsEntry), cmp_make_attrs_entry);
+        MakeAttrsEntry *sorted = merge_sort_make_attrs_entries(entries, scratch, count);
         for (int64_t i = 0; i < count; i++) {
             char *entry = (char *)mem + ASNIX_ATTRS_OFF_ENTRIES + i * ASNIX_ATTR_SIZE;
-            int64_t src = entries[i].idx;
-            *(uint32_t *)(entry + ASNIX_ATTR_OFF_SYM) = entries[i].sym;
+            int64_t src = sorted[i].idx;
+            *(uint32_t *)(entry + ASNIX_ATTR_OFF_SYM) = sorted[i].sym;
             *(Value *)(entry + ASNIX_ATTR_OFF_VALUE) = vals[src];
         }
-        free(entries);
     }
     return (Value){ .raw = (uint64_t)(uintptr_t)mem | ASNIX_TAG_ATTRS };
 }
