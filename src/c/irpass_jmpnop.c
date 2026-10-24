@@ -47,7 +47,8 @@
  * alone rather than risking a hard abort. */
 static int op_is_jump(int id) {
     return id == OP_IF || id == OP_JMP || id == OP_WITH_TRY || id == OP_SELECT_OR ||
-           id == OP_SELECT_DYNAMIC_OR;
+           id == OP_SELECT_DYNAMIC_OR || id == OP_EQ_IF || id == OP_NEQ_IF || id == OP_LT_IF ||
+           id == OP_GE_IF || id == OP_HAS_ATTR_IF; /* M162 */
 }
 
 static int is_targeted_by_another_jump(IrOp *ops, size_t len, size_t idx) {

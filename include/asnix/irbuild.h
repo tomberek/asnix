@@ -173,6 +173,22 @@ size_t ib_check_formals(IrBuilder *b, int64_t required_count, const uint32_t *re
  * and the fixed symbol id `sym` (operand `b`) -- see OP_SELECT_OR in ir.h. */
 size_t ib_select_or(IrBuilder *b, uint32_t sym);
 
+/* M162: branch-fused comparison/`?`-membership ops -- see their OP_*_IF
+ * comments in ir.h for the full rationale. Each emits with a placeholder
+ * delta (operand `a`, patched via ib_patch_delta, same convention as
+ * ib_if/ib_jmp), taken when the comparison/test is FALSE; a TRUE result
+ * falls through to the very next op. Only compiler.c's AST_IF case emits
+ * these (when the condition is literally a bare comparison/`?` test) --
+ * never general-purpose replacements for ib_eq/ib_neq/ib_lt/ib_ge/
+ * ib_has_attr, which remain unchanged for every other use (e.g. `&&`/
+ * `||`'s own operands, or a comparison used as an ordinary non-`if`-
+ * condition value). */
+size_t ib_eq_if(IrBuilder *b);
+size_t ib_neq_if(IrBuilder *b);
+size_t ib_lt_if(IrBuilder *b);
+size_t ib_ge_if(IrBuilder *b);
+size_t ib_has_attr_if(IrBuilder *b, uint32_t sym);
+
 /* Finalizes the builder: runs ir_link() over the accumulated ops in place
  * and returns an IrProgram ready for asnix_eval(). */
 IrProgram *ib_finish(IrBuilder *b);

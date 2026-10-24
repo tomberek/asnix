@@ -156,7 +156,8 @@ int asnix_irpass_firing_belongs_to_program(size_t i, const void *prog) {
  * self-relative index delta. */
 static int op_is_jump(int op_id) {
     return op_id == OP_IF || op_id == OP_JMP || op_id == OP_WITH_TRY || op_id == OP_SELECT_OR ||
-           op_id == OP_SELECT_DYNAMIC_OR;
+           op_id == OP_SELECT_DYNAMIC_OR || op_id == OP_EQ_IF || op_id == OP_NEQ_IF || op_id == OP_LT_IF ||
+           op_id == OP_GE_IF || op_id == OP_HAS_ATTR_IF; /* M162 */
 }
 
 void asnix_irpass_remove(IrOp *ops, size_t *len, size_t start, size_t count) {

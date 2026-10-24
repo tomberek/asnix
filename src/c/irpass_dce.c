@@ -87,7 +87,8 @@
 
 static int dce_op_is_jump(int op_id) {
     return op_id == OP_IF || op_id == OP_JMP || op_id == OP_WITH_TRY || op_id == OP_SELECT_OR ||
-           op_id == OP_SELECT_DYNAMIC_OR;
+           op_id == OP_SELECT_DYNAMIC_OR || op_id == OP_EQ_IF || op_id == OP_NEQ_IF || op_id == OP_LT_IF ||
+           op_id == OP_GE_IF || op_id == OP_HAS_ATTR_IF; /* M162 */
 }
 
 /* BFS/worklist over ops[0..n) starting at index 0, marking `reachable`

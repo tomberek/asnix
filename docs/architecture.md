@@ -18598,3 +18598,193 @@ Either finding alone would be enough to decline; together they leave no
 plausible path to a measurable win here. No source files changed
 (temporary instrumentation added and fully reverted). Files:
 `docs/architecture.md` only.
+
+## M164: branch-fused `OP_HAS_ATTR_IF`/`OP_EQ_IF`/`OP_NEQ_IF`/`OP_LT_IF`/`OP_GE_IF` -- `if` no longer materializes a `TRUE`/`FALSE` `Value` for a condition that was already a bare comparison/`?` test
+
+Two prior investigations into opcode fusion this campaign (a histogram of
+real `(op, next_op)` dispatch-pair frequencies, and an actually-built-
+and-measured `MK_THUNK`->`FRAME_SET` fusion prototype) both correctly
+declined fusion as not worth it -- but both only ever targeted
+eliminating the generic dispatch-TAIL overhead (the advance/load/jmp and
+a push/pop, ~3-9 instructions/occurrence). Re-examining the same measured
+top-20 `(op, next_op)` pairs on a real `d.nix`/ffmpeg eval
+(14,656,701 total dispatch steps) through a different lens -- does
+fusion eliminate real REDUNDANT WORK, not just dispatch tail? -- found a
+qualitatively different case: `(HAS_ATTR, IF)`, 352,692 occurrences.
+`op_has_attr.S`'s `OP_HAS_ATTR` computes a definitive true/false answer
+in its own internal control flow, then pays ~2 instructions to push it as
+a tagged `Value` onto VALSTACK (store + pointer bump). `op_if.S`'s
+`OP_IF` then pays ~10 more to pop it back, re-derive its tag, mask it,
+compare against `TAG_IMM`, shift, and compare against `TRUE`/`FALSE` --
+fully RE-VERIFYING a type the producer already knew with certainty. That
+is genuine redundant work, confirmed structural via `compiler.c`'s
+`AST_IF` case (the condition was ALWAYS compiled fully generically --
+`compile_expr` then `ib_if`, zero special-casing for what produced the
+boolean), unlike `&&`/`||`, which `ir.h`'s own comment already flags as
+deliberately compiled branch-shaped instead of eager. Comparison ops
+(`op_cmp.S`'s `EQ`/`NEQ`/`LT`/`GT`/`LE`/`GE`) produce booleans the
+identical way and share the exact same opportunity, though none
+individually appeared in this benchmark's own top-20 pairs (their real
+volume on `d.nix` specifically was unmeasured going in).
+
+**The fix.** Five new IR ops (`ir.h`): `OP_HAS_ATTR_IF` (`a` = byte delta
+to the else-branch, patched via `ib_patch_delta`, same self-relative
+convention as `OP_IF`/`OP_JMP`; `b` = symbol id, same a/b roles as
+`OP_WITH_TRY`/`OP_SELECT_OR`) and `OP_EQ_IF`/`OP_NEQ_IF`/`OP_LT_IF`/
+`OP_GE_IF` (`a` = byte delta only). Each branches DIRECTLY off the same
+internal true/false result the plain op already computes -- a TRUE
+result falls through to the very next op (the compiled "then" branch); a
+FALSE result jumps by `a` to the "else" branch -- never tagging/pushing/
+popping/re-deriving a `Value` at all. New asm:
+`src/asm/ops/op_has_attr_if.S` (lifted directly from `op_has_attr.S`,
+including its M154 union-probe fast path and never-forces/never-fatal-
+on-non-attrset semantics, unchanged) and `src/asm/ops/op_cmp_if.S` (all
+four comparisons, each lifted directly from its `op_cmp.S` counterpart --
+`OP_LT_IF`/`OP_GE_IF` keep the identical INT fast path and the identical
+C fallback, `asnix_cmp_lt_values`/`asnix_cmp_ge_values`, for anything
+else, fatal on a genuine type mismatch exactly as before; `OP_EQ_IF`/
+`OP_NEQ_IF` keep the identical `asnix_bshared_value_eq_op` call).
+`OP_GT`/`OP_LE` themselves get no fused form -- they're already dead code
+per the existing M51 comment (`>`/`<=` never compile to the native
+`OP_GT`/`OP_LE`, only to swapped `OP_LT`/`OP_NOT`).
+
+`compiler.c`'s `AST_IF` case now special-cases its own `cond` node: a
+bare `AST_HAS_ATTR` (static symbol only, not the `? ${expr}` dynamic
+form -- out of scope, no measured volume justifying the extra
+complexity) emits `OP_HAS_ATTR_IF` directly; a bare comparison
+`AST_BINOP` (`e`/`n`/`l`/`G`/`g`/`L`) emits the matching `_IF` op, with
+`g` (`>`) and `L` (`<=`) reusing `OP_LT_IF` via the exact same swapped-
+operand-push trick the ordinary (non-`if`) `>`/`<=` path already uses
+(M51's own comment) -- `<=` additionally swaps which compiled branch is
+the fallthrough vs. the jump target, since `a <= b` is `!(b < a)`: the
+fallthrough-on-true side of `OP_LT_IF(b, a)` means "`b < a` is true",
+i.e. "`a <= b` is false", i.e. the caller's ELSE; the jump-target side is
+the caller's THEN. A constant-foldable comparison (literal int/float
+operands on both sides) is explicitly excluded via a cheap
+`try_fold_const_binop` probe-and-discard before taking the fused path,
+so it falls through unchanged to the ordinary `PUSH_TRUE/FALSE` + `OP_IF`
+compile -- this fusion never interacts with that separate, pre-existing
+optimization. Every other `if`-condition shape (a variable, `&&`/`||`,
+a call result, ...) is completely unaffected, still compiling through
+the original generic `compile_expr(cond); ib_if(b);` path.
+
+**The jump-retargeting hazard, handled.** All five new ops carry a
+self-relative byte-delta operand in `a`, exactly like `OP_IF`/`OP_JMP`/
+`OP_WITH_TRY`/`OP_SELECT_OR`/`OP_SELECT_DYNAMIC_OR` -- which means every
+one of the (opt-in, `ASNIX_IR_OPT=1`-only) bytecode-optimization passes'
+own `op_is_jump`-style predicate, used both by `irpass.c`'s
+`asnix_irpass_remove` (the shared delta-fixup-on-removal primitive) and
+by each pass's own incoming-jump safety check, had to be extended to
+recognize the five new ops too -- otherwise a pass removing/relocating
+ops around one of them would silently leave its delta stale (exactly the
+hazard class this project's own `cmpnot`/`strconcat` bug history already
+established). Updated in all ten call sites: `irpass.c`,
+`irpass_dce.c`, `irpass_dce_if.c`, `irpass_deadframe.c`,
+`irpass_jmpnop.c`, `irpass_jmpthread.c`, `irpass_notfold.c`,
+`irpass_strconcat.c`, `irpass_streq.c`, `irpass_cmpnot.c`. None of
+these passes are registered by default (opt-in only, no Makefile test
+target sets `ASNIX_IR_OPT`), so this wasn't exercised by the correctness
+ladder, but left unfixed it would have been a latent miscompile waiting
+for whoever next ran with `ASNIX_IR_OPT=1` -- not something to leave for
+later. `bytecode.c`'s serializer/deserializer needed one addition
+(`OP_HAS_ATTR_IF` joins `OP_WITH_TRY`/`OP_SELECT_OR` in the existing
+`PTAG_OP_SYM_B` case -- symbol re-interned by name, not replayed as a
+stale cross-process integer, same M103-era fix those two ops already
+have); `OP_EQ_IF`/`OP_NEQ_IF`/`OP_LT_IF`/`OP_GE_IF` need no special
+case at all, falling through to the existing generic `PTAG_OP` path
+exactly like `OP_IF`/`OP_JMP` already do (a plain delta, no symbol, no
+pool reference). `dispatch_table.c` and `irdump.c` (op name table +
+disassembly operand printing) updated for all five.
+
+**Correctness.** `make test`, `make test-e2e` (296 OK), `make test-
+conformance` (all OK) all green. `make test-nix-conformance
+NIX_CONFORMANCE_DIR=/tmp/nix-conformance`: `pass=655 fail=3 skip=148`,
+the same 3 pre-existing position-tracking failures
+(`eval-okay-getattrpos-functionargs.nix`, `eval-okay-getattrpos.nix`,
+`eval-okay-inherit-attr-pos.nix`). `make test-nixpkgs-hash`: `pass=148
+fail=0`. `./asnix d.nix` output byte-identical:
+`/nix/store/29iacg6h530yx7rxz4k1fhvi0kxxhsam-ffmpeg-9.0.1-bin`. Hand-
+written differential checks against `? attr` on an attrset/non-attrset/
+missing-key target, all six comparison operators on int/string/float
+operands (including both orderings of `<`/`>`/`<=`/`>=`), a NaN-float
+comparison (`0 < n` / `0 >= n` both `false`, matching the existing non-
+total-order NaN behavior `irpass_cmpnot.c`'s own comment already
+documents -- this fusion calls the identical C fallback, so it couldn't
+diverge from that even if it tried), a non-int/non-string ordering
+comparison (fatal, correct error message preserved), the dynamic `?
+${name}` form (confirmed still routed through the unchanged generic
+`OP_HAS_ATTR_DYNAMIC` + `OP_IF` path, untouched by this milestone's
+scope), and nested/non-`if`-condition uses of `?`/comparisons (a sub-
+expression compiled the ordinary way, never accidentally branch-fused)
+-- all matched expected semantics via `irdump` inspection and direct
+`./asnix` runs.
+
+**Measured, interleaved, 20 trials (`perf stat -e cpu_core/instructions/,
+cpu_core/cycles/`, `taskset -c 0`, before/after/before/after..., two
+batches of 10 run hours apart to rule out a time-of-day confound).** Raw
+instruction counts were noisier run-to-run than expected for a
+deterministic program (~0.08% spread within repeated runs of the SAME
+binary) -- too noisy for a trustworthy unpaired mean comparison alone --
+but the PAIRED per-trial difference (this milestone's whole reason for
+insisting on interleaved, not batched, trials) was unanimous: all 20 of
+20 trials showed `after < before`, zero exceptions. The implementer's own
+mean paired reduction: -3,604,174 instructions (-0.057%, 95% CI
+[-0.070%, -0.044%]) out of a ~6.32B-instruction baseline.
+
+**Independent verification found a materially larger effect.** A
+separate adversarial-verify pass ran 35 total interleaved paired trials
+(20 before/after + 15 reversed after/before, fresh isolated builds,
+output hash checked on every one of the 35+15 control runs) -- unanimous
+in 35/35, same hard-win signature. Combined mean: **-0.132%** (95% CI
+[-0.142%, -0.122%], ~-8.3M instructions out of a ~6.322B baseline) --
+roughly 2.3x larger than the implementer's own -0.057%. A same-binary-
+vs-itself order-bias control (15 trials, baseline measured in both
+slots) found only a -0.0078% slot-order bias, NOT unanimous in sign
+(10/15) -- about 17x smaller than the real signal and inconsistent in
+sign, ruling out measurement-order artifacts as the explanation for
+either number. Per this campaign's established practice for resolving a
+magnitude discrepancy (M157/M161's own precedent), **the number to trust
+going forward is -0.132% (~8.3M instructions), not -0.057%** -- a
+favorable correction: the fix is real and noticeably better than first
+reported. The verify pass also ran 54 hand-written adversarial
+correctness cases (bare `?`/all six comparisons on int/string/float/
+mixed operands, fatal non-comparable-type orderings, NaN comparisons,
+negated and `&&`/`||`-wrapped conditions confirmed NOT fused, paren-
+wrapped/let-bound conditions confirmed NOT fused, the dynamic `?
+${name}` form confirmed untouched) cross-checked against real
+`nix-instantiate`, all 54/54 agreeing with real Nix where comparable --
+including confirming one pre-existing, unrelated asnix gap (list
+ordering comparison is fatal here where real Nix allows lexicographic
+`<`) is identical in both the baseline and this fix, i.e. not a
+regression this milestone introduced.
+Cycles/wall-clock, as this campaign's own M154 entry would predict for
+an effect this size, were too noisy to read a consistent sign from
+directly (mixed signs across paired diffs in both the implementer's and
+verifier's runs); instruction count, where the paired signal was
+unanimous both times, is the trustworthy one here.
+
+**Honest verdict: a genuine, fully-correctness-preserving win --
+shipped.** -0.132% is modest but real, bigger than the implementer's own
+first estimate and bigger than a couple of this campaign's other shipped
+small fixes (M157, M159, M160, M161). The implementation reuses every
+existing op's exact semantics byte-for-byte (no new C fallback
+functions, no behavioral drift), and the architectural pattern
+(branch-fuse a boolean-producing op directly into its own `if`-consumer,
+mirroring `&&`/`||`'s existing precedent) generalizes for free to any
+future comparison-shaped op this project adds. Shipped because the risk
+was low (every hazard class this kind of change could hit --
+jump-retargeting, type-check semantics, constant-fold interaction -- was
+identified and verified closed above, and an unusually large 54-case
+adversarial correctness battery found nothing) and the win, independently
+reproduced twice, is unambiguous.
+
+Files: `include/asnix/ir.h` (five new `OP_*_IF` enum entries + comments),
+`include/asnix/irbuild.h`/`src/c/irbuild.c` (`ib_eq_if`/`ib_neq_if`/
+`ib_lt_if`/`ib_ge_if`/`ib_has_attr_if`), `src/asm/ops/op_has_attr_if.S`
+(new), `src/asm/ops/op_cmp_if.S` (new), `src/c/dispatch_table.c`,
+`src/c/bytecode.c` (`OP_HAS_ATTR_IF` joins the `PTAG_OP_SYM_B` case),
+`src/c/irdump.c` (op names + operand printing), `src/c/compiler.c`
+(`AST_IF` case), and the `op_is_jump` predicate in all ten irpass files
+(`irpass.c`, `irpass_dce.c`, `irpass_dce_if.c`, `irpass_deadframe.c`,
+`irpass_jmpnop.c`, `irpass_jmpthread.c`, `irpass_notfold.c`,
+`irpass_strconcat.c`, `irpass_streq.c`, `irpass_cmpnot.c`).

@@ -50,6 +50,7 @@ static const char *op_names[] = {
     "ASSERT_FAIL", "STR_CONCAT", "WITH", "WITH_TRY", "WITH_MISS", "WITH_EXIT", "HAS_ATTR", "CHECK_FORMALS",
     "SELECT_OR", "SELECT_DYNAMIC", "CONCAT", "DIV", "INSERT_DYNAMIC_ATTR", "SELECT_DYNAMIC_OR",
     "RESOLVE_SEARCH_PATH", "HAS_ATTR_DYNAMIC", "REC_OVERRIDES_MERGE", "VAR_REF_RAW", "PATH_CONCAT",
+    "EQ_IF", "NEQ_IF", "LT_IF", "GE_IF", "HAS_ATTR_IF",
 };
 _Static_assert(sizeof(op_names) / sizeof(op_names[0]) == OP_COUNT,
                "irdump.c's op_names[] is out of sync with ir.h's OP_* enum -- update both");
@@ -177,14 +178,19 @@ static void dump_program(IrProgram *prog, int id, SeenVec *seen, Worklist *work)
             }
             case OP_SELECT_OR:
             case OP_SELECT_DYNAMIC_OR:
-            case OP_WITH_TRY: {
+            case OP_WITH_TRY:
+            case OP_HAS_ATTR_IF: {
                 size_t nlen;
                 const char *n = asnix_sym_name((uint32_t)op->b, &nlen);
                 printf("   ; jump_delta=%lld sym=%.*s", (long long)op->a, (int)nlen, n ? n : "?");
                 break;
             }
             case OP_IF:
-            case OP_JMP: {
+            case OP_JMP:
+            case OP_EQ_IF:
+            case OP_NEQ_IF:
+            case OP_LT_IF:
+            case OP_GE_IF: {
                 /* a = byte delta from THIS op's own slot (see
                  * ib_patch_delta) -- convert to an absolute op index for
                  * readability. */

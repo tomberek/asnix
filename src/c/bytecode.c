@@ -359,8 +359,8 @@ enum {
                           * this process coincidentally interned at the stale id
                           * `builtins.attrNames` itself was compiled against. */
     PTAG_OP_SYM_B = 9,  /* same, but the bare symbol id is in `b` -- OP_WITH_TRY,
-                          * OP_SELECT_OR (both also have a real jump-delta in `a`, passed
-                          * through unchanged). */
+                          * OP_SELECT_OR, OP_HAS_ATTR_IF (M162) (all three also have a real
+                          * jump-delta in `a`, passed through unchanged). */
 };
 
 static int write_program(WBuf *b, IrProgram *prog);
@@ -546,7 +546,8 @@ static int write_one_op(WBuf *b, IrOp *op, int64_t *pool) {
             return 0;
         }
         case OP_WITH_TRY:
-        case OP_SELECT_OR: {
+        case OP_SELECT_OR:
+        case OP_HAS_ATTR_IF: {
             /* `b` is the bare symbol id here; `a` is a real jump delta,
              * passed through unchanged. See PTAG_OP_SYM_A's comment. */
             size_t len;

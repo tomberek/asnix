@@ -57,7 +57,8 @@
  * never expected to trigger. */
 static int op_is_jump(int op_id) {
     return op_id == OP_IF || op_id == OP_JMP || op_id == OP_WITH_TRY || op_id == OP_SELECT_OR ||
-           op_id == OP_SELECT_DYNAMIC_OR;
+           op_id == OP_SELECT_DYNAMIC_OR || op_id == OP_EQ_IF || op_id == OP_NEQ_IF || op_id == OP_LT_IF ||
+           op_id == OP_GE_IF || op_id == OP_HAS_ATTR_IF; /* M162 */
 }
 
 static int thread_jumps(IrOp *ops, size_t *len, int64_t **pool, size_t *pool_len, size_t *pool_cap) {

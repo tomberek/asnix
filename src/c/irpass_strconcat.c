@@ -49,7 +49,8 @@
  * per-op comments; same exhaustive list irpass.c's own op_is_jump uses. */
 static int op_is_jump(int op_id) {
     return op_id == OP_IF || op_id == OP_JMP || op_id == OP_WITH_TRY || op_id == OP_SELECT_OR ||
-           op_id == OP_SELECT_DYNAMIC_OR;
+           op_id == OP_SELECT_DYNAMIC_OR || op_id == OP_EQ_IF || op_id == OP_NEQ_IF || op_id == OP_LT_IF ||
+           op_id == OP_GE_IF || op_id == OP_HAS_ATTR_IF; /* M162 */
 }
 
 /* Found on a REAL nixpkgs workload (not caught by the 308-fixture +

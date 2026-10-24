@@ -410,6 +410,58 @@ enum {
                      * already be a Path constant (see resolve_path_chunk), so
                      * asnix_concat_path (value_util.c) can unconditionally canon+wrap the
                      * final result with no runtime type check. */
+    /* M162: branch-fused comparison/`?`-membership ops -- compiler.c's
+     * AST_IF case emits ONE of these instead of {comparison-or-HAS_ATTR
+     * op; OP_IF} whenever the `if`'s condition is LITERALLY a bare
+     * comparison or `?` test (not merely known to be boolean-typed some
+     * other way), eliminating a real, measured chunk of redundant work:
+     * the producer op (OP_EQ/OP_LT/.../OP_HAS_ATTR) already knows its
+     * true/false answer with certainty in its own internal control flow,
+     * but the old two-op shape still paid ~2 instructions to tag and
+     * push a TRUE/FALSE Value onto VALSTACK, immediately followed by
+     * OP_IF paying ~10 more to pop it back, re-derive its tag, mask it,
+     * compare against TAG_IMM, shift, and compare against TRUE/FALSE --
+     * fully re-verifying a type the producer already knew for certain.
+     * These ops fold that round trip into a single direct conditional
+     * branch: `a` is a byte delta to the else-branch (same self-relative
+     * convention as OP_IF/OP_JMP -- patched via ib_patch_delta), taken
+     * when the comparison/test is FALSE; a TRUE result simply falls
+     * through to the very next op (the compiled "then" branch), exactly
+     * mirroring OP_IF's own true/false convention so compiler.c's
+     * AST_IF case can reuse its existing if_site/jmp_site/ib_patch_delta
+     * shape verbatim, just swapping which op goes at if_site. Mirrors
+     * AST_AND/AST_OR's own precedent of compiling branch-shaped instead
+     * of eager (ir.h's OP_EQ comment above) -- generalized here to any
+     * AST_IF whose condition is one of these shapes, not just `&&`/`||`.
+     * Each one's OWN type-error/fallback semantics (see op_cmp.S/
+     * op_has_attr.S) are preserved EXACTLY: OP_HAS_ATTR_IF never forces
+     * or errors on a non-attrset target (a miss just takes the
+     * else-branch, same as plain OP_HAS_ATTR returning FALSE); OP_LT_IF/
+     * OP_GE_IF still fatal on a non-int/non-float operand via the
+     * identical C fallback (asnix_cmp_lt_values/asnix_cmp_ge_values)
+     * plain OP_LT/OP_GE already use, only skipping the TRUE/FALSE-
+     * tagging step on the way back since the branch is taken directly
+     * off the result instead. `>`/`<=`-as-condition reuse OP_LT_IF with
+     * the same swapped-operand-push trick compiler.c's AST_BINOP case
+     * already uses for plain `>`/`<=` (see that case's own M51 comment),
+     * `<=` additionally swapping which compiled branch is the
+     * fallthrough vs. the jump target (since `a <= b` is `!(b < a)`) --
+     * see compiler.c's AST_IF case for the exact mapping. Comparison
+     * fusion deliberately excludes `OP_GT`/`OP_LE` themselves (dead code
+     * already, per compiler.c's own M51 comment: `>`/`<=` never compile
+     * to the native OP_GT/OP_LE at all, only to swapped OP_LT/OP_NOT) --
+     * only OP_EQ/OP_NEQ/OP_LT/OP_GE need a fused `_IF` form. A constant-
+     * foldable comparison (try_fold_const_binop, compiler.c) is NOT
+     * routed through these -- it still compiles via the ordinary
+     * PUSH_TRUE/FALSE + OP_IF path, unchanged, so this fusion never
+     * interacts with that separate optimization. */
+    OP_EQ_IF,       /* a = byte delta to else; pops rhs,lhs (same order as OP_EQ) */
+    OP_NEQ_IF,      /* ditto, negated */
+    OP_LT_IF,       /* a = byte delta to else; pops rhs,lhs (same order/fast-path/slow-path as OP_LT) */
+    OP_GE_IF,       /* ditto, OP_GE's own independent (not not-of-LT) semantics */
+    OP_HAS_ATTR_IF, /* a = byte delta to else (patched via ib_patch_delta); b = symbol id
+                      * (same a/b roles as OP_WITH_TRY/OP_SELECT_OR) -- pops a value, same
+                      * never-forces/never-fatal-on-non-attrset semantics as plain OP_HAS_ATTR */
     OP_COUNT
 };
 

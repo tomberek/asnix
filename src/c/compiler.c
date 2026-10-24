@@ -1067,13 +1067,114 @@ static void compile_expr(IrBuilder *b, Ast *node, ScopeFrame *scope) {
             return;
         }
         case AST_IF: {
-            compile_expr(b, node->as.if1.cond, scope);
+            Ast *cond = node->as.if1.cond;
+            Ast *then_node = node->as.if1.then_;
+            Ast *else_node = node->as.if1.else_;
+
+            /* M162: when the condition is LITERALLY a bare `?` test or a
+             * bare comparison, compile directly against the op's own
+             * internal true/false result (OP_HAS_ATTR_IF/OP_EQ_IF/
+             * OP_NEQ_IF/OP_LT_IF/OP_GE_IF) instead of the generic
+             * {producer op; OP_IF} shape -- see ir.h's comment on those
+             * ops for the full rationale (the generic shape pays to tag/
+             * push a TRUE/FALSE Value just for OP_IF to immediately pop
+             * and re-validate a type the producer already knows for
+             * certain). A constant-foldable comparison is deliberately
+             * excluded (falls through to the generic path below,
+             * unchanged) so this never interacts with try_fold_const_
+             * binop's own separate optimization. */
+            if (cond->kind == AST_HAS_ATTR && !cond->as.has_attr.attr_expr) {
+                compile_expr(b, cond->as.has_attr.target, scope);
+                uint32_t sym = asnix_intern(cond->as.has_attr.attr, cond->as.has_attr.attr_len);
+                size_t if_site = ib_has_attr_if(b, sym);
+                compile_expr(b, then_node, scope);
+                size_t jmp_site = ib_jmp(b);
+                size_t else_idx = ib_len(b);
+                ib_patch_delta(b, if_site, else_idx);
+                compile_expr(b, else_node, scope);
+                size_t end_idx = ib_len(b);
+                ib_patch_delta(b, jmp_site, end_idx);
+                return;
+            }
+            if (cond->kind == AST_BINOP) {
+                char cop = cond->as.binop.op;
+                int is_cmp = (cop == 'e' || cop == 'n' || cop == 'l' || cop == 'G' || cop == 'g' || cop == 'L');
+                int fold_is_bool, fold_is_float;
+                int64_t fold_val;
+                double fold_fval;
+                if (is_cmp && !try_fold_const_binop(cond, &fold_is_bool, &fold_is_float, &fold_val, &fold_fval)) {
+                    size_t if_site;
+                    switch (cop) {
+                        case 'e':
+                        case 'n':
+                        case 'l':
+                        case 'G':
+                            /* Already left-to-right, no operand swap -- same order plain
+                             * ib_eq/ib_neq/ib_lt/ib_ge use for these four op chars. */
+                            compile_expr(b, cond->as.binop.lhs, scope);
+                            compile_expr(b, cond->as.binop.rhs, scope);
+                            if (cop == 'e') if_site = ib_eq_if(b);
+                            else if (cop == 'n') if_site = ib_neq_if(b);
+                            else if (cop == 'l') if_site = ib_lt_if(b);
+                            else if_site = ib_ge_if(b);
+                            compile_expr(b, then_node, scope);
+                            {
+                                size_t jmp_site = ib_jmp(b);
+                                size_t else_idx = ib_len(b);
+                                ib_patch_delta(b, if_site, else_idx);
+                                compile_expr(b, else_node, scope);
+                                size_t end_idx = ib_len(b);
+                                ib_patch_delta(b, jmp_site, end_idx);
+                            }
+                            return;
+                        case 'g':
+                            /* `a > b` == `b < a` -- same swapped-operand-push trick
+                             * compiler.c's AST_BINOP case uses for plain `>` (M51's own
+                             * comment there), reusing OP_LT_IF with ordinary then/else
+                             * mapping (no branch swap needed here). */
+                            compile_expr(b, cond->as.binop.rhs, scope);
+                            compile_expr(b, cond->as.binop.lhs, scope);
+                            if_site = ib_lt_if(b);
+                            compile_expr(b, then_node, scope);
+                            {
+                                size_t jmp_site = ib_jmp(b);
+                                size_t else_idx = ib_len(b);
+                                ib_patch_delta(b, if_site, else_idx);
+                                compile_expr(b, else_node, scope);
+                                size_t end_idx = ib_len(b);
+                                ib_patch_delta(b, jmp_site, end_idx);
+                            }
+                            return;
+                        case 'L':
+                            /* `a <= b` == `!(b < a)` -- same swap as `>` above, PLUS the
+                             * compiled then/else branches themselves are swapped (the
+                             * fallthrough-on-true side of OP_LT_IF(b,a) is "b < a is
+                             * true", i.e. "a <= b is false", i.e. our ELSE; the jump-
+                             * target side is our THEN). */
+                            compile_expr(b, cond->as.binop.rhs, scope);
+                            compile_expr(b, cond->as.binop.lhs, scope);
+                            if_site = ib_lt_if(b);
+                            compile_expr(b, else_node, scope);
+                            {
+                                size_t jmp_site = ib_jmp(b);
+                                size_t then_idx = ib_len(b);
+                                ib_patch_delta(b, if_site, then_idx);
+                                compile_expr(b, then_node, scope);
+                                size_t end_idx = ib_len(b);
+                                ib_patch_delta(b, jmp_site, end_idx);
+                            }
+                            return;
+                    }
+                }
+            }
+
+            compile_expr(b, cond, scope);
             size_t if_site = ib_if(b);
-            compile_expr(b, node->as.if1.then_, scope);
+            compile_expr(b, then_node, scope);
             size_t jmp_site = ib_jmp(b);
             size_t else_idx = ib_len(b);
             ib_patch_delta(b, if_site, else_idx);
-            compile_expr(b, node->as.if1.else_, scope);
+            compile_expr(b, else_node, scope);
             size_t end_idx = ib_len(b);
             ib_patch_delta(b, jmp_site, end_idx);
             return;

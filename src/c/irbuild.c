@@ -275,6 +275,22 @@ size_t ib_select_or(IrBuilder *b, uint32_t sym) {
     return ib_emit(b, OP_SELECT_OR, 0, (int64_t)sym);
 }
 
+size_t ib_eq_if(IrBuilder *b) {
+    return ib_emit(b, OP_EQ_IF, 0, 0);
+}
+size_t ib_neq_if(IrBuilder *b) {
+    return ib_emit(b, OP_NEQ_IF, 0, 0);
+}
+size_t ib_lt_if(IrBuilder *b) {
+    return ib_emit(b, OP_LT_IF, 0, 0);
+}
+size_t ib_ge_if(IrBuilder *b) {
+    return ib_emit(b, OP_GE_IF, 0, 0);
+}
+size_t ib_has_attr_if(IrBuilder *b, uint32_t sym) {
+    return ib_emit(b, OP_HAS_ATTR_IF, 0, (int64_t)sym);
+}
+
 IrProgram *ib_finish(IrBuilder *b) {
     /* M118: opt-in bytecode-to-bytecode pass pipeline (asnix/irpass.h) --
      * a no-op (0 passes registered) in every normal build/run, so this
