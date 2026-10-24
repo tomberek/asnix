@@ -20040,3 +20040,62 @@ real call sites rather than assumed) and no new abstraction (one static
 
 Files: `src/c/aterm.c` (`g_aterm_buf`; `asnix_build_derivation_aterm_
 cached` reset/writeback/copy-out).
+
+## M175: a genuine single-pass N-way union merge, built and measured for real -- confirms M88's binary pairwise-tree design was the right call, with real numbers this time
+
+A cross-reference investigation into iets's own "loser tree" fix (see
+M173-adjacent investigation thread above) had already found, via
+structural reading, that asnix's lazy-union resolve
+(`asnix_bshared_attrs_resolve` / `asnix_attrs_eager_merge`) uses a
+bottom-up **binary pairwise-tree** merge for an n-leaf union (n up to 9
+observed on the real `d.nix`/ffmpeg eval), not a simultaneous N-way scan
+-- a deliberate M88 choice, made after an even worse left-to-right fold
+was found and fixed away from. That investigation correctly found no
+analog to iets's own N-way-scan bug in asnix's code, but left one
+question unanswered by structural reading alone: the binary-tree
+approach re-copies every surviving entry once per tree level (roughly
+`log2(n)` levels), so would a genuine single-pass N-way merge -- writing
+each output entry exactly once instead of `log2(n)` times -- actually
+win in practice, despite needing no analog bug to port in?
+
+**Measured the real data-movement overhead first.** Re-instrumented
+(reverted after measuring) the 3+-leaf slice of real unions on `d.nix`:
+2,576,541 actual entry-copies performed by the current binary-tree
+approach, versus 1,081,714 for an ideal single-pass total -- a real
+2.38x data-movement overhead, confirming the premise was worth testing
+for real rather than dismissing on structural grounds alone.
+
+**Built it anyway, to settle the question with real numbers.** A
+genuine single-pass N-way merge: a linear scan for the minimum key
+among all of a union's (up to 9) leaf cursors, writing each output
+entry exactly once, preserving `//`'s exact right-biased tie-breaking
+semantics. Correctness fully verified: full ladder green (`make
+test`/`test-e2e`/`test-conformance`, `make test-nix-conformance
+NIX_CONFORMANCE_DIR=/tmp/nix-conformance` exact baseline `pass=655
+fail=3 skip=148`, `make test-nixpkgs-hash` `pass=148 fail=0`), plus 5
+hand-written differential cases against real `nix-instantiate --eval`,
+including the trickiest one (a middle layer sets a key that a later
+layer never touches -- the value must survive the merge, not get
+dropped by an off-by-one in the cursor-advance logic) -- all correct.
+
+**Measured: a real, clean regression, not a win.** 15 interleaved
+trials, `taskset -c 0`, `perf stat -e cpu_core/instructions/`: before
+avg 6,142,147,496 instructions, after avg 6,206,485,833 -- **+1.047%**,
+every single trial worse, zero overlap between the before/after bands.
+Root cause: the single-pass approach scans all n cursors TWICE per
+output element (once to find the minimum, once to advance every tied
+cursor) -- for the real n=3-9 distribution on this workload, that
+per-element comparison/branch overhead costs more in aggregate than the
+binary-tree approach's own repeated-but-simpler two-pointer comparisons
+at each tree level. The 2.38x data-movement saving this milestone set
+out to capture is real, but it doesn't pay for the new per-element
+scanning cost it requires to realize that saving.
+
+**Conclusion: declined, and M88's original binary pairwise-tree design
+is now confirmed correct by direct measurement, not just by structural
+absence of a bug to fix.** This closes out the full loser-tree -> k-way-
+merge -> sizing-heuristic -> genuine-N-way-merge investigation thread
+with a concrete, measured answer at every step, rather than stopping at
+"no obvious bug found." Reverted; no source files changed.
+
+Files: `docs/architecture.md` only.
