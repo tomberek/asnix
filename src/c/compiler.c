@@ -947,6 +947,13 @@ static int try_fused_native_call2(IrBuilder *b, Ast *node, ScopeFrame *scope) {
 }
 
 static void compile_expr(IrBuilder *b, Ast *node, ScopeFrame *scope) {
+    /* Debug-only (irbuild.h's ib_enable_line_tracking, off by default): a
+     * plain field write, no branch, cheap enough to leave unconditional
+     * rather than checking a flag on every single node compiled -- see
+     * ib_set_current_src_pos's own comment. `node->src_pos` is 0 for any
+     * node compiler.c itself synthesizes (desugared formals, etc. --
+     * no Parser in scope there), which irdump prints as "line=?". */
+    ib_set_current_src_pos(node->src_pos);
     switch (node->kind) {
         case AST_INT:
             ib_push_int(b, node->as.int_val);

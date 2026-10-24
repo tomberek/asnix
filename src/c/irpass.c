@@ -95,6 +95,17 @@ typedef struct {
 static AsnixIrFiring g_firings[ASNIX_IRPASS_MAX_FIRINGS];
 static size_t g_nfirings = 0;
 
+#ifdef ASNIX_IRDUMP_LINE_TRACKING
+/* irdump's own variant build only -- see irpass.h's own comment on
+ * asnix_irpass_set_line_array. Absent entirely from a real production
+ * build of this file. */
+static uint32_t *g_tracked_lines = NULL;
+
+void asnix_irpass_set_line_array(uint32_t *lines) {
+    g_tracked_lines = lines;
+}
+#endif
+
 void asnix_irpass_reset_stats(void) {
     for (size_t i = 0; i < g_npasses; i++) g_fire_counts[i] = 0;
     g_nfirings = 0;
@@ -181,6 +192,17 @@ void asnix_irpass_remove(IrOp *ops, size_t *len, size_t start, size_t count) {
         }
     }
     memmove(&ops[start], &ops[start + count], (old_len - start - count) * sizeof(IrOp));
+#ifdef ASNIX_IRDUMP_LINE_TRACKING
+    /* `lines[i]` is a plain per-op attribute, not a jump target needing
+     * remapping -- it just needs to move along with whichever op it
+     * describes, so a lockstep memmove over the exact same range is
+     * sufficient, unlike the jump-target fixup loop below. Entirely
+     * absent (not even this check) from a real production build. */
+    if (g_tracked_lines) {
+        memmove(&g_tracked_lines[start], &g_tracked_lines[start + count],
+                (old_len - start - count) * sizeof(uint32_t));
+    }
+#endif
     size_t new_len = old_len - count;
     /* Re-point every jump whose own position or target shifted. Op i's new
      * position maps back to old position (i < start ? i : i + count) --

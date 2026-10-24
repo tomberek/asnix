@@ -25,6 +25,7 @@
 
 #include "asnix/arena.h"
 #include "asnix/ir.h"
+#include "asnix/irbuild.h"
 #include "asnix/irpass.h"
 #include "asnix/value.h"
 #include "compiler.h"
@@ -148,8 +149,34 @@ static void worklist_push(Worklist *w, IrProgram *p) {
  * buffer on a malformed/future op shape. */
 #define IRDUMP_MAX_OPS 200000
 
+/* Set once, at the top of lex_parse_compile_dump, below -- read by
+ * byte_pos_to_line so dump_program (called from the worklist loop, not
+ * handed `src` directly) can map a tracked op back to a source line.
+ * Single global is fine: irdump re-lexes+re-parses+re-compiles once per
+ * CLI invocation, never concurrently, never re-entrantly. */
+static const char *g_dump_src = NULL;
+
+/* 1-based source line containing byte offset `pos` -- a plain linear scan
+ * (irdump is a debug tool, not the hot production path; re-scanning per
+ * op print is simple and fast enough for the file sizes this is meant to
+ * be run on). `pos == 0` is ambiguous with "really is line 1" vs "no
+ * position recorded" (compiler.c-synthesized nodes default src_pos to 0)
+ * -- callers print "line=?" for pos == 0 instead of calling this, see
+ * below. */
+static int byte_pos_to_line(uint32_t pos) {
+    int line = 1;
+    for (uint32_t i = 0; i < pos && g_dump_src[i]; i++) {
+        if (g_dump_src[i] == '\n') line++;
+    }
+    return line;
+}
+
 static void dump_program(IrProgram *prog, int id, SeenVec *seen, Worklist *work) {
     printf("\n=== program #%d (ops=%p pool=%p) ===\n", id, (void *)prog->ops, (void *)prog->pool);
+    /* NULL when line tracking is off, or for a program ib_finish built
+     * before ib_enable_line_tracking() was ever called -- see
+     * irbuild.h's asnix_ib_lookup_program_lines comment. */
+    const uint32_t *prog_lines = asnix_ib_lookup_program_lines(prog);
     for (int64_t i = 0; i < IRDUMP_MAX_OPS; i++) {
         IrOp *op = &prog->ops[i];
         int id_of = op_id_of(op->handler);
@@ -158,7 +185,13 @@ static void dump_program(IrProgram *prog, int id, SeenVec *seen, Worklist *work)
                    op->handler);
             break;
         }
-        printf("  [%4lld] %-20s a=%-8lld b=%-8lld", (long long)i, op_names[id_of], (long long)op->a, (long long)op->b);
+        if (prog_lines && prog_lines[i] != 0) {
+            printf("  [%4lld] (line %-5d) %-20s a=%-8lld b=%-8lld", (long long)i, byte_pos_to_line(prog_lines[i]),
+                   op_names[id_of], (long long)op->a, (long long)op->b);
+        } else {
+            printf("  [%4lld] (line %-5s) %-20s a=%-8lld b=%-8lld", (long long)i, "?", op_names[id_of],
+                   (long long)op->a, (long long)op->b);
+        }
 
         switch (id_of) {
             case OP_PUSH_INT: /* M169: literal lives in the pool now, not inline in `a` */
@@ -280,6 +313,7 @@ static void dump_program(IrProgram *prog, int id, SeenVec *seen, Worklist *work)
  * ib_finish() takes for a real build, same rationale as this file's own
  * top-of-file comment about decoding the real compiled artifact. */
 static void lex_parse_compile_dump(const char *src, const char *path) {
+    g_dump_src = src; /* see byte_pos_to_line's own comment above */
     Ast *ast = asnix_parse(src);
 
     /* base_dir only affects relative-import resolution inside the
@@ -324,6 +358,7 @@ int main(int argc, char **argv) {
         return 1;
     }
     asnix_arena_init(0);
+    ib_enable_line_tracking(); /* always on for this debug tool -- see irbuild.h */
 
     FILE *f = fopen(argv[1], "rb");
     if (!f) {

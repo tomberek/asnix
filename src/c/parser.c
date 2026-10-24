@@ -979,7 +979,7 @@ static void parse_binding_stmt(Parser *p, BTVec *out, DynBindingVec *dyn_out) {
                 .name = hidden_name, .name_len = (size_t)hlen,
                 .is_leaf = 1, .leaf_value = src_expr, .is_inherit = 0, .is_hidden = 1 };
             btvec_push(out, hidden_node);
-            Ast *v = asnix_ast_new(AST_VAR);
+            Ast *v = asnix_ast_new_at(AST_VAR, cur(p).start);
             v->as.var.name = hidden_name;
             v->as.var.name_len = (size_t)hlen;
             hidden_var = v;
@@ -1004,7 +1004,7 @@ static void parse_binding_stmt(Parser *p, BTVec *out, DynBindingVec *dyn_out) {
                  * blackhole (confirmed via numtide/nix-conformance's own
                  * eval-okay-inherit-from.nix, whose `rec {}` block has
                  * exactly this shape). */
-                Ast *sel = asnix_ast_new(AST_SELECT);
+                Ast *sel = asnix_ast_new_at(AST_SELECT, cur(p).start);
                 sel->as.select.target = hidden_var ? hidden_var : src_expr;
                 sel->as.select.attr = name.attr;
                 sel->as.select.attr_len = name.attr_len;
@@ -1012,7 +1012,7 @@ static void parse_binding_stmt(Parser *p, BTVec *out, DynBindingVec *dyn_out) {
                 sel->as.select.default_ = NULL;
                 value = sel;
             } else {
-                Ast *v = asnix_ast_new(AST_VAR);
+                Ast *v = asnix_ast_new_at(AST_VAR, cur(p).start);
                 v->as.var.name = name.attr;
                 v->as.var.name_len = name.attr_len;
                 value = v;
@@ -1106,7 +1106,7 @@ static void parse_binding_stmt(Parser *p, BTVec *out, DynBindingVec *dyn_out) {
  * chunk alone becomes a Path constant and the rest becomes a runtime
  * OP_PATH_CONCAT chain. */
 static Ast *parse_path_literal_interp(Parser *p, Token t) {
-    Ast *n = asnix_ast_new(AST_PATH);
+    Ast *n = asnix_ast_new_at(AST_PATH, cur(p).start);
     n->as.path.text = tok_text(p, t);
     n->as.path.len = tok_len(t);
     n->as.path.is_search = 0;
@@ -1168,7 +1168,7 @@ static Ast *parse_dquote_string(Parser *p) {
     advance(p); /* TOK_STR_END */
     size_t parts_count;
     AstStringPart *parts_items = partvec_commit(parts_mark, &parts_count);
-    Ast *n = asnix_ast_new(AST_STRING);
+    Ast *n = asnix_ast_new_at(AST_STRING, cur(p).start);
     n->as.string.parts = parts_items;
     n->as.string.count = parts_count;
     return n;
@@ -1230,7 +1230,7 @@ static Ast *parse_indented_string(Parser *p) {
     AstStringPart *parts = strip_indentation(raw_items, raw_count, &count);
     free(raw_items);
 
-    Ast *n = asnix_ast_new(AST_STRING);
+    Ast *n = asnix_ast_new_at(AST_STRING, cur(p).start);
     n->as.string.parts = parts;
     n->as.string.count = count;
     return n;
@@ -1241,7 +1241,7 @@ static Ast *parse_atom(Parser *p) {
     switch (t.kind) {
         case TOK_INT: {
             advance(p);
-            Ast *n = asnix_ast_new(AST_INT);
+            Ast *n = asnix_ast_new_at(AST_INT, cur(p).start);
             /* M141: decoded on demand, straight from the raw source span --
              * see lexer.h's own Token comment for why strtoll here is safe
              * unbounded (the lexer's own digit-run scan already found the
@@ -1251,25 +1251,25 @@ static Ast *parse_atom(Parser *p) {
         }
         case TOK_FLOAT: {
             advance(p);
-            Ast *n = asnix_ast_new(AST_FLOAT);
+            Ast *n = asnix_ast_new_at(AST_FLOAT, cur(p).start);
             n->as.float_val = asnix_decode_float_literal(p->src, t.start, t.end);
             return n;
         }
         case TOK_TRUE: {
             advance(p);
-            Ast *n = asnix_ast_new(AST_BOOL);
+            Ast *n = asnix_ast_new_at(AST_BOOL, cur(p).start);
             n->as.bool_val = 1;
             return n;
         }
         case TOK_FALSE: {
             advance(p);
-            Ast *n = asnix_ast_new(AST_BOOL);
+            Ast *n = asnix_ast_new_at(AST_BOOL, cur(p).start);
             n->as.bool_val = 0;
             return n;
         }
         case TOK_NULL: {
             advance(p);
-            return asnix_ast_new(AST_NULL);
+            return asnix_ast_new_at(AST_NULL, cur(p).start);
         }
         case TOK_STR_START:
             return parse_dquote_string(p);
@@ -1289,12 +1289,12 @@ static Ast *parse_atom(Parser *p) {
              * rather than a lexically-rebindable identifier. */
             if (t.kind == TOK_IDENT && tok_len(t) == 8 && memcmp(tok_text(p, t), "__curPos", 8) == 0) {
                 advance(p);
-                Ast *n = asnix_ast_new(AST_CURPOS);
+                Ast *n = asnix_ast_new_at(AST_CURPOS, cur(p).start);
                 curpos_line_col(p->src, p->src + t.start, &n->as.curpos.line, &n->as.curpos.column);
                 return n;
             }
             advance(p);
-            Ast *n = asnix_ast_new(AST_VAR);
+            Ast *n = asnix_ast_new_at(AST_VAR, cur(p).start);
             n->as.var.name = tok_text(p, t);
             n->as.var.name_len = tok_len(t);
             return n;
@@ -1312,7 +1312,7 @@ static Ast *parse_atom(Parser *p) {
             if (cur(p).kind == TOK_DOLLAR_LBRACE) {
                 return parse_path_literal_interp(p, t);
             }
-            Ast *n = asnix_ast_new(AST_PATH);
+            Ast *n = asnix_ast_new_at(AST_PATH, cur(p).start);
             n->as.path.text = tok_text(p, t);
             n->as.path.len = tok_len(t);
             n->as.path.is_search = 0;
@@ -1328,7 +1328,7 @@ static Ast *parse_atom(Parser *p) {
              * ever produces). See lexer.c's try_scan_uri for the
              * grammar/precedence rationale. */
             advance(p);
-            Ast *n = asnix_ast_new(AST_STRING);
+            Ast *n = asnix_ast_new_at(AST_STRING, cur(p).start);
             AstStringPart *parts = malloc(sizeof(AstStringPart));
             parts[0].is_expr = 0;
             parts[0].text = tok_text(p, t);
@@ -1340,7 +1340,7 @@ static Ast *parse_atom(Parser *p) {
         }
         case TOK_SEARCH_PATH: {
             advance(p);
-            Ast *n = asnix_ast_new(AST_PATH);
+            Ast *n = asnix_ast_new_at(AST_PATH, cur(p).start);
             n->as.path.text = tok_text(p, t);
             n->as.path.len = tok_len(t);
             n->as.path.is_search = 1;
@@ -1362,7 +1362,7 @@ static Ast *parse_atom(Parser *p) {
             advance(p); /* ']' */
             size_t elems_count;
             Ast **elems_items = astvec_commit(elems_mark, &elems_count);
-            Ast *n = asnix_ast_new(AST_LIST);
+            Ast *n = asnix_ast_new_at(AST_LIST, cur(p).start);
             n->as.list.elems = elems_items;
             n->as.list.count = elems_count;
             return n;
@@ -1376,7 +1376,7 @@ static Ast *parse_atom(Parser *p) {
             BindingVec bindings = { 0 };
             finalize_bt_vec(&bt, &bindings);
             VEC_TRIM(bindings, AstBinding);
-            Ast *n = asnix_ast_new(AST_ATTRSET);
+            Ast *n = asnix_ast_new_at(AST_ATTRSET, cur(p).start);
             n->as.attrset.bindings = bindings.items;
             n->as.attrset.count = bindings.len;
             n->as.attrset.is_rec = 0;
@@ -1395,7 +1395,7 @@ static Ast *parse_atom(Parser *p) {
             BindingVec bindings = { 0 };
             finalize_bt_vec(&bt, &bindings);
             VEC_TRIM(bindings, AstBinding);
-            Ast *n = asnix_ast_new(AST_ATTRSET);
+            Ast *n = asnix_ast_new_at(AST_ATTRSET, cur(p).start);
             n->as.attrset.bindings = bindings.items;
             n->as.attrset.count = bindings.len;
             n->as.attrset.is_rec = 1;
@@ -1415,7 +1415,7 @@ static Ast *parse_select(Parser *p) {
     int had_select = 0;
     while (cur(p).kind == TOK_DOT) {
         advance(p);
-        Ast *n = asnix_ast_new(AST_SELECT);
+        Ast *n = asnix_ast_new_at(AST_SELECT, cur(p).start);
         n->as.select.target = e;
         n->as.select.default_ = NULL;
         /* Dynamic attribute name, `.${expr}` or an interpolated quoted
@@ -1481,7 +1481,7 @@ static Ast *parse_app(Parser *p) {
     Ast *fn = parse_select(p);
     while (starts_atom(cur(p).kind)) {
         Ast *arg = parse_select(p);
-        Ast *app = asnix_ast_new(AST_APP);
+        Ast *app = asnix_ast_new_at(AST_APP, cur(p).start);
         app->as.app.fn = fn;
         app->as.app.arg = arg;
         fn = app;
@@ -1508,9 +1508,9 @@ static Ast *parse_negate(Parser *p) {
     if (cur(p).kind == TOK_MINUS) {
         advance(p);
         Ast *operand = parse_negate(p); /* right-recurse: allows `--x`, harmless */
-        Ast *zero = asnix_ast_new(AST_INT);
+        Ast *zero = asnix_ast_new_at(AST_INT, cur(p).start);
         zero->as.int_val = 0;
-        Ast *n = asnix_ast_new(AST_BINOP);
+        Ast *n = asnix_ast_new_at(AST_BINOP, cur(p).start);
         n->as.binop.op = '-';
         n->as.binop.lhs = zero;
         n->as.binop.rhs = operand;
@@ -1532,7 +1532,7 @@ static Ast *parse_negate(Parser *p) {
     if (cur(p).kind == TOK_BANG) {
         advance(p);
         Ast *operand = parse_binop(p, PREC_ADD);
-        Ast *n = asnix_ast_new(AST_NOT);
+        Ast *n = asnix_ast_new_at(AST_NOT, cur(p).start);
         n->as.not1.operand = operand;
         return n;
     }
@@ -1566,17 +1566,17 @@ static Ast *parse_has_attr(Parser *p) {
          * intermediate value that exists but isn't an attrset, and a
          * fully-present chain -- all graceful (`false`), none fatal. */
         AttrSeg seg = parse_attr_segment(p, "an attribute name");
-        Ast *n = asnix_ast_new(AST_HAS_ATTR);
+        Ast *n = asnix_ast_new_at(AST_HAS_ATTR, cur(p).start);
         n->as.has_attr.target = e;
         set_has_attr_segment(n, seg);
         Ast *result = n;
         Ast *running_target = e;
         while (cur(p).kind == TOK_DOT) {
             advance(p);
-            Ast *sel = asnix_ast_new(AST_SELECT);
+            Ast *sel = asnix_ast_new_at(AST_SELECT, cur(p).start);
             sel->as.select.target = running_target;
             set_select_segment(sel, seg);   /* the segment just checked above */
-            Ast *empty_attrs = asnix_ast_new(AST_ATTRSET);
+            Ast *empty_attrs = asnix_ast_new_at(AST_ATTRSET, cur(p).start);
             empty_attrs->as.attrset.bindings = NULL;
             empty_attrs->as.attrset.count = 0;
             empty_attrs->as.attrset.is_rec = 0;
@@ -1586,11 +1586,11 @@ static Ast *parse_has_attr(Parser *p) {
             running_target = sel; /* == the previous target's `.attr or {}` */
 
             seg = parse_attr_segment(p, "an attribute name");
-            Ast *next_check = asnix_ast_new(AST_HAS_ATTR);
+            Ast *next_check = asnix_ast_new_at(AST_HAS_ATTR, cur(p).start);
             next_check->as.has_attr.target = running_target;
             set_has_attr_segment(next_check, seg);
 
-            Ast *and_node = asnix_ast_new(AST_AND);
+            Ast *and_node = asnix_ast_new_at(AST_AND, cur(p).start);
             and_node->as.logic.lhs = result;
             and_node->as.logic.rhs = next_check;
             result = and_node;
@@ -1763,7 +1763,7 @@ static Ast *parse_binop_primary(Parser *p) {
     if (cur(p).kind == TOK_BANG) {
         advance(p);
         Ast *operand = parse_binop(p, PREC_ADD);
-        Ast *n = asnix_ast_new(AST_NOT);
+        Ast *n = asnix_ast_new_at(AST_NOT, cur(p).start);
         n->as.not1.operand = operand;
         return n;
     }
@@ -1844,7 +1844,7 @@ static Ast *parse_let_bindings(Parser *p) {
     finalize_bt_vec(&bt, &bindings);
     VEC_TRIM(bindings, AstBinding);
 
-    Ast *n = asnix_ast_new(AST_LET);
+    Ast *n = asnix_ast_new_at(AST_LET, cur(p).start);
     n->as.let1.bindings = bindings.items;
     n->as.let1.count = bindings.len;
     n->as.let1.body = body;
@@ -1947,14 +1947,14 @@ static Ast *parse_expr(Parser *p) {
             BindingVec bindings = { 0 };
             finalize_bt_vec(&bt, &bindings);
             VEC_TRIM(bindings, AstBinding);
-            Ast *attrs = asnix_ast_new(AST_ATTRSET);
+            Ast *attrs = asnix_ast_new_at(AST_ATTRSET, cur(p).start);
             attrs->as.attrset.bindings = bindings.items;
             attrs->as.attrset.count = bindings.len;
             attrs->as.attrset.is_rec = 1;
             merge_bt_dyn_into(&bt, &dyn); /* M67 */
             attrs->as.attrset.dyn_bindings = finalize_dyn_vec(&dyn);
             attrs->as.attrset.dyn_count = dyn.len;
-            Ast *n = asnix_ast_new(AST_SELECT);
+            Ast *n = asnix_ast_new_at(AST_SELECT, cur(p).start);
             n->as.select.target = attrs;
             n->as.select.attr = "body";
             n->as.select.attr_len = 4;
@@ -1969,7 +1969,7 @@ static Ast *parse_expr(Parser *p) {
         Ast *attrs = parse_expr(p);
         expect(p, TOK_SEMI, "';'");
         Ast *body = parse_expr(p); /* recursing here is what lets further let/if/with/lambda follow */
-        Ast *n = asnix_ast_new(AST_WITH);
+        Ast *n = asnix_ast_new_at(AST_WITH, cur(p).start);
         n->as.with1.attrs = attrs;
         n->as.with1.body = body;
         return n;
@@ -1981,7 +1981,7 @@ static Ast *parse_expr(Parser *p) {
         Ast *then_ = parse_expr(p);
         expect(p, TOK_ELSE, "'else'");
         Ast *else_ = parse_expr(p);
-        Ast *n = asnix_ast_new(AST_IF);
+        Ast *n = asnix_ast_new_at(AST_IF, cur(p).start);
         n->as.if1.cond = cond;
         n->as.if1.then_ = then_;
         n->as.if1.else_ = else_;
@@ -1992,7 +1992,7 @@ static Ast *parse_expr(Parser *p) {
         advance(p);
         advance(p); /* ':' */
         Ast *body = parse_expr(p); /* recursing here is what makes `a: b: body` curry */
-        Ast *n = asnix_ast_new(AST_LAMBDA);
+        Ast *n = asnix_ast_new_at(AST_LAMBDA, cur(p).start);
         n->as.lambda.param = tok_text(p, param);
         n->as.lambda.param_len = tok_len(param);
         n->as.lambda.body = body;
@@ -2007,7 +2007,7 @@ static Ast *parse_expr(Parser *p) {
         size_t span_len = (size_t)(semi_tok.start - start_tok.start);
         while (span_len > 0 && isspace((unsigned char)p->src[start_tok.start + span_len - 1])) span_len--;
         Ast *body = parse_expr(p);
-        Ast *n = asnix_ast_new(AST_ASSERT);
+        Ast *n = asnix_ast_new_at(AST_ASSERT, cur(p).start);
         n->as.assert1.cond = cond;
         n->as.assert1.body = body;
         n->as.assert1.cond_text = p->src + start_tok.start;
@@ -2026,7 +2026,7 @@ static Ast *parse_expr(Parser *p) {
         parse_formals(p, &formals, &fcount, &ellipsis);
         expect(p, TOK_COLON, "':'");
         Ast *body = parse_expr(p);
-        Ast *n = asnix_ast_new(AST_LAMBDA);
+        Ast *n = asnix_ast_new_at(AST_LAMBDA, cur(p).start);
         n->as.lambda.is_pattern = 1;
         n->as.lambda.formals = formals;
         n->as.lambda.formals_count = fcount;
@@ -2060,7 +2060,7 @@ static Ast *parse_expr(Parser *p) {
             }
             expect(p, TOK_COLON, "':'");
             Ast *body = parse_expr(p);
-            Ast *n = asnix_ast_new(AST_LAMBDA);
+            Ast *n = asnix_ast_new_at(AST_LAMBDA, cur(p).start);
             n->as.lambda.is_pattern = 1;
             n->as.lambda.formals = formals;
             n->as.lambda.formals_count = fcount;

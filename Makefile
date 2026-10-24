@@ -79,6 +79,18 @@ C_LIB_SRCS   := $(filter-out src/c/main.c src/c/irdump.c,$(C_ALL_SRCS))
 MAIN_SRC     := src/c/main.c
 IRDUMP_SRC   := src/c/irdump.c
 
+# irdump's own "which Nix construct fired this pass" line-tracking
+# feature (ast.h's src_pos, irbuild.h/irpass.h's line-array plumbing)
+# measured as a real, reproducible instruction regression on `asnix`
+# itself even when gated by a runtime flag defaulting off -- so instead
+# it is compiled ONLY into a separate ".irdump.o" variant of these 5
+# files, built with -DASNIX_IRDUMP_LINE_TRACKING, used ONLY by the
+# `irdump` target below. `asnix`/`libasnix.a` keep compiling the plain
+# (undefined-macro) objects, byte-identical to before this feature
+# existed.
+IRDUMP_LINE_TRACKING_SRCS := src/c/ast.c src/c/parser.c src/c/compiler.c src/c/irbuild.c src/c/irpass.c
+IRDUMP_LINE_TRACKING_OBJS := $(IRDUMP_LINE_TRACKING_SRCS:.c=.irdump.o)
+
 LIB_OBJS     := $(ASM_SRCS:.S=.o) $(C_LIB_SRCS:.c=.o)
 MAIN_OBJ     := $(MAIN_SRC:.c=.o)
 ALL_OBJS     := $(LIB_OBJS) $(MAIN_OBJ)
@@ -133,7 +145,7 @@ OPT_STAMP := .opt-stamp
 STAMP_KEY := $(EFFECTIVE_OPT)|$(MIMALLOC_LDLIBS)
 $(shell last=$$(cat $(OPT_STAMP) 2>/dev/null); \
 	if [ "$$last" != "$(STAMP_KEY)" ]; then \
-		rm -f $(ALL_OBJS) $(DEPS) asnix libasnix.a $(TEST_ASM_BINS) $(TEST_IR_BINS) $(TEST_C_BINS) irdump $(IRDUMP_SRC:.c=.o); \
+		rm -f $(ALL_OBJS) $(DEPS) asnix libasnix.a $(TEST_ASM_BINS) $(TEST_IR_BINS) $(TEST_C_BINS) irdump $(IRDUMP_SRC:.c=.o) $(IRDUMP_LINE_TRACKING_OBJS); \
 		echo "$(STAMP_KEY)" > $(OPT_STAMP); \
 	fi)
 
@@ -154,17 +166,40 @@ libasnix.a: $(LIB_OBJS)
 
 # Companion tool: decodes+pretty-prints a compiled IrProgram (see
 # irdump.c's own header comment) -- not part of `all`/`make`'s default
-# build, built on demand like the test binaries below.
-irdump: $(IRDUMP_SRC:.c=.o) libasnix.a
-	$(CC) $(LDFLAGS) -o $@ $(IRDUMP_SRC:.c=.o) -L. -lasnix
+# build, built on demand like the test binaries below. Links explicitly
+# against the line-tracking-enabled variant objects (see
+# IRDUMP_LINE_TRACKING_OBJS above) FIRST, then `-lasnix` for everything
+# else (lexer.o, value_util.o, ...) unaffected by that feature -- the
+# linker resolves each symbol from the first definition it finds, so the
+# explicit .irdump.o files' definitions of asnix_parse/asnix_compile/
+# ib_finish/etc. win over libasnix.a's plain versions of the same
+# symbols, and the archive is never asked to supply them.
+irdump: $(IRDUMP_SRC:.c=.o) $(IRDUMP_LINE_TRACKING_OBJS) libasnix.a
+	$(CC) $(LDFLAGS) -o $@ $(IRDUMP_SRC:.c=.o) $(IRDUMP_LINE_TRACKING_OBJS) -L. -lasnix
 
 # .S files are cpp-preprocessed by `cc` (capital S => real #include of
 # include/asnix/*.h, shared verbatim with the C side -- zero constant drift).
 %.o: %.S
 	$(CC) $(CFLAGS) -c -o $@ $<
 
+# irdump.c itself calls ib_enable_line_tracking/asnix_ib_lookup_program_
+# lines directly, which only exist when ASNIX_IRDUMP_LINE_TRACKING is
+# defined (irbuild.h) -- a specific rule (make prefers the more specific
+# match over the generic %.o: %.c pattern below) so only THIS file's own
+# object needs the macro; it is only ever linked into the `irdump` binary
+# above, never into libasnix.a/asnix.
+src/c/irdump.o: src/c/irdump.c
+	$(CC) $(CFLAGS) -DASNIX_IRDUMP_LINE_TRACKING -c -o $@ $<
+
 %.o: %.c
 	$(CC) $(CFLAGS) -c -o $@ $<
+
+# irdump-only line-tracking variant objects -- see IRDUMP_LINE_TRACKING_SRCS
+# above. Same CFLAGS plus the one extra macro; a distinct suffix (not
+# plain .o) so these never collide with or get picked up by the ordinary
+# %.o rule's dependents (libasnix.a, asnix, the test binaries).
+%.irdump.o: %.c
+	$(CC) $(CFLAGS) -DASNIX_IRDUMP_LINE_TRACKING -c -o $@ $<
 
 # Tier-1 ("smoke") tests: in-process asm-primitive unit tests + M3 IR fixtures.
 # No subprocess spawn beyond the test binary itself; target is sub-second total.
@@ -376,9 +411,11 @@ clean:
 	rm -f $(TEST_ASM_SRCS:.c=.d) $(TEST_IR_SRCS:.c=.d) $(TEST_C_SRCS:.c=.d)
 	rm -f $(OPT_STAMP)
 	rm -f irdump $(IRDUMP_SRC:.c=.o) $(IRDUMP_SRC:.c=.d)
+	rm -f $(IRDUMP_LINE_TRACKING_OBJS) $(IRDUMP_LINE_TRACKING_OBJS:.o=.d)
 
 -include $(DEPS)
 -include $(TEST_ASM_SRCS:.c=.d)
 -include $(TEST_IR_SRCS:.c=.d)
 -include $(TEST_C_SRCS:.c=.d)
 -include $(IRDUMP_SRC:.c=.d)
+-include $(IRDUMP_LINE_TRACKING_OBJS:.o=.d)

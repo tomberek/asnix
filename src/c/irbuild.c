@@ -15,6 +15,45 @@ size_t ib_len(IrBuilder *b) {
     return b->len;
 }
 
+#ifdef ASNIX_IRDUMP_LINE_TRACKING
+/* See irbuild.h's own comments -- compiled in only for irdump's own
+ * variant build of this file; a real production build of irbuild.c never
+ * defines this macro, so none of the below exists in `asnix`/
+ * `libasnix.a` at all. g_current_src_pos is a plain global, not
+ * per-builder, mirroring irpass.c's own g_current_pass: compile_expr sets
+ * it right before compiling each Ast node, and whichever IrBuilder's
+ * ib_emit happens to run next reads it -- correct because compilation is
+ * single-threaded and strictly nested (a child program's own builder is
+ * fully finished via ib_finish before compile_expr resumes emitting into
+ * the parent's). */
+static int g_line_tracking_enabled = 0;
+static uint32_t g_current_src_pos = 0;
+
+void ib_enable_line_tracking(void) {
+    g_line_tracking_enabled = 1;
+}
+
+void ib_set_current_src_pos(uint32_t pos) {
+    g_current_src_pos = pos;
+}
+
+/* Pointer-identity side table from a finished IrProgram to the `lines`
+ * array its builder recorded -- see irbuild.h's asnix_ib_lookup_program_
+ * lines comment for why this is a side table and not a field on
+ * IrProgram itself. */
+#define ASNIX_IB_MAX_LINE_PROGRAMS 65536 /* matches irpass.c's ASNIX_IRPASS_MAX_PROGRAM_RANGES precedent */
+static const IrProgram *g_line_programs[ASNIX_IB_MAX_LINE_PROGRAMS];
+static const uint32_t *g_line_program_lines[ASNIX_IB_MAX_LINE_PROGRAMS];
+static size_t g_nline_programs = 0;
+
+const uint32_t *asnix_ib_lookup_program_lines(const IrProgram *prog) {
+    for (size_t i = 0; i < g_nline_programs; i++) {
+        if (g_line_programs[i] == prog) return g_line_program_lines[i];
+    }
+    return NULL;
+}
+#endif /* ASNIX_IRDUMP_LINE_TRACKING */
+
 /* perf (M132): initial capacity 16->24 for `ops`, 8->24 for `pool` below --
  * measured directly (temporary instrumentation, same ASNIX_LEX_STATS-style
  * convention M123 used for the lexer's own TokVec fix): across a real
@@ -43,6 +82,15 @@ static size_t ib_emit(IrBuilder *b, int op_id, int64_t a, int64_t bval) {
     b->ops[b->len].handler = (void *)(intptr_t)op_id;
     b->ops[b->len].a = a;
     b->ops[b->len].b = bval;
+#ifdef ASNIX_IRDUMP_LINE_TRACKING
+    if (g_line_tracking_enabled) {
+        if (b->len == b->lines_cap) {
+            b->lines_cap = b->lines_cap ? b->lines_cap * 2 : 24; /* same growth schedule as `ops` above */
+            b->lines = realloc(b->lines, b->lines_cap * sizeof(uint32_t));
+        }
+        b->lines[b->len] = g_current_src_pos;
+    }
+#endif
     return b->len++;
 }
 
@@ -319,7 +367,20 @@ IrProgram *ib_finish(IrBuilder *b) {
      * one static size_t either way, cheap enough to leave unconditional
      * rather than gating it behind "any passes registered" here too. */
     asnix_irpass_begin_program();
+#ifdef ASNIX_IRDUMP_LINE_TRACKING
+    /* Lets asnix_irpass_remove's existing shift logic keep `b->lines`
+     * aligned with `ops` across a pass's removal, exactly the way it
+     * already keeps the firing log and jump targets aligned. Cleared
+     * again right after, so a later, unrelated ib_finish call (irdump
+     * re-entering lex_parse_compile_dump for its own nested child
+     * programs) never sees a stale pointer. Entirely absent from a real
+     * production build -- see irbuild.h's own comment. */
+    asnix_irpass_set_line_array(g_line_tracking_enabled ? b->lines : NULL);
+#endif
     asnix_irpass_run(b->ops, &b->len, &b->pool, &b->pool_len, &b->pool_cap);
+#ifdef ASNIX_IRDUMP_LINE_TRACKING
+    asnix_irpass_set_line_array(NULL);
+#endif
     ir_link(b->ops, b->len);
     /* M86 perf: ops/pool are handed to `prog`, which lives for the rest
      * of the process (every compiled function/thunk keeps its own
@@ -376,6 +437,20 @@ IrProgram *ib_finish(IrBuilder *b) {
     prog->ops = b->ops;
     prog->pool = b->pool;
     asnix_irpass_mark_program(prog); /* tags this program's own slice of the firing log -- see irpass.h */
+#ifdef ASNIX_IRDUMP_LINE_TRACKING
+    /* Register (prog, lines) in the side table irdump looks up by pointer
+     * identity (asnix_ib_lookup_program_lines, irbuild.h). Deliberately
+     * not routed through the arena shrink-to-fit above: this is a
+     * one-shot debug CLI tool's own scratch memory, not a cost a real
+     * long-running eval ever pays (this whole block is absent from a
+     * real production build), so there is no permanent-footprint reason
+     * to bother. */
+    if (g_line_tracking_enabled && b->lines && g_nline_programs < ASNIX_IB_MAX_LINE_PROGRAMS) {
+        g_line_programs[g_nline_programs] = prog;
+        g_line_program_lines[g_nline_programs] = b->lines;
+        g_nline_programs++;
+    }
+#endif
     /* perf: ops/pool were just pulled out into `prog` above -- nothing
      * else references the outer IrBuilder struct itself afterward (every
      * caller discards its local builder variable immediately after this

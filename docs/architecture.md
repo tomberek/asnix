@@ -21210,3 +21210,76 @@ implementation strategy is worth trying later.
 Files: none on master (the implementation lived on a disposable branch,
 not merged, per this project's established "measure, don't assume"
 practice of only merging genuine wins).
+
+## M188: `irdump` now annotates each op with its source line number and which pass fired there, to help find real nixpkgs code worth hand-optimizing
+
+A directive asked for `irdump` to show line numbers or context for the
+IR passes that fire, so a human reading its output can map an
+optimization directly back to the Nix source line that triggered it --
+useful for finding real nixpkgs code worth hand-optimizing, not just
+for debugging asnix itself.
+
+**What changed.** `Ast` gains `.src_pos` (byte offset of the node's
+leading token), set by parser.c's 46 real construction sites via a new
+`asnix_ast_new_at`. `irbuild.h`/`irpass.h` thread that position through
+to a per-op `lines` array (parallel to `ops`, in a pointer-identity side
+table, not a field on `IrProgram` itself, so a real eval's hundreds of
+thousands of long-lived `IrProgram` instances never carry this
+debug-only pointer). `asnix_irpass_remove` shifts this array in
+lockstep with `ops` across every pass removal. `irdump` prints
+`(line NNN)` per op (converting the byte offset via a one-time newline
+scan) alongside its existing "pass fired here" marker. Verified working
+end-to-end: a constant `if` collapsing via `dce`+`dce_if`+`jmpnop`
+correctly shows the triggering source line, surviving the op-array
+shift through pass removal.
+
+**Compile-time gated, not just a runtime flag.** An early design used a
+runtime-checked flag (defaulting off), but still cost a real,
+reproducible ~1-2% instruction regression on the production `asnix`
+binary -- root-caused via direct object-size comparison, not assumed:
+adding `Ast.src_pos` shifts every subsequent union member's byte
+offset, inflating addressing-mode encoding size across every file
+dereferencing `Ast.as.*` (parser.c/compiler.c/codegen.c/
+bytecode_cache.c), not from any one hot branch or wrapper call (both
+hypotheses were built, measured, and ruled out). Fixed for
+`irbuild.h`/`irpass.h`/`irbuild.c`/`irpass.c` by compiling the
+line-tracking logic into a separate `.irdump.o` variant build of 5
+files, used only by the `irdump` binary -- `asnix`/`libasnix.a` compile
+the plain objects.
+
+**Residual flagged by the implementer, independently investigated and
+measured here: not actually present.** `Ast.src_pos` itself stays
+unconditional (gating it would require turning `codegen.c`/
+`bytecode_cache.c` into variants too, risking a struct-layout ABI
+mismatch across translation units -- judged not worth the risk). The
+implementer flagged this as a known, honestly-unresolved residual cost,
+not independently re-measured after the last fix. Measured directly
+here: object sizes DO grow slightly in the plain (non-variant) build
+(`ast.o` +128B, `parser.o` +40B, `compiler.o` +96B, `codegen.o` +112B,
+`bytecode_cache.o` +104B, all confirmed real, not assumed) -- but a
+clean interleaved `perf stat` comparison on the real `d.nix`/ffmpeg eval
+(6 rounds, `taskset -c 0`, fresh baseline built at the exact parent
+commit) shows **no regression**: avg 5,569.9M (this milestone) vs.
+5,573.1M (M182 baseline) instructions, **-0.057%**, 6/6 rounds favoring
+this milestone with completely non-overlapping ranges. The small static
+size growth does not translate into a measurable dynamic cost on this
+workload -- the residual is real at the object-file level but not
+impactful in practice, closing out the implementer's own flagged
+concern with a real number rather than leaving it open.
+
+**Correctness.** Full ladder green: `make test`, `make test-e2e`
+(296/296), `make test-conformance`, `make test-nix-conformance`
+(`pass=655 fail=3 skip=148`, same 3 known pre-existing failures), `make
+test-nixpkgs-hash` (`pass=148 fail=0`), `./asnix d.nix` output hash
+unchanged.
+
+Files: `include/asnix/ast.h` (`Ast.src_pos`, `asnix_ast_new_at`),
+`src/c/parser.c` (46 call sites converted to `asnix_ast_new_at`),
+`src/c/compiler.c` (one new `ib_set_current_src_pos` call in
+`compile_expr`), `include/asnix/irbuild.h` + `src/c/irbuild.c`
+(`IrBuilder.lines`, line-tracking API, `#ifdef`-gated), `include/asnix/
+irpass.h` + `src/c/irpass.c` (`asnix_irpass_set_line_array`, the
+`asnix_irpass_remove` shift block, `#ifdef`-gated), `src/c/irdump.c`
+(line printing, `byte_pos_to_line`), `Makefile`
+(`IRDUMP_LINE_TRACKING_SRCS`/`_OBJS`, the irdump-variant `%.irdump.o`
+rule).

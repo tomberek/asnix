@@ -14,10 +14,55 @@ typedef struct {
     size_t len, cap;
     int64_t *pool;
     size_t pool_len, pool_cap;
+#ifdef ASNIX_IRDUMP_LINE_TRACKING
+    /* Source-position debug tracking: parallel to `ops`, one entry per
+     * emitted op. Compiled into this struct ONLY in irdump's own variant
+     * build (see Makefile) -- a real production `asnix`/`libasnix.a`
+     * build never defines ASNIX_IRDUMP_LINE_TRACKING, so IrBuilder there
+     * is byte-identical in layout to before this feature existed. */
+    uint32_t *lines;
+    size_t lines_cap;
+#endif
 } IrBuilder;
 
 IrBuilder *ib_new(void);
 size_t ib_len(IrBuilder *b);
+
+#ifdef ASNIX_IRDUMP_LINE_TRACKING
+/* Debug-only source-line tracking for irdump's "which Nix construct fired
+ * this optimizer pass" feature. Compiled in ONLY for irdump's own variant
+ * build of these files (ast.c/parser.c/compiler.c/irbuild.c/irpass.c --
+ * see Makefile's IRDUMP_LINE_TRACKING_SRCS); a real production eval links
+ * against the plain (undefined-macro) objects and never sees any of this
+ * code at all -- not a runtime-disabled flag, genuinely absent from the
+ * compiled instructions. Measured directly: even a runtime-flag-gated
+ * version of this (checked but defaulted off) cost a real, reproducible
+ * instruction regression on the real d.nix/ffmpeg eval -- not from any
+ * one obvious hot branch, but diffusely enough (parser.c's 46 call sites,
+ * the IrBuilder struct's own size, ib_emit's extra field write) that a
+ * true compile-time exclusion was the only approach that measured as
+ * genuinely free. */
+void ib_enable_line_tracking(void);
+void ib_set_current_src_pos(uint32_t pos);
+
+/* Looks up the finished `lines` array a given IrProgram's builder recorded
+ * (NULL if line tracking was off, or if `prog` is unrecognized) -- a
+ * pointer-identity side table, not a field on IrProgram itself, so a real
+ * eval's IrProgram struct (hundreds of thousands of long-lived instances
+ * per real eval) never carries this debug-only pointer's permanent 8-byte
+ * cost even in the irdump variant build. irdump.c is the only real
+ * caller. */
+const uint32_t *asnix_ib_lookup_program_lines(const IrProgram *prog);
+#else
+/* Plain production build: these become unconditional no-ops so compiler.c
+ * (shared source between both build variants) doesn't need its own
+ * #ifdef around the one call site that uses them -- see compiler.c's
+ * compile_expr. `static inline`, defined here so they fully disappear
+ * (no call, no symbol) rather than becoming a real but empty function
+ * call. */
+static inline void ib_enable_line_tracking(void) {}
+static inline void ib_set_current_src_pos(uint32_t pos) { (void)pos; }
+#endif
 
 size_t ib_push_int(IrBuilder *b, int64_t v);
 size_t ib_push_true(IrBuilder *b);

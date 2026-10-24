@@ -114,6 +114,18 @@ int asnix_irpass_run(IrOp *ops, size_t *len, int64_t **pool, size_t *pool_len, s
  * would otherwise silently miscompile. */
 void asnix_irpass_remove(IrOp *ops, size_t *len, size_t start, size_t count);
 
+#ifdef ASNIX_IRDUMP_LINE_TRACKING
+/* irdump's own variant build only (see Makefile): registers the CURRENT
+ * program's own per-op source-position array so asnix_irpass_remove
+ * above shifts it in lockstep with `ops` across every removal, the same
+ * way it already keeps the firing log and jump targets aligned. A real
+ * production build of irpass.c never defines this macro, so neither this
+ * declaration nor the shift logic inside asnix_irpass_remove exists
+ * there at all -- measured directly that even a single always-false
+ * runtime check here was not free enough to leave in unconditionally. */
+void asnix_irpass_set_line_array(uint32_t *lines);
+#endif
+
 /* The sibling GROW primitive for the pool (as asnix_irpass_remove is for
  * ops): appends `v` to *pool[0..*pool_len), doubling *pool_cap (starting
  * from 8, same growth policy as irbuild.c's own ib_pool_add -- these ARE

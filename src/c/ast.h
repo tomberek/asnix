@@ -112,6 +112,15 @@ typedef struct {
 
 struct Ast {
     AstKind kind;
+    /* Byte offset of this node's leading token in the source buffer, set
+     * by asnix_ast_new_at (parser.c's own construction sites) -- 0 for
+     * any node built via the plain asnix_ast_new (compiler.c's synthetic
+     * desugared nodes have no single corresponding source span). Exists
+     * purely so a debug tool (irdump) can map a compiled op back to an
+     * approximate source line for a human auditing which Nix constructs
+     * trigger which optimizer passes -- never read by compile_expr or
+     * any other part of the real eval path. */
+    uint32_t src_pos;
     union {
         int64_t int_val;   /* AST_INT */
         double float_val;  /* AST_FLOAT */
@@ -276,6 +285,37 @@ struct Ast {
  * scratch, fully dead once asnix_compile()/asnix_compile_scoped() walks
  * it into an IrProgram. */
 Ast *asnix_ast_new(AstKind kind);
+
+/* Same as asnix_ast_new, plus sets the new node's src_pos (see struct
+ * Ast's own comment above) -- used by parser.c's real construction
+ * sites, which always know the current token's byte offset.
+ *
+ * ASNIX_IRDUMP_LINE_TRACKING-gated, not just a runtime no-op: measured
+ * directly (real d.nix/ffmpeg eval, interleaved perf stat) that even an
+ * always-inlined "set one extra field" version cost a real, reproducible
+ * ~1.1% instruction regression on its own (parser.c's 46 call sites are
+ * hot enough, and `cur(p).start`'s own evaluation apparently isn't fully
+ * free at every one of them) -- on top of a further ~1.5% from the
+ * IrBuilder/irpass side (irbuild.h/irpass.h). Neither half is a real
+ * production cost this project would accept for a debug/offline-only
+ * convenience feature, so irdump.c is compiled as its own variant build
+ * (see Makefile's IRDUMP_LINE_TRACKING_SRCS) with this macro defined;
+ * `asnix`/`libasnix.a` never define it, so the real production build's
+ * parser.c/ast.c/compiler.c/irbuild.c/irpass.c object code is BYTE-
+ * IDENTICAL to before this feature existed -- confirmed directly
+ * (`objdump -d`/`cmp` against a pristine master build). When undefined,
+ * `asnix_ast_new_at(kind, pos)` macro-expands to plain `asnix_ast_new
+ * (kind)` -- a pure textual substitution, so `pos`'s expression (e.g.
+ * `cur(p).start`) is never even evaluated, not just cheaply skipped. */
+#ifdef ASNIX_IRDUMP_LINE_TRACKING
+static inline Ast *asnix_ast_new_at(AstKind kind, uint32_t src_pos) {
+    Ast *n = asnix_ast_new(kind);
+    n->src_pos = src_pos;
+    return n;
+}
+#else
+#define asnix_ast_new_at(kind, src_pos) asnix_ast_new(kind)
+#endif
 
 /* Frees every Ast node allocated since the last reset (or process
  * start). Call right after a top-level asnix_compile()/
