@@ -619,13 +619,13 @@ static AstStringPart *strip_indentation(RawIndPart *raw, size_t n, size_t *out_c
 }
 
 typedef struct {
-    LexCursor *lc; /* M135: tokens are lexed on demand through this cursor instead of
-                    * a pre-filled array -- see lexer.h's own LexCursor comment and
-                    * docs/architecture.md M134/M135. cur()/peek2()/find_matching_rbrace
-                    * are the only three places that ever read a Token by index; all
-                    * three now go through lexcur_tok(p->lc, idx), which lexes forward
-                    * exactly as far as asked and never less or more. */
-    size_t pos;
+    Lexer *lx;  /* M175: a true pull-based lexer (lexer.h) -- no backing Token array at
+                 * all, unlike M135's LexCursor/TokVec. `tok`/`next` below are this
+                 * parser's own 2-slot lookahead buffer, by VALUE, filled by calling
+                 * lexer_next(lx) -- cur()/peek2() are now plain field reads, never a
+                 * lexer.c call; only advance() ever calls lexer_next(). */
+    Token tok;  /* cur() */
+    Token next; /* peek2() */
     const char *src; /* M80: the buffer every Token.pos/.start points into -- see
                        * curpos_line_col below, parser.h's own asnix_parse comment. */
 } Parser;
@@ -657,24 +657,40 @@ static void curpos_line_col(const char *src, const char *at, int *out_line, int 
  * path/URI/search-path literals -- never TOK_STR_PART/TOK_ISTR_PART/
  * TOK_ISTR_ESC, which need a real decode step instead, see
  * asnix_decode_dquote_span/asnix_decode_istr_esc's own call sites below). */
-static const char *tok_text(Parser *p, Token *t) { return p->src + t->start; }
-static size_t tok_len(Token *t) { return (size_t)(t->end - t->start); }
+static const char *tok_text(Parser *p, Token t) { return p->src + t.start; }
+static size_t tok_len(Token t) { return (size_t)(t.end - t.start); }
 
-static Token *cur(Parser *p) {
-    return lexcur_tok(p->lc, p->pos);
+static Token cur(Parser *p) {
+    return p->tok;
 }
-static Token *peek2(Parser *p) {
-    return lexcur_tok(p->lc, p->pos + 1); /* always in range: TOK_EOF is the final element */
+static Token peek2(Parser *p) {
+    return p->next;
+}
+/* M175/M158: `is_formals_pattern`'s `{...}`-vs-formals disambiguation needs a
+ * THIRD token of lookahead beyond `tok`/`next` -- probed by saving the
+ * lexer's full resumable state, calling lexer_next() once to see what
+ * comes after `next`, then rewinding immediately, exactly mirroring
+ * `iets`'s own `Lexer::pos()`/`set_pos()` save/probe/rewind pattern
+ * (~/gnix/iets/src/syntax/lexer.rs's `peek3`, "only valid right after
+ * peek2" per its own doc comment -- same precondition here: this is only
+ * ever called with the lexer already sitting exactly one token past
+ * `next`, which lexer_save() below captures regardless). */
+static TokKind peek3(Parser *p) {
+    LexerSave save = lexer_save(p->lx);
+    TokKind k = lexer_next(p->lx).kind;
+    lexer_restore(p->lx, save);
+    return k;
 }
 static void advance(Parser *p) {
-    p->pos++;
+    p->tok = p->next;
+    p->next = lexer_next(p->lx);
 }
-static Token *expect(Parser *p, TokKind kind, const char *what) {
-    if (cur(p)->kind != kind) {
+static Token expect(Parser *p, TokKind kind, const char *what) {
+    if (cur(p).kind != kind) {
         fprintf(stderr, "asnix: parse error: expected %s\n", what);
         exit(1);
     }
-    Token *t = cur(p);
+    Token t = cur(p);
     advance(p);
     return t;
 }
@@ -734,7 +750,7 @@ static Ast *parse_select(Parser *p);
  * (or a sibling file reached from `d.nix`) has `"${ident}Fallback" =
  * fallback;`-shaped bindings. */
 static AttrSeg parse_attr_segment(Parser *p, const char *what) {
-    if (cur(p)->kind == TOK_DOLLAR_LBRACE) {
+    if (cur(p).kind == TOK_DOLLAR_LBRACE) {
         advance(p);
         Ast *name_expr = parse_expr(p);
         expect(p, TOK_RBRACE, "'}' closing a dynamic attribute name");
@@ -764,18 +780,18 @@ static AttrSeg parse_attr_segment(Parser *p, const char *what) {
         }
         return (AttrSeg){ .is_dynamic = 1, .name_expr = name_expr };
     }
-    if (cur(p)->kind != TOK_STR_START) {
+    if (cur(p).kind != TOK_STR_START) {
         /* M67: `or` as a bare (unquoted) binding/attribute name -- see
          * starts_atom's own comment above for the full rationale;
          * `"or"` (quoted) was already accepted here (this function's own
          * header comment), only the unquoted keyword-token form was
          * missing. */
-        if (cur(p)->kind == TOK_OR) {
-            Token *t = cur(p);
+        if (cur(p).kind == TOK_OR) {
+            Token t = cur(p);
             advance(p);
             return (AttrSeg){ .is_dynamic = 0, .attr = tok_text(p, t), .attr_len = tok_len(t) };
         }
-        Token *t = expect(p, TOK_IDENT, what);
+        Token t = expect(p, TOK_IDENT, what);
         return (AttrSeg){ .is_dynamic = 0, .attr = tok_text(p, t), .attr_len = tok_len(t) };
     }
     /* Quoted-string segment -- reuses parse_dquote_string's own chunk-
@@ -874,10 +890,10 @@ static Ast *build_dynamic_chain_value(AttrSeg *segs, size_t start, size_t count,
 static int g_inherit_hidden_counter = 0;
 
 static void parse_binding_stmt(Parser *p, BTVec *out, DynBindingVec *dyn_out) {
-    if (cur(p)->kind == TOK_INHERIT) {
+    if (cur(p).kind == TOK_INHERIT) {
         advance(p);
         Ast *src_expr = NULL;
-        if (cur(p)->kind == TOK_LPAREN) {
+        if (cur(p).kind == TOK_LPAREN) {
             advance(p);
             src_expr = parse_expr(p);
             expect(p, TOK_RPAREN, "')'");
@@ -889,7 +905,7 @@ static void parse_binding_stmt(Parser *p, BTVec *out, DynBindingVec *dyn_out) {
          * below can decide, from the final count, whether to share one
          * evaluation of `expr` across every name. */
         size_t names_mark = attrsegvec_mark();
-        while (cur(p)->kind == TOK_IDENT || cur(p)->kind == TOK_STR_START || cur(p)->kind == TOK_DOLLAR_LBRACE) {
+        while (cur(p).kind == TOK_IDENT || cur(p).kind == TOK_STR_START || cur(p).kind == TOK_DOLLAR_LBRACE) {
             AttrSeg name = parse_attr_segment(p, "an inherited name");
             /* real Nix's grammar lets a bare `${...}`/interpolated
              * string reach this position syntactically (`attrs: attrs
@@ -1043,7 +1059,7 @@ static void parse_binding_stmt(Parser *p, BTVec *out, DynBindingVec *dyn_out) {
      * has `"${ident}Fallback" = fallback;`-shaped bindings. */
     size_t segs_mark = attrsegvec_mark();
     attrsegvec_push(parse_attr_segment(p, "a binding name"));
-    while (cur(p)->kind == TOK_DOT) {
+    while (cur(p).kind == TOK_DOT) {
         advance(p);
         attrsegvec_push(parse_attr_segment(p, "an attribute name"));
     }
@@ -1089,20 +1105,20 @@ static void parse_binding_stmt(Parser *p, BTVec *out, DynBindingVec *dyn_out) {
  * compiler.c's AST_PATH case (resolve_path_chunk) for how the first
  * chunk alone becomes a Path constant and the rest becomes a runtime
  * OP_PATH_CONCAT chain. */
-static Ast *parse_path_literal_interp(Parser *p, Token *t) {
+static Ast *parse_path_literal_interp(Parser *p, Token t) {
     Ast *n = asnix_ast_new(AST_PATH);
     n->as.path.text = tok_text(p, t);
     n->as.path.len = tok_len(t);
     n->as.path.is_search = 0;
-    n->as.path.is_home = (p->src[t->start] == '~'); /* M141: derived, not carried on Token (see lexer.h) */
+    n->as.path.is_home = (p->src[t.start] == '~'); /* M141: derived, not carried on Token (see lexer.h) */
 
     size_t parts_mark = partvec_mark();
-    while (cur(p)->kind != TOK_PATH_END) {
-        if (cur(p)->kind == TOK_PATH_PART) {
-            Token *pt = cur(p);
+    while (cur(p).kind != TOK_PATH_END) {
+        if (cur(p).kind == TOK_PATH_PART) {
+            Token pt = cur(p);
             partvec_push((AstStringPart){ .is_expr = 0, .text = tok_text(p, pt), .text_len = tok_len(pt) });
             advance(p);
-        } else if (cur(p)->kind == TOK_DOLLAR_LBRACE) {
+        } else if (cur(p).kind == TOK_DOLLAR_LBRACE) {
             advance(p);
             Ast *e = parse_expr(p);
             expect(p, TOK_RBRACE, "'}' closing a path interpolation");
@@ -1128,18 +1144,18 @@ static Ast *parse_path_literal_interp(Parser *p, Token *t) {
 static Ast *parse_dquote_string(Parser *p) {
     advance(p); /* TOK_STR_START */
     size_t parts_mark = partvec_mark();
-    while (cur(p)->kind != TOK_STR_END) {
-        if (cur(p)->kind == TOK_STR_PART) {
+    while (cur(p).kind != TOK_STR_END) {
+        if (cur(p).kind == TOK_STR_PART) {
             /* M141: TOK_STR_PART is now a raw (escapes-not-yet-applied) span --
              * decode exactly once, right here, at the point this AstStringPart
              * is actually built (see asnix_decode_dquote_span's own comment,
              * lexer.h). */
-            Token *t = cur(p);
+            Token t = cur(p);
             size_t dlen;
-            char *dtext = asnix_decode_dquote_span(p->src, t->start, t->end, &dlen);
+            char *dtext = asnix_decode_dquote_span(p->src, t.start, t.end, &dlen);
             partvec_push((AstStringPart){ .is_expr = 0, .text = dtext, .text_len = dlen });
             advance(p);
-        } else if (cur(p)->kind == TOK_DOLLAR_LBRACE) {
+        } else if (cur(p).kind == TOK_DOLLAR_LBRACE) {
             advance(p);
             Ast *e = parse_expr(p);
             expect(p, TOK_RBRACE, "'}' closing a string interpolation");
@@ -1166,19 +1182,19 @@ static Ast *parse_dquote_string(Parser *p) {
 static Ast *parse_indented_string(Parser *p) {
     advance(p); /* TOK_ISTR_START */
     size_t raw_mark = rawind_mark();
-    while (cur(p)->kind != TOK_ISTR_END) {
-        if (cur(p)->kind == TOK_ISTR_PART) {
+    while (cur(p).kind != TOK_ISTR_END) {
+        if (cur(p).kind == TOK_ISTR_PART) {
             /* M141: a raw content run never has escapes in it by construction
              * (an escape always ends the run, see lex_indented_run) -- its
              * span IS its final text verbatim, no decode and no copy needed
              * at all (points straight into the long-lived source buffer,
              * unlike the pre-M141 lexer, which always malloc'd a copy here
              * even though nothing about this case ever needed one). */
-            Token *t = cur(p);
+            Token t = cur(p);
             rawind_push((RawIndPart){ .is_expr = 0, .text = tok_text(p, t), .text_len = tok_len(t),
                                        .has_indentation = 1 });
             advance(p);
-        } else if (cur(p)->kind == TOK_ISTR_ESC) {
+        } else if (cur(p).kind == TOK_ISTR_ESC) {
             /* M141: one `''$`/`'''`/`''\<c>` escape unit -- decode now, into a
              * freshly malloc'd (<=2-byte) owned buffer, matching the owned-
              * copy convention every other RawIndPart.text already relies on
@@ -1188,15 +1204,15 @@ static Ast *parse_indented_string(Parser *p) {
              * parse_indented_string below; the TOK_ISTR_PART case above is
              * the one deliberate exception, since IT points into source,
              * which this file never frees). */
-            Token *t = cur(p);
+            Token t = cur(p);
             char decoded[2];
             size_t dlen;
-            asnix_decode_istr_esc(p->src, t->start, decoded, &dlen);
+            asnix_decode_istr_esc(p->src, t.start, decoded, &dlen);
             char *owned = malloc(dlen);
             memcpy(owned, decoded, dlen);
             rawind_push((RawIndPart){ .is_expr = 0, .text = owned, .text_len = dlen, .has_indentation = 0 });
             advance(p);
-        } else if (cur(p)->kind == TOK_DOLLAR_LBRACE) {
+        } else if (cur(p).kind == TOK_DOLLAR_LBRACE) {
             advance(p);
             Ast *e = parse_expr(p);
             expect(p, TOK_RBRACE, "'}' closing a string interpolation");
@@ -1221,8 +1237,8 @@ static Ast *parse_indented_string(Parser *p) {
 }
 
 static Ast *parse_atom(Parser *p) {
-    Token *t = cur(p);
-    switch (t->kind) {
+    Token t = cur(p);
+    switch (t.kind) {
         case TOK_INT: {
             advance(p);
             Ast *n = asnix_ast_new(AST_INT);
@@ -1230,13 +1246,13 @@ static Ast *parse_atom(Parser *p) {
              * see lexer.h's own Token comment for why strtoll here is safe
              * unbounded (the lexer's own digit-run scan already found the
              * exact same stopping point this call will). */
-            n->as.int_val = strtoll(p->src + t->start, NULL, 10);
+            n->as.int_val = strtoll(p->src + t.start, NULL, 10);
             return n;
         }
         case TOK_FLOAT: {
             advance(p);
             Ast *n = asnix_ast_new(AST_FLOAT);
-            n->as.float_val = asnix_decode_float_literal(p->src, t->start, t->end);
+            n->as.float_val = asnix_decode_float_literal(p->src, t.start, t.end);
             return n;
         }
         case TOK_TRUE: {
@@ -1271,10 +1287,10 @@ static Ast *parse_atom(Parser *p) {
              * ever becoming an ordinary AST_VAR, exactly like real Nix's
              * own grammar treats it as a distinct token/production
              * rather than a lexically-rebindable identifier. */
-            if (t->kind == TOK_IDENT && tok_len(t) == 8 && memcmp(tok_text(p, t), "__curPos", 8) == 0) {
+            if (t.kind == TOK_IDENT && tok_len(t) == 8 && memcmp(tok_text(p, t), "__curPos", 8) == 0) {
                 advance(p);
                 Ast *n = asnix_ast_new(AST_CURPOS);
-                curpos_line_col(p->src, p->src + t->start, &n->as.curpos.line, &n->as.curpos.column);
+                curpos_line_col(p->src, p->src + t.start, &n->as.curpos.line, &n->as.curpos.column);
                 return n;
             }
             advance(p);
@@ -1293,14 +1309,14 @@ static Ast *parse_atom(Parser *p) {
              * A bare "${" can't otherwise appear here at all (it's not
              * valid Nix syntax outside a string/path literal), so this
              * peek is unambiguous. */
-            if (cur(p)->kind == TOK_DOLLAR_LBRACE) {
+            if (cur(p).kind == TOK_DOLLAR_LBRACE) {
                 return parse_path_literal_interp(p, t);
             }
             Ast *n = asnix_ast_new(AST_PATH);
             n->as.path.text = tok_text(p, t);
             n->as.path.len = tok_len(t);
             n->as.path.is_search = 0;
-            n->as.path.is_home = (p->src[t->start] == '~'); /* M141: derived, see lexer.h */
+            n->as.path.is_home = (p->src[t.start] == '~'); /* M141: derived, see lexer.h */
             n->as.path.interp_parts = NULL;
             n->as.path.interp_count = 0;
             return n;
@@ -1342,7 +1358,7 @@ static Ast *parse_atom(Parser *p) {
         case TOK_LBRACKET: {
             advance(p);
             size_t elems_mark = astvec_mark();
-            while (cur(p)->kind != TOK_RBRACKET) astvec_push(parse_select(p));
+            while (cur(p).kind != TOK_RBRACKET) astvec_push(parse_select(p));
             advance(p); /* ']' */
             size_t elems_count;
             Ast **elems_items = astvec_commit(elems_mark, &elems_count);
@@ -1355,7 +1371,7 @@ static Ast *parse_atom(Parser *p) {
             advance(p);
             BTVec bt = { 0 };
             DynBindingVec dyn = { 0 };
-            while (cur(p)->kind != TOK_RBRACE) parse_binding_stmt(p, &bt, &dyn);
+            while (cur(p).kind != TOK_RBRACE) parse_binding_stmt(p, &bt, &dyn);
             advance(p); /* '}' */
             BindingVec bindings = { 0 };
             finalize_bt_vec(&bt, &bindings);
@@ -1374,7 +1390,7 @@ static Ast *parse_atom(Parser *p) {
             expect(p, TOK_LBRACE, "'{'");
             BTVec bt = { 0 };
             DynBindingVec dyn = { 0 };
-            while (cur(p)->kind != TOK_RBRACE) parse_binding_stmt(p, &bt, &dyn);
+            while (cur(p).kind != TOK_RBRACE) parse_binding_stmt(p, &bt, &dyn);
             advance(p); /* '}' */
             BindingVec bindings = { 0 };
             finalize_bt_vec(&bt, &bindings);
@@ -1397,7 +1413,7 @@ static Ast *parse_atom(Parser *p) {
 static Ast *parse_select(Parser *p) {
     Ast *e = parse_atom(p);
     int had_select = 0;
-    while (cur(p)->kind == TOK_DOT) {
+    while (cur(p).kind == TOK_DOT) {
         advance(p);
         Ast *n = asnix_ast_new(AST_SELECT);
         n->as.select.target = e;
@@ -1447,7 +1463,7 @@ static Ast *parse_select(Parser *p) {
      * possible without at least one preceding `.select` (real Nix's
      * grammar agrees -- a bare `x or y` is the separate, unsupported
      * "cursed or" rule). */
-    if (had_select && cur(p)->kind == TOK_OR) {
+    if (had_select && cur(p).kind == TOK_OR) {
         advance(p);
         Ast *default_ast = parse_select(p);
         Ast *chain_node = e;
@@ -1463,7 +1479,7 @@ static Ast *parse_select(Parser *p) {
 
 static Ast *parse_app(Parser *p) {
     Ast *fn = parse_select(p);
-    while (starts_atom(cur(p)->kind)) {
+    while (starts_atom(cur(p).kind)) {
         Ast *arg = parse_select(p);
         Ast *app = asnix_ast_new(AST_APP);
         app->as.app.fn = fn;
@@ -1489,7 +1505,7 @@ static Ast *parse_app(Parser *p) {
 static Ast *parse_binop(Parser *p, int min_prec); /* forward decl -- see parse_negate's own `!` case below */
 #define PREC_ADD 6 /* must match TOK_PLUS/TOK_MINUS's own `prec` entry in the BINOPS table, further down this file -- moved up here (not duplicated) since parse_negate's own `!`-operand case below needs it */
 static Ast *parse_negate(Parser *p) {
-    if (cur(p)->kind == TOK_MINUS) {
+    if (cur(p).kind == TOK_MINUS) {
         advance(p);
         Ast *operand = parse_negate(p); /* right-recurse: allows `--x`, harmless */
         Ast *zero = asnix_ast_new(AST_INT);
@@ -1513,7 +1529,7 @@ static Ast *parse_negate(Parser *p) {
      * when `parse_negate` is entered directly (no leading `-` already
      * consumed), since the top-level check above would have intercepted
      * a leading `!` there first. */
-    if (cur(p)->kind == TOK_BANG) {
+    if (cur(p).kind == TOK_BANG) {
         advance(p);
         Ast *operand = parse_binop(p, PREC_ADD);
         Ast *n = asnix_ast_new(AST_NOT);
@@ -1529,7 +1545,7 @@ static Ast *parse_negate(Parser *p) {
  * attrset left-hand side is simply "no", see op_has_attr.S. */
 static Ast *parse_has_attr(Parser *p) {
     Ast *e = parse_negate(p);
-    while (cur(p)->kind == TOK_QUESTION) {
+    while (cur(p).kind == TOK_QUESTION) {
         advance(p);
         /* `expr ? attrpath`, real Nix's grammar for the right-hand side
          * (`~/nix/src/libexpr/parser.y`: `expr_op '?' attrpath`) is a
@@ -1555,7 +1571,7 @@ static Ast *parse_has_attr(Parser *p) {
         set_has_attr_segment(n, seg);
         Ast *result = n;
         Ast *running_target = e;
-        while (cur(p)->kind == TOK_DOT) {
+        while (cur(p).kind == TOK_DOT) {
             advance(p);
             Ast *sel = asnix_ast_new(AST_SELECT);
             sel->as.select.target = running_target;
@@ -1744,7 +1760,7 @@ static Ast *parse_binop(Parser *p, int min_prec);
  * `?`'s dotted-chain desugaring, then unary negate, application, select,
  * atom) for everything else -- unchanged, unaffected by this rewrite. */
 static Ast *parse_binop_primary(Parser *p) {
-    if (cur(p)->kind == TOK_BANG) {
+    if (cur(p).kind == TOK_BANG) {
         advance(p);
         Ast *operand = parse_binop(p, PREC_ADD);
         Ast *n = asnix_ast_new(AST_NOT);
@@ -1784,7 +1800,7 @@ static Ast *parse_binop(Parser *p, int min_prec) {
      * exactly the first case. */
     int last_non_assoc_prec = -1;
     for (;;) {
-        const BinOpInfo *info = lookup_binop(cur(p)->kind);
+        const BinOpInfo *info = lookup_binop(cur(p).kind);
         if (!info || info->prec < min_prec) break;
         if (info->non_assoc && info->prec == last_non_assoc_prec) break;
         advance(p);
@@ -1805,7 +1821,7 @@ static Ast *parse_impl(Parser *p) {
  * and every sibling regardless of source order -- see ast.h/compiler.c). */
 static Ast *parse_let_bindings(Parser *p) {
     BTVec bt = { 0 };
-    while (cur(p)->kind != TOK_IN) parse_binding_stmt(p, &bt, NULL); /* NULL: reject dynamic attrs */
+    while (cur(p).kind != TOK_IN) parse_binding_stmt(p, &bt, NULL); /* NULL: reject dynamic attrs */
     advance(p); /* 'in' */
     Ast *body = parse_expr(p);
 
@@ -1861,20 +1877,22 @@ static Ast *parse_let_bindings(Parser *p) {
  * the normal attrset-literal/formals parse path instead of this function's
  * own dedicated check -- matching this project's standing convention of
  * matching an error's class, not its exact wording (see Makefile's
- * test-nix-conformance target comment). */
-static int is_formals_pattern(Parser *p, size_t open_idx) {
-    TokKind t1 = lexcur_tok(p->lc, open_idx + 1)->kind;
+ * test-nix-conformance target comment). M175: ported onto the new
+ * tok/next lookahead buffer -- `p` is always positioned with `cur(p)`
+ * exactly AT the `{` itself, so `t1` is just `peek2(p)`; the one
+ * occasional third token of lookahead (`t2`) goes through `peek3()`
+ * (parser.c's own save/probe/rewind helper, see its comment), never a
+ * direct array index the way `lexcur_tok(p->lc, open_idx + N)` used to
+ * read. */
+static int is_formals_pattern(Parser *p) {
+    TokKind t1 = peek2(p).kind;
     if (t1 == TOK_ELLIPSIS) return 1;
     if (t1 == TOK_RBRACE) {
-        /* t1 != TOK_EOF here, so open_idx+1 is strictly before the source's
-         * TOK_EOF index, making open_idx+2 a legal lexcur_tok query (at
-         * most that EOF index) -- see lexer.h's own precondition comment
-         * on lexcur_tok/lexcur_tok_slow. */
-        TokKind t2 = lexcur_tok(p->lc, open_idx + 2)->kind;
+        TokKind t2 = peek3(p);
         return t2 == TOK_COLON || t2 == TOK_AT;
     }
     if (t1 == TOK_IDENT) {
-        TokKind t2 = lexcur_tok(p->lc, open_idx + 2)->kind;
+        TokKind t2 = peek3(p);
         return t2 == TOK_COMMA || t2 == TOK_QUESTION || t2 == TOK_RBRACE;
     }
     return 0;
@@ -1887,20 +1905,20 @@ static int is_formals_pattern(Parser *p, size_t open_idx) {
 static void parse_formals(Parser *p, AstFormal **out_items, size_t *out_count, int *out_ellipsis) {
     size_t formals_mark = formalvec_mark();
     int ellipsis = 0;
-    while (cur(p)->kind != TOK_RBRACE) {
-        if (cur(p)->kind == TOK_ELLIPSIS) {
+    while (cur(p).kind != TOK_RBRACE) {
+        if (cur(p).kind == TOK_ELLIPSIS) {
             advance(p);
             ellipsis = 1;
             break; /* `...` must be the last formal */
         }
-        Token *name = expect(p, TOK_IDENT, "a formal name");
+        Token name = expect(p, TOK_IDENT, "a formal name");
         Ast *default_ = NULL;
-        if (cur(p)->kind == TOK_QUESTION) {
+        if (cur(p).kind == TOK_QUESTION) {
             advance(p);
             default_ = parse_expr(p); /* arbitrary lazy expression -- see compiler.c's AST_LAMBDA case */
         }
         formalvec_push((AstFormal){ .name = tok_text(p, name), .name_len = tok_len(name), .default_ = default_ });
-        if (cur(p)->kind == TOK_COMMA) {
+        if (cur(p).kind == TOK_COMMA) {
             advance(p);
             continue;
         }
@@ -1912,9 +1930,9 @@ static void parse_formals(Parser *p, AstFormal **out_items, size_t *out_count, i
 }
 
 static Ast *parse_expr(Parser *p) {
-    if (cur(p)->kind == TOK_LET) {
+    if (cur(p).kind == TOK_LET) {
         advance(p);
-        if (cur(p)->kind == TOK_LBRACE) {
+        if (cur(p).kind == TOK_LBRACE) {
             /* Legacy `let { ..., body = ...; }` form -- real Nix desugars
              * this directly to `(rec { ... }).body` (cppnix's parser.y:
              * "Let expressions `let {..., body = ...}' are just desugared
@@ -1924,7 +1942,7 @@ static Ast *parse_expr(Parser *p) {
             advance(p); /* '{' */
             BTVec bt = { 0 };
             DynBindingVec dyn = { 0 };
-            while (cur(p)->kind != TOK_RBRACE) parse_binding_stmt(p, &bt, &dyn);
+            while (cur(p).kind != TOK_RBRACE) parse_binding_stmt(p, &bt, &dyn);
             advance(p); /* '}' */
             BindingVec bindings = { 0 };
             finalize_bt_vec(&bt, &bindings);
@@ -1946,7 +1964,7 @@ static Ast *parse_expr(Parser *p) {
         }
         return parse_let_bindings(p);
     }
-    if (cur(p)->kind == TOK_WITH) {
+    if (cur(p).kind == TOK_WITH) {
         advance(p);
         Ast *attrs = parse_expr(p);
         expect(p, TOK_SEMI, "';'");
@@ -1956,7 +1974,7 @@ static Ast *parse_expr(Parser *p) {
         n->as.with1.body = body;
         return n;
     }
-    if (cur(p)->kind == TOK_IF) {
+    if (cur(p).kind == TOK_IF) {
         advance(p);
         Ast *cond = parse_expr(p);
         expect(p, TOK_THEN, "'then'");
@@ -1969,8 +1987,8 @@ static Ast *parse_expr(Parser *p) {
         n->as.if1.else_ = else_;
         return n;
     }
-    if (cur(p)->kind == TOK_IDENT && peek2(p)->kind == TOK_COLON) {
-        Token *param = cur(p);
+    if (cur(p).kind == TOK_IDENT && peek2(p).kind == TOK_COLON) {
+        Token param = cur(p);
         advance(p);
         advance(p); /* ':' */
         Ast *body = parse_expr(p); /* recursing here is what makes `a: b: body` curry */
@@ -1980,25 +1998,25 @@ static Ast *parse_expr(Parser *p) {
         n->as.lambda.body = body;
         return n;
     }
-    if (cur(p)->kind == TOK_ASSERT) {
+    if (cur(p).kind == TOK_ASSERT) {
         advance(p);
-        Token *start_tok = cur(p);
+        Token start_tok = cur(p);
         Ast *cond = parse_expr(p);
-        Token *semi_tok = cur(p); /* captured before expect() consumes it */
+        Token semi_tok = cur(p); /* captured before expect() consumes it */
         expect(p, TOK_SEMI, "';'");
-        size_t span_len = (size_t)(semi_tok->start - start_tok->start);
-        while (span_len > 0 && isspace((unsigned char)p->src[start_tok->start + span_len - 1])) span_len--;
+        size_t span_len = (size_t)(semi_tok.start - start_tok.start);
+        while (span_len > 0 && isspace((unsigned char)p->src[start_tok.start + span_len - 1])) span_len--;
         Ast *body = parse_expr(p);
         Ast *n = asnix_ast_new(AST_ASSERT);
         n->as.assert1.cond = cond;
         n->as.assert1.body = body;
-        n->as.assert1.cond_text = p->src + start_tok->start;
+        n->as.assert1.cond_text = p->src + start_tok.start;
         n->as.assert1.cond_text_len = span_len;
         return n;
     }
-    if (cur(p)->kind == TOK_IDENT && peek2(p)->kind == TOK_AT) {
+    if (cur(p).kind == TOK_IDENT && peek2(p).kind == TOK_AT) {
         /* `name@{...}: body` -- the whole-arg alias comes first. */
-        Token *asname = cur(p);
+        Token asname = cur(p);
         advance(p);
         advance(p); /* '@' */
         expect(p, TOK_LBRACE, "'{' after '@'");
@@ -2019,12 +2037,12 @@ static Ast *parse_expr(Parser *p) {
         n->as.lambda.body = body;
         return n;
     }
-    if (cur(p)->kind == TOK_LBRACE) {
+    if (cur(p).kind == TOK_LBRACE) {
         /* Could be a lambda pattern (`{...}: body` / `{...}@name: body`) or
          * an ordinary attrset-literal expression -- a bounded lookahead at
          * the first 1-2 tokens tells which, same disambiguation real Nix's
          * own grammar makes (see is_formals_pattern's comment). */
-        if (is_formals_pattern(p, p->pos)) {
+        if (is_formals_pattern(p)) {
             advance(p); /* '{' */
             AstFormal *formals;
             size_t fcount;
@@ -2033,9 +2051,9 @@ static Ast *parse_expr(Parser *p) {
             int has_as = 0;
             const char *as_name = NULL;
             size_t as_name_len = 0;
-            if (cur(p)->kind == TOK_AT) {
+            if (cur(p).kind == TOK_AT) {
                 advance(p);
-                Token *asname = expect(p, TOK_IDENT, "a name after '@'");
+                Token asname = expect(p, TOK_IDENT, "a name after '@'");
                 has_as = 1;
                 as_name = tok_text(p, asname);
                 as_name_len = tok_len(asname);
@@ -2061,15 +2079,21 @@ static Ast *parse_expr(Parser *p) {
 }
 
 /* M135: fuses lexing and parsing -- src is lexed on demand through a
- * LexCursor instead of being fully lexed into an array before this
- * function is ever called (that was the old asnix_lex(src,&n)+
- * asnix_parse(toks,n,src) two-call pattern every caller used; see
- * docs/architecture.md M134/M135). */
+ * Lexer instead of being fully lexed into an array before this function
+ * is ever called (that was the old asnix_lex(src,&n)+asnix_parse(toks,n,
+ * src) two-call pattern every caller used; see docs/architecture.md
+ * M134/M135). M175: that on-demand `Lexer` is now a true pull cursor
+ * (lexer.h) with no backing Token array at all -- `p.tok`/`p.next` are
+ * primed here by calling lexer_next() twice up front, mirroring the old
+ * invariant that `peek2()` is always valid even right at TOK_EOF (lexing
+ * an empty file primes both slots to TOK_EOF, same as before). */
 Ast *asnix_parse(const char *src) {
-    LexCursor *lc = lexcur_new(src);
-    Parser p = { .lc = lc, .pos = 0, .src = src };
+    Lexer *lx = lexer_new(src);
+    Parser p = { .lx = lx, .src = src };
+    p.tok = lexer_next(lx);
+    p.next = lexer_next(lx);
     Ast *result = parse_expr(&p);
     expect(&p, TOK_EOF, "end of input");
-    lexcur_free(lc);
+    lexer_free(lx);
     return result;
 }

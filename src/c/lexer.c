@@ -69,12 +69,8 @@ static int cc_digit(char c) { return (CHAR_CLASS[(unsigned char)c] & CC_DIGIT) !
 static int cc_space(char c) { return (CHAR_CLASS[(unsigned char)c] & CC_SPACE) != 0; }
 static int cc_alpha(char c) { return (CHAR_CLASS[(unsigned char)c] & CC_ALPHA) != 0; }
 
-static void push_tok(TokVec *v, Token t) {
-    if (v->len == v->cap) {
-        v->cap = v->cap ? v->cap * 2 : 64;
-        v->toks = realloc(v->toks, v->cap * sizeof(Token));
-    }
-    v->toks[v->len++] = t;
+static Token mk_tok(TokKind k, size_t start, size_t end) {
+    return (Token){ .kind = k, .start = (uint32_t)start, .end = (uint32_t)end };
 }
 
 /* Path-literal scanning (import-paths). Real Nix's lexer recognizes PATH
@@ -345,37 +341,71 @@ static void keyword_lookup_selfcheck(void) {
  * lexing) pushes NORMAL; every "}" pops one level. Only when a pop reveals
  * STRING/ISTRING underneath does the "}" that closed an interpolation
  * actually mean "resume string-content lexing" -- the asm/dispatch loop
- * terminology doesn't apply here, this is purely a lexer-internal stack. */
-static void mode_push(ModeStack *m, LexMode mode) {
-    if (m->len == m->cap) {
-        m->cap = m->cap ? m->cap * 2 : 16;
-        m->modes = realloc(m->modes, m->cap * sizeof(LexMode));
+ * terminology doesn't apply here, this is purely a lexer-internal stack.
+ *
+ * M175: this mode stack, the byte position, and a one-slot pending-token
+ * buffer (see lexer.h's own Lexer comment) are now ALL the state a `Lexer`
+ * carries -- no backing Token array (TokVec) at all, unlike M135's
+ * LexCursor. The pending slot exists because a handful of scan steps
+ * below naturally produce TWO tokens before there's anywhere sensible to
+ * pause (e.g. a string's content chunk immediately followed by its own
+ * closing delimiter or a "${" boundary, where the delimiter/boundary
+ * token's own mode-stack push/pop has to happen atomically with it being
+ * produced) -- `lexer_next()` hands back the first of the two and stashes
+ * the second for the very next call, instead of returning both from one
+ * call the way `push_tok`-into-an-array used to allow. */
+typedef enum { MODE_NORMAL, MODE_STRING, MODE_ISTRING, MODE_PATH } LexMode;
+
+struct Lexer {
+    const char *src;
+    size_t pos;
+    LexMode *modes;
+    size_t modes_len, modes_cap;
+    /* M177: a mirror of modes[modes_len-1] (the only slot mode_top ever
+     * reads), kept in sync by mode_push/mode_pop so lex_normal's own
+     * per-token mode_top() call becomes a single field load instead of a
+     * 3-load chain (modes_len, then the modes pointer, then
+     * modes[modes_len-1] itself) -- see mode_push/mode_top/mode_pop below
+     * for the invariant this depends on: EVERY mutation of modes/modes_len
+     * happens through those three functions, nothing else in this file
+     * (or anywhere else -- Lexer is opaque outside lexer.c, see lexer.h)
+     * ever touches a Lexer's mode fields directly. */
+    LexMode cur;
+    Token pending;
+    int has_pending;
+};
+
+static void mode_push(Lexer *lx, LexMode mode) {
+    if (lx->modes_len == lx->modes_cap) {
+        lx->modes_cap = lx->modes_cap ? lx->modes_cap * 2 : 16;
+        lx->modes = realloc(lx->modes, lx->modes_cap * sizeof(LexMode));
     }
-    m->modes[m->len++] = mode;
-    m->cur = mode; /* M174: the slot just written is the new top */
+    lx->modes[lx->modes_len++] = mode;
+    lx->cur = mode; /* M177: the slot just written is the new top */
 }
-static LexMode mode_top(ModeStack *m) {
-    /* M174: used to be m->modes[m->len - 1] -- a 3-load chain (m->len,
-     * m->modes, then the indexed load) paid on EVERY lex_until iteration,
-     * even though mode_push/mode_pop (the only two places that ever
-     * change what the top actually is) already know the new top value
-     * at the moment they change it. m->cur mirrors that value exactly,
-     * so this is a pure redundant-recomputation removal: same stack,
-     * same contents, same output, one load instead of three. */
-    return m->cur;
+static LexMode mode_top(Lexer *lx) {
+    /* M177: used to be lx->modes[lx->modes_len - 1] -- a 3-load chain
+     * (modes_len, modes, then the indexed load) paid on EVERY lex_normal
+     * iteration, even though mode_push/mode_pop (the only two places that
+     * ever change what the top actually is) already know the new top
+     * value at the moment they change it. lx->cur mirrors that value
+     * exactly, so this is a pure redundant-recomputation removal: same
+     * stack, same contents, same output, one load instead of three. */
+    return lx->cur;
 }
-static void mode_pop(ModeStack *m) {
+static void mode_pop(Lexer *lx) {
     /* Every push above is paired 1:1 with a pop at a matching "}"/closing
      * quote, driven entirely by well-formed-by-construction scan logic
      * below -- an underflow here would be a lexer bug, not malformed
      * input (malformed `}`-without-`{` is caught before this is ever
      * called, see the MODE_NORMAL '}' case). */
-    m->len--;
-    m->cur = m->modes[m->len - 1]; /* M174: popping reveals a new top --
-                                      * re-mirror it (this IS the array
-                                      * read mode_top used to do every
-                                      * single token; now it happens only
-                                      * here, once per actual pop). */
+    lx->modes_len--;
+    lx->cur = lx->modes[lx->modes_len - 1]; /* M177: popping reveals a new
+                                                top -- re-mirror it (this IS
+                                                the array read mode_top used
+                                                to do every single token;
+                                                now it happens only here,
+                                                once per actual pop). */
 }
 
 static void fatal_unterminated(const char *what) {
@@ -456,32 +486,48 @@ void asnix_decode_istr_esc(const char *src, uint32_t start, char out[2], size_t 
  * unlike this lexer's pre-interpolation M5 behavior -- see
  * docs/architecture.md's Known Bugs list) and the \n \r \t \" \\ \$
  * escapes. */
-static void lex_dquote_run(const char *src, size_t *i, ModeStack *modes, TokVec *v) {
-    size_t start = *i;
+/* M175: produces exactly ONE Token per call -- a content chunk still
+ * returns first; whenever this step's own boundary token (TOK_STR_END or
+ * TOK_DOLLAR_LBRACE) is ready at the SAME time (the mode-stack change has
+ * to happen atomically with it), that second token is stashed in
+ * `lx->pending` for the very next call to hand back immediately, instead
+ * of both being pushed into an array in one go (see lexer.h's own Lexer
+ * comment). `lx->pos` always ends up at the position reflecting BOTH
+ * tokens already consumed, even though only the first is returned here --
+ * the pending slot alone is what makes the second one still show up, in
+ * order, on the next call. */
+static Token lex_dquote_run(Lexer *lx) {
+    const char *src = lx->src;
+    size_t start = lx->pos;
+    size_t i = lx->pos;
     for (;;) {
-        char c = src[*i];
+        char c = src[i];
         if (c == '\0') fatal_unterminated("string literal");
         if (c == '"') {
-            push_tok(v, (Token){ .kind = TOK_STR_PART, .start = (uint32_t)start, .end = (uint32_t)*i });
-            (*i)++;
-            mode_pop(modes);
-            push_tok(v, (Token){ .kind = TOK_STR_END, .start = (uint32_t)*i, .end = (uint32_t)*i });
-            return;
+            Token part = mk_tok(TOK_STR_PART, start, i);
+            i++;
+            mode_pop(lx);
+            lx->pos = i;
+            lx->pending = mk_tok(TOK_STR_END, i, i);
+            lx->has_pending = 1;
+            return part;
         }
-        if (c == '$' && src[*i + 1] == '{') {
-            push_tok(v, (Token){ .kind = TOK_STR_PART, .start = (uint32_t)start, .end = (uint32_t)*i });
-            *i += 2;
-            mode_push(modes, MODE_NORMAL);
-            push_tok(v, (Token){ .kind = TOK_DOLLAR_LBRACE, .start = (uint32_t)*i - 2, .end = (uint32_t)*i });
-            return;
+        if (c == '$' && src[i + 1] == '{') {
+            Token part = mk_tok(TOK_STR_PART, start, i);
+            i += 2;
+            mode_push(lx, MODE_NORMAL);
+            lx->pos = i;
+            lx->pending = mk_tok(TOK_DOLLAR_LBRACE, i - 2, i);
+            lx->has_pending = 1;
+            return part;
         }
         if (c == '\\') {
-            char e = src[*i + 1];
+            char e = src[i + 1];
             if (e == '\0') fatal_unterminated("string literal");
-            *i += 2;
+            i += 2;
             continue;
         }
-        (*i)++; /* includes raw '\n' -- real Nix allows literal newlines in "..." */
+        i++; /* includes raw '\n' -- real Nix allows literal newlines in "..." */
     }
 }
 
@@ -513,59 +559,84 @@ static void lex_dquote_run(const char *src, size_t *i, ModeStack *modes, TokVec 
  * in the vanishingly rare case of a leading "'$" run of whitespace, never
  * the produced string's actual bytes -- not exercised by any case in
  * tests/e2e, and not worth the extra complexity here. */
-static void lex_indented_run(const char *src, size_t *i, ModeStack *modes, TokVec *v) {
-    size_t content_start = *i;
+/* M175: produces exactly one Token per call, same pending-slot convention
+ * as lex_dquote_run above for the two unconditional-pair boundaries
+ * (closing "''" and "${"). The escape case (''$ / ''' / ''\<c>) is
+ * handled WITHOUT the pending slot at all, by a different trick: when a
+ * nonempty content run precedes the escape, this returns just the
+ * TOK_ISTR_PART chunk and -- critically -- leaves `lx->pos` sitting right
+ * BEFORE the escape's own bytes (not past them), rather than consuming it
+ * here. The very next call re-enters this same function fresh with
+ * `content_start == lx->pos` (recomputed at entry, see below) landing
+ * exactly on that same escape; this time `i > content_start` is false (no
+ * unflushed content ahead of it), so it falls straight to the
+ * `lx->pos = esc_end; return TOK_ISTR_ESC` branch instead of looping back
+ * into content-scanning -- i.e. the SAME escape is "re-detected", not
+ * re-decoded or duplicated, by ordinary re-entry rather than a stashed
+ * second token. Safe only because content_start is always freshly derived
+ * from lx->pos at this function's own top, never carried across calls any
+ * other way -- true both before and after this milestone. */
+static Token lex_indented_run(Lexer *lx) {
+    const char *src = lx->src;
+    size_t content_start = lx->pos;
+    size_t i = lx->pos;
 
     for (;;) {
-        char c = src[*i];
+        char c = src[i];
         if (c == '\0') fatal_unterminated("indented string literal (''...'')");
 
-        if (c == '$' && src[*i + 1] == '{') {
+        if (c == '$' && src[i + 1] == '{') {
             /* Always emit a (possibly empty) PART before the boundary --
              * matches the pre-M141 istr_flush_always convention. */
-            push_tok(v, (Token){ .kind = TOK_ISTR_PART, .start = (uint32_t)content_start, .end = (uint32_t)*i });
-            *i += 2;
-            mode_push(modes, MODE_NORMAL);
-            push_tok(v, (Token){ .kind = TOK_DOLLAR_LBRACE, .start = (uint32_t)*i - 2, .end = (uint32_t)*i });
-            return;
+            Token part = mk_tok(TOK_ISTR_PART, content_start, i);
+            i += 2;
+            mode_push(lx, MODE_NORMAL);
+            lx->pos = i;
+            lx->pending = mk_tok(TOK_DOLLAR_LBRACE, i - 2, i);
+            lx->has_pending = 1;
+            return part;
         }
 
-        if (c == '\'' && src[*i + 1] == '\'') {
-            char third = src[*i + 2];
+        if (c == '\'' && src[i + 1] == '\'') {
+            char third = src[i + 2];
             if (third == '\'' || third == '$' || third == '\\') {
-                size_t esc_start = *i;
+                size_t esc_start = i;
                 size_t esc_end;
                 if (third == '\\') {
-                    if (src[*i + 3] == '\0') fatal_unterminated("indented string literal (''...'')");
-                    esc_end = *i + 4;
+                    if (src[i + 3] == '\0') fatal_unterminated("indented string literal (''...'')");
+                    esc_end = i + 4;
                 } else {
-                    esc_end = *i + 3; /* ''' or ''$ -- both exactly 3 raw bytes */
+                    esc_end = i + 3; /* ''' or ''$ -- both exactly 3 raw bytes */
                 }
                 /* Flush the pending content run only if nonempty -- matches
                  * the pre-M141 istr_flush_if_nonempty convention (a
                  * content-to-escape category change doesn't force an empty
-                 * PART the way a real boundary does). */
-                if (*i > content_start) {
-                    push_tok(v, (Token){ .kind = TOK_ISTR_PART, .start = (uint32_t)content_start, .end = (uint32_t)*i });
+                 * PART the way a real boundary does). See this function's
+                 * own header comment: returning here WITHOUT consuming the
+                 * escape (lx->pos left at the escape's own start) is what
+                 * makes the next call re-detect and emit it alone. */
+                if (i > content_start) {
+                    lx->pos = i;
+                    return mk_tok(TOK_ISTR_PART, content_start, i);
                 }
-                push_tok(v, (Token){ .kind = TOK_ISTR_ESC, .start = (uint32_t)esc_start, .end = (uint32_t)esc_end });
-                *i = esc_end;
-                content_start = *i;
-                continue;
+                lx->pos = esc_end;
+                return mk_tok(TOK_ISTR_ESC, esc_start, esc_end);
             }
             /* Bare '' not followed by ', $, or \\ -- always the closing delimiter. */
-            push_tok(v, (Token){ .kind = TOK_ISTR_PART, .start = (uint32_t)content_start, .end = (uint32_t)*i });
-            *i += 2;
-            mode_pop(modes);
-            push_tok(v, (Token){ .kind = TOK_ISTR_END, .start = (uint32_t)*i, .end = (uint32_t)*i });
-            return;
+            Token part = mk_tok(TOK_ISTR_PART, content_start, i);
+            i += 2;
+            mode_pop(lx);
+            lx->pos = i;
+            lx->pending = mk_tok(TOK_ISTR_END, i, i);
+            lx->has_pending = 1;
+            return part;
         }
 
         /* Plain content: everything else, including a lone '$' not
          * followed by '{', a lone '\'' not followed by another '\'', and
          * raw newlines (which indentation-stripping treats specially) --
          * just extend the pending content run, nothing to write yet. */
-        (*i)++;
+        i++;
     }
 }
 
@@ -590,26 +661,32 @@ static void lex_indented_run(const char *src, size_t *i, ModeStack *modes, TokVe
  * `./a-${foo}-b`'s "-b", is perfectly valid here -- only the very
  * FIRST chunk of a path literal needs that requirement, to tell a path
  * apart from "not a path at all"). */
-static void lex_path_run(const char *src, size_t *i, ModeStack *modes, TokVec *v) {
-    size_t start = *i;
-    size_t j = *i;
+static Token lex_path_run(Lexer *lx) {
+    const char *src = lx->src;
+    size_t start = lx->pos;
+    size_t j = lx->pos;
     while (path_char(src[j])) j++;
     int saw_group = 0;
     j = scan_path_groups(src, j, &saw_group);
     if (saw_group && src[j] == '/') j++; /* optional trailing slash, same rule as try_scan_path */
-    *i = j;
+    size_t i = j;
 
-    if (at_dollar_brace(src, *i)) {
-        push_tok(v, (Token){ .kind = TOK_PATH_PART, .start = (uint32_t)start, .end = (uint32_t)*i });
-        *i += 2;
-        mode_push(modes, MODE_NORMAL); /* MODE_PATH underneath is left in place -- the matching
-                                         * '}' pops back to it, re-entering this same function */
-        push_tok(v, (Token){ .kind = TOK_DOLLAR_LBRACE, .start = (uint32_t)*i - 2, .end = (uint32_t)*i });
-        return;
+    if (at_dollar_brace(src, i)) {
+        Token part = mk_tok(TOK_PATH_PART, start, i);
+        i += 2;
+        mode_push(lx, MODE_NORMAL); /* MODE_PATH underneath is left in place -- the matching
+                                      * '}' pops back to it, re-entering this same function */
+        lx->pos = i;
+        lx->pending = mk_tok(TOK_DOLLAR_LBRACE, i - 2, i);
+        lx->has_pending = 1;
+        return part;
     }
-    push_tok(v, (Token){ .kind = TOK_PATH_PART, .start = (uint32_t)start, .end = (uint32_t)*i });
-    mode_pop(modes);
-    push_tok(v, (Token){ .kind = TOK_PATH_END, .start = (uint32_t)*i, .end = (uint32_t)*i });
+    Token part = mk_tok(TOK_PATH_PART, start, i);
+    mode_pop(lx);
+    lx->pos = i;
+    lx->pending = mk_tok(TOK_PATH_END, i, i);
+    lx->has_pending = 1;
+    return part;
 }
 
 /* M141: shared tail-scan for a float literal already known to match
@@ -634,76 +711,45 @@ static void scan_float_tail(const char *src, size_t *i) {
     }
 }
 
-static void lex_until(const char *src, size_t *i_inout, ModeStack *modes, TokVec *v, size_t min_len);
-
-Token *asnix_lex(const char *src, size_t *out_count) {
-    keyword_lookup_selfcheck();
-    /* perf: presize the token array from the source length instead of
-     * letting push_tok's cap-doubling start from scratch (0->64->128->...)
-     * on every single file -- see this project's own M123 writeup for the
-     * full measured rationale (unchanged by M141's Token shrink, since the
-     * measured-average "8.6 bytes of SOURCE per token" ratio this sizing
-     * is based on is about source bytes, not Token's own size). */
-    size_t src_len = strlen(src);
-    TokVec v = { .toks = malloc((src_len / 3 + 32) * sizeof(Token)), .len = 0, .cap = src_len / 3 + 32 };
-    ModeStack modes = { 0 };
-    mode_push(&modes, MODE_NORMAL);
-    size_t i = 0;
-    lex_until(src, &i, &modes, &v, SIZE_MAX);
-    free(modes.modes);
-    *out_count = v.len;
-    return v.toks;
-}
-
-/* M135: fuses lexing and parsing into one interleaved pass instead of two
- * sequential ones (docs/architecture.md's M134 finding: asnix used to lex
- * the whole file into an array, THEN hand it to the parser -- a full write
- * pass followed by a full read pass over every token, with no equivalent
- * boundary in iets's pull-based lexer/parser). Called with min_len =
- * SIZE_MAX (asnix_lex above) this behaves exactly as the lexer always did:
- * run to EOF in one call. Called with a finite min_len (lexcur_tok below,
- * the parser's own on-demand driver) it stops the instant v->len tokens are
- * available and picks back up exactly where it left off on the next call,
- * via the same (i, modes, v) triple threaded through by the caller -- same
- * per-token scanning code, same output, just possibly paused partway
- * through. */
-static void lex_until(const char *src, size_t *i_inout, ModeStack *modes, TokVec *v, size_t min_len) {
-    size_t i = *i_inout;
+/* M175: replaces M135's `lex_until` (which pushed every produced token
+ * into a shared TokVec array, stopping once at least `min_len` tokens
+ * existed) -- this produces exactly ONE Token per call, by value, never
+ * writing into any array at all. Every per-character scanning DECISION
+ * below is byte-for-byte identical to the pre-M175 code (nothing about
+ * what counts as a token, or where one ends, changed); only the "what do
+ * we do once we know a token's span" step changed, from `push_tok(v,
+ * ...); continue;` to `lx->pos = ...; return mk_tok(...);` (a direct
+ * value return instead of an array append). The handful of steps that
+ * used to push TWO tokens in one go (a path/URI chunk immediately
+ * followed by a "${" interpolation boundary) stash the second one in
+ * `lx->pending` for the very next call, exactly like lex_dquote_run/
+ * lex_indented_run/lex_path_run above -- see lexer.h's own Lexer comment. */
+static Token lex_normal(Lexer *lx) {
+    const char *src = lx->src;
     for (;;) {
-        if (v->len > min_len) { *i_inout = i; return; }
-        LexMode mode = mode_top(modes);
-
-        if (mode == MODE_STRING) {
-            lex_dquote_run(src, &i, modes, v);
-            continue;
-        }
-        if (mode == MODE_ISTRING) {
-            lex_indented_run(src, &i, modes, v);
-            continue;
-        }
-        if (mode == MODE_PATH) {
-            lex_path_run(src, &i, modes, v);
-            continue;
-        }
-
-        /* mode == MODE_NORMAL: ordinary expression/identifier/operator lexing. */
+        size_t i = lx->pos;
         char c = src[i];
         size_t tok_start = i; /* byte offset of whatever token (if any) starts here */
 
         if (c == '\0') {
-            if (modes->len != 1) {
+            if (lx->modes_len != 1) {
                 fprintf(stderr, "asnix: unexpected end of input inside '${ ... }'\n");
                 exit(1);
             }
-            break;
+            lx->pos = i; /* left unchanged: a repeated call at EOF keeps producing TOK_EOF,
+                           * same re-callable convention the old array-based design had
+                           * (peek2() at the EOF position used to grow the array by one more
+                           * duplicate EOF entry on demand; here it's just another call). */
+            return mk_tok(TOK_EOF, i, i);
         }
 
         if (cc_space(c)) {
-            i++;
+            lx->pos = i + 1;
             continue;
         }
         if (c == '#') { /* line comment, a harmless real-Nix-ism to allow in fixtures */
             while (src[i] && src[i] != '\n') i++;
+            lx->pos = i;
             continue;
         }
         if (c == '/' && src[i + 1] == '*') { /* block comment -- real Nix files are full of these
@@ -723,6 +769,7 @@ static void lex_until(const char *src, size_t *i_inout, ModeStack *modes, TokVec
                 exit(1);
             }
             i += 2;
+            lx->pos = i;
             continue;
         }
 
@@ -750,15 +797,17 @@ static void lex_until(const char *src, size_t *i_inout, ModeStack *modes, TokVec
         {
             size_t hlen = try_scan_home_path(src, i);
             if (hlen > 0) {
-                push_tok(v, (Token){ .kind = TOK_PATH, .start = (uint32_t)i, .end = (uint32_t)(i + hlen) });
-                i += hlen;
-                if (at_dollar_brace(src, i)) {
-                    i += 2;
-                    mode_push(modes, MODE_PATH);
-                    mode_push(modes, MODE_NORMAL);
-                    push_tok(v, (Token){ .kind = TOK_DOLLAR_LBRACE, .start = (uint32_t)i - 2, .end = (uint32_t)i });
+                size_t end = i + hlen;
+                if (at_dollar_brace(src, end)) {
+                    mode_push(lx, MODE_PATH);
+                    mode_push(lx, MODE_NORMAL);
+                    lx->pos = end + 2;
+                    lx->pending = mk_tok(TOK_DOLLAR_LBRACE, end, end + 2);
+                    lx->has_pending = 1;
+                    return mk_tok(TOK_PATH, i, end);
                 }
-                continue;
+                lx->pos = end;
+                return mk_tok(TOK_PATH, i, end);
             }
         }
 
@@ -808,21 +857,22 @@ static void lex_until(const char *src, size_t *i_inout, ModeStack *modes, TokVec
             if (nb == '/' || nb == ':' || nb == '.' || nb == '+') {
                 size_t plen = try_scan_path(src, i);
                 if (plen > 0) {
-                    push_tok(v, (Token){ .kind = TOK_PATH, .start = (uint32_t)i, .end = (uint32_t)(i + plen) });
-                    i += plen;
-                    if (at_dollar_brace(src, i)) {
-                        i += 2;
-                        mode_push(modes, MODE_PATH);
-                        mode_push(modes, MODE_NORMAL);
-                        push_tok(v, (Token){ .kind = TOK_DOLLAR_LBRACE, .start = (uint32_t)i - 2, .end = (uint32_t)i });
+                    size_t end = i + plen;
+                    if (at_dollar_brace(src, end)) {
+                        mode_push(lx, MODE_PATH);
+                        mode_push(lx, MODE_NORMAL);
+                        lx->pos = end + 2;
+                        lx->pending = mk_tok(TOK_DOLLAR_LBRACE, end, end + 2);
+                        lx->has_pending = 1;
+                        return mk_tok(TOK_PATH, i, end);
                     }
-                    continue;
+                    lx->pos = end;
+                    return mk_tok(TOK_PATH, i, end);
                 }
                 size_t ulen = try_scan_uri(src, i);
                 if (ulen > 0) {
-                    push_tok(v, (Token){ .kind = TOK_URI, .start = (uint32_t)i, .end = (uint32_t)(i + ulen) });
-                    i += ulen;
-                    continue;
+                    lx->pos = i + ulen;
+                    return mk_tok(TOK_URI, i, i + ulen);
                 }
             }
             /* Plain identifier or keyword: [i, j), with j already computed
@@ -832,9 +882,8 @@ static void lex_until(const char *src, size_t *i_inout, ModeStack *modes, TokVec
             size_t start = i;
             size_t len = j - start;
             TokKind kind = keyword_lookup(src + start, len);
-            push_tok(v, (Token){ .kind = kind, .start = (uint32_t)start, .end = (uint32_t)j });
-            i = j;
-            continue;
+            lx->pos = j;
+            return mk_tok(kind, start, j);
         }
 
         /* Not an identifier lead (handled, with its own guard, just above):
@@ -849,15 +898,17 @@ static void lex_until(const char *src, size_t *i_inout, ModeStack *modes, TokVec
         {
             size_t plen = try_scan_path(src, i);
             if (plen > 0) {
-                push_tok(v, (Token){ .kind = TOK_PATH, .start = (uint32_t)i, .end = (uint32_t)(i + plen) });
-                i += plen;
-                if (at_dollar_brace(src, i)) {
-                    i += 2;
-                    mode_push(modes, MODE_PATH);
-                    mode_push(modes, MODE_NORMAL);
-                    push_tok(v, (Token){ .kind = TOK_DOLLAR_LBRACE, .start = (uint32_t)i - 2, .end = (uint32_t)i });
+                size_t end = i + plen;
+                if (at_dollar_brace(src, end)) {
+                    mode_push(lx, MODE_PATH);
+                    mode_push(lx, MODE_NORMAL);
+                    lx->pos = end + 2;
+                    lx->pending = mk_tok(TOK_DOLLAR_LBRACE, end, end + 2);
+                    lx->has_pending = 1;
+                    return mk_tok(TOK_PATH, i, end);
                 }
-                continue;
+                lx->pos = end;
+                return mk_tok(TOK_PATH, i, end);
             }
         }
 
@@ -872,9 +923,8 @@ static void lex_until(const char *src, size_t *i_inout, ModeStack *modes, TokVec
             size_t k = start;
             while (path_char(src[k]) || src[k] == '/') k++;
             if (k > start && src[k] == '>') {
-                push_tok(v, (Token){ .kind = TOK_SEARCH_PATH, .start = (uint32_t)start, .end = (uint32_t)k });
-                i = k + 1;
-                continue;
+                lx->pos = k + 1;
+                return mk_tok(TOK_SEARCH_PATH, start, k);
             }
         }
 
@@ -912,11 +962,11 @@ static void lex_until(const char *src, size_t *i_inout, ModeStack *modes, TokVec
             if (is_float) {
                 i++; /* consume '.' */
                 scan_float_tail(src, &i);
-                push_tok(v, (Token){ .kind = TOK_FLOAT, .start = (uint32_t)start, .end = (uint32_t)i });
-                continue;
+                lx->pos = i;
+                return mk_tok(TOK_FLOAT, start, i);
             }
-            push_tok(v, (Token){ .kind = TOK_INT, .start = (uint32_t)start, .end = (uint32_t)i });
-            continue;
+            lx->pos = i;
+            return mk_tok(TOK_INT, start, i);
         }
 
         /* M51: a float literal with no leading digit at all -- the
@@ -929,15 +979,15 @@ static void lex_until(const char *src, size_t *i_inout, ModeStack *modes, TokVec
             size_t start = i;
             i++; /* consume '.' */
             scan_float_tail(src, &i);
-            push_tok(v, (Token){ .kind = TOK_FLOAT, .start = (uint32_t)start, .end = (uint32_t)i });
-            continue;
+            lx->pos = i;
+            return mk_tok(TOK_FLOAT, start, i);
         }
 
         if (c == '"') {
             i++;
-            mode_push(modes, MODE_STRING);
-            push_tok(v, (Token){ .kind = TOK_STR_START, .start = (uint32_t)tok_start, .end = (uint32_t)i });
-            continue;
+            mode_push(lx, MODE_STRING);
+            lx->pos = i;
+            return mk_tok(TOK_STR_START, tok_start, i);
         }
 
         if (c == '\'' && src[i + 1] == '\'') {
@@ -951,9 +1001,9 @@ static void lex_until(const char *src, size_t *i_inout, ModeStack *modes, TokVec
             size_t j = i;
             while (src[j] == ' ') j++;
             if (src[j] == '\n') i = j + 1;
-            mode_push(modes, MODE_ISTRING);
-            push_tok(v, (Token){ .kind = TOK_ISTR_START, .start = (uint32_t)tok_start, .end = (uint32_t)i });
-            continue;
+            mode_push(lx, MODE_ISTRING);
+            lx->pos = i;
+            return mk_tok(TOK_ISTR_START, tok_start, i);
         }
 
         /* `${expr}` directly in normal-mode code (not inside a string) --
@@ -969,41 +1019,40 @@ static void lex_until(const char *src, size_t *i_inout, ModeStack *modes, TokVec
          * `set.${name}`), see docs/architecture.md's Known Bugs list. */
         if (c == '$' && src[i + 1] == '{') {
             i += 2;
-            mode_push(modes, MODE_NORMAL);
-            push_tok(v, (Token){ .kind = TOK_DOLLAR_LBRACE, .start = (uint32_t)tok_start, .end = (uint32_t)i });
-            continue;
+            mode_push(lx, MODE_NORMAL);
+            lx->pos = i;
+            return mk_tok(TOK_DOLLAR_LBRACE, tok_start, i);
         }
 
         if (c == '{') {
             i++;
-            mode_push(modes, MODE_NORMAL);
-            push_tok(v, (Token){ .kind = TOK_LBRACE, .start = (uint32_t)tok_start, .end = (uint32_t)i });
-            continue;
+            mode_push(lx, MODE_NORMAL);
+            lx->pos = i;
+            return mk_tok(TOK_LBRACE, tok_start, i);
         }
         if (c == '}') {
-            if (modes->len == 1) {
+            if (lx->modes_len == 1) {
                 fprintf(stderr, "asnix: unmatched '}'\n");
                 exit(1);
             }
             i++;
-            mode_pop(modes);
-            push_tok(v, (Token){ .kind = TOK_RBRACE, .start = (uint32_t)tok_start, .end = (uint32_t)i });
-            continue;
+            mode_pop(lx);
+            lx->pos = i;
+            return mk_tok(TOK_RBRACE, tok_start, i);
         }
 
         /* M138: the ident_start(c) branch that used to live here (plain
          * TOK_IDENT/keyword scanning, re-walking ident_cont from scratch)
          * was moved up above, merged into the new guarded path/URI check --
          * ident_start(c) can never reach this point anymore (that earlier
-         * branch always `continue`s). */
+         * branch always `continue`s/`return`s). */
 
         /* `...` (lambda-pattern ellipsis) is checked before any single- or
          * double-character operator, same lookahead style as the two-char
          * operators below. */
         if (c == '.' && src[i + 1] == '.' && src[i + 2] == '.') {
-            push_tok(v, (Token){ .kind = TOK_ELLIPSIS, .start = (uint32_t)tok_start, .end = (uint32_t)(tok_start + 3) });
-            i += 3;
-            continue;
+            lx->pos = i + 3;
+            return mk_tok(TOK_ELLIPSIS, tok_start, tok_start + 3);
         }
 
         /* Two-character operators are checked before falling back to their
@@ -1052,44 +1101,103 @@ static void lex_until(const char *src, size_t *i_inout, ModeStack *modes, TokVec
                     exit(1);
             }
         }
-        push_tok(v, (Token){ .kind = kind, .start = (uint32_t)tok_start, .end = (uint32_t)(tok_start + width) });
-        i += width;
+        lx->pos = tok_start + width;
+        return mk_tok(kind, tok_start, tok_start + width);
     }
-
-    push_tok(v, (Token){ .kind = TOK_EOF, .start = (uint32_t)i, .end = (uint32_t)i });
-    *i_inout = i;
 }
 
-/* M135: the parser's own on-demand lexing driver (see lex_until's comment
- * above) -- bundles exactly the (src, i, modes, v) state asnix_lex used to
- * keep as locals into one persistent, heap-allocated cursor so repeated
- * lexcur_tok() calls can resume lexing across many separate parser calls
- * instead of running to completion in one shot. */
-LexCursor *lexcur_new(const char *src) {
-    LexCursor *lc = malloc(sizeof(LexCursor));
+/* M175: the parser's own on-demand lexing driver, now a true pull
+ * interface -- `pending` first (a step that produced two tokens at once
+ * stashed its second one here), else dispatch on the current mode and
+ * delegate to the one step function that owns it, exactly mirroring
+ * `iets`'s own `Lexer::next_token` dispatch (~/gnix/iets/src/syntax/
+ * lexer.rs), minus its separate-functions-called-directly-by-the-parser
+ * detail (asnix keeps every token, including string/path content chunks,
+ * flowing through this single entry point instead, unchanged from M135). */
+Token lexer_next(Lexer *lx) {
+    if (lx->has_pending) {
+        lx->has_pending = 0;
+        return lx->pending;
+    }
+    LexMode mode = mode_top(lx);
+    if (mode == MODE_STRING) return lex_dquote_run(lx);
+    if (mode == MODE_ISTRING) return lex_indented_run(lx);
+    if (mode == MODE_PATH) return lex_path_run(lx);
+    return lex_normal(lx);
+}
+
+Lexer *lexer_new(const char *src) {
+    Lexer *lx = malloc(sizeof(Lexer));
+    lx->src = src;
+    lx->pos = 0;
+    lx->modes = NULL;
+    lx->modes_len = 0;
+    lx->modes_cap = 0;
+    mode_push(lx, MODE_NORMAL);
+    lx->has_pending = 0;
+    return lx;
+}
+
+void lexer_free(Lexer *lx) {
+    free(lx->modes);
+    free(lx);
+}
+
+LexerSave lexer_save(Lexer *lx) {
+    return (LexerSave){
+        .pos = lx->pos, .modes_len = lx->modes_len,
+        .pending = lx->pending, .has_pending = lx->has_pending };
+}
+
+void lexer_restore(Lexer *lx, LexerSave save) {
+    lx->pos = save.pos;
+    lx->modes_len = save.modes_len; /* `.modes` itself (and its `.modes_cap`) is only ever
+                                      * grown, never shrunk/reallocated-away by mode_push, so
+                                      * truncating `.modes_len` back down is a complete,
+                                      * correct undo -- nothing above the restored length is
+                                      * ever read again until a fresh mode_push overwrites it. */
+    lx->cur = lx->modes[lx->modes_len - 1]; /* M177's cur-mirror has to be re-synced here too --
+                                               * mode_push/mode_pop are the only two places that
+                                               * normally keep it in sync, but a restore changes
+                                               * modes_len WITHOUT going through either of them,
+                                               * so without this line lx->cur would be left at
+                                               * whatever it was at save-time's "future" (the
+                                               * probed-ahead state), not at the restored position's
+                                               * actual top -- a real divergence the very next
+                                               * mode_top() call (inside lexer_next) would read.
+                                               * `.modes` is never shrunk (see above), so the slot
+                                               * this reads was never overwritten by the probe. */
+    lx->pending = save.pending;
+    lx->has_pending = save.has_pending;
+}
+
+/* Dead code as of M135 (every real caller goes through asnix_parse's
+ * internal Lexer instead -- see lexer.h's own comment); kept as a still-
+ * correct, still-tested-by-construction (same lex_normal/lex_dquote_run/
+ * lex_indented_run/lex_path_run core every lexer_next call ultimately
+ * runs) standalone entry point, matching this project's own M127/M135
+ * precedent of keeping a correct-but-unused reference implementation
+ * rather than deleting a working, independently-useful API. M175: re-
+ * implemented in terms of the new pull-based lexer_next() -- this
+ * function's own small, local, malloc'd-and-grown array is now the ONLY
+ * place in this file that assembles tokens into an array at all (every
+ * real, in-use caller never materializes one). */
+Token *asnix_lex(const char *src, size_t *out_count) {
+    keyword_lookup_selfcheck();
+    Lexer *lx = lexer_new(src);
     size_t src_len = strlen(src);
-    lc->src = src;
-    lc->i = 0;
-    lc->modes = (ModeStack){ 0 };
-    mode_push(&lc->modes, MODE_NORMAL);
-    lc->v = (TokVec){ .toks = malloc((src_len / 3 + 32) * sizeof(Token)), .len = 0, .cap = src_len / 3 + 32 };
-    return lc;
-}
-
-/* Ensures toks[0..idx] have all been lexed (lexing forward from wherever
- * the cursor last stopped, never backward, never re-lexing an already-
- * produced token) and returns a pointer to toks[idx]. idx must be at most
- * the eventual TOK_EOF's own index -- every caller (parser.c's cur/peek2/
- * find_matching_rbrace) already only ever asks for indices up to and
- * including whatever TOK_EOF it has already seen, exactly as it did
- * against the old eagerly-filled array. */
-Token *lexcur_tok_slow(LexCursor *lc, size_t idx) {
-    lex_until(lc->src, &lc->i, &lc->modes, &lc->v, idx);
-    return &lc->v.toks[idx];
-}
-
-void lexcur_free(LexCursor *lc) {
-    free(lc->modes.modes);
-    free(lc->v.toks);
-    free(lc);
+    size_t cap = src_len / 3 + 32, len = 0;
+    Token *out = malloc(cap * sizeof(Token));
+    for (;;) {
+        Token t = lexer_next(lx);
+        if (len == cap) {
+            cap *= 2;
+            out = realloc(out, cap * sizeof(Token));
+        }
+        out[len++] = t;
+        if (t.kind == TOK_EOF) break;
+    }
+    lexer_free(lx);
+    *out_count = len;
+    return out;
 }

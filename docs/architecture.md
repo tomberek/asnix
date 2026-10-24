@@ -20473,3 +20473,209 @@ changed on master; the investigation worktree and its disposable
 instrumentation were built, measured, and removed.
 
 Files: none changed (investigation only, no code modified on master).
+
+## M181: the lexer's `TokVec` array (M135's `LexCursor`) replaced with a true pull-based `Lexer` -- no backing Token array anywhere
+
+A separate investigation phase (this session, read-only) found `push_tok`
+-- the plain append-into-a-growable-array routine every single lexed
+token goes through (`lexer.c`, M135's `LexCursor`/`TokVec`) -- responsible
+for roughly 46% of `lex_until`'s own self-time on a real, very large
+nixpkgs file, bigger than every content-scanning function (identifiers,
+strings, paths, numbers) combined. `iets` (a sibling evaluator,
+`~/gnix/iets/src/syntax/lexer.rs`) has no equivalent cost at all: its
+`next_token()` returns a `Token` BY VALUE, with no append/capacity-check/
+array-growth anywhere -- the parser calls it once per token consumed,
+caching the result itself. This milestone ports that design.
+
+**Why this wasn't believed to pay off before, and why that doesn't apply
+here.** M135 (lex/parse fusion) found that interleaving lex and parse was
+a small net REGRESSION (+3.3% instructions) and explicitly named
+`find_matching_rbrace`'s full-span backward scan as a "hard blocker"
+against a true single-token-lookahead pull design, since it needed
+unbounded forward random access into an already-materialized array. Two
+things changed since: M158 deleted `find_matching_rbrace` outright,
+replacing it with `is_formals_pattern`, a bounded 1-2-token lookahead --
+the exact technique a pull design needs, already landed and measured
+(-0.72% instructions) as its own milestone. And M135's own regression was
+never caused by `push_tok`/`TokVec` at all -- M135 kept the SAME array
+before and after, lexing lazily instead of eagerly but still writing
+every token into it; the regression came from an added bounds-check
+branch on every `cur()`/`peek2()` call that wasn't there in the eager
+version, a cost orthogonal to the array itself. Eliminating the array
+entirely (this milestone) removes a different, larger cost than M135
+ever touched.
+
+**Investigation: every token-array dependency in `parser.c`, checked
+directly against the current code (not assumed from the M135 writeup).**
+A complete line-by-line read of `parser.c` (2075 lines) plus the relevant
+parts of `lexer.c`/`lexer.h` found every touchpoint is one of:
+- `cur()`/`peek2()`: forward lookahead, depth 0/1 -- maps directly onto a
+  2-slot `tok`/`next` buffer on `Parser` itself, by value.
+- `is_formals_pattern` (M158): forward lookahead, depth <=2 -- the one
+  place needing a THIRD token beyond `tok`/`next`, resolved the same way
+  `iets`'s own `peek3()` resolves it: save the lexer's full state, call
+  `lexer_next()` once to probe, restore -- see `peek3()`, `lexer_save()`/
+  `lexer_restore()` below.
+- `AST_ASSERT`'s `cond_text`/`cond_text_len`, and three other sites
+  (`parse_formals`'s `name`, the single-param-lambda's `param`, the
+  `name@{...}` lambda's `asname`) hold a `Token` across a NESTED
+  `parse_expr()` call before reading its fields. Every one of these reads
+  is a byte-OFFSET computation (`Token.start`/`.end`, `uint32_t`s, not
+  array indices, since M141) -- needs no array at all, and is actually
+  SAFER as a by-value `Token` than the pre-M181 `Token *`: `push_tok`
+  reallocs `TokVec`'s backing store on growth (`lexer.c`), and the
+  initial capacity estimate (`src_len/3+32`) is a heuristic, not a hard
+  bound -- it CAN still grow mid-file on token-dense input. All four of
+  these sites held a `Token *` across a recursive call that can itself
+  trigger further lexing/growth -- a latent dangling-pointer hazard in
+  the pre-M181 code, never known to be hit in practice (the capacity
+  heuristic is generous enough for every real fixture tried), but
+  genuine UB whenever it isn't. A by-value `Token` removes this bug
+  class entirely, as a side effect of the performance change, not a
+  separate fix.
+- No backward indexing (`pos - N`-style token-index arithmetic) exists
+  anywhere in `parser.c` (confirmed by grep, the only hits are unrelated
+  `AttrSeg`-array arithmetic in `insert_attrpath`).
+- No whole-file pre-materialization dependency exists: `asnix_parse`
+  already lexes on demand (M135's standing architecture); the old eager
+  `asnix_lex` is confirmed dead code, used only by its own declared
+  reference-implementation role (kept, per this project's M127/M135
+  precedent of keeping a correct-but-unused standalone entry point).
+
+**The one real wrinkle the parser-side investigation didn't cover: the
+lexer's OWN internal structure.** `lex_until` (and its three per-mode
+helpers, `lex_dquote_run`/`lex_indented_run`/`lex_path_run`) sometimes
+produce TWO tokens in one scanning step before there's anywhere sensible
+to pause -- a string/path content chunk immediately followed by its own
+closing delimiter or a `"${"` interpolation boundary, where the
+boundary's mode-stack push/pop has to happen atomically with it being
+produced. A true value-returning `next()` can only hand back one Token
+per call, so this needed an explicit mechanism, not just a mechanical
+`Token*` -> `Token` rename. Two techniques, both verified correct against
+the full test ladder below:
+- A one-slot `pending`/`has_pending` buffer on `Lexer` itself: the first
+  of the two tokens returns immediately; the second is stashed and
+  handed back, unconditionally, on the very next `lexer_next()` call,
+  before any further scanning resumes. Used for every unconditional pair
+  (string/indented-string/path-literal content-chunk-then-delimiter, and
+  the three path-literal-interpolation-boundary sites in the main
+  normal-mode scanner).
+- For `lex_indented_run`'s escape-unit case specifically (`''$`/`'''`/
+  `''\<c>`, which can repeat arbitrarily many times in a row before any
+  real boundary, inside what was previously ONE call producing an
+  unbounded number of tokens via an internal `continue`-loop): no pending
+  slot needed at all. Returning the (possibly nonexistent) content chunk
+  WITHOUT consuming the escape -- leaving `lx->pos` sitting right at the
+  escape's own first byte -- makes the very next call re-enter the same
+  function fresh (its own `content_start` is always recomputed from
+  `lx->pos` at entry, true both before and after this milestone), land
+  on that same escape again, and this time emit it alone (since no
+  unflushed content precedes it). Re-detection by ordinary re-entry, not
+  re-decoding or duplication -- one escape unit is still produced exactly
+  once, just over two calls instead of one.
+
+**What changed.** `lexer.h`: `LexMode`/`ModeStack`/`TokVec`/`LexCursor`
+removed; `Lexer` is now opaque (`typedef struct Lexer Lexer;`), with
+`lexer_new`/`lexer_next`/`lexer_free` plus `lexer_save`/`lexer_restore`
+(the save/probe/rewind pair `peek3()` needs) as its only public surface
+-- no `static inline` fast path needed here at all, unlike M135's
+`lexcur_tok`: `cur()`/`peek2()` are now plain `Parser` field reads with
+zero calls into `lexer.c`, so `lexer_next()` is only ever called once per
+token actually consumed (by `advance()`), not many times per token the
+way the old array's "is it already there" check had to tolerate -- no
+cross-TU-inlining concern the way M135 found for that design. `lexer.c`:
+`push_tok` removed; `lex_until`'s per-character scanning body split into
+`lex_normal` (ordinary expression/operator/number/identifier lexing) and
+the three existing per-mode helpers, every one restructured to `return`
+a `Token` by value instead of `push_tok`-then-`continue`, using the two
+techniques above wherever a step used to produce two tokens at once;
+`lexer_next()` is the new top-level dispatch (pending first, else mode-
+dispatch). `asnix_lex` (dead code, kept as reference) reimplemented atop
+`lexer_next()` with its own small local array -- the only place in this
+file that still assembles tokens into an array at all. `parser.c`:
+`Parser.lc`/`.pos` (a `LexCursor *` plus an index) replaced by `Parser.
+lx`/`.tok`/`.next` (a `Lexer *` plus a 2-slot `Token` lookahead buffer,
+by value); `cur()`/`peek2()` are now trivial field reads; `advance()`
+shifts `next` into `tok` and calls `lexer_next()` for the new `next`;
+`peek3()` added (save/probe/rewind, used only by `is_formals_pattern`,
+now `is_formals_pattern(Parser *p)` with no `open_idx` parameter --
+`cur(p)` is always exactly the `{` in question); every one of the ~20
+`Token *` locals in `parser.c` (`parse_attr_segment`, `parse_atom`,
+`parse_path_literal_interp`, `parse_dquote_string`, `parse_indented_
+string`, `parse_formals`, the single-param-lambda/`name@{...}`/
+`AST_ASSERT` cases in `parse_expr`) changed to plain `Token` locals,
+with every `->` field access on them changed to `.`; `tok_text`/`tok_len`
+take `Token` by value now. `asnix_parse` primes `p.tok`/`p.next` by
+calling `lexer_next()` twice up front (mirroring the old "`peek2()` is
+always valid, even right at `TOK_EOF`" invariant -- an empty file primes
+both slots to `TOK_EOF`, same as before: `lexer_next()` at EOF leaves
+`lx->pos` unchanged, so it stays re-callable, producing another `TOK_EOF`
+every time, exactly like the old array's `peek2()`-past-the-end case
+used to grow the array by one more duplicate `EOF` entry on demand).
+
+**Correctness.** Full ladder green on this milestone's own branch (built
+from a worktree branched at M174, `04b691c`): `make test` (all unit/asm/
+ir/c tests pass), `make test-e2e` (296/296 `OK`, zero `FAIL`), `make
+test-conformance` (all `OK`, zero `FAIL`). `make test-nix-conformance
+NIX_CONFORMANCE_DIR=/tmp/nix-conformance`: exact baseline match, `pass=655
+fail=3 skip=148` (the same 3 pre-existing position-tracking gaps:
+`eval-okay-getattrpos-functionargs.nix`, `eval-okay-getattrpos.nix`,
+`eval-okay-inherit-attr-pos.nix`). `make test-nixpkgs-hash`: `pass=148
+fail=0`. `./asnix d.nix` output hash unchanged: `/nix/store/
+29iacg6h530yx7rxz4k1fhvi0kxxhsam-ffmpeg-9.0.1-bin`.
+
+**Measured** (`perf stat -e cpu_core/instructions/,cpu_core/cycles/`,
+`taskset -c 0`, 15 interleaved trials (before,after,before,after,...) on
+the real cold `d.nix`/ffmpeg eval against a from-scratch baseline binary
+built at the exact parent commit (`04b691c`, M174) in a separate git
+worktree, output hash checked every single trial, zero mismatches):
+
+| | instructions | cycles |
+|---|---|---|
+| before (M174 baseline) | 6,124,428,742 (avg) | 3,464,006,610 (avg) |
+| after (M181) | 5,798,919,853 (avg) | 3,383,398,112 (avg) |
+| delta | **-5.315%** (~325.5M instructions) | **-2.327%** |
+| wins | 15/15 | 15/15 |
+
+Instructions: completely non-overlapping across all 15 pairs (every
+BEFORE trial 6,115.9M-6,134.8M, every AFTER trial 5,791.4M-5,814.0M) -- a
+large, hard, repetition-independent win, by far the biggest single lever
+this session's lexer investigation found (M158's bounded-lookahead fix,
+by comparison, landed -0.72%). Cycles also won on every trial, a less
+noisy signal than this project's usual shared-machine cycle counts tend
+to produce, consistent with this being a real structural cost removed
+(every `push_tok` call site -- roughly 30 of them -- used to pay a
+bounds-check-plus-possible-realloc on every single token in every
+imported file; none of that exists anymore) rather than a borderline
+or direction-only result.
+
+Merge note (landed after M176/M177, both preserved): M176's `keyword_
+lookup`/`keyword_lookup_selfcheck` length-first dispatch carries through
+unchanged (identifier-vs-keyword classification doesn't depend on the
+TokVec-vs-pull-Lexer distinction at all). M177's `mode_top()` cache
+also survives, just relocated: `ModeStack` as a standalone type is gone
+(it had only ever been exposed in `lexer.h` so `lexcur_tok`'s fast path
+could inline across `lexer.c`/`parser.c` -- no longer needed now that
+`Lexer` is fully opaque and `parser.c` keeps its own lookahead buffer),
+so the mirrored-top field (`modes[modes_len-1]`, written by
+`mode_push`/`mode_pop`) now lives directly on `struct Lexer` itself as
+`.cur` instead of on a separate `ModeStack`. One latent bug found and
+fixed while re-threading this: `lexer_restore()` truncates `modes_len`
+but was not re-deriving `.cur` from the (preserved) `modes` array
+afterward, which would have left `.cur` stale after any
+save/probe/rewind that crossed a mode push/pop (`parser.c`'s `peek3()`,
+used by `is_formals_pattern`) -- fixed by re-reading
+`modes[modes_len-1]` into `.cur` inside `lexer_restore()`.
+
+Files: `src/c/lexer.h` (`Lexer` opaque type, `lexer_new`/`lexer_next`/
+`lexer_free`/`lexer_save`/`lexer_restore`; `LexMode`/`ModeStack`/`TokVec`/
+`LexCursor`/`lexcur_new`/`lexcur_tok`/`lexcur_tok_slow`/`lexcur_free`
+removed), `src/c/lexer.c` (`push_tok` removed; `lex_normal`/`lex_dquote_
+run`/`lex_indented_run`/`lex_path_run`/`lexer_next`/`lexer_new`/`lexer_
+free`/`lexer_save`/`lexer_restore`/`asnix_lex` rewritten; `keyword_lookup`/
+`keyword_lookup_selfcheck` (M176) and the `.cur` mode-top mirror (M177,
+now a `struct Lexer` field instead of `ModeStack`'s) both carried
+forward), `src/c/parser.c` (`Parser.lx`/`.tok`/`.next` replacing
+`.lc`/`.pos`; `cur`/`peek2`/`advance`/`expect`/`tok_text`/`tok_len`/
+`is_formals_pattern`/`asnix_parse` updated; `peek3` added; every
+`Token *` local converted to `Token`).

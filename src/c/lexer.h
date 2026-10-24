@@ -165,14 +165,14 @@ typedef struct {
 
 /* Tokenizes the whole source in one pass into a malloc'd array terminated
  * by a TOK_EOF entry (*out_count includes that terminator). Dead code as
- * of M135 (every real caller goes through asnix_parse's internal
- * LexCursor instead -- see below), kept as a still-correct, still-tested-
- * by-construction (same lex_until core every LexCursor call ultimately
- * runs) standalone entry point, matching this project's own M127/M135
- * precedent of keeping a correct-but-unused reference implementation
- * rather than deleting a working, independently-useful API. Aborts the
- * process with a message on an unrecognized character -- this is a
- * from-scratch minimal-subset lexer, not a full Nix lexer (see
+ * of M135 (every real caller goes through asnix_parse's internal Lexer
+ * instead -- see below), kept as a still-correct, still-tested-by-
+ * construction (same per-token scanning core every lexer_next() call
+ * ultimately runs) standalone entry point, matching this project's own
+ * M127/M135 precedent of keeping a correct-but-unused reference
+ * implementation rather than deleting a working, independently-useful
+ * API. Aborts the process with a message on an unrecognized character --
+ * this is a from-scratch minimal-subset lexer, not a full Nix lexer (see
  * docs/architecture.md M4 scope notes). */
 Token *asnix_lex(const char *src, size_t *out_count);
 
@@ -212,59 +212,49 @@ char *asnix_decode_dquote_span(const char *src, uint32_t start, uint32_t end, si
  * just evaluated later, from the raw span instead of while lexing. */
 void asnix_decode_istr_esc(const char *src, uint32_t start, char out[2], size_t *out_len);
 
-/* M135: an incremental, resumable lexer cursor -- used by the parser
- * (parser.c) to fuse lexing and parsing into one interleaved pass instead
- * of running asnix_lex to completion before parsing starts (see
- * docs/architecture.md M134/M135). Tokens are produced on demand, exactly
- * as far ahead as lexcur_tok() is ever asked for, by the same scanning
- * logic asnix_lex itself uses -- never re-lexed, never discarded.
+/* M175: a true pull-based lexer, replacing M135's LexCursor/TokVec
+ * (array-backed, grown via push_tok) design entirely -- see
+ * docs/architecture.md M175 for the full rationale (modeled directly on
+ * `iets`'s own Lexer, ~/gnix/iets/src/syntax/lexer.rs: `pos()`/`set_pos()`
+ * plus a stateless-per-call `next_token()` returning a `Token` BY VALUE,
+ * no backing array anywhere).
  *
- * LexMode/ModeStack/TokVec are otherwise lexer.c-private (mirrored here,
- * not re-exported from there) -- the ONLY reason they're visible in this
- * header at all is so lexcur_tok's fast path below can be `static inline`
- * and actually inline at every parser.c call site (cur()/peek2() run on
- * EVERY token access, many times per token -- measured directly: routing
- * every single one through a real cross-TU function call into lexer.c's
- * lex_until, even just to hit its own early-return check, cost a real
- * +10.5% instruction regression on a full d.nix eval before this fast
- * path existed). The slow path (lexcur_tok_slow, lexer.c) still owns all
- * the real lexing logic; this is purely a "is the token already there"
- * short-circuit, never duplicated scanning logic. */
-typedef enum { MODE_NORMAL, MODE_STRING, MODE_ISTRING, MODE_PATH } LexMode;
+ * `Lexer` is opaque here (its fields -- byte position, the string/path
+ * mode stack, and a one-slot pending-token buffer for the rare step that
+ * naturally produces two tokens at once, e.g. a string's content chunk
+ * immediately followed by its closing delimiter -- are lexer.c-private;
+ * nothing outside lexer.c ever needs to read them directly, unlike the
+ * old LexCursor, which had to be partially exposed here purely so
+ * lexcur_tok's "is it already there" fast path could be `static inline`).
+ * `lexer_next()` produces exactly the next Token in source order every
+ * call, never re-lexing a byte once produced -- parser.c's own `cur()`/
+ * `peek2()` are now plain reads of a 2-slot lookahead buffer it keeps on
+ * the `Parser` struct itself (no lexer.c call at all for a repeated peek
+ * at the same position), so `lexer_next()` is only ever called once per
+ * token actually consumed, not many times per token the way the old
+ * `lexcur_tok` fast path needed to tolerate -- no cross-TU-inlining
+ * concern here the way M135 found for that design. */
+typedef struct Lexer Lexer;
 
+Lexer *lexer_new(const char *src);
+Token lexer_next(Lexer *lx);
+void lexer_free(Lexer *lx);
+
+/* Full resumable state of a Lexer at some point in time -- lets a caller
+ * probe one token further ahead than its own lookahead buffer holds and
+ * then rewind as if the probe never happened, exactly mirroring `iets`'s
+ * own `Lexer::pos()`/`set_pos()` save/probe/rewind pattern. The only user
+ * is parser.c's `peek3()` (`is_formals_pattern`'s bounded 1-2-token-ahead
+ * `{...}`-vs-formals disambiguation, M158, needs a third token of
+ * lookahead beyond the `tok`/`next` buffer parser.c otherwise keeps). */
 typedef struct {
-    LexMode *modes;
-    size_t len, cap;
-    /* M174: a mirror of modes[len-1] (the only slot mode_top ever reads),
-     * kept in sync by mode_push/mode_pop so lex_until's own per-token
-     * mode_top() call becomes a single field load instead of a 3-load
-     * chain (len, then the modes pointer, then modes[len-1] itself) --
-     * see lexer.c's mode_push/mode_top/mode_pop for the invariant this
-     * depends on: EVERY mutation of modes/len happens through those
-     * three functions, nothing else in the codebase ever touches a
-     * ModeStack's fields directly (grepped the whole tree to confirm). */
-    LexMode cur;
-} ModeStack;
+    size_t pos;
+    size_t modes_len;
+    Token pending;
+    int has_pending;
+} LexerSave;
 
-typedef struct {
-    Token *toks;
-    size_t len, cap;
-} TokVec;
-
-typedef struct LexCursor {
-    const char *src;
-    size_t i;
-    ModeStack modes;
-    TokVec v;
-} LexCursor;
-
-LexCursor *lexcur_new(const char *src);
-Token *lexcur_tok_slow(LexCursor *lc, size_t idx);
-void lexcur_free(LexCursor *lc);
-
-static inline Token *lexcur_tok(LexCursor *lc, size_t idx) {
-    if (idx < lc->v.len) return &lc->v.toks[idx];
-    return lexcur_tok_slow(lc, idx);
-}
+LexerSave lexer_save(Lexer *lx);
+void lexer_restore(Lexer *lx, LexerSave save);
 
 #endif /* ASNIX_LEXER_H */
