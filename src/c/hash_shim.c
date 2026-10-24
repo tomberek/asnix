@@ -79,33 +79,67 @@ static void *asnix_load_libcrypto(void) {
     return 0;
 }
 
+/* perf: `dlsym` does a real symbol-table lookup (hash-bucket walk plus a
+ * string compare against every candidate in the bucket, `do_sym`/
+ * `_dlerror_run` in a `perf` profile of this file's old behavior) -- cheap
+ * once, but this function used to re-resolve all 3 symbols on EVERY single
+ * hash call, not just the first. On the real `d.nix`/ffmpeg eval
+ * (M146's own count: ~35K `asnix_hash_sha256` calls alone, plus whatever
+ * md5/sha1/sha512 call sites add on top), that is 3 redundant `dlsym`
+ * calls per hash computed, forever, for a result (the function's address)
+ * that can never change mid-process -- `asnix_libcrypto_handle` was
+ * already cached this way (see `asnix_load_libcrypto` above); the 3
+ * function pointers resolved from it were not, for no reason tied to
+ * correctness. One cache slot per algorithm (4 total, each populated via
+ * `asnix_hash_one`'s own `cache` out-param on first use, read directly
+ * thereafter) -- a `dlsym` per call becomes a `dlsym` per algorithm per
+ * process, matching `asnix_load_libcrypto`'s own one-time-resolution
+ * discipline instead of re-deriving what's already known. */
+typedef struct {
+    asnix_hash_init_fn init;
+    asnix_hash_update_fn update;
+    asnix_hash_final_fn final_fn;
+    int resolved; /* 1 once init/update/final_fn have been looked up (even
+                   * if any came back NULL -- a symbol genuinely missing
+                   * from this libcrypto isn't going to appear later, so a
+                   * failed resolution is cached too, not retried forever). */
+} AsnixHashFnCache;
+
 static int64_t asnix_hash_one(const char *init_sym, const char *update_sym,
                                const char *final_sym, const void *input,
-                               size_t input_len, unsigned char *out) {
-    void *h = asnix_load_libcrypto();
-    if (!h) return -1;
-    asnix_hash_init_fn init = (asnix_hash_init_fn)dlsym(h, init_sym);
-    asnix_hash_update_fn update = (asnix_hash_update_fn)dlsym(h, update_sym);
-    asnix_hash_final_fn final_fn = (asnix_hash_final_fn)dlsym(h, final_sym);
-    if (!init || !update || !final_fn) return -2;
+                               size_t input_len, unsigned char *out,
+                               AsnixHashFnCache *cache) {
+    if (!cache->resolved) {
+        void *h = asnix_load_libcrypto();
+        if (!h) return -1;
+        cache->init = (asnix_hash_init_fn)dlsym(h, init_sym);
+        cache->update = (asnix_hash_update_fn)dlsym(h, update_sym);
+        cache->final_fn = (asnix_hash_final_fn)dlsym(h, final_sym);
+        cache->resolved = 1;
+    }
+    if (!cache->init || !cache->update || !cache->final_fn) return -2;
     asnix_hash_ctx ctx;
-    init(&ctx);
-    update(&ctx, input, input_len);
-    final_fn(out, &ctx);
+    cache->init(&ctx);
+    cache->update(&ctx, input, input_len);
+    cache->final_fn(out, &ctx);
     return 0;
 }
 
 int64_t asnix_hash_md5(const void *input, size_t input_len, unsigned char *out) {
-    return asnix_hash_one("MD5_Init", "MD5_Update", "MD5_Final", input, input_len, out);
+    static AsnixHashFnCache cache = { 0 };
+    return asnix_hash_one("MD5_Init", "MD5_Update", "MD5_Final", input, input_len, out, &cache);
 }
 int64_t asnix_hash_sha1(const void *input, size_t input_len, unsigned char *out) {
-    return asnix_hash_one("SHA1_Init", "SHA1_Update", "SHA1_Final", input, input_len, out);
+    static AsnixHashFnCache cache = { 0 };
+    return asnix_hash_one("SHA1_Init", "SHA1_Update", "SHA1_Final", input, input_len, out, &cache);
 }
 int64_t asnix_hash_sha256(const void *input, size_t input_len, unsigned char *out) {
-    return asnix_hash_one("SHA256_Init", "SHA256_Update", "SHA256_Final", input, input_len, out);
+    static AsnixHashFnCache cache = { 0 };
+    return asnix_hash_one("SHA256_Init", "SHA256_Update", "SHA256_Final", input, input_len, out, &cache);
 }
 int64_t asnix_hash_sha512(const void *input, size_t input_len, unsigned char *out) {
-    return asnix_hash_one("SHA512_Init", "SHA512_Update", "SHA512_Final", input, input_len, out);
+    static AsnixHashFnCache cache = { 0 };
+    return asnix_hash_one("SHA512_Init", "SHA512_Update", "SHA512_Final", input, input_len, out, &cache);
 }
 
 void asnix_hash_to_hex(const unsigned char *bytes, size_t n, char *out_hex) {

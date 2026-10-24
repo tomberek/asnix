@@ -20679,3 +20679,82 @@ forward), `src/c/parser.c` (`Parser.lx`/`.tok`/`.next` replacing
 `.lc`/`.pos`; `cur`/`peek2`/`advance`/`expect`/`tok_text`/`tok_len`/
 `is_formals_pattern`/`asnix_parse` updated; `peek3` added; every
 `Token *` local converted to `Token`).
+
+## M182: `hash_shim.c` re-resolved its `libcrypto` function pointers via `dlsym` on every single hash call, not just the first -- cached instead
+
+A fresh profiling pass against `iets` on the real `d.nix`/ffmpeg eval
+(`perf record -e cpu_core/instructions/`, `taskset -c 0`, DWARF call
+graphs) found asnix spending real `libc.so.6` self-time in `dlsym`/
+`do_sym`/`_dlerror_run` -- dynamic-linker symbol-lookup machinery `iets`
+has no equivalent of at all (its `sha2` crate links statically, no
+`dlopen`/`dlsym` anywhere).
+
+**Root cause.** `src/c/hash_shim.c`'s `asnix_load_libcrypto()` already
+caches the `dlopen`'d handle across calls, but `asnix_hash_one()`
+re-resolved all 3 function pointers (`*_Init`/`*_Update`/`*_Final`) via
+`dlsym` on EVERY hash call, not just the first -- for a symbol address
+that can never change mid-process. M146's own prior comment in this
+file counted ~35K `asnix_hash_sha256` calls alone on this workload
+(derivation/NAR/content hashing).
+
+**Fix.** One static `AsnixHashFnCache` per algorithm (md5/sha1/sha256/
+sha512), resolved via `dlsym` on first use, read directly thereafter --
+mirroring the handle's own already-existing one-time-resolution
+discipline.
+
+**Correctness.** Full ladder green: `make test` (including
+`test_hash_shim`'s oracle vectors), `make test-e2e` (296/296 OK), `make
+test-conformance`. `make test-nix-conformance`: exact baseline
+`pass=655 fail=3 skip=148` (same 3 known pre-existing failures). `make
+test-nixpkgs-hash`: `pass=148 fail=0`. `./asnix d.nix` output hash
+unchanged.
+
+**Measured** (15 interleaved `perf stat` trials, `taskset -c 0`, against
+a from-scratch M181 baseline):
+
+| | instructions |
+|---|---|
+| before | 5,650,629,038 (avg) |
+| after | 5,567,525,675 (avg) |
+| delta | **-1.471%** (-83.1M instructions) |
+| wins | 15/15, completely non-overlapping ranges |
+
+Cycles: -1.18%, 13/15 wins (noisier, as expected on this shared host).
+The win is bigger than the ~0.24% self-time sample alone suggested --
+`dlsym`'s real cost includes dynamic-linker lock/lookup machinery beyond
+the individually-sampled leaf symbols. Confirmed via `grep -rn
+"dlsym(" src/c/*.c` that this was the only site in the codebase with
+this anti-pattern.
+
+**Context: the overall asnix-vs-iets gap has shrunk substantially this
+session.** On the real full `d.nix`/ffmpeg eval, post-M182: asnix
+5,567.5M instructions vs `iets` 5,071.2M (avg of 3 `perf stat` runs) --
+asnix is now only ~9.8% more instructions, down from the ~2.07x/1.34x
+ratios cited in earlier milestones (M123/M173) on different measurement
+setups.
+
+**Follow-up candidates found, not acted on this shot:**
+- `lexer_next` is still disproportionately costly vs `iets`'s
+  `next_token` even after M181: 8.05% self-time share in asnix vs 5.21%
+  in `iets` (scaled: ~448M vs ~264M instructions, a ~184M-instruction
+  gap -- bigger than this milestone's own win). `lex_normal` is already
+  the subject of 9+ dedicated milestones (M129/130/135/138/141/147/158/
+  176/177/181) with carefully-proven fast-path guards; no quick,
+  low-risk win was found in the time available. Worth a dedicated
+  follow-up pass given the file's delicacy, not a same-shot fix.
+- glibc `regexec` fallback in `builtins_regex.c` costs ~1.1% self-time
+  (`re_search_internal`/`re_acquire_state`/etc.) vs `iets`'s pure-Rust
+  regex engine at ~0.25%. asnix's own custom NFA engine
+  (`regex_engine.c`) only recomputes capture groups for ambiguity-risk
+  patterns (M68/M80/M82/M143) -- it always calls glibc `regexec` for the
+  match span itself, since the custom engine doesn't claim general POSIX
+  leftmost-longest semantics. A fast path letting the custom engine be
+  authoritative for patterns provably free of that ambiguity (e.g. no
+  alternation-with-groups) could remove the glibc dependency for common
+  `lib.versions`-style patterns, but this is a correctness-sensitive
+  semantic classification problem needing its own design pass, not
+  attempted here.
+
+Files: `src/c/hash_shim.c` (`AsnixHashFnCache` added; `asnix_hash_one`
+takes a per-algorithm cache pointer; `asnix_hash_md5`/`sha1`/`sha256`/
+`sha512` each keep their own static cache instance).
