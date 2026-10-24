@@ -38,6 +38,15 @@ across the full real eval — a real number, comparable in scale to
 milestones this project has already shipped and valued (M80's arena
 shrink was 151MB -> 126MB).
 
+**Confirmed by direct measurement after M169 landed**: peak RSS on the
+real `d.nix` eval (`/usr/bin/time -v`, 3 interleaved trials each,
+`taskset -c 0`) dropped from an average of 542,960 KB (M168, pre-shrink)
+to 520,843 KB (M169, post-shrink) — a measured **-21.6 MB (-4.1%)**,
+consistent in direction and close in magnitude to the hand-calculated
+prediction above. This was not checked at the time M169 was merged (only
+instruction count was measured); worth noting as a gap in that
+milestone's own verification, closed here after the fact.
+
 ## Proposal A: narrow `a`/`b` to `int32_t`
 
 Shrinks `IrOp` 24 -> 16 bytes. `OP_PUSH_INT` is the one exception: its
