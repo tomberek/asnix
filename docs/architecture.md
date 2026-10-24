@@ -20205,3 +20205,113 @@ Files: `src/c/lexer.c` only (`KEYWORDS` table unchanged; the identifier/
 keyword call site's old linear-scan loop replaced by a call to the new
 `keyword_lookup()`, plus `keyword_lookup_selfcheck()` and its
 `asnix_lex` call site).
+
+## M177: `lex_until`'s per-token `mode_top()` recomputed `modes[len-1]` from scratch on EVERY token -- cached as a mirrored field instead, landed
+
+A follow-on to M173's own `hackage-packages.nix` investigation (asnix's
+lexer specifically 2.12x iets's on that file, vs. a 1.34x program-wide
+average), itself pushed further by a dedicated read-only session asking
+*which* of `lex_until`'s inlined scan paths (dquote-string content,
+identifier scanning, path scanning) concentrates that disproportionate
+cost. `perf annotate lex_until`, classified by source-text marker at
+every inlined call site (same methodology M153 used, resetting
+classification at the backward jump to `lex_until`'s own dispatch-loop
+head), found the dquote-SWAR hypothesis M153 already declined does NOT
+explain the gap here either: `lex_dquote_run`'s own share of
+`lex_until`'s self-time was only ~2.2-2.5% across two captures on this
+file (**~0.6% of the whole eval**) -- actually SMALLER than M153's own
+`d.nix` baseline (~0.80%), despite this file's quoted strings averaging
+26.1 bytes (measured directly: 91,579 string literals, median 16,
+19,437 `sha256 = "..."` literals averaging exactly 52 bytes each) --
+because string tokens are a small minority of this file's token
+population (91,579) next to its punctuation (`;` 192,307, `=` 191,557,
+`,` 203,500) and identifiers (964,758 occurrences). The real
+concentration was elsewhere: the shared `push_tok`-adjacent epilogue for
+ordinary single/two-char operator tokens (~46% of `lex_until`'s own
+self-time, ~12% of the whole eval) and generic dispatch/mode-check
+bookkeeping (~27-29%, ~7% of the whole eval) dwarfed every content-
+scanning function. Reading `~/gnix/iets/src/syntax/lexer.rs` directly
+pinpointed the mechanism behind the dispatch-side half of that: its
+`next_token()` is a flat `match b { ... }` on the leading byte with NO
+per-token mode check at all -- the *parser* decides once, at each call
+site, whether to call `next_token()` or one of the string/indented-
+string/path body-lexing methods; iets's lexer never re-derives "what
+mode am I in" from any stack. asnix's `lex_until`, by contrast, calls
+`mode_top(modes)` -- `m->modes[m->len - 1]`, a 3-load chain (`m->len`,
+`m->modes`, then the indexed load) -- at the top of EVERY loop
+iteration, even though `mode_push`/`mode_pop` (the only two places that
+ever change what the top actually is, confirmed by grepping the whole
+tree for any other access to a `ModeStack`'s fields -- none exist) only
+fire at `"`, `''`, `{`, `}`, `${`, a tiny minority of tokens next to the
+plain operators/identifiers/numbers that make up the overwhelming
+majority of any real file's token stream.
+
+**The fix**: `ModeStack` (`src/c/lexer.h`) gained one field, `LexMode
+cur`, mirroring `modes[len-1]` at all times. `mode_push` (`src/c/
+lexer.c`) sets `m->cur = mode` right after writing the new top slot;
+`mode_pop` sets `m->cur = m->modes[m->len - 1]` right after decrementing
+`len` (the exact array read `mode_top` used to do on every single
+token, now done only once per actual pop); `mode_top` itself became a
+one-line `return m->cur`. Zero behavioral change: the stack's actual
+contents, growth, and underflow-safety invariant (every pop is paired
+1:1 with an earlier push, by well-formed-by-construction scan logic,
+same as before) are completely untouched -- this is a pure redundant-
+recomputation removal, not a new code path.
+
+**Verified**: `make test`/`test-e2e` (296 checks)/`test-conformance` (19
+checks) all green. `make test-nix-conformance
+NIX_CONFORMANCE_DIR=/tmp/nix-conformance`: `pass=655 fail=3 skip=148`
+(the same 3 pre-existing position-tracking gaps). `make
+test-nixpkgs-hash`: `pass=148 fail=0`. `d.nix` (ffmpeg's closure) output
+hash unchanged: `/nix/store/29iacg6h530yx7rxz4k1fhvi0kxxhsam-ffmpeg-9.0.1-bin`.
+
+**Measured**, two binaries built from the otherwise-identical tree
+(manual `lexer.c`/`lexer.h` file-swap via `git show <parent>:...`, not
+`git stash`, per this project's own standing convention; round-tripped
+back to a byte-identical rebuild of the "after" binary to confirm the
+swap left no residue), `taskset -c 0`, `cpu_core/instructions/,cpu_core/
+cycles/`, 15 INTERLEAVED trials (before, after, before, after, ...,
+never batched) on each of two workloads:
+
+- **Full `d.nix` eval** (ffmpeg's closure, bytecode cache off so every
+  file genuinely re-lexes): **15 out of 15 pairs** show fewer
+  instructions after, a tight, deterministic -0.59% to -0.70% per pair,
+  mean 6,139,500,450 -> 6,100,806,785, **-38,693,665 instructions
+  (-0.630%)**. Cycles were noisy in the usual way for this shared host
+  (mean -0.014%, individual pairs moving both directions by a few
+  percent) -- not trusted as its own directional claim, but not
+  contradicting the instruction-count win either.
+- **Isolated `hackage-packages.nix` harness** (`let f = import
+  .../hackage-packages.nix; in builtins.typeOf f` -- forces full lex/
+  parse/compile of the 783,197-line file while keeping runtime eval of
+  the resulting lambda value trivial, the same minimal-import approach
+  used throughout M173's own investigation): **15 out of 15 pairs**
+  again show fewer instructions after, mean 1,886,779,979 ->
+  1,856,644,339, **-30,135,640 instructions (-1.597%)** -- about 2.5x
+  the relative win seen on the full `d.nix` average, consistent with
+  this fix mattering more on token-dense files (exactly the file shape
+  M173 flagged as asnix's worst case against iets). Cycles were noisier
+  still here (two of the 15 pairs show a +26.6%/-1.1% swing from
+  evident concurrent-host contention, the same pattern M153's own
+  writeup already documented for this host); excluding those two
+  outlier pairs, the remaining 13 move -0.256%, directionally consistent
+  with, not contradicting, the instruction-count win.
+
+**Honest sizing**: this is a genuinely small, narrowly-scoped win --
+`mode_top`'s own 3-load chain was never going to be more than a sliver
+of total eval cost -- but it is a clean, zero-risk, deterministic one
+(15/15 both times, tight variance), and it specifically helps the file
+shape M173 identified as asnix's own worst-case gap against iets, more
+than it helps the program-wide average. It does not, on its own, close
+that gap (M173's own `lex_until` self-time on `hackage-packages.nix` was
+dominated by the `push_tok`-adjacent operator-emission path, ~46% of
+`lex_until`'s self-time, far bigger than the mode-check bucket this
+fix targets) -- removing asnix's own token array entirely, the way
+iets's pull-based, no-array `next_token()` avoids that cost altogether,
+remains the single largest lever, and remains a genuinely architectural
+change (touching `parser.c`'s `cur`/`peek2`/`find_matching_rbrace`
+lookahead, which currently assumes random access into a persisted
+`TokVec`) flagged for a dedicated future milestone, not attempted here.
+
+Files: `src/c/lexer.h` (`ModeStack` gains `cur`), `src/c/lexer.c`
+(`mode_push`/`mode_top`/`mode_pop`).

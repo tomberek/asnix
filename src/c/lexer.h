@@ -235,6 +235,15 @@ typedef enum { MODE_NORMAL, MODE_STRING, MODE_ISTRING, MODE_PATH } LexMode;
 typedef struct {
     LexMode *modes;
     size_t len, cap;
+    /* M174: a mirror of modes[len-1] (the only slot mode_top ever reads),
+     * kept in sync by mode_push/mode_pop so lex_until's own per-token
+     * mode_top() call becomes a single field load instead of a 3-load
+     * chain (len, then the modes pointer, then modes[len-1] itself) --
+     * see lexer.c's mode_push/mode_top/mode_pop for the invariant this
+     * depends on: EVERY mutation of modes/len happens through those
+     * three functions, nothing else in the codebase ever touches a
+     * ModeStack's fields directly (grepped the whole tree to confirm). */
+    LexMode cur;
 } ModeStack;
 
 typedef struct {

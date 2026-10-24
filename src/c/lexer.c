@@ -352,9 +352,17 @@ static void mode_push(ModeStack *m, LexMode mode) {
         m->modes = realloc(m->modes, m->cap * sizeof(LexMode));
     }
     m->modes[m->len++] = mode;
+    m->cur = mode; /* M174: the slot just written is the new top */
 }
 static LexMode mode_top(ModeStack *m) {
-    return m->modes[m->len - 1];
+    /* M174: used to be m->modes[m->len - 1] -- a 3-load chain (m->len,
+     * m->modes, then the indexed load) paid on EVERY lex_until iteration,
+     * even though mode_push/mode_pop (the only two places that ever
+     * change what the top actually is) already know the new top value
+     * at the moment they change it. m->cur mirrors that value exactly,
+     * so this is a pure redundant-recomputation removal: same stack,
+     * same contents, same output, one load instead of three. */
+    return m->cur;
 }
 static void mode_pop(ModeStack *m) {
     /* Every push above is paired 1:1 with a pop at a matching "}"/closing
@@ -363,6 +371,11 @@ static void mode_pop(ModeStack *m) {
      * input (malformed `}`-without-`{` is caught before this is ever
      * called, see the MODE_NORMAL '}' case). */
     m->len--;
+    m->cur = m->modes[m->len - 1]; /* M174: popping reveals a new top --
+                                      * re-mirror it (this IS the array
+                                      * read mode_top used to do every
+                                      * single token; now it happens only
+                                      * here, once per actual pop). */
 }
 
 static void fatal_unterminated(const char *what) {
