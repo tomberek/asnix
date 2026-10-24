@@ -20415,3 +20415,61 @@ pursuing. Recorded here so this question does not get re-asked and
 re-investigated from scratch in a future session.
 
 Files: none changed (investigation only, no code modified on master).
+
+## M180: asnix's compile-to-IR step is fully eager -- measured at ~62% of all compiled IR volume wasted on thunk bodies never forced, not fixed this shot
+
+A follow-on investigation asked whether asnix could do lazier parsing or
+compiling -- mirroring the way lazy *evaluation* already works, but one
+layer up, at the compile-to-IR step itself.
+
+**Confirmed: `compile_expr` compiles every binding's value immediately,
+whether or not it is ever forced.** Reading `compiler.c`'s `AST_LET`/
+`AST_ATTRSET`/`AST_LAMBDA` cases shows every thunk body gets compiled to
+IR as soon as its enclosing scope is compiled (e.g. `compiler.c:1055-1060`),
+with no deferral to first-force the way a tree-walking evaluator gets for
+free (an unforced binding there costs nothing beyond the initial AST
+parse). This is a structural cost asnix's bytecode-ahead-of-time design
+pays that a tree-walker would not.
+
+**Measured directly on the real `d.nix`/ffmpeg eval**, via temporary
+disposable counters (not committed) at the compile site and at all 5
+real force-entry sites in the codebase (`op_var_ref.S`, `op_select.S`,
+`op_select_or.S`, `op_with.S`, `force.S` -- verified exhaustive via
+`grep -rl ASNIX_THUNK_STATE_IN_PROGRESS`):
+
+| metric | value |
+|---|---|
+| distinct thunk bodies compiled | 469,859 |
+| total IR ops compiled across those bodies | 2,133,165 |
+| distinct thunk bodies ever forced at least once | 43,640 |
+| thunk bodies compiled but never forced | 426,219 (90.7%) |
+
+Applying the population's own real average (4.54 ops/thunk) to the
+426,219 never-forced thunks gives roughly **1.93M wasted IR ops -- about
+62% of the eval's entire 3.1M total compiled IR volume** (the
+corpus-wide total already established by the IrOp-compaction proposal's
+own measurement). This matches the expected shape of a real nixpkgs
+eval: forcing one package forces compilation of every sibling binding in
+the same file (`let`/attrset scope), almost none of which are ever
+selected.
+
+**Not fixed in this shot.** Deferring a thunk body's `compile_expr` call
+to first-force (and caching the compiled result, the same way a thunk's
+*value* is already cached once forced) is architecturally sound in
+principle, but it touches scope/closure-capture semantics the existing
+code already treats as delicate -- `let`'s self/sibling visibility,
+`inherit` scoping, `rec`-attrset self-reference (see the M146-era
+comments in `compiler.c`). This is comparably sized, in design-and-risk
+terms, to the IrOp-compaction proposal (`docs/irop-compaction-proposal.md`)
+and deserves the same treatment: a dedicated design pass and phased
+verification, not a same-shot patch. The numbers above are the sizing
+justification for why that follow-up is worth doing -- at 62% of total
+compiled IR volume, this is larger than any single lever found so far
+this session, including the lexer TokVec-elimination win.
+
+**Conclusion: investigated, quantified, and NOT implemented -- a real,
+large, well-evidenced opportunity for a dedicated follow-up.** No code
+changed on master; the investigation worktree and its disposable
+instrumentation were built, measured, and removed.
+
+Files: none changed (investigation only, no code modified on master).
