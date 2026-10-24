@@ -20315,3 +20315,62 @@ lookahead, which currently assumes random access into a persisted
 
 Files: `src/c/lexer.h` (`ModeStack` gains `cur`), `src/c/lexer.c`
 (`mode_push`/`mode_top`/`mode_pop`).
+
+## M178: a perfect-hash jump-table for keyword lookup, built and measured -- loses to M176's simple length-first dispatch, declined
+
+A follow-on to M176 asked a reasonable next question: M176's
+length-first dispatch still needs up to a 5-way `memcmp` chain within a
+length bucket (the largest real bucket, length 4, holds `then`/`else`/
+`true`/`null`/`with`) -- could a small perfect hash (incremental, over
+the first byte/last byte/length) collapse that to a single table lookup
+plus at most one verification compare, with zero branching through
+multiple candidates?
+
+**Built it.** A 32-slot table (`KW_HASH_TABLE[32]`), populated via C99
+designated initializers at compile-time hash indices (`h = (first*3) ^
+(last<<1) ^ length`, masked to 5 bits), verified collision-free for all
+13 real keywords. `keyword_lookup` becomes: early-out on length outside
+`[2,7]`, compute the hash, check whether the slot is empty (zero
+comparisons on a miss), else one `memcmp` to verify the match. The old
+switch-based dispatch was kept as `keyword_lookup_slow`, used only
+inside `keyword_lookup_selfcheck()` to cross-validate the new table
+against both the canonical `KEYWORDS[]` list and the old implementation
+on every real keyword.
+
+**Correctness.** `make test`/`test-e2e`/`test-conformance` all green.
+`make test-nix-conformance` reproduces the exact baseline `pass=655
+fail=3 skip=148`. `make test-nixpkgs-hash` reproduces `pass=148 fail=0`.
+`./asnix d.nix` produces the correct ffmpeg store path.
+
+**Measured: a real, if small, regression, not a win.** Interleaved
+`perf stat`, `taskset -c 0`, 4 rounds each, against M177 (`76c1b3a`). On
+the real `d.nix`/ffmpeg eval: instructions flat to very slightly worse
+(+0.01-0.15%, all 4 rounds positive). On an isolated identifier-dense
+harness (`pkgs/development/haskell-modules/hackage-packages.nix`, 783K
+lines, parse-only, no eval -- the same file M173/M176/M177 all profiled
+on): **consistently and repeatably worse**, +3.8M to +6.1M instructions
+out of a ~1.756B baseline (+0.2-0.35%), same direction in all 4 rounds,
+well outside same-binary run-to-run noise (~180K).
+
+**Root cause, found by reading the generated code, not assumed.** The
+switch-based baseline's `memcmp(s, "literal", N)` calls have a compile-
+time-constant second argument AND length, so GCC strength-reduces each
+one into a single inlined load+compare (1-2 instructions) -- there is no
+real `memcmp` call anywhere in M176's own hot path. The hash table's
+verification step instead compares against a RUNTIME pointer
+(`e->kw`, read from the matched table slot) with a runtime length, which
+GCC cannot constant-fold the same way -- it compiles down to a real,
+generic `memcmp` function call. That one real call costs more than the
+up-to-5 comparisons it was built to eliminate, because none of those
+5 comparisons were ever real function calls to begin with.
+
+**Conclusion: declined.** M176's length-first dispatch already captured
+the win available here; a perfect-hash table doesn't beat compiler-
+visible constant-folding on fixed string literals, and trying to make
+the lookup itself more "clever" moved the comparison out of the
+compiler's reach rather than making it cheaper. No code changed on
+master; both temporary worktrees were built, tested, measured, and
+removed.
+
+Files: none changed (investigated and measured in a disposable
+worktree; `src/c/lexer.c` on master is unaffected).
