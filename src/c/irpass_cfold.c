@@ -18,18 +18,24 @@
  * OP_DIV is skipped whenever the divisor is 0, or the pair is
  * (INT64_MIN, -1) -- both must still reach the runtime op (abort with
  * "division by zero", and avoid signed-overflow UB respectively), not be
- * silently folded away. */
+ * silently folded away.
+ *
+ * M169: OP_PUSH_INT no longer carries its literal inline in `a` (IrOp's
+ * fields are now only 32 bits, too narrow for an arbitrary int64 literal)
+ * -- both operands are now read from the pool via each op's own `b`
+ * (pool index), same as OP_PUSH_CONST. The fold result is written back
+ * IN PLACE into ops[i]'s own already-owned pool slot (ops[i].b is left
+ * unchanged) rather than appending a new pool entry -- that slot isn't
+ * shared with any other op, so overwriting it is safe and needs no pool
+ * growth (`pool_len`/`pool_cap` stay unused here, same as before). */
 static int fold_constant_int_binop(IrOp *ops, size_t *len, int64_t **pool, size_t *pool_len, size_t *pool_cap) {
-    (void)pool;
     (void)pool_len;
-    (void)pool_cap; /* strconcat-fold extension widened AsnixIrPass's signature for every pass
-                      * uniformly (see irpass.h) -- this pass folds only int immediates (OP_PUSH_INT's
-                      * own operand field, never a pool index), so it has no use for the pool itself. */
+    (void)pool_cap;
     for (size_t i = 0; i + 2 < *len; i++) {
         if ((int)(intptr_t)ops[i].handler != OP_PUSH_INT) continue;
         if ((int)(intptr_t)ops[i + 1].handler != OP_PUSH_INT) continue;
         int op_id = (int)(intptr_t)ops[i + 2].handler;
-        int64_t a = ops[i].a, b = ops[i + 1].a;
+        int64_t a = (*pool)[ops[i].b], b = (*pool)[ops[i + 1].b];
         int64_t result = 0;
         int is_bool = 0, ok = 1;
         switch (op_id) {
@@ -53,11 +59,13 @@ static int fold_constant_int_binop(IrOp *ops, size_t *len, int64_t **pool, size_
         if (is_bool) {
             ops[i].handler = (void *)(intptr_t)(result ? OP_PUSH_TRUE : OP_PUSH_FALSE);
             ops[i].a = 0;
+            ops[i].b = 0;
         } else {
             ops[i].handler = (void *)(intptr_t)OP_PUSH_INT;
-            ops[i].a = result;
+            (*pool)[ops[i].b] = result; /* overwrite ops[i]'s own pool slot in place */
+            ops[i].a = 0;
+            /* ops[i].b intentionally left as-is: same pool slot, now holding `result` */
         }
-        ops[i].b = 0;
         asnix_irpass_remove(ops, len, i + 1, 2);
         return 1; /* re-scan from the top next iteration -- simplest correct strategy */
     }

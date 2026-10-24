@@ -18,7 +18,7 @@
     .globl asnix_op_assert_fail
     .type asnix_op_assert_fail, @function
 asnix_op_assert_fail:                   // b = pool index of {msg ptr, msg len}
-    movq ASNIX_IROP_OFF_B(%rsi), %rax
+    movl ASNIX_IROP_OFF_B(%rsi), %eax
     movq (%r13, %rax, 8), %rdi          // msg ptr (compiler.c-built, names the failed condition)
     movq 8(%r13, %rax, 8), %rsi         // msg len
     // `call`, not `jmp`, even though this never returns: unlike

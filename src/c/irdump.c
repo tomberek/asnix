@@ -161,8 +161,8 @@ static void dump_program(IrProgram *prog, int id, SeenVec *seen, Worklist *work)
         printf("  [%4lld] %-20s a=%-8lld b=%-8lld", (long long)i, op_names[id_of], (long long)op->a, (long long)op->b);
 
         switch (id_of) {
-            case OP_PUSH_INT:
-                printf("   ; value=%lld", (long long)op->a);
+            case OP_PUSH_INT: /* M169: literal lives in the pool now, not inline in `a` */
+                printf("   ; pool[%lld] = value:%lld", (long long)op->b, (long long)prog->pool[op->b]);
                 break;
             case OP_VAR_REF:
             case OP_VAR_REF_CELL:

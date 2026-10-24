@@ -122,7 +122,7 @@ asnix_op_with_try:
     movq ASNIX_ATTRS_OFF_COUNT(%rax), %r8 // reload -- now guaranteed non-negative
 .Lwith_try_resolved:
 
-    movq ASNIX_IROP_OFF_B(%rsi), %rdx   // rdx = target symbol id
+    movl ASNIX_IROP_OFF_B(%rsi), %edx   // rdx = target symbol id
     // %r8 already holds hi = count
     xorq %rcx, %rcx                     // rcx = lo = 0
 .Lwith_try_loop:
@@ -293,7 +293,7 @@ asnix_op_with_try:
     jmp *%rax
 
 .Lwith_try_not_found:
-    movq ASNIX_IROP_OFF_A(%rsi), %rax
+    movslq ASNIX_IROP_OFF_A(%rsi), %rax
     addq %rax, %rsi
     movq (%rsi), %rax
     jmp *%rax

@@ -2,17 +2,35 @@
 #define ASNIX_IR_H
 
 /*
- * Flat, fixed-width IR: a 24-byte, 8-byte-aligned record per instruction.
+ * Flat, fixed-width IR: a 16-byte, 8-byte-aligned record per instruction.
  * `handler` starts out holding a small op-id (as emitted by the builder /
  * M4 compiler) and is rewritten in place to a real handler address by
  * ir_link() -- see docs/ir-format.md. Fixed-width records mean "advance to
  * the next instruction" is a pure pointer increment, never a decode.
+ *
+ * M169: `a`/`b` narrowed from int64_t to int32_t (24 -> 16 bytes, a 33%
+ * reduction in compiled-IR memory/cache footprint). A read-only operand-
+ * field-width survey across a real nixpkgs eval (3.1M compiled ops, the
+ * largest single compiled program at 19,439 ops) found every op field
+ * value comfortably fits in 32 bits EXCEPT ONE: OP_PUSH_INT.a used to
+ * carry a literal Nix integer straight from source, and real Nix integers
+ * are full 64-bit values (nixpkgs has a literal exactly at 2^32, plus
+ * negative literals) -- so OP_PUSH_INT no longer carries its value inline
+ * at all; it now routes through the constant pool exactly like
+ * OP_PUSH_CONST (b = pool index of the raw int64 literal), the same
+ * precedent M105 set narrowing ASNIX_ATTR_SIZE 16->12. Every OTHER
+ * op's `a`/`b` is internal bookkeeping (a De Bruijn depth/slot, a frame
+ * slot index, a pool index, a symbol id, a self-relative jump byte-delta,
+ * an element count) bounded by the size of the compiled program or the
+ * symbol table itself, nowhere near the 32-bit ceiling. A 16-byte IrOp
+ * (8-byte pointer + two 4-byte ints) is still naturally aligned with no
+ * compiler-inserted padding, same as the old 24-byte layout.
  */
 
-#define ASNIX_IROP_SIZE        24
+#define ASNIX_IROP_SIZE        16
 #define ASNIX_IROP_OFF_HANDLER 0
 #define ASNIX_IROP_OFF_A       8
-#define ASNIX_IROP_OFF_B       16
+#define ASNIX_IROP_OFF_B       12
 
 #define ASNIX_IRPROG_OFF_OPS  0
 #define ASNIX_IRPROG_OFF_POOL 8
@@ -164,12 +182,16 @@
 
 typedef struct {
     void *handler;
-    int64_t a;
-    int64_t b;
+    int32_t a;
+    int32_t b;
 } IrOp;
 
 enum {
-    OP_PUSH_INT,
+    OP_PUSH_INT,   /* M169: b = pool index of a raw (untagged) int64 literal -- a 64-bit Nix
+                     * integer can't fit in IrOp's now-32-bit `a`/`b` fields, so this routes
+                     * through the constant pool exactly like OP_PUSH_CONST instead of carrying
+                     * the literal inline. op_push_int.S still does the ASNIX_INT_MIN/MAX
+                     * range check + tagging at run time, just against the pool-loaded value. */
     OP_PUSH_TRUE,
     OP_PUSH_FALSE,
     OP_PUSH_NULL,

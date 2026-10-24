@@ -62,7 +62,7 @@ asnix_op_has_attr:                      // a = symbol id; pops a value, pushes T
     jmp .Lhas_attr_false
 .Lhas_attr_resolved:
 
-    movq ASNIX_IROP_OFF_A(%rsi), %rdx   // rdx = target symbol id
+    movl ASNIX_IROP_OFF_A(%rsi), %edx   // rdx = target symbol id
     // %r8 already holds hi = count
     xorq %rcx, %rcx                     // rcx = lo = 0
 .Lhas_attr_loop:

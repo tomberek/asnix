@@ -88,24 +88,28 @@ static Env *root_env(void) {
 static void fixture_dead_region_with_internal_jumps(void) {
     IrOp ops[12];
     size_t len = 12;
-    ops[0] = mk(OP_PUSH_INT, 1, 0);
+    /* M169: OP_PUSH_INT's literal lives in the pool now (b = pool index),
+     * not inline in `a` -- each literal below gets its own pool slot,
+     * index == its own op's position in this array purely by coincidence
+     * of this fixture's layout (not a general invariant). */
+    int64_t pool_storage[12] = { 1, 0, 10, 20, 0, 30, 0, 40, 50, 2, 0, 0 };
+    int64_t *pool = pool_storage;
+    size_t pool_len = 12, pool_cap = 12;
+    ops[0] = mk(OP_PUSH_INT, 0, 0);
     ops[1] = mk(OP_JMP, (9 - 1) * ASNIX_IROP_SIZE, 0);
-    ops[2] = mk(OP_PUSH_INT, 10, 0);
-    ops[3] = mk(OP_PUSH_INT, 20, 0);
+    ops[2] = mk(OP_PUSH_INT, 0, 2);
+    ops[3] = mk(OP_PUSH_INT, 0, 3);
     ops[4] = mk(OP_IF, (7 - 4) * ASNIX_IROP_SIZE, 0);
-    ops[5] = mk(OP_PUSH_INT, 30, 0);
+    ops[5] = mk(OP_PUSH_INT, 0, 5);
     ops[6] = mk(OP_JMP, (8 - 6) * ASNIX_IROP_SIZE, 0);
-    ops[7] = mk(OP_PUSH_INT, 40, 0);
-    ops[8] = mk(OP_PUSH_INT, 50, 0);
-    ops[9] = mk(OP_PUSH_INT, 2, 0);
+    ops[7] = mk(OP_PUSH_INT, 0, 7);
+    ops[8] = mk(OP_PUSH_INT, 0, 8);
+    ops[9] = mk(OP_PUSH_INT, 0, 9);
     ops[10] = mk(OP_ADD, 0, 0);
     ops[11] = mk(OP_HALT, 0, 0);
 
     asnix_irpass_clear();
     asnix_irpass_register_dce();
-
-    int64_t *pool = NULL;
-    size_t pool_len = 0, pool_cap = 0;
     int changed = asnix_irpass_run(ops, &len, &pool, &pool_len, &pool_cap);
     CHECK(changed, "fixture_dead_region_with_internal_jumps: dce should report a change");
     CHECK(len == 5, "fixture_dead_region_with_internal_jumps: len==5 after removing the 7 dead ops");
@@ -122,10 +126,13 @@ static void fixture_dead_region_with_internal_jumps(void) {
         if (ids[i] != expect_ids[i]) shape_ok = 0;
     }
     CHECK(shape_ok, "fixture_dead_region_with_internal_jumps: surviving op shape matches expectation");
-    CHECK(ops[0].a == 1, "fixture_dead_region_with_internal_jumps: op0 (PUSH_INT 1) untouched");
+    /* M169: the literal lives in the pool now (b = pool index) -- dce
+     * never touches `b`, only `a` (jump deltas), so each surviving
+     * PUSH_INT's pool index is untouched by the removal. */
+    CHECK(pool[ops[0].b] == 1, "fixture_dead_region_with_internal_jumps: op0 (PUSH_INT 1) untouched");
     int64_t jmp_target = 1 + ops[1].a / ASNIX_IROP_SIZE;
     CHECK(jmp_target == 2, "fixture_dead_region_with_internal_jumps: op1 (JMP) retargeted to new index 2");
-    CHECK(ops[2].a == 2, "fixture_dead_region_with_internal_jumps: surviving PUSH_INT 2 untouched");
+    CHECK(pool[ops[2].b] == 2, "fixture_dead_region_with_internal_jumps: surviving PUSH_INT 2 untouched");
 
     /* Link + actually run the rewritten bytecode -- confirms the
      * rewrite is not just shaped right but still evaluates correctly
@@ -134,7 +141,7 @@ static void fixture_dead_region_with_internal_jumps(void) {
     ir_link(ops, len);
     IrProgram prog;
     prog.ops = ops;
-    prog.pool = NULL;
+    prog.pool = pool; /* M169: OP_PUSH_INT now reads its literal from here */
     Value v = asnix_eval(&prog, root_env());
     CHECK(asnix_tag_of(v) == ASNIX_TAG_INT, "fixture_dead_region_with_internal_jumps: result is an int");
     CHECK(asnix_int_value(v) == 3, "fixture_dead_region_with_internal_jumps: 1 + 2 == 3 after the rewrite");

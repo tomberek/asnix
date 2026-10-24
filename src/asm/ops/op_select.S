@@ -97,13 +97,13 @@ asnix_op_select:                        // a = symbol id; pops an attrset, pushe
                                          // result already goes through, below
     jmp .Lselect_resolve
 .Lselect_probe_missing:
-    movq ASNIX_IROP_OFF_A(%rsi), %rdx   // %rsi restored above -- .Lselect_missing's own
+    movl ASNIX_IROP_OFF_A(%rsi), %edx   // %rsi restored above -- .Lselect_missing's own
                                          // handler expects %rdx = symbol id, same as the
                                          // already-flat path sets it at .Lselect_resolved
     jmp .Lselect_missing
 .Lselect_resolved:
 
-    movq ASNIX_IROP_OFF_A(%rsi), %rdx   // rdx = target symbol id
+    movl ASNIX_IROP_OFF_A(%rsi), %edx   // rdx = target symbol id
     // %r8 already holds hi = count (loaded above)
     xorq %rcx, %rcx                     // rcx = lo = 0
 .Lselect_loop:

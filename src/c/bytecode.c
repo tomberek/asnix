@@ -361,6 +361,10 @@ enum {
     PTAG_OP_SYM_B = 9,  /* same, but the bare symbol id is in `b` -- OP_WITH_TRY,
                           * OP_SELECT_OR, OP_HAS_ATTR_IF (M162) (all three also have a real
                           * jump-delta in `a`, passed through unchanged). */
+    PTAG_OP_PUSHINT = 10, /* M169: OP_PUSH_INT -- one raw (untagged) int64 literal follows,
+                          * written/read exactly like PTAG_OP_CONST except the payload is a
+                          * bare int64 (write_value/read_value's Value.raw encoding), not a
+                          * fully-formed, already-tagged Value -- see irbuild.c's ib_push_int. */
 };
 
 static int write_program(WBuf *b, IrProgram *prog);
@@ -454,6 +458,15 @@ static int write_one_op(WBuf *b, IrOp *op, int64_t *pool) {
     int op_id = handler_to_op_id(op->handler);
     if (op_id < 0) return -1;
     switch (op_id) {
+        case OP_PUSH_INT: {
+            /* M169: pool[op->b] is a raw (untagged) int64 literal, not a
+             * fully-formed Value -- write it directly, no write_value
+             * envelope (that function's encoding is for already-tagged
+             * Value.raw words, e.g. OP_PUSH_CONST's string/etc. constants). */
+            wbuf_u8(b, PTAG_OP_PUSHINT);
+            wbuf_i64(b, pool[op->b]);
+            return 0;
+        }
         case OP_PUSH_CONST: {
             Value v = { .raw = (uint64_t)pool[op->b] };
             wbuf_u8(b, PTAG_OP_CONST);
@@ -577,8 +590,22 @@ int asnix_bytecode_serialize(IrProgram *prog, uint8_t **out_buf, size_t *out_len
      * first field) -- asnix_bytecode_deserialize's own magic check below
      * rejects it outright, same as any other corrupt/foreign entry,
      * degrading cleanly to a cache miss (recompile, overwrite) per this
-     * cache's own silent-degrade-to-miss design (bytecode_cache.c). */
-    wbuf_bytes(&b, "ASNXBC02", 8);
+     * cache's own silent-degrade-to-miss design (bytecode_cache.c).
+     *
+     * M169: magic bumped 02 -> 03 -- OP_PUSH_INT's own wire encoding
+     * changed (new PTAG_OP_PUSHINT, see write_one_op/read_one_tagged_op):
+     * a pre-M169 ASNXBC02 entry wrote OP_PUSH_INT under plain PTAG_OP with
+     * the literal inline in `a` (back when IrOp.a was 64 bits); this
+     * binary's IrOp.a is now only 32 bits, so blindly replaying that old
+     * entry's db_emit(OP_PUSH_INT, a, b) call would SILENTLY TRUNCATE any
+     * literal outside +-2^31 instead of erroring -- not a crash, a wrong
+     * answer. Every other op's wire shape is actually unchanged (the
+     * varint encoding was always value-based, not a raw IrOp struct dump
+     * -- see this function's own M102 comment), but gating on OP_PUSH_INT
+     * alone would mean this format's own version history could no longer
+     * be determined by the magic string alone -- bumping the whole magic
+     * is the simpler, already-established invalidation mechanism. */
+    wbuf_bytes(&b, "ASNXBC03", 8);
     if (write_program(&b, prog) != 0 || b.failed) {
         free(b.buf);
         return -1;
@@ -700,6 +727,15 @@ static int read_one_tagged_op(RCur *r, DBuilder *d) {
             const char *name = rcur_bytes_with_len(r, &len);
             if (r->failed || op_id < 0 || op_id >= OP_COUNT) return -1;
             db_emit(d, (int)op_id, a, (int64_t)asnix_intern(name, len));
+            return d->failed ? -1 : 0;
+        }
+        case PTAG_OP_PUSHINT: {
+            /* M169: see write_one_op's matching OP_PUSH_INT case -- the
+             * payload is a bare int64 literal, not a tagged Value. */
+            int64_t v = rcur_i64(r);
+            if (r->failed) return -1;
+            int64_t idx = db_pool_add(d, v);
+            db_emit(d, OP_PUSH_INT, 0, idx);
             return d->failed ? -1 : 0;
         }
         case PTAG_OP_CONST: {
@@ -924,9 +960,10 @@ static int read_program_into(RCur *r, DBuilder *d) {
 
 IrProgram *asnix_bytecode_deserialize(const uint8_t *buf, size_t len) {
     /* Also rejects a pre-M102 ASNXBC01 entry (fixed-8-byte-int wire
-     * format) -- see asnix_bytecode_serialize's own comment on the magic
-     * bump. */
-    if (len < 8 || memcmp(buf, "ASNXBC02", 8) != 0) return NULL;
+     * format) and a pre-M169 ASNXBC02 entry (OP_PUSH_INT's old inline-`a`
+     * encoding) -- see asnix_bytecode_serialize's own comment on the
+     * magic bump. */
+    if (len < 8 || memcmp(buf, "ASNXBC03", 8) != 0) return NULL;
     RCur r = { .buf = buf, .len = len, .pos = 8, .failed = 0 };
     DBuilder d = { 0 };
     if (read_program_into(&r, &d) != 0 || r.pos != len) {

@@ -44,8 +44,17 @@ static size_t ib_emit(IrBuilder *b, int op_id, int64_t a, int64_t bval) {
     return b->len++;
 }
 
+/* Forward-declared: defined below, next to the rest of the pool-management
+ * helpers -- ib_push_int (M169) needs it now that OP_PUSH_INT routes its
+ * literal through the pool instead of carrying it inline. */
+static size_t ib_pool_add(IrBuilder *b, int64_t v);
+
 size_t ib_push_int(IrBuilder *b, int64_t v) {
-    return ib_emit(b, OP_PUSH_INT, v, 0);
+    /* M169: OP_PUSH_INT no longer carries its literal inline (IrOp.a is
+     * only 32 bits now, too narrow for an arbitrary int64 Nix literal) --
+     * routes through the constant pool exactly like ib_push_const. */
+    size_t pool_idx = ib_pool_add(b, v);
+    return ib_emit(b, OP_PUSH_INT, 0, (int64_t)pool_idx);
 }
 size_t ib_push_true(IrBuilder *b) {
     return ib_emit(b, OP_PUSH_TRUE, 0, 0);

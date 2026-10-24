@@ -11,7 +11,7 @@
 asnix_op_path_concat:                   // a = count; pops `count` values (reverse push order,
                                          // same convention as OP_STR_CONCAT), concatenates
                                          // them and re-canonicalizes the result as a Path.
-    movq ASNIX_IROP_OFF_A(%rsi), %rbx   // rbx = count (callee-saved, survives the call below)
+    movl ASNIX_IROP_OFF_A(%rsi), %ebx   // rbx = count (callee-saved, survives the call below)
     movq %rsi, %rbp                     // save IP (callee-saved, survives the call below)
     movq %rdi, %r15                     // save ENV (ditto)
 

@@ -8,7 +8,7 @@
     .globl asnix_op_mk_list
     .type asnix_op_mk_list, @function
 asnix_op_mk_list:                       // a = count; pops `count` values (reverse push order)
-    movq ASNIX_IROP_OFF_A(%rsi), %rbx   // rbx = count (callee-saved, survives the call below)
+    movl ASNIX_IROP_OFF_A(%rsi), %ebx   // rbx = count (callee-saved, survives the call below)
     movq %rsi, %rbp                     // save IP
     movq %rdi, %r15                     // save ENV
 

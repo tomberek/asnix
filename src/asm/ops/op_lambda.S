@@ -9,8 +9,8 @@
 asnix_op_lambda:                        // a = arity, b = pool index of {body IrProgram*,
                                          // formals} (M100: prog is a single pointer, not a
                                          // {body IrOp*, body pool} pair)
-    movq ASNIX_IROP_OFF_A(%rsi), %rbx   // rbx = arity (callee-saved, survives the call below)
-    movq ASNIX_IROP_OFF_B(%rsi), %rcx
+    movl ASNIX_IROP_OFF_A(%rsi), %ebx   // rbx = arity (callee-saved, survives the call below)
+    movl ASNIX_IROP_OFF_B(%rsi), %ecx
     movq (%r13, %rcx, 8), %rbp          // rbp = body IrProgram* (callee-saved, survives the call below)
 
     pushq %rsi                          // save IP
@@ -43,7 +43,7 @@ asnix_op_lambda:                        // a = arity, b = pool index of {body Ir
     // restored) and %r13 (POOL, callee-saved, untouched by the call) is
     // simpler and avoids needing a 4th callee-saved scratch register
     // (%rbx/%rbp are already spoken for) or extra stack padding.
-    movq ASNIX_IROP_OFF_B(%rsi), %rcx
+    movl ASNIX_IROP_OFF_B(%rsi), %ecx
     movq 8(%r13, %rcx, 8), %rdx
     movq %rdx, ASNIX_CLOSURE_OFF_FORMALS(%rax)
 

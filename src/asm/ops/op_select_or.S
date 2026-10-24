@@ -95,7 +95,7 @@ asnix_op_select_or:
     jmp .Lselect_or_resolve
 .Lselect_or_resolved:
 
-    movq ASNIX_IROP_OFF_B(%rsi), %rdx   // rdx = target symbol id
+    movl ASNIX_IROP_OFF_B(%rsi), %edx   // rdx = target symbol id
     // %r8 already holds hi = count
     xorq %rcx, %rcx                     // rcx = lo = 0
 .Lselect_or_loop:
@@ -267,7 +267,7 @@ asnix_op_select_or:
     jmp *%rax
 
 .Lselect_or_not_found:
-    movq ASNIX_IROP_OFF_A(%rsi), %rax   // byte delta from THIS op's own address
+    movslq ASNIX_IROP_OFF_A(%rsi), %rax // byte delta from THIS op's own address
     addq %rax, %rsi
     movq (%rsi), %rax
     jmp *%rax

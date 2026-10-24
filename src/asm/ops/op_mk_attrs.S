@@ -8,8 +8,8 @@
     .globl asnix_op_mk_attrs
     .type asnix_op_mk_attrs, @function
 asnix_op_mk_attrs:                      // a = count, b = pool index of `count` sorted symbol ids
-    movq ASNIX_IROP_OFF_A(%rsi), %rbx   // rbx = count (callee-saved, survives the call below)
-    movq ASNIX_IROP_OFF_B(%rsi), %rbp   // rbp = pool_idx (ditto)
+    movl ASNIX_IROP_OFF_A(%rsi), %ebx   // rbx = count (callee-saved, survives the call below)
+    movl ASNIX_IROP_OFF_B(%rsi), %ebp   // rbp = pool_idx (ditto)
     pushq %rsi                          // save IP
     pushq %rdi                          // save ENV (2 pushes -- stays 16-byte aligned)
 

@@ -12,7 +12,7 @@
     .type asnix_op_var_ref_raw, @function
 asnix_op_var_ref_raw:                   // a = depth, b = slot
     movq %rdi, %rcx                     // rcx = env, walked up `depth` hops
-    movq ASNIX_IROP_OFF_A(%rsi), %rdx   // rdx = depth
+    movl ASNIX_IROP_OFF_A(%rsi), %edx   // rdx = depth
 .Lvar_ref_raw_walk:
     testq %rdx, %rdx
     jz .Lvar_ref_raw_done
@@ -22,7 +22,7 @@ asnix_op_var_ref_raw:                   // a = depth, b = slot
     decq %rdx
     jmp .Lvar_ref_raw_walk
 .Lvar_ref_raw_done:
-    movq ASNIX_IROP_OFF_B(%rsi), %rdx   // rdx = slot
+    movl ASNIX_IROP_OFF_B(%rsi), %edx   // rdx = slot
     movq ASNIX_ENV_OFF_VALUES(%rcx, %rdx, 8), %rax // rax = raw tagged value, unforced
 
     ASNIX_CHECK_VALSTACK %rcx

@@ -17,7 +17,7 @@
     .type asnix_op_var_ref_cell, @function
 asnix_op_var_ref_cell:                  // a = depth, b = slot
     movq %rdi, %rcx                     // rcx = env, walked up `depth` hops
-    movq ASNIX_IROP_OFF_A(%rsi), %rdx   // rdx = depth
+    movl ASNIX_IROP_OFF_A(%rsi), %edx   // rdx = depth
 .Lvar_ref_cell_walk:
     testq %rdx, %rdx
     jz .Lvar_ref_cell_done
@@ -27,7 +27,7 @@ asnix_op_var_ref_cell:                  // a = depth, b = slot
     decq %rdx
     jmp .Lvar_ref_cell_walk
 .Lvar_ref_cell_done:
-    movq ASNIX_IROP_OFF_B(%rsi), %rdx   // rdx = slot
+    movl ASNIX_IROP_OFF_B(%rsi), %edx   // rdx = slot
     leaq ASNIX_ENV_OFF_VALUES(%rcx, %rdx, 8), %rbx // rbx = &env->values[slot] (callee-saved,
                                          // survives the call below)
 

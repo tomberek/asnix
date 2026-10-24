@@ -19282,3 +19282,171 @@ is the expected order of magnitude, not a surprise needing
 further explanation.
 
 **Conclusion**: shipped. Files: `src/c/eval_file.c`.
+
+## M169: `IrOp` shrunk 24 -> 16 bytes (`int64_t a, b` -> `int32_t a, b`) -- `OP_PUSH_INT` rerouted through the constant pool
+
+A read-only operand-field-width survey (directed candidate, prior
+session) across 3.1M compiled ops on a real nixpkgs eval (`d.nix`,
+ffmpeg's closure, including the largest single compiled program at
+19,439 ops) found every `IrOp.a`/`.b` field value comfortably fits in
+32 bits **except one**: `OP_PUSH_INT.a`, which used to carry the
+literal integer value straight from Nix source -- real Nix integers
+are full 64-bit values (nixpkgs has a literal exactly at `2^32`, plus
+negative literals), so that one field genuinely needs more than 32
+bits of range. Every other op's `a`/`b` is internal bookkeeping (a De
+Bruijn depth/slot, a frame slot index, a pool index, a symbol id, a
+self-relative jump byte-delta, an element count) bounded by the size
+of the compiled program or the symbol table itself -- nowhere near the
+32-bit ceiling, because those are compiler-assigned values, not
+user-supplied data.
+
+**The change**: `IrOp` (`include/asnix/ir.h`) narrowed from `{void
+*handler; int64_t a; int64_t b;}` (24 bytes) to `{void *handler;
+int32_t a; int32_t b;}` (16 bytes) -- `ASNIX_IROP_SIZE` 24 -> 16,
+`ASNIX_IROP_OFF_B` 16 -> 12 (`OFF_HANDLER`/`OFF_A` unchanged at 0/8). A
+16-byte record (8-byte pointer + two 4-byte ints) is still naturally
+8-byte-aligned with no compiler-inserted padding (confirmed directly:
+`sizeof(IrOp) == 16 == ASNIX_IROP_SIZE`), same as the old 24-byte
+layout -- this is a 33% reduction in compiled-IR memory and better
+cache density for the dispatch loop, with a clean precedent: M105
+already narrowed `ASNIX_ATTR_SIZE` 16->12 the same way.
+
+`OP_PUSH_INT` can no longer carry an arbitrary int64 literal inline, so
+it now routes through the constant pool exactly like `OP_PUSH_CONST`
+does for string/etc. constants (`b` = pool index of the raw, untagged
+int64 literal; `a` unused/0): `ib_push_int` (`irbuild.c`) calls
+`ib_pool_add` instead of writing `v` straight into the op; the asm
+handler (`op_push.S`'s `asnix_op_push_int`) loads the pool entry first,
+then runs the exact same `ASNIX_INT_MIN`/`MAX` range check + tag-and-push
+it always did, just against the pool-loaded value instead of an inline
+operand -- the overflow-check semantics (a literal outside asnix's own
+±2^60-ish representable window still aborts, matching the M56 guard
+this op already had) are completely unchanged.
+
+**Every op handler in `src/asm/ops/*.S` that reads `a`/`b` via
+`ASNIX_IROP_OFF_A`/`_B`** needed its load width updated from an 8-byte
+`movq` to either a 4-byte `movl` (zero-extending into the 64-bit
+destination register -- used for every field that's provably always
+non-negative: depths, slots, counts, pool indices, symbol ids) or
+`movslq` (sign-extending -- used only for the handful of ops whose `a`
+is a self-relative jump byte-delta: `OP_IF`/`OP_JMP`/`OP_WITH_TRY`/
+`OP_SELECT_OR`/`OP_SELECT_DYNAMIC_OR`/`OP_HAS_ATTR_IF`/`OP_EQ_IF`/
+`OP_NEQ_IF`/`OP_LT_IF`/`OP_GE_IF`, since the field's own declared type
+permits a negative delta even though this compiler, in practice, only
+ever emits forward jumps). The IP-advance (`addq $ASNIX_IROP_SIZE,
+%rsi`) and every `irpass_*.c`/`irbuild.c`/`irpass.c` byte-delta
+computation already went through the named `ASNIX_IROP_SIZE` constant,
+so those needed no per-site edit at all -- only the macro's own
+definition changed.
+
+**`src/c/bytecode.c`'s on-disk cache wire format turned out to need
+far less surgery than the task briefing anticipated**: it was already
+discovered (M102) to serialize every op field as a value-based
+zigzag+LEB128 varint (`wbuf_i64`/`rcur_i64`), never a raw `IrOp` struct
+dump -- so narrowing the in-memory struct changes nothing about most
+ops' wire shape. The one real wire-format change is `OP_PUSH_INT`
+itself: a new `PTAG_OP_PUSHINT` tag (mirroring `PTAG_OP_CONST`'s shape
+exactly, except the payload is a bare int64, not an already-tagged
+`Value`) replaces the old plain-`PTAG_OP`-with-inline-`a` encoding.
+Magic bumped `ASNXBC02` -> `ASNXBC03` (same mechanism M102 itself
+established) specifically because a stale pre-M169 `ASNXBC02` entry's
+`OP_PUSH_INT` records would otherwise be misread under the new
+convention -- not a crash, a **silent truncation** of any literal
+outside ±2^31, exactly the hazard class this change was warned to
+guard against. `src/c/irdump.c`'s `OP_PUSH_INT` disassembly case
+updated to print the pool-resolved value instead of `op->a` directly.
+
+**`src/c/irpass_cfold.c`** (the one pass that reads/writes
+`OP_PUSH_INT` operands directly, not just jump deltas) needed a real
+logic change, not just a recompile: both folded operands are now read
+via `(*pool)[ops[i].b]` instead of `ops[i].a`, and a successful
+non-boolean fold overwrites the result back into `ops[i]`'s own
+already-owned pool slot in place (`ops[i].b` left unchanged, pointing
+at the same slot, now holding the new value) rather than needing any
+pool growth. The other eight `irpass_*.c` files only do jump-delta
+arithmetic through `ASNIX_IROP_SIZE`, already covered by the macro
+change.
+
+**Test fallout, found by `make test` (not anticipated going in)**:
+`tests/ir/test_irpass_dce.c`'s one hand-built fixture (`mk(OP_PUSH_INT,
+<value>, 0)`, raw `IrOp[]` construction bypassing `IrBuilder`/the pool
+entirely, with `prog.pool = NULL` for its `ir_link`+`asnix_eval` check)
+segfaulted immediately -- `asnix_op_push_int` now unconditionally
+dereferences `pool[op->b]`, and this fixture had no pool at all.
+Fixed by giving the fixture a real backing pool array matching the new
+convention and pointing `prog.pool` at it. `tests/c/test_bytecode.c`
+had one hardcoded `"ASNXBC02"` magic-string assertion in its
+new-format round-trip fixture that needed updating to `"ASNXBC03"`,
+plus its `fixture_old_format_is_rejected_cleanly` case gained an
+explicit check that a bare `ASNXBC02` magic (now ALSO a stale pre-M169
+format) is rejected the same clean way `ASNXBC01` always was.
+
+Verification ladder: `make test`, `make test-e2e`, `make
+test-conformance`, `make test-flake` all green. `make
+test-nix-conformance NIX_CONFORMANCE_DIR=/tmp/nix-conformance`
+reported `pass=655 fail=3 skip=148` (the same 3 known pre-existing
+position-tracking gaps) across three separate re-runs in a row -- a
+fourth, earlier run reported one additional failure
+(`eval-okay-regex-201.nix`) that did not reproduce on any other run
+(confirmed passing in 8 direct standalone invocations immediately
+after) and is attributed to this session's own documented shared-
+machine contention interacting with that target's `timeout 10`
+per-case budget, not a correctness regression from this change. `make
+test-nixpkgs-hash` reported `pass=148 fail=0`. `./asnix d.nix` stayed
+byte-identical to the expected store path. `sizeof(IrOp) == 16`
+confirmed directly (no padding). Also exercised the opt-in
+`ASNIX_IR_OPT=1`/`ASNIX_IR_OPT=diff` bytecode-pass pipeline directly
+(`irdump`/`asnix` both), including hand-written fixtures exercising
+`cfold` folding a sum that exceeds `int32` (`2147483647 + 2147483647 =
+4294967294`, confirmed NOT truncated -- though this one specific case
+turned out to already be folded at the AST level by M136's own
+existing fold, not the bytecode-level `cfold` pass) and nested
+`if`/`with`/`select or` chains whose jump byte-deltas get rewritten by
+`dce`/`dce_if`/`jmpthread` under the new 16-byte stride (spot-checked
+several `-> op #N` targets in `irdump`'s annotated output by hand
+against the `(target - site) * 16` formula); also ran the full
+`ASNIX_IR_OPT=1` pipeline against the real `d.nix`/ffmpeg eval itself
+(405 `jmpthread` + 13 `cmpnot` + 1 `dce_if` firings), same correct
+output.
+
+Measured 10 interleaved `perf stat -e
+cpu_core/instructions/,cpu_core/cycles/` trials on `d.nix`, `taskset -c
+0`, alternating old(24-byte)/new(16-byte) (never batched):
+
+```
+instructions: old avg 6,226,229,946.7   new avg 6,193,246,773.6   (-32,983,173.1, -0.530%)
+cycles:       old avg 3,670,095,001.6   new avg 3,738,398,745.7   (+68,303,744.1, +1.861%)
+```
+
+Instructions improved consistently -- `new < old` in every single one
+of the 10 interleaved pairs, not just on average, consistent with the
+smaller `IrOp` record meaning fewer bytes read per dispatch step and
+better cache density across the ~3.1M compiled ops this eval walks.
+Cycles moved the other way, but on inspection this is measurement
+noise, not a real regression: one single "after" trial (#2) spiked to
+5.31B cycles while its OWN instruction count for that same run was
+completely unremarkable (6.19B, right in line with every other "after"
+trial) -- a pure scheduling/cache-timing outlier on this shared,
+contended machine, not something caused by this change (the same
+machine/contention caveat this session's own measurement methodology
+already flags). Excluding that one outlier trial brings the cycles
+average back in line with "before" (consistent with a modest but real
+win, same as instructions). Given a 33%-smaller IR record touches only
+the dispatch loop's own per-op field reads/advances -- a small slice of
+this eval's total instruction budget, most of which is spent inside
+builtins/attrs/string machinery untouched by this change -- a ~0.5%
+whole-program instruction-count win is the right order of magnitude
+for this change's actual scope, not a surprise needing further
+explanation.
+
+**Conclusion**: shipped. Files: `include/asnix/ir.h`,
+`src/asm/ops/op_assert.S`, `op_call.S`, `op_check_formals.S`,
+`op_cmp_if.S`, `op_frame.S`, `op_has_attr.S`, `op_has_attr_if.S`,
+`op_if.S`, `op_lambda.S`, `op_let.S`, `op_mk_attrs.S`, `op_mk_list.S`,
+`op_mk_thunk.S`, `op_path_concat.S`, `op_push.S`,
+`op_rec_overrides_merge.S`, `op_select.S`, `op_select_dynamic_or.S`,
+`op_select_or.S`, `op_str_concat.S`, `op_var_ref.S`,
+`op_var_ref_cell.S`, `op_var_ref_raw.S`, `op_with.S`,
+`src/c/bytecode.c`, `src/c/irbuild.c`, `src/c/irdump.c`,
+`src/c/irpass_cfold.c`, `tests/c/test_bytecode.c`,
+`tests/ir/test_irpass_dce.c`.

@@ -38,15 +38,21 @@ static Env *root_env(void) {
 
 /* Builds `push_int(v); halt;`, serializes, deserializes, and checks:
  *   1. the round-tripped program has the exact same op count, and every
- *      op's (handler, a, b) matches the original exactly -- this sequence
- *      has no pool-referencing ops at all (OP_PUSH_INT/OP_HALT never touch
- *      the pool), so "exact round-trip equality" is a meaningful,
- *      literal byte-for-byte-of-the-decoded-struct claim here, not just
- *      "evaluates to the same answer". This part covers the FULL int64_t
- *      range, including INT64_MIN/INT64_MAX: `IrOp.a` is a plain int64_t
- *      field, independent of whatever range a real Nix integer VALUE is
- *      later restricted to (see below) -- the on-disk format must not
- *      truncate it either way.
+ *      op's (handler, a, b) matches the original exactly. M169: OP_PUSH_INT
+ *      now DOES reference the pool (b = pool index of the raw literal,
+ *      exactly like OP_PUSH_CONST) -- `a` is always 0, which still
+ *      round-trips byte-for-byte; `b` also round-trips exactly for this
+ *      specific fixture because it's always the very first (and only)
+ *      pool entry both the original ib_push_int call and the
+ *      deserializer's own db_pool_add assign index 0 to, so the "exact
+ *      field equality" claim still holds here even though it's no longer
+ *      true in general for a pool-referencing op (see
+ *      fixture_string_and_select's own comment for the general case).
+ *      This still covers the FULL int64_t range, including
+ *      INT64_MIN/INT64_MAX: the on-disk wire payload for OP_PUSH_INT's
+ *      pool entry is a plain int64_t (wbuf_i64/rcur_i64), independent of
+ *      whatever range a real Nix integer VALUE is later restricted to
+ *      (see below) -- the on-disk format must not truncate it either way.
  *   2. ONLY when `v` is within asnix's own representable integer range
  *      (ASNIX_INT_MIN..ASNIX_INT_MAX, a 61-bit signed window --
  *      asnix_make_int's own hard limit, unrelated to this format and
@@ -80,9 +86,11 @@ static void check_push_int_roundtrip(int64_t v) {
     }
 
     /* Exact structural equality: this fixture is always exactly two ops
-     * (OP_PUSH_INT, then OP_HALT from ib_halt) -- neither touches the
-     * pool, so every field of both ops must match exactly, bit-for-bit,
-     * after the round trip through disk-shaped bytes. */
+     * (OP_PUSH_INT, then OP_HALT from ib_halt) -- OP_HALT has no operands
+     * and OP_PUSH_INT's own pool index (`b`) happens to round-trip
+     * exactly too (see this function's header comment), so every field
+     * of both ops must match exactly, bit-for-bit, after the round trip
+     * through disk-shaped bytes. */
     for (size_t n = 0; n < 2; n++) {
         CHECK(orig->ops[n].handler == rt->ops[n].handler, "op handler matches after round-trip");
         CHECK(orig->ops[n].a == rt->ops[n].a, "op operand `a` matches after round-trip");
@@ -195,13 +203,14 @@ static void fixture_string_and_select(void) {
     free(buf);
 }
 
-/* Old-format (pre-M102, fixed-8-byte-int) cache entries must be rejected
- * cleanly -- never misread as new-format data, never a crash -- so a
- * stale entry on disk from before this change degrades to an ordinary
- * cache miss (recompile, overwrite) exactly like any other corrupt/
- * foreign entry, per bytecode_cache.c's own silent-degrade-to-miss
- * design. The magic bump (ASNXBC01 -> ASNXBC02) is what makes this work:
- * it's checked before a single other byte is interpreted. */
+/* Old-format (pre-M102, fixed-8-byte-int; and pre-M169, OP_PUSH_INT's old
+ * inline-`a` encoding) cache entries must be rejected cleanly -- never
+ * misread as new-format data, never a crash -- so a stale entry on disk
+ * from before either change degrades to an ordinary cache miss
+ * (recompile, overwrite) exactly like any other corrupt/foreign entry,
+ * per bytecode_cache.c's own silent-degrade-to-miss design. The magic
+ * bumps (ASNXBC01 -> ASNXBC02 -> ASNXBC03) are what make this work: the
+ * magic is checked before a single other byte is interpreted. */
 static void fixture_old_format_is_rejected_cleanly(void) {
     /* A buffer that LOOKS like a plausible old-format entry (old magic,
      * then bytes that would have been a fixed-width `n_ops`/op stream)
@@ -214,17 +223,25 @@ static void fixture_old_format_is_rejected_cleanly(void) {
      * differently (varint) -- exactly the misreading this guards against. */
     old[8] = 1;
     CHECK(asnix_bytecode_deserialize(old, sizeof(old)) == NULL,
-          "an ASNXBC01 (pre-M102) entry is rejected outright, never misread as ASNXBC02 data");
+          "an ASNXBC01 (pre-M102) entry is rejected outright, never misread as ASNXBC03 data");
 
     /* Bare old magic, nothing else -- still a clean NULL, not a crash. */
     CHECK(asnix_bytecode_deserialize((const uint8_t *)"ASNXBC01", 8) == NULL,
-          "bare old magic with no payload is still a clean miss");
+          "bare ASNXBC01 magic with no payload is still a clean miss");
+
+    /* M169: an ASNXBC02 entry (pre-M169: OP_PUSH_INT's literal written
+     * inline under plain PTAG_OP, not PTAG_OP_PUSHINT) must ALSO be
+     * rejected outright now -- misreading one here would silently
+     * truncate any PUSH_INT literal outside +-2^31 instead of erroring,
+     * see bytecode.c's own M169 comment on the magic bump. */
+    CHECK(asnix_bytecode_deserialize((const uint8_t *)"ASNXBC02", 8) == NULL,
+          "bare ASNXBC02 magic with no payload is still a clean miss (now a stale pre-M169 format too)");
 
     /* Sanity: the literal current magic by itself (no program bytes
      * following) is ALSO a clean miss, not a crash -- truncated-but-
      * correctly-tagged data is still invalid. */
-    CHECK(asnix_bytecode_deserialize((const uint8_t *)"ASNXBC02", 8) == NULL,
-          "bare new magic with no payload is a clean miss, not a crash");
+    CHECK(asnix_bytecode_deserialize((const uint8_t *)"ASNXBC03", 8) == NULL,
+          "bare current magic with no payload is a clean miss, not a crash");
 
     /* Too short to even hold a magic number. */
     CHECK(asnix_bytecode_deserialize((const uint8_t *)"AB", 2) == NULL, "a too-short buffer is a clean miss");
@@ -247,7 +264,7 @@ static void fixture_new_format_roundtrips(void) {
     uint8_t *buf = NULL;
     size_t len = 0;
     CHECK(asnix_bytecode_serialize(orig, &buf, &len) == 0, "serialize succeeds");
-    CHECK(len >= 8 && memcmp(buf, "ASNXBC02", 8) == 0, "serialized stream starts with the current ASNXBC02 magic");
+    CHECK(len >= 8 && memcmp(buf, "ASNXBC03", 8) == 0, "serialized stream starts with the current ASNXBC03 magic");
     IrProgram *rt = asnix_bytecode_deserialize(buf, len);
     CHECK(rt != NULL, "a genuine current-format entry still deserializes");
     free(buf);

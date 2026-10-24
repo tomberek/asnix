@@ -16,11 +16,18 @@
      * `9223372036854775807` (INT64_MAX) round-tripped to `-1`. Checked
      * inline (not via a `call asnix_make_int`) for the same hot-path
      * reason this op already inlines the tagging bit trick instead of
-     * calling asnix_make_int -- see value.S's header comment. */
+     * calling asnix_make_int -- see value.S's header comment.
+     *
+     * M169: the literal no longer lives inline in `a` (IrOp's operand
+     * fields are only 32 bits now, too narrow for an arbitrary int64 Nix
+     * literal) -- `b` is a pool index instead, exactly like
+     * OP_PUSH_CONST, loaded here before the same range check/tag runs
+     * against the pool-loaded value. */
     .globl asnix_op_push_int
     .type asnix_op_push_int, @function
 asnix_op_push_int:
-    movq ASNIX_IROP_OFF_A(%rsi), %rax
+    movl ASNIX_IROP_OFF_B(%rsi), %eax   // zero-extended pool index
+    movq (%r13, %rax, 8), %rax          // rax = raw (untagged) int64 literal
     movq $ASNIX_INT_MAX, %r9
     cmpq %r9, %rax
     jg .Lpush_int_overflow
@@ -80,7 +87,7 @@ asnix_op_push_null:
     .globl asnix_op_push_const
     .type asnix_op_push_const, @function
 asnix_op_push_const:                    // b = pool index of a pre-formed Value.raw
-    movq ASNIX_IROP_OFF_B(%rsi), %rax
+    movl ASNIX_IROP_OFF_B(%rsi), %eax
     movq (%r13, %rax, 8), %rax
     ASNIX_CHECK_VALSTACK %rcx
     movq %rax, (%r12)

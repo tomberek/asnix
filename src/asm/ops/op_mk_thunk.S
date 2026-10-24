@@ -8,7 +8,7 @@
     .type asnix_op_mk_thunk, @function
 asnix_op_mk_thunk:                      // b = pool index of {body IrProgram*} (M100: a single
                                          // pointer, not a {body IrOp*, body pool} pair)
-    movq ASNIX_IROP_OFF_B(%rsi), %rcx
+    movl ASNIX_IROP_OFF_B(%rsi), %ecx
     movq (%r13, %rcx, 8), %rbp          // rbp = body IrProgram* (callee-saved, survives the call below)
 
     pushq %rsi                          // save IP

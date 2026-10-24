@@ -46,7 +46,7 @@ asnix_op_select_dynamic_or:
     jmp *%rax
 
 .Lsdo_miss:
-    movq ASNIX_IROP_OFF_A(%rsi), %rax   // byte delta from THIS op's own address
+    movslq ASNIX_IROP_OFF_A(%rsi), %rax // byte delta from THIS op's own address
     addq %rax, %rsi
     movq (%rsi), %rax
     jmp *%rax

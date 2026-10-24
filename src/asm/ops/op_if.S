@@ -32,7 +32,7 @@ asnix_op_if:                            // a = byte delta to jump when condition
     jmp *%rax
 
 .Lif_false:
-    movq ASNIX_IROP_OFF_A(%rsi), %rax
+    movslq ASNIX_IROP_OFF_A(%rsi), %rax
     addq %rax, %rsi
     movq (%rsi), %rax
     jmp *%rax
@@ -46,7 +46,7 @@ asnix_op_if:                            // a = byte delta to jump when condition
     .globl asnix_op_jmp
     .type asnix_op_jmp, @function
 asnix_op_jmp:                           // a = unconditional byte delta
-    movq ASNIX_IROP_OFF_A(%rsi), %rax
+    movslq ASNIX_IROP_OFF_A(%rsi), %rax
     addq %rax, %rsi
     movq (%rsi), %rax
     jmp *%rax

@@ -8,7 +8,7 @@
 asnix_op_str_concat:                    // a = count; pops `count` values (reverse push order,
                                          // same convention as OP_MK_LIST), coerces each to a
                                          // string and concatenates them in source order.
-    movq ASNIX_IROP_OFF_A(%rsi), %rbx   // rbx = count (callee-saved, survives the call below)
+    movl ASNIX_IROP_OFF_A(%rsi), %ebx   // rbx = count (callee-saved, survives the call below)
     movq %rsi, %rbp                     // save IP (callee-saved, survives the call below)
     movq %rdi, %r15                     // save ENV (ditto)
 

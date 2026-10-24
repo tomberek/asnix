@@ -6,7 +6,7 @@
     .globl asnix_op_let
     .type asnix_op_let, @function
 asnix_op_let:                           // a = nslots; binds the next `nslots` pushed values
-    movq ASNIX_IROP_OFF_A(%rsi), %rbx   // rbx = nslots (callee-saved, survives the call below)
+    movl ASNIX_IROP_OFF_A(%rsi), %ebx   // rbx = nslots (callee-saved, survives the call below)
     movq %rsi, %rbp                     // save IP (callee-saved, survives the call below)
     movq %rdi, %r15                     // save current ENV = up-pointer for the new frame
 

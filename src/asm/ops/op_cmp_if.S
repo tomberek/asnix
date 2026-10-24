@@ -147,7 +147,7 @@ asnix_op_ge_if:                         // a = byte delta to else
     // byte delta from THIS op's own address (`%rsi` hasn't moved yet),
     // same self-relative convention as OP_IF's own false path.
 .Lcmp_if_false:
-    movq ASNIX_IROP_OFF_A(%rsi), %rax
+    movslq ASNIX_IROP_OFF_A(%rsi), %rax
     addq %rax, %rsi
     movq (%rsi), %rax
     jmp *%rax

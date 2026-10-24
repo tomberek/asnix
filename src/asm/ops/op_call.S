@@ -14,7 +14,7 @@
     .globl asnix_op_call
     .type asnix_op_call, @function
 asnix_op_call:                          // a = argc
-    movq ASNIX_IROP_OFF_A(%rsi), %rbx   // rbx = argc (callee-saved, survives the call below)
+    movl ASNIX_IROP_OFF_A(%rsi), %ebx   // rbx = argc (callee-saved, survives the call below)
 
     // Locate the callee: VALSTACK[top - argc - 1] (args were pushed after it).
     movq %rbx, %rax

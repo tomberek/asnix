@@ -70,8 +70,8 @@ asnix_op_check_formals:                 // a = required_count; b = pool_idx
 .Lcf_resolved:
     leaq ASNIX_ATTRS_OFF_ENTRIES(%rax), %rbp   // rbp = given entries base
 
-    movq ASNIX_IROP_OFF_A(%rsi), %r8    // r8 = required_count
-    movq ASNIX_IROP_OFF_B(%rsi), %r9    // r9 = pool_idx
+    movl ASNIX_IROP_OFF_A(%rsi), %r8d   // r8 = required_count
+    movl ASNIX_IROP_OFF_B(%rsi), %r9d   // r9 = pool_idx
 
     // ---- Phase 1: every required field must be present among the given
     // entries (binary search, since the given Attrs is sorted by sym). ----

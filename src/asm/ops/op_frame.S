@@ -19,7 +19,7 @@
     .globl asnix_op_frame_alloc
     .type asnix_op_frame_alloc, @function
 asnix_op_frame_alloc:                   // a = nslots
-    movq ASNIX_IROP_OFF_A(%rsi), %rbx   // rbx = nslots (callee-saved, survives the call below)
+    movl ASNIX_IROP_OFF_A(%rsi), %ebx   // rbx = nslots (callee-saved, survives the call below)
     movq %rsi, %rbp                     // save IP (callee-saved, survives the call below)
     movq %rdi, %r15                     // save current ENV = up-pointer for the new frame
 
@@ -47,7 +47,7 @@ asnix_op_frame_alloc:                   // a = nslots
     .globl asnix_op_frame_set
     .type asnix_op_frame_set, @function
 asnix_op_frame_set:                     // a = slot index; pops VALSTACK into ENV.values[slot]
-    movq ASNIX_IROP_OFF_A(%rsi), %rdx   // rdx = slot
+    movl ASNIX_IROP_OFF_A(%rsi), %edx   // rdx = slot
     subq $8, %r12
     movq (%r12), %rax
     movq %rax, ASNIX_ENV_OFF_VALUES(%rdi, %rdx, 8)
@@ -64,7 +64,7 @@ asnix_op_frame_set:                     // a = slot index; pops VALSTACK into EN
     .globl asnix_op_frame_get
     .type asnix_op_frame_get, @function
 asnix_op_frame_get:                     // a = slot index; pushes ENV.values[slot] verbatim
-    movq ASNIX_IROP_OFF_A(%rsi), %rdx   // rdx = slot
+    movl ASNIX_IROP_OFF_A(%rsi), %edx   // rdx = slot
     movq ASNIX_ENV_OFF_VALUES(%rdi, %rdx, 8), %rax
 
     ASNIX_CHECK_VALSTACK %rcx

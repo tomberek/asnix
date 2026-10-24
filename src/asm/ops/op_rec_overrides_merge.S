@@ -22,8 +22,8 @@
     .globl asnix_op_rec_overrides_merge
     .type asnix_op_rec_overrides_merge, @function
 asnix_op_rec_overrides_merge:       // a = n, b = pool index of [n syms][overrides_slot]
-    movq ASNIX_IROP_OFF_A(%rsi), %rax   // rax = n (temp; becomes arg2)
-    movq ASNIX_IROP_OFF_B(%rsi), %rcx   // rcx = pool_idx
+    movl ASNIX_IROP_OFF_A(%rsi), %eax   // rax = n (temp; becomes arg2)
+    movl ASNIX_IROP_OFF_B(%rsi), %ecx   // rcx = pool_idx
     leaq (%r13, %rcx, 8), %rcx           // rcx = &pool[pool_idx] = meta pointer (temp; becomes arg3)
 
     pushq %rsi                          // save IP
