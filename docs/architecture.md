@@ -20374,3 +20374,44 @@ removed.
 
 Files: none changed (investigated and measured in a disposable
 worktree; `src/c/lexer.c` on master is unaffected).
+
+## M179: startup-cost comparison against iets -- asnix is already ~11x cheaper, reconfirming M123; one non-actionable mimalloc wrinkle found
+
+A follow-on investigation asked whether asnix does more work than iets
+during initialization/startup specifically (as opposed to steady-state
+eval), on the theory that a structural startup gap could be hiding
+behind the steady-state wins already measured this session.
+
+**Measured directly, not assumed.** `perf stat -e instructions`,
+interleaved rounds, on the cheapest possible eval shape for each
+evaluator (a trivial `true`-literal expression, so the measurement
+isolates startup/init cost rather than any real evaluation work): asnix
+costs **4.48M instructions**, iets costs **49.5M instructions**. asnix
+is **~11x cheaper** at startup, not more expensive -- this directly
+reconfirms M123's earlier finding (which put the ratio at 10-30x) rather
+than assuming it was stale.
+
+**One genuine new wrinkle found, judged not actionable.** Of asnix's
+4.48M startup instructions, mimalloc's own lazy first-malloc
+initialization accounts for about **2.09M** of them on its own -- almost
+doubling the cost from a 2.39M plain-glibc-malloc baseline to 4.48M.
+This is real, but fixing it is not recommended: mimalloc's adoption was
+already measured and shipped as a net win on real workloads (-7.8% to
+-8.9% on the real `d.nix`/ffmpeg eval), and "fixing" its lazy-init tax
+would mean giving up mimalloc for an eval shape (a trivial literal, with
+almost no allocation after startup) that does not represent any real
+workload this project optimizes for.
+
+**Also checked: iets's builtins registration.** iets builds its builtins
+table at runtime, the same as asnix does -- there is no structural
+asnix-specific gap there. iets's larger absolute startup cost most
+likely comes from elsewhere in its own design (tokio's async runtime
+init, config parsing, gRPC linkage), none of which has an asnix
+equivalent to fix.
+
+**Conclusion: no action taken.** asnix's startup is already
+substantially cheaper than iets's, confirming this is not a lever worth
+pursuing. Recorded here so this question does not get re-asked and
+re-investigated from scratch in a future session.
+
+Files: none changed (investigation only, no code modified on master).
