@@ -19803,3 +19803,108 @@ Files: `src/c/builtins_compare.c` (`json_encode_attrs_ctx` given a
 small-N stack-array fast path below the new
 `ASNIX_JSON_ATTRS_SORT_STACK_MAX` threshold; the existing `malloc` +
 insertion-sort path unchanged above it).
+
+## M173: why asnix falls behind iets specifically on `hackage-packages.nix` -- not a new bug, and the real answer already exists in the codebase as an off-by-design feature
+
+A syscall-timing comparison against iets on the real `d.nix`/ffmpeg eval
+found the two evaluators track within noise across ~900 of 1052 commonly
+opened files, but asnix takes a sharp, isolated +0.187s longer than iets
+(which stays flat) at exactly the point of finishing one file:
+`pkgs/development/haskell-modules/hackage-packages.nix` -- 783,197 lines
+/ 16,633,882 bytes, a single auto-generated non-`rec` attrset literal
+with 19,261 package bindings, by far the largest file either evaluator
+touches in this eval. That one file accounts for the large majority of
+the measured total gap.
+
+**Isolating the file confirmed this is real, not a fluke of file
+ordering**: asnix 1,887,034,959 instructions / 0.239s vs iets
+1,408,518,153 instructions / 0.144s on this file alone -- asnix pays
+~34% more instructions and ~66% more wall time, worse than its ~1.34x
+program-wide average ratio on the rest of the corpus.
+
+**It is not a new algorithmic bug.** `lex_until` is the dominant
+self-time symbol on this file (23.98%, more than 2.5x `compile_expr`'s
+9.35%) -- but this is the SAME already-heavily-tuned machinery
+(M129/M130/M135/M138/M141/M147 for lexing, M142/M149 for the giant-
+attrset compile path) straining proportionally at a token volume
+(~1.34M words in one file) no prior isolated profiling pass happened to
+exercise. `insert_attrpath`/`btvec_index_rehash` (M142's own fix for
+`all-packages.nix`'s 4,280-binding case) barely register here (1.90%)
+despite this file having 4.5x more bindings, confirming that machinery
+scales correctly even at this much larger size -- the cost shifted from
+the outer attrset's O(n log n) bookkeeping to the aggregate per-token
+lex/intern/scope cost, because this file averages 69.6 words/binding
+(9.8x denser than `all-packages.nix`'s 7.1 words/binding -- each binding
+here is a full inline `callPackage (pattern: mkDerivation {15-25
+fields}) {...}`, not a terse one-liner). Profiling iets on the identical
+isolated file shows the exact same qualitative shift (its own
+`Lexer::next_token` beats `Compiler::expr`, 15.13% vs 7.42%) --
+lex-dominates-compile on this file is intrinsic to the file's shape on
+both independently-implemented evaluators, not an asnix-specific
+anomaly. A finer breakdown found asnix's *lexer* specifically is 2.12x
+iets's on this file (worse than the 1.34x program-wide average), while
+the historically-blamed compile-side gap (M142's original target) is
+actually *less* divergent here (~1.69x) than M142's own aggregate-corpus
+study found -- the disproportionate cost on this file is concentrated in
+lexing, not compiling, which is a genuine inversion of the usual
+pattern. The two adjacent, obvious lexer-side interventions in exactly
+this territory -- M153's SWAR `lex_dquote_run` scan and M135's lex/parse
+fusion -- were both already tried and measured as regressions on the
+aggregate corpus; a follow-up check of whether a file-shape-conditional
+version of M153's SWAR idea could flip the sign specifically on
+string-literal-dense files like this one (this file has 19,437
+fixed-~44-52-byte `sha256 = "..."` literals, comfortably above the
+8-byte SWAR chunk size that killed the unconditional version) is a
+separate, still-open sub-question -- see that investigation's own
+findings if/when it lands, not assumed here.
+
+**The real, decisive answer came from reading iets's own documentation
+of this exact file.** iets's `docs/explanation/caching.md` and
+`docs/explanation/evaluation.md` both name `hackage-packages.nix` by
+name as their own worst single-file bottleneck too ("one helper spends
+about 0.17s alone reading and compiling the 16.6 MB
+`hackage-packages.nix`"), and their own fix is NOT a lexer/parser
+speedup -- it is a persistent, on-disk cache of each imported file's
+*compiled IR*, checked before recompiling, giving a measured ~2.7x win
+on warm/repeat runs for this exact file (iets's own numbers: 190-218ms
+cold vs 71-77ms warm).
+
+**asnix already has the exact analogous mechanism** -- `src/c/
+bytecode_cache.c` (M94), an on-disk compiled-`IrProgram` cache gated by
+`ASNIX_BYTECODE_CACHE=1`, off by default. It has never been exercised by
+this campaign's own `d.nix` cold-eval benchmark methodology, which
+deliberately runs with it off specifically so every file genuinely
+re-lexes/re-compiles each trial (a correct, deliberate choice for
+measuring COLD, from-scratch eval cost, which is what this whole
+campaign's instruction-count comparisons are about -- NOT an oversight).
+Tested directly on this one file in isolation (scratch worktree, torn
+down after): cold/no-cache 1,886,358,470 instructions / 0.198s vs warm
+cache hit (`ASNIX_BYTECODE_CACHE=1`, pre-populated) 1,059,025,148
+instructions / 0.100s -- **~1.78x fewer instructions, ~1.97x fewer
+cycles/wall-time**, closely tracking iets's own ~2.7x ratio for the
+identical file. The honest caveat iets's own `docs/explanation/
+history.md` ("Memory ideas") independently confirms is relevant here
+too: *producing* the cache the first time costs MORE than compiling
+without caching at all (measured here: 3.4B instructions vs 1.89B, ~1.8x
+extra, dominated by SHA256-content-hashing the 16.6MB source plus
+serializing ~21MB to disk) -- this only pays off on repeat/warm runs,
+never a first cold eval, which is exactly why this campaign's own cold-
+benchmark methodology correctly never exercises it.
+
+**Conclusion.** This is not a gap to close with new code -- the lever
+already exists, is correctly scoped off for this campaign's own cold-
+eval measurement methodology, and would be the single largest available
+win (far bigger than anything found via lexer/compiler micro-
+optimization on this file) for any REAL-WORLD usage pattern that
+re-evaluates the same files repeatedly (incremental rebuilds, repeated
+`nix-instantiate` calls during development, etc.) -- a different,
+already-solved problem from the one this campaign's cold-eval
+comparisons are measuring. iets's own history also independently
+confirms a related negative result worth inheriting without re-testing:
+"Compiling `hackage-packages.nix` lazily" (deferring per-binding
+compilation until forced) was tried and dropped by iets, saving only
+~15MB against a 7.1GB arena baseline with no speed benefit -- not worth
+chasing for asnix either.
+
+Files: none changed (investigation and cross-reference only; the
+bytecode cache feature itself already exists, unmodified, since M94).
