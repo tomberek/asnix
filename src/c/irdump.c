@@ -172,6 +172,32 @@ static int byte_pos_to_line(uint32_t pos) {
     return line;
 }
 
+/* M191: prints the actual nixpkgs source text of the line containing
+ * byte offset `pos`, as its own row immediately above the first op of
+ * a same-line run (see dump_program's run-start check below -- never
+ * once per op, that would just repeat the identical line and defeat
+ * the point). M188/M189 already map an op back to a line NUMBER; the
+ * actual motivation for doing that at all was letting a human scanning
+ * for nixpkgs code worth hand-optimizing see what's there WITHOUT
+ * separately opening the file -- a number alone still requires that
+ * round trip, the source text doesn't. Leading indentation is trimmed
+ * so the snippet lines up with the op rows under it instead of
+ * inheriting the source file's own indentation; very long lines
+ * (minified/generated Nix) are capped so one pathological line can't
+ * blow out the dump. */
+static void print_source_snippet(uint32_t pos) {
+    const char *s = g_dump_src;
+    uint32_t start = pos;
+    while (start > 0 && s[start - 1] != '\n') start--;
+    uint32_t end = pos;
+    while (s[end] && s[end] != '\n') end++;
+    while (start < end && (s[start] == ' ' || s[start] == '\t')) start++;
+    uint32_t len = end - start;
+    int capped = len > 160;
+    if (capped) len = 160;
+    printf("        | %.*s%s\n", (int)len, s + start, capped ? "..." : "");
+}
+
 static void dump_program(IrProgram *prog, int id, SeenVec *seen, Worklist *work) {
     printf("\n=== program #%d (ops=%p pool=%p) ===\n", id, (void *)prog->ops, (void *)prog->pool);
     /* NULL when line tracking is off, or for a program ib_finish built
@@ -237,6 +263,13 @@ static void dump_program(IrProgram *prog, int id, SeenVec *seen, Worklist *work)
             snprintf(lc_buf, sizeof lc_buf, "?:%d", line_run[i]);
         } else {
             snprintf(lc_buf, sizeof lc_buf, "?:1");
+        }
+        /* M191: a new run (this op's line differs from the previous
+         * op's, or this is the program's first op) gets the actual
+         * source line printed once, right above it -- see
+         * print_source_snippet's own comment. */
+        if (i < n_ops && line_no[i] != 0 && (i == 0 || line_no[i] != line_no[i - 1])) {
+            print_source_snippet(prog_lines[i]);
         }
         printf("  [%4lld] %-8s %-20s b=%-8lld", (long long)i, lc_buf, op_names[id_of], (long long)op->b);
 

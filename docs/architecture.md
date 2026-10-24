@@ -21383,3 +21383,36 @@ Nix int value can represent).
 
 Files: `src/c/irpass_constprop.c`/`.h` (new pass), `src/c/irpass_cfold.c`
 (overflow-check fix), `src/c/main.c`/`src/c/irdump.c` (registration).
+
+## M191: `irdump` now prints the actual source line, not just its number, above each run of ops it compiled from
+
+Follow-up to M189's `lineno:count` compaction, prompted by a direct
+observation mid-review: once `irdump` tracks a byte offset per op and
+can resolve it to a line *number* (M188), resolving it to the line's
+actual *text* is nearly free, and is strictly more useful for the
+stated goal (scanning for real nixpkgs code worth hand-optimizing) --
+a number still requires a human to go open the file and find that
+line; the text doesn't.
+
+**What changed.** A new `print_source_snippet(uint32_t pos)` slices
+`g_dump_src` back to the previous `\n` and forward to the next one,
+trims leading indentation (so the snippet lines up with the op rows
+under it rather than inheriting the source file's own indent), and
+caps pathologically long lines at 160 chars. `dump_program` calls it
+exactly once per run of consecutive same-line ops -- at the run's
+first op, reusing the run-boundary check M189 already computes --
+never once per op (that would just repeat the identical line
+`line_run[i])` times and defeat the point).
+
+Lines with no tracked position (`line_no[i] == 0`, i.e.
+compiler-synthesized nodes) print no snippet, same as they print `?`
+instead of a line number.
+
+**Correctness.** Full ladder green: `make test`, `make test-e2e`
+(300/300), `make test-conformance`, `make test-nix-conformance`
+(`pass=655 fail=3 skip=148`, same 3 known pre-existing failures), `make
+test-nixpkgs-hash` (`pass=148 fail=0`). `./asnix d.nix` output hash
+unchanged; diff touches only `src/c/irdump.c`.
+
+Files: `src/c/irdump.c` (`print_source_snippet`, the run-start call
+site in `dump_program`).
