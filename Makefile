@@ -19,7 +19,14 @@ OPT          ?= -O2
 # `=` (recursive), not `:=` -- CFLAGS must re-expand $(OPT) at each use so
 # `debug`'s target-specific `OPT := -O0` (below) actually takes effect.
 # `:=` would bake in whatever OPT was at *this* line permanently.
-CFLAGS       = -std=c11 -Wall -Wextra -g $(OPT) $(INC) -MMD -MP -U_FORTIFY_SOURCE -Wa,--noexecstack
+# M183: GCC injects -fstack-protector-strong by default; its per-call
+# canary load/store+check costs real instructions on hot, high-call-count
+# functions (measured on lexer_next, called once per token -- hundreds of
+# millions of times on a real nixpkgs eval). Disabled project-wide, the
+# same "unrequested-hardening-for-a-perf-research-evaluator" tradeoff this
+# Makefile already made for -U_FORTIFY_SOURCE above. User-authorized
+# explicitly (a security-relevant tradeoff, not a default to assume).
+CFLAGS       = -std=c11 -Wall -Wextra -g $(OPT) $(INC) -MMD -MP -U_FORTIFY_SOURCE -fno-stack-protector -Wa,--noexecstack
 LDFLAGS      :=
 
 # M146: statically link mimalloc into the final `asnix` executable as a

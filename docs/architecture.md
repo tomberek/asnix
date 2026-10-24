@@ -20758,3 +20758,58 @@ setups.
 Files: `src/c/hash_shim.c` (`AsnixHashFnCache` added; `asnix_hash_one`
 takes a per-algorithm cache pointer; `asnix_hash_md5`/`sha1`/`sha256`/
 `sha512` each keep their own static cache instance).
+
+## M183: GCC's default `-fstack-protector-strong` disabled project-wide -- a real per-call tax on high-call-count functions like `lexer_next`
+
+A profiling pass investigating `lexer_next`'s residual per-token cost
+(vs the sibling Rust evaluator `iets`'s `next_token`, post-M181/M182)
+found the real cause wasn't dispatch structure, struct layout, or
+missed inlining -- all checked directly and ruled out. It was hardening
+instrumentation this toolchain injects by DEFAULT, unrequested by this
+project's own Makefile: `-fstack-protector-strong` (confirmed via `cc
+-v`), in the same unrequested-hardening category this Makefile already
+strips for `_FORTIFY_SOURCE`. Every GCC-compiled function pays a canary
+load/store-plus-check on entry/exit; for a function called once per
+token (`lexer_next`, hundreds of millions of times on a real nixpkgs
+eval), this fixed per-call tax is amplified far more than for an
+ordinarily-called function.
+
+**This is a real security/performance tradeoff, not a free win --
+required and received explicit user authorization before implementing**
+(disabling a buffer-overflow exploit mitigation, project-wide, in a
+program that parses Nix expression source). Presented with the real
+measured numbers (scoped-to-lexer.o: -0.44%; project-wide: -1.37%) and
+the explicit tradeoff, the user chose project-wide.
+
+**Correctness.** Full ladder green, independently re-verified twice
+after an initial run hit one transient `ninja.drvPath(crash)` failure
+during `make test-nixpkgs-hash` under extreme host load (load average
+41.52, swap 100% exhausted, confirmed via `uptime`/`free -h` at the
+time) -- 5/5 isolated reruns of that exact eval succeeded cleanly, and
+two full-suite reruns after load dropped (down to 0.89) both passed
+`pass=148 fail=0` cleanly, with no further investigation needed: the
+failure pattern (single flake under extreme concurrent load, not
+reproducible in isolation, not reproducible once load dropped) matches
+resource exhaustion, not a memory-safety bug newly exposed by removing
+the canary. `make test` (all units), `make test-e2e` (296/296), `make
+test-conformance`, `make test-nix-conformance` (`pass=655 fail=3
+skip=148`, same 3 known pre-existing failures), `make test-nixpkgs-hash`
+(`pass=148 fail=0`, confirmed twice clean), `./asnix d.nix` output hash
+unchanged.
+
+**Measured** (`perf stat -e cpu_core/instructions/`, `taskset -c 0`, 5
+interleaved trials against a from-scratch M182 baseline built in a
+separate worktree, output hash checked every trial):
+
+| | instructions |
+|---|---|
+| before (M182 baseline) | 5,573,465,854 (avg) |
+| after (M183) | 5,494,066,867 (avg) |
+| delta | **-1.425%** (~79.4M instructions) |
+| wins | 5/5, completely non-overlapping ranges |
+
+Consistent with the implementer's own independently-measured -1.37%
+(12/12 wins in their own trial set).
+
+Files: `Makefile` (`CFLAGS` gains `-fno-stack-protector`, right next to
+the existing `-U_FORTIFY_SOURCE`).
