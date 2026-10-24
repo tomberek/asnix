@@ -22,6 +22,31 @@
  * results unchanged if the custom engine can't parse the pattern at all
  * (should not happen for anything regcomp itself accepted, but costs
  * nothing to guard defensively -- see that function's own comment).
+ *
+ * M184: `asnix_prim_match2_impl` additionally makes the custom engine
+ * AUTHORITATIVE for the match/no-match decision ITSELF (not just
+ * capture recompute), skipping regexec()'s own EXECUTION (not just
+ * regcomp -- M143 already made that free after the first call per
+ * distinct pattern) once a given pattern's custom-engine existence
+ * verdict has been empirically proven, over several real calls, to
+ * agree with glibc's -- see RegexCacheEntry's `span_trusted` field and
+ * docs/architecture.md's M184 section for the full correctness
+ * argument (short version: `match`'s own question, "does the WHOLE
+ * fixed-length string match", is answered correctly by ANY complete
+ * backtracking search regardless of which decomposition it prefers
+ * when more than one exists -- the ambiguity M68 found only affects
+ * WHICH capture wins, never whether a full-length match exists at
+ * all -- so this is safe against the alternation/repetition ambiguity
+ * class; the per-pattern empirical verification window exists as
+ * defense-in-depth against plain parser bugs in regex_engine.c's own
+ * narrower grammar, not against ambiguity). `split2_impl` is
+ * deliberately NOT changed by M184: its unanchored search can
+ * genuinely disagree with glibc on the match SPAN itself even without
+ * capture groups (top-level alternation's longest-vs-ordered
+ * preference can differ between libstdc++ and glibc in search mode --
+ * see M68's quirk 3 and the M184 writeup's own worked example), a
+ * fundamentally different and harder-to-bound risk than match's
+ * tie-break-independent existence question.
  */
 #include "builtins_regex.h"
 
@@ -245,6 +270,28 @@ typedef struct {
     int custom_attempted;     /* asnix_regex_compile already tried once (success or not) */
     AsnixCustomRegex *custom_re; /* compiled form, or NULL if the attempt failed */
     int64_t custom_nsub;
+
+    /* M184: per-pattern empirical trust state for making the custom
+     * engine AUTHORITATIVE for `match`'s whole-string span decision
+     * itself (not just capture recompute for a span glibc already
+     * found) -- see this file's top comment and the M184 writeup in
+     * docs/architecture.md for the full rationale. Tri-state:
+     *   0  -- still verifying: the next several calls with this exact
+     *         pattern cross-check the custom engine's existence verdict
+     *         against glibc's regexec() on the SAME call, and the
+     *         glibc-derived result (already correct, unchanged) is what
+     *         gets returned while still in this state.
+     *   1  -- trusted: `span_verify_count` consecutive calls all agreed,
+     *         so `asnix_prim_match2_impl` skips regexec() entirely for
+     *         later calls with this pattern and trusts the custom
+     *         engine's own existence verdict directly.
+     *  -1  -- proven unsafe (a disagreement was actually observed, or
+     *         the custom engine can't compile this pattern / reports a
+     *         different group count than regcomp) -- permanently falls
+     *         back to the regexec()-driven path for this pattern, same
+     *         as before this milestone, forever. */
+    int span_trusted;
+    int span_verify_count;
 } RegexCacheEntry;
 
 static RegexCacheEntry **g_regex_cache = NULL;
@@ -308,6 +355,8 @@ static RegexCacheEntry *regex_cache_insert(const char *pattern, int64_t len) {
     e->custom_attempted = 0;
     e->custom_re = NULL;
     e->custom_nsub = 0;
+    e->span_trusted = 0;
+    e->span_verify_count = 0;
 
     if (g_regex_cache_count == g_regex_cache_cap) {
         g_regex_cache_cap = g_regex_cache_cap ? g_regex_cache_cap * 2 : 32;
@@ -450,6 +499,18 @@ static Value custom_groups_to_list(const AsnixRegexGroup *g, int64_t nsub, const
  * (unimproved, but also unregressed) `pmatch`-based capture groups. */
 #define ASNIX_REGEX_CUSTOM_MAX_SPAN 2000
 
+/* M184: number of consecutive agreeing calls (per distinct pattern)
+ * required before `asnix_prim_match2_impl` trusts the custom engine's
+ * own existence verdict and skips regexec() entirely for later calls --
+ * see RegexCacheEntry's `span_trusted` field for the full scheme. A
+ * small number is enough: real nixpkgs evals call match/split with a
+ * small set of DISTINCT patterns repeated across thousands of packages
+ * (M143's own finding), so this one-time per-pattern verification cost
+ * is negligible next to the win on every later call; a handful of
+ * different subjects (not just one) also guards specifically against
+ * the "first subject got lucky" risk a single-call check would have. */
+#define ASNIX_REGEX_SPAN_VERIFY_CALLS 8
+
 /* Given a match glibc's regexec already found spans `[match_so,
  * match_eo)` of the full `subject` (absolute offsets -- `match_so`/
  * `match_eo` are NOT relative to `base`, see groups_to_list's own
@@ -582,10 +643,66 @@ Value asnix_prim_match2_impl(const Value *args, int64_t argc) {
     regex_t *preg = regex_cache_ensure_glibc(re, pattern, "match");
 
     size_t nsub = preg->re_nsub;
+
+    /* M184: once this exact pattern's custom-engine existence verdict
+     * has been empirically proven to agree with glibc's regexec() (see
+     * RegexCacheEntry's `span_trusted` comment above), skip regexec()
+     * entirely -- it's the measured-expensive part (M182's follow-up
+     * finding: `re_search_internal`/`re_acquire_state`/etc., not
+     * `regcomp`, which M143 already made effectively free after the
+     * first call). Falls through to the glibc-driven path below
+     * (unchanged) whenever not yet trusted, proven unsafe, the custom
+     * engine can't compile this pattern, or the subject is too long to
+     * safely recurse over. */
+    if (re->span_trusted == 1 && slen <= ASNIX_REGEX_CUSTOM_MAX_SPAN) {
+        AsnixCustomRegex *cre = regex_cache_ensure_custom(re, pattern, plen);
+        if (cre && re->custom_nsub == (int64_t)nsub) {
+            AsnixRegexGroup *g = nsub > 0 ? malloc(nsub * sizeof *g) : NULL;
+            int ok = asnix_regex_match_anchored(cre, subject, slen, 0, slen, 0, g);
+            if (ok) {
+                result = nsub > 0 ? custom_groups_to_list(g, (int64_t)nsub, subject) : asnix_bshared_make_list(NULL, 0);
+            } else {
+                result = ASNIX_NULL;
+            }
+            free(g);
+            free(pattern);
+            free(subject);
+            return result;
+        }
+        /* Shouldn't happen (span_trusted==1 means this already
+         * succeeded on a prior call for the SAME cached entry, and
+         * compile success/nsub are deterministic properties of the
+         * pattern text alone) -- defensively fall through to the
+         * glibc path below rather than trust a half-formed state. */
+    }
+
     regmatch_t *pmatch = malloc((nsub + 1) * sizeof(regmatch_t));
     int mrc = regexec(preg, subject, nsub + 1, pmatch, 0);
+    int glibc_ok = (mrc == 0 && pmatch[0].rm_so == 0 && pmatch[0].rm_eo == (regoff_t)slen);
 
-    if (mrc != 0 || pmatch[0].rm_so != 0 || pmatch[0].rm_eo != (regoff_t)slen) {
+    /* M184: still in the verification window for this pattern --
+     * cross-check the custom engine's own existence verdict against
+     * glibc's (just computed above) on this SAME call/subject, without
+     * changing what this call itself returns (the glibc-derived result
+     * below is used regardless, exactly as before this milestone). */
+    if (re->span_trusted == 0 && slen <= ASNIX_REGEX_CUSTOM_MAX_SPAN) {
+        AsnixCustomRegex *cre = regex_cache_ensure_custom(re, pattern, plen);
+        if (cre && re->custom_nsub == (int64_t)nsub) {
+            AsnixRegexGroup *g = nsub > 0 ? malloc(nsub * sizeof *g) : NULL;
+            int custom_ok = asnix_regex_match_anchored(cre, subject, slen, 0, slen, 0, g);
+            if (custom_ok != glibc_ok) {
+                re->span_trusted = -1; /* diverged for real -- never trust this pattern's span */
+            } else {
+                re->span_verify_count++;
+                if (re->span_verify_count >= ASNIX_REGEX_SPAN_VERIFY_CALLS) re->span_trusted = 1;
+            }
+            free(g);
+        } else {
+            re->span_trusted = -1; /* can't compile under the custom engine, or a differing group count */
+        }
+    }
+
+    if (!glibc_ok) {
         result = ASNIX_NULL;
     } else {
         result = groups_to_list_recomputed(pmatch, nsub, subject, re, pattern, plen, subject, slen, 0, slen, 0);

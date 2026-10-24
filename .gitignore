@@ -34,3 +34,4 @@ tests/c/test_toml
 tests/c/test_regex_engine_scratch
 tests/c/test_bytecode
 tests/ir/test_irpass_dce
+tests/c/test_regex_span_authoritative

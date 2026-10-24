@@ -20813,3 +20813,253 @@ Consistent with the implementer's own independently-measured -1.37%
 
 Files: `Makefile` (`CFLAGS` gains `-fno-stack-protector`, right next to
 the existing `-U_FORTIFY_SOURCE`).
+
+## M184: made the custom NFA engine authoritative for `builtins.match`'s own span decision, not just capture recompute -- skips `regexec()`'s execution entirely once a pattern is empirically proven safe
+
+Follow-up candidate from M182's own profiling pass: `builtins_regex.c`
+always calls glibc's `regexec()` to decide whether `builtins.match`'s
+pattern matches the WHOLE subject string, even though `regex_engine.c`
+(M68) already recomputes capture groups for that same match via its own
+from-scratch backtracking search whenever the pattern has any capture
+group. M182 measured this `regexec()` EXECUTION (not `regcomp` -- M143
+already made that free after the first call per distinct pattern) at
+~1.1% self-time on the real `d.nix`/ffmpeg eval (`re_search_internal`/
+`re_acquire_state`/`re_node_set_*`/`sift_states_backward`), vs `iets`'s
+pure-Rust engine at ~0.25%, and flagged that removing it would need "its
+own design pass" given the correctness stakes (M68/M80/M82/M143's whole
+reason for keeping glibc in the loop at all is that `regex_engine.c`
+doesn't claim general POSIX leftmost-longest semantics for the match
+*span* itself, only for captures within a span glibc already decided).
+
+**The correctness question, worked through from first principles before
+writing any code.** M68's own documented ambiguity (`regex_engine.c`'s
+header comment, and this file's M68 scope notes above) is specifically
+about WHICH decomposition a backtracking engine prefers when MORE THAN
+ONE decomposition reaches the same outcome -- ordered alternation
+(`(aa|a)(aa|a)` on `"aaa"`: both `("aa","a")` and `("a","aa")` are valid
+full-length decompositions; libstdc++ picks the first-tried one) and
+greedy repetition's trailing-empty-iteration quirk (`(a*)*` on `"aa"`:
+both `[""]`-via-one-more-empty-rep and `["aa"]`-via-stopping-after-the-
+real-reps are internally consistent AST walks; libstdc++ picks the
+former). Both examples -- and every other quirk this project has found
+and fixed (M55/M68/M80) -- are about *capture content*, never about
+*whether a whole-string match exists at all*. This isn't a coincidence:
+for a FIXED required end position (exactly what `builtins.match`'s own
+implicit whole-string anchoring already is, see `asnix_prim_match2_impl`'s
+own top-of-function comment on the "does the longest match starting at
+0 reach the end" trick), "does some decomposition of this pattern
+consume the string exactly, end to end" is a pure EXISTENCE question --
+it is decided correctly by ANY complete backtracking search regardless
+of which successful path that search happens to prefer when more than
+one exists, *provided the search is actually exhaustive* (tries every
+alternative/every repetition count on backtracking, never gives up
+early while an untried option remains). Reading `regex_engine.c` directly
+confirms `asnix_regex_match_anchored` is exactly this: `ctx.budget =
+NULL` ("anchored mode's RN_ALT never consults it" -- its own comment),
+and `RN_ALT`'s anchored-mode branch is a plain `for` loop trying every
+branch in order with full recursive backtracking, `match_rep` explores
+every repetition count from the greedy maximum down to `rep_min` on
+backtrack, and the zero-width-iteration guard (`blocked`) is the
+standard, well-known, non-skipping infinite-loop guard every
+backtracking engine needs (it never removes a reachable decomposition,
+just a redundant duplicate of one already tried). So: `asnix_regex_
+match_anchored`'s own existence verdict for a FIXED-length anchored
+match is sound independent of M68's ambiguity class, by construction --
+this is a different (and settled) question from "is `regex_engine.c`'s
+hand-rolled ERE parser bug-for-bug a correct implementation of every
+construct in its grammar", which is a real, separate, residual risk
+(plain parser bugs, not ambiguity) this milestone defends against
+empirically rather than by proof (see below). `builtins.split`'s own
+unanchored search is a genuinely different, harder question -- see the
+explicit scope cut at the end of this section.
+
+**The fix: per-pattern empirical self-verification, not a static
+syntactic classifier.** The task that motivated this investigation
+suggested classifying patterns "provably free of leftmost-longest
+ambiguity" at compile time (e.g. no alternation-with-capture-groups).
+Working through the reasoning above found that framing doesn't actually
+match where the real residual risk is for `match` specifically (it's
+parser completeness, not ambiguity) -- and a static classifier would
+still be no defense at all against a plain `regex_engine.c` parsing bug
+in some construct, which IS a real risk this project's own test corpus
+doesn't fully rule out for patterns that never exercised the custom
+engine in production before now (specifically: patterns with ZERO
+capture groups, which previously never touched `regex_engine.c` at all,
+even for capture recompute, since there was nothing to recompute).
+Instead, `RegexCacheEntry` (M143's per-pattern cache) gained a tri-state
+`span_trusted` field: **0** (still verifying -- the next several calls
+with this exact pattern string run BOTH engines on the same call and
+compare their existence verdicts, returning the glibc-derived answer,
+unchanged from before this milestone, while still in this state), **1**
+(trusted -- `ASNIX_REGEX_SPAN_VERIFY_CALLS` (8) consecutive calls all
+agreed, so later calls skip `regexec()`'s execution entirely and trust
+`asnix_regex_match_anchored`'s verdict directly), **-1** (proven unsafe
+-- an actual disagreement was observed, or the custom engine can't
+compile this pattern or reports a different capture-group count than
+`regcomp` did -- permanently falls back to the unmodified `regexec()`
+path for this pattern, for the rest of the process). This piggybacks
+directly on M143's own finding that real nixpkgs evals call `match`/
+`split` with a SMALL set of DISTINCT patterns repeated across THOUSANDS
+of packages, so paying double the cost for the first 8 calls of each
+distinct pattern is noise next to the win on every later call of that
+same pattern. Captures are completely unaffected by this milestone --
+they already went through `regex_engine.c` (`groups_to_list_recomputed`)
+whenever `nsub > 0`, unchanged; M184 only changes who decides the
+boolean existence verdict.
+
+**Why this is a stronger safety argument than a compile-time classifier
+for the SAME reason it's harder to formally audit**: a static
+classifier can only be as good as the person writing it noticing every
+ambiguous shape ahead of time (M68 alone took real work to find all
+three of its quirks by hand-probing real `nix-instantiate`). The
+verify-then-trust scheme instead asks glibc's OWN `regexec()` -- already
+proven correct in production for years -- directly, on real calls with
+real subjects, and only trusts the custom engine for a given pattern
+once it has ACTUALLY been shown to agree, several times, for that exact
+pattern. Its own honestly-stated residual risk: a pattern could pass its
+8-call verification window on subjects that happen not to trigger a
+latent divergence, then hit one on call 9+. This is fundamentally a
+sampling argument, not a proof, for that specific residual category --
+but per the correctness argument above, that category is narrowed to
+"plain parser bugs" (not ambiguity, which is proof-backed), and 8 calls
+across *different* subjects (not the same one repeated) is a real,
+non-trivial amount of evidence for the realistic workload this project
+targets (the same literal pattern string applied to many distinct real
+version/path/URL strings across different packages in one eval).
+
+**Empirical validation, four ways:**
+
+1. **Direct engine-vs-engine existence agreement**, a new
+   `tests/c/test_regex_span_authoritative.c` battery: calls glibc's
+   `regexec` and `regex_engine.c`'s `asnix_regex_match_anchored`
+   independently (bypassing `builtins_regex.c` entirely) across ~35
+   `(pattern, subject)` pairs, deliberately weighted toward
+   ZERO-capture-group patterns (top-level alternation, repetition
+   adjacent to overlapping content, interval quantifiers, bracket
+   classes, anchors, the empty pattern) -- the specific class that
+   never touched `regex_engine.c` in production before this milestone
+   -- plus the exact M68 quirk patterns themselves, re-probed for
+   EXISTENCE agreement specifically (capture-content agreement is
+   already covered separately by `test_regex_engine_scratch.c`). All
+   agree.
+2. **Full-ladder differential probe against real `nix-instantiate`**:
+   an 83-case battery (ambiguous alternation/repetition shapes, bracket
+   extensions, realistic nixpkgs-style patterns pulled from a live
+   nixpkgs checkout's actual `builtins.match` call sites --
+   `lib.versions`-style version/hash/path parsing -- anchors, empty
+   subjects/patterns) run through ONE asnix process (so repeated
+   patterns actually exercise the cache/trust-transition machinery) and
+   diffed byte-for-byte against the SAME expression evaluated by real
+   `nix-instantiate --eval --strict --json`: zero mismatches.
+3. **Direct observation of the trust transition firing correctly**: a
+   dedicated probe (`(aa|a)(aa|a)` -- M68's own sharpest ambiguity
+   example -- over 15 varied subjects, repeating the first few at the
+   end) with temporary instrumentation confirmed the trust flip fires
+   on exactly the 8th call as designed, and the LAST three (post-trust,
+   fully custom-engine-driven, zero `regexec()` calls) reproduce the
+   SAME answers as the first three (verification-window,
+   glibc-cross-checked) -- and both match real `nix-instantiate`
+   exactly.
+4. **Zero divergences on the real `d.nix`/ffmpeg eval itself**: the
+   same temporary instrumentation on the real workload found 14 DISTINCT
+   patterns reached the trusted (`span_trusted == 1`) state over the
+   course of evaluating ffmpeg's full dependency closure (e.g.
+   `[a-zA-Z_][a-zA-Z0-9_]*`, `(.*)\.(git|tar|zip|...)$`, `mirror://
+   ([a-z]+)/(.*)`, `/bin/([^/]+)`) -- zero disagreements recorded across
+   however many real calls those 14 patterns' combined usage amounts to
+   in a full ffmpeg closure eval, and `./asnix d.nix`'s own output is
+   still byte-identical to real Nix's.
+
+**New test coverage**: `tests/c/test_regex_span_authoritative.c` (above).
+Four new `tests/e2e/m183_match_span_*.nix` fixtures, each independently
+verified against real `nix-instantiate --eval --strict` before being
+trusted: `trust_transition_alternation` (M68's quirk-1 pattern across 15
+subjects, spanning both the verification window and the post-trust fast
+path, with 3 repeated subjects at the end to directly confirm pre-/
+post-trust answers for identical inputs don't change);
+`trust_transition_trailing_empty_rep` (M68's quirk-2 pattern, same
+shape, 10 subjects); `bracket_extension_unaffected` (confirms the
+pre-existing `asnix_regex_needs_custom_engine` full-bypass route, an
+equivalence class pattern, is untouched by this milestone's changes);
+`long_subject_falls_back` (a 2500-character subject, over
+`ASNIX_REGEX_CUSTOM_MAX_SPAN`, confirms the fast path correctly declines
+and falls back to the unmodified glibc path rather than risking the
+pre-existing C-recursion-depth cap).
+
+**Full verification ladder**: `make test` (including the new unit
+battery), `make test-e2e` (300/300 -- 296 pre-existing + 4 new),
+`make test-conformance`, `make test-nix-conformance
+NIX_CONFORMANCE_DIR=/tmp/nix-conformance`: exact baseline `pass=655
+fail=3 skip=148` (same 3 pre-existing position-tracking failures).
+`make test-nixpkgs-hash`: `pass=148 fail=0`. `./asnix d.nix` output
+unchanged: `/nix/store/29iacg6h530yx7rxz4k1fhvi0kxxhsam-ffmpeg-9.0.1-bin`.
+All outputs byte-identical to the pre-M184 binary across every `perf`
+trial taken for the measurement below (checked directly, not assumed).
+
+**Measured** (6 interleaved `perf stat` trials, `taskset -c 0`,
+`cpu_core/instructions/`+`cpu_core/cycles/`, real `d.nix`/ffmpeg eval,
+freshly built pre-/post-M184 binaries from the exact same otherwise-
+unchanged tree):
+
+| | instructions |
+|---|---|
+| before | 5,570,498,894 (avg) |
+| after | 5,540,012,437 (avg) |
+| delta | **-0.547%** (-30.5M instructions) |
+| wins | 6/6, completely non-overlapping ranges |
+
+Smaller than M182's own ~1.1%-self-time estimate for the whole glibc
+`regexec` fallback -- expected and confirmed directly by `perf record`
+(DWARF call graphs, before/after): `regexec`'s own descendant self-time
+under `asnix_prim_match2_impl` collapsed from ~1.26% to ~0.03% (down to
+just the handful of calls still inside each pattern's 8-call
+verification window), but `regex_engine.c`'s own matcher
+(`asnix_regex_match_anchored`/`match_rep`/`run_cont`) now costs real,
+measurable self-time in its place (~0.84-1.08% combined) -- the custom
+engine's CPS backtracking isn't free, it's a *different-shaped* cost
+(recursive, not DFA-table-driven) that happens to be cheaper than
+glibc's DFA execution for this workload's actual pattern mix, but not
+dramatically so. Summed regex-family self-time (flat `perf report`,
+`-g none`): ~1.21% before -> ~0.60% after, roughly halved, consistent
+with the ~0.55% whole-process instruction delta `perf stat` measured
+independently.
+
+**Explicit scope cut: `builtins.split` is deliberately NOT changed by
+this milestone.** `split2_impl` already routes unanchored search
+entirely through the custom engine whenever `nsub > 0` (M68's own quirk-
+3 fix) -- this milestone only closes the analogous gap for `match`'s
+ANCHORED case. The `nsub == 0` branch of `split2_impl` (plain, literal,
+or otherwise capture-group-free patterns) still uses the unmodified
+`regexec()`-driven loop, and this was a deliberate decision, not an
+oversight: unlike `match`'s fixed-endpoint existence question,
+`split`'s own unanchored search is asking a genuinely different
+question -- WHERE does the match start and end -- and that answer is
+NOT tie-break-independent the way existence is. Worked through
+concretely: M68's own quirk 3 (`(x*)(xy)?` committing to `x*`'s greedy
+read and never backtracking into it for a later optional's sake) can
+affect the reported SPAN even without any capture group at all, in
+principle, if an equivalent ambiguity can be built from top-level
+(unparenthesized) alternation interacting with a preceding repetition
+over shared characters -- and `regex_engine.c`'s own search-mode `RN_ALT`
+handling (explore every branch to completion, keep whichever reaches
+furthest) was deliberately built to reproduce libstdc++'s real behavior
+at the ALTERNATION level while still leaving plain repetition greedy-
+committed, a genuinely different (and asymmetric -- unlike anchored
+mode's ordered-first-wins convention) algorithm from true POSIX
+leftmost-longest. The same verify-then-trust architecture this milestone
+built COULD plausibly extend to `split`'s `nsub == 0` case too, but
+verifying it would mean comparing two full match-sequences per
+pattern (not one boolean), a real implementation under-taking in its
+own right, and real nixpkgs's own `split` usage (checked directly
+against a live nixpkgs checkout's `lib.strings.splitString`/
+`splitStringBy`) is overwhelmingly plain `escapeRegex`'d literal
+separators with no metacharacters at all -- meaning the realistic
+win available there is small relative to the added risk surface and
+implementation cost. Left as a well-scoped follow-up candidate, not
+attempted here.
+
+Files: `src/c/builtins_regex.c` (`RegexCacheEntry` gained `span_trusted`/
+`span_verify_count`; `asnix_prim_match2_impl` gained the verify-then-
+trust fast path; `regex_engine.c`/`.h` untouched). New:
+`tests/c/test_regex_span_authoritative.c`; four `tests/e2e/m183_match_
+span_*.nix`/`.expected` fixture pairs.
