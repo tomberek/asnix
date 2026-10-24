@@ -19011,3 +19011,151 @@ machine code and measuring, not by pattern-matching the source shape.
 **Conclusion**: declined. Change fully reverted (`git diff` against the
 pre-change tree is empty); no source files modified. Files:
 `docs/architecture.md` only.
+
+## M167: extending M162's hand-inlined Cell-chain walk to `op_select.S`/`op_select_or.S`/`op_with.S`'s own `call asnix_resolve_cell_chain` sites
+
+M162 hand-inlined the "unwrap however many `Cell`s are chained together"
+loop (a bare-variable alias, e.g. `let y = x; in y`) directly into
+`op_var_ref.S`/`force.S`, but left `op_select.S`/`op_select_or.S`/
+`op_with.S`'s own identical `call asnix_resolve_cell_chain` sites alone.
+M162's own comment asserted those three "weren't hot enough on `d.nix`
+to be worth inlining too" -- but that claim was never actually measured
+against this specific benchmark at the time; it was an assumption, not a
+finding. This milestone checked it directly.
+
+**Read `op_var_ref.S`'s own M162 implementation first** (`.Lvar_ref_cell_
+loop`/`.Lforce_cell_loop` in `force.S`) to confirm the exact shape being
+proposed: mask the tag bits, compare against `ASNIX_TAG_PTR`, mask+load
+the base pointer (clearing the low 3 tag bits and, for M118 compatibility,
+the high 16 ThunkMap-index bits), compare the leading qword against
+`ASNIX_CELL_MARKER`, loop on a hit (chained alias) up to
+`ASNIX_CELL_CHASE_LIMIT` (heap.h), or fall through to the existing resolve
+label on a miss (which may itself still be an unforced Thunk/LazyApp/
+ThunkMap, handled exactly as before).
+
+**Confirmed the three target call sites genuinely match this shape**
+before assuming it: `op_select.S:214`, `op_select_or.S:203`, and
+`op_with.S:226` (`OP_WITH_TRY`, not `OP_WITH` -- a different function in
+the same file; `OP_WITH`'s own `ASNIX_ENV_WITH_TAG` frame-tagging logic
+lives entirely in `asnix_op_with`/`asnix_op_with_exit` and is untouched by
+this change) are byte-for-byte the same `pushq %rsi; pushq %rdi; movq
+%rax, %rdi; call asnix_resolve_cell_chain; popq %rdi; popq %rsi; jmp
+.L*_resolve` pattern M162 already replaced twice over.
+
+**Measured the real volume first**, the same way M163 did before deciding
+anything (temporary per-call-site `incq` counters directly in the three
+`.S` files, a matching hit-count global + `__attribute__((destructor))`
+printer in `value_util.c`, reverted before committing -- confirmed via
+`git status`/`git diff` both clean after reverting). Result on the full
+`d.nix` eval:
+
+```
+DBG select_cell=77236 select_or_cell=22490 with_cell=1128 total_hops=122709
+```
+
+100,854 total Cell-hit calls across the three sites (122,709 chase hops,
+~1.22 hops/call -- overwhelmingly single-hop, same as M162's own `let y =
+x; in y` common case) -- nowhere near M163's 1,568-call "almost never
+reached" verdict that justified declining there. `objdump` on
+`asnix_resolve_cell_chain` confirmed the same nested-call shape M162's
+own investigation found at `op_var_ref.S`'s site: `asnix_resolve_cell_
+chain` itself was never inlined with `asnix_value_is_cell` (which itself
+calls `asnix_tag_of`) or `asnix_cell_target` by GCC, so every one of
+these 100,854 calls paid 2-3 nested out-of-line calls just to mask tag
+bits/compare a marker/load a pointer, on top of the `call`/`ret` and
+push/pop pair at the `.S` call site itself.
+
+**The fix.** Hand-rolled the identical loop directly at all three sites,
+named `.Lselect_cell_loop`/`.Lselect_or_cell_loop`/`.Lwith_try_cell_loop`
+to match each file's own existing label-naming convention. Register
+liveness was checked at each site (not assumed): in all three, the
+`call`'s immediate predecessor is the binary search's `.L*_found` label
+(or the `attrs_probe` hit path, which re-converges on the same `resolve`
+label with the same registers free), so `%r9`/`%r10`/`%r11`/`%rdx` are
+all confirmed dead at the "it's a Cell" label and free to reuse as the
+chase-limit counter/scratch, exactly like `op_var_ref.S`'s own
+`.Lvar_ref_cell_loop` reuses `%rdx`/`%r8`-`%r10`.
+
+**`op_select_or.S`'s fallback/default-value path, checked specifically**
+per this milestone's own correctness concern: a Cell is only ever reached
+at this label *after* the binary search (or `attrs_probe`) already found
+a matching entry -- the `or` default/`.Lselect_or_not_found` path is a
+completely separate, earlier branch (taken on a miss or a non-attrset
+target), never entered from inside the Cell loop. The only way the Cell
+loop diverts away from the ordinary resolve/push flow is the chase-limit-
+exceeded case, which jumps to `.Lselect_or_blackhole` (fatal) -- the same
+outcome the old `call`-based version had via `asnix_resolve_cell_chain`'s
+own `exit(1)` on exceeding the limit, just now consistent with how
+`op_var_ref.S`/`force.S` already report it (a catchable-by-nothing fatal
+message rather than a bare `exit(1)`, a strict improvement, not a
+behavior change in any passing test). This does NOT change `or`'s miss
+semantics: a miss is decided entirely before a Cell is ever examined.
+
+**`op_with.S`'s `ASNIX_ENV_WITH_TAG` frame-tagging, checked specifically**
+per the same concern: `OP_WITH_TRY`'s new `.Lwith_try_cell_loop` only
+reads/writes `%rax`/`%rcx`/`%rdx`/`%r8`/`%r9`/`%r10`, none of which carry
+ENV or frame-tag state -- that logic lives entirely in `asnix_op_with`
+(the frame-allocation function above `asnix_op_with_try` in the same
+file) and `asnix_op_with_exit`, neither of which this change touches at
+all.
+
+**Correctness.** `make test`, `make test-e2e`, `make test-conformance`
+all green. `make test-nix-conformance NIX_CONFORMANCE_DIR=/tmp/
+nix-conformance` reports `pass=655 fail=3 skip=148`, the same 3
+pre-existing position-tracking gaps as every prior milestone
+(`eval-okay-getattrpos-functionargs.nix`, `eval-okay-getattrpos.nix`,
+`eval-okay-inherit-attr-pos.nix`). `make test-nixpkgs-hash` reports
+`pass=148 fail=0`. `./asnix d.nix` output byte-identical:
+`/nix/store/29iacg6h530yx7rxz4k1fhvi0kxxhsam-ffmpeg-9.0.1-bin`.
+Hand-written differential tests against real `nix-instantiate --eval`
+(not part of the permanent suite), covering exactly the three touched op
+codes: a bare-alias attrset select (`let a={...}; b=a; c={inherit (b)
+x;}; in c.x`), a select-with-default hit and miss through an alias
+(`b.x or 99` / `b.y or 99`), a `with` over an alias (`with b; x + y`), a
+2000-hop non-cyclic alias chain resolved via `OP_SELECT` (`e.x` after
+2000 `let`-chained aliases), a 2000-hop `OP_WITH_TRY` chain, and a
+genuine `let x = y; y = x; in x.foo` alias cycle (caught by `op_var_ref.
+S`'s own already-inlined blackhole, confirming the shared
+`ASNIX_CELL_CHASE_LIMIT` constant still terminates correctly) -- all
+matched `nix-instantiate` exactly (including one deliberately-not-a-bug
+case, `with b; y or 55`, which both evaluators reject identically with
+"undefined variable 'y'", since a bare-variable `or` default is parsed
+as plain variable resolution, not attribute-select-with-default).
+
+**Measured (10 interleaved `perf stat` trials, `taskset -c 0`, `d.nix`,
+before/after/before/after...)**:
+
+| | mean | stdev |
+|---|---|---|
+| before (all 10) | 6,243,948,568.2 | 8,942,782.6 |
+| after (all 10) | 6,234,909,754.3 | 4,327,168.5 |
+
+One trial pair (#4) carried a shared-machine contention spike common to
+both before and after (+27-29M instructions on both sides relative to the
+other 9 pairs) that inflated `before`'s raw stdev well above its usual
+~880K; excluding that single pair (both sides, not cherry-picked):
+
+| | mean | stdev |
+|---|---|---|
+| before (9 trials) | 6,241,132,786.0 | 879,175.3 |
+| after (9 trials) | 6,233,597,250.6 | 1,298,053.4 |
+
+A -0.12% / ~7.5M instruction reduction, ~8.6x either side's stdev --
+smaller than M162's own -1.25%/-78.8M (expected: 100,854 calls here vs.
+834,237 Cell reads there, and split across three colder op codes instead
+of one hot one), but comfortably above the noise floor and, critically,
+in the same direction in **all 10 of 10** trials with no exceptions
+(including the noisy #4 pair) -- a result that would occur by chance with
+probability 1/1024 if the true effect were zero. Shipped.
+
+**Conclusion**: M162's own comment calling these three sites "not hot
+enough to be worth inlining" was a reasonable-sounding but unverified
+assumption, not a measured finding -- actually counting hits on `d.nix`
+found over 100K combined calls, enough to produce a small but real,
+consistently-signed win once applied. Smaller than M162 itself, but a
+genuine instruction-count reduction at effectively zero risk (identical,
+already-proven logic, copied three more times with per-site register-
+liveness checks, not a new design).
+
+Files: `src/asm/ops/op_select.S`, `src/asm/ops/op_select_or.S`,
+`src/asm/ops/op_with.S`, `docs/architecture.md`.

@@ -206,15 +206,36 @@ asnix_op_select:                        // a = symbol id; pops an attrset, pushe
     cmpq $ASNIX_CELL_MARKER, %r9
     jne .Lselect_check_lazyapp           // PTR but not a Cell -- maybe a LazyApp instead
 
-    // It's a Cell -- see op_var_ref.S's matching comment on
-    // asnix_resolve_cell_chain (value_util.c).
-    pushq %rsi                           // save IP
-    pushq %rdi                           // save ENV (2 pushes, stays 16-byte aligned)
-    movq %rax, %rdi                      // arg1 = the Cell value
-    call asnix_resolve_cell_chain
-    popq %rdi                            // restore ENV
-    popq %rsi                            // restore IP
-    jmp .Lselect_resolve
+    // It's a Cell -- M166: inline Cell-chain walk, same hand-rolled loop
+    // as op_var_ref.S's .Lvar_ref_cell_loop (see that file's comment for
+    // the full rationale). %r8 already holds the masked base pointer of
+    // a CONFIRMED Cell (the check just above). %r9/%r10/%r11 are free
+    // scratch here (the binary search above is done; %r9 held the
+    // Cell-marker just checked, now dead). %rdx is free too (last
+    // written setting up the binary search's target symbol id, dead
+    // since .Lselect_loop/.Lselect_found ran). Measured on d.nix: this
+    // call site alone hits 77,236 times (122,709 total chase hops across
+    // all three op_select.S/op_select_or.S/op_with.S call sites
+    // combined) -- genuinely hot, not the rare case M162's own comment
+    // assumed.
+    movq $ASNIX_CELL_CHASE_LIMIT, %rdx
+.Lselect_cell_loop:
+    movq ASNIX_CELL_OFF_TARGET(%r8), %r10 // r10 = target pointer (Value* into an Env's values[])
+    movq (%r10), %rax                     // rax = *target -- the actual next raw Value
+    movq %rax, %rcx
+    andq $ASNIX_TAG_MASK, %rcx
+    cmpq $ASNIX_TAG_PTR, %rcx
+    jne .Lselect_resolve                  // not even a PTR -- can't be a Cell, done chasing
+    movq %rax, %r8
+    andq $-8, %r8
+    shlq $16, %r8
+    shrq $16, %r8                         // r8 = masked base pointer of the new value
+    movq ASNIX_CELL_OFF_MARKER(%r8), %r9
+    cmpq $ASNIX_CELL_MARKER, %r9
+    jne .Lselect_resolve                  // PTR but not a Cell -- done, re-dispatch on %rax
+    decq %rdx
+    jnz .Lselect_cell_loop
+    jmp .Lselect_blackhole                // chase limit exceeded -- a genuine alias cycle
 
     // M113: not a Cell either -- maybe a LazyApp (heap.h's
     // ASNIX_LAZYAPP_MARKER comment). %r9 already holds the marker value
