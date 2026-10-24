@@ -19678,3 +19678,128 @@ actually materialize; both axes improved together.
 **Conclusion**: shipped. A genuine, cleanly-reproduced win on both of
 the metrics this candidate cared about, with no tradeoff to report
 either way. Files: `src/c/irbuild.c`, `docs/architecture.md`.
+
+## M172: `json_encode_attrs_ctx` (`builtins.toJSON`'s attrset path) unconditionally `malloc`'d a scratch array -- given M161's own small-N stack-array treatment
+
+`builtins_compare.c`'s `json_encode_attrs_ctx` is the attrset case of
+`builtins.toJSON`'s recursive encoder -- every `__structuredAttrs = true`
+derivation's `env`/`buildCommand` JSON blob goes through it, once per
+nested attrset. Since M154 it has, unconditionally, for every call
+regardless of entry count `n`: `malloc`'d a `JsonAttrEntry[n]` scratch
+array (`{name, len, idx}` per entry), insertion-sorted it by name, walked
+it to emit `{...}`, then `free`'d it. This is the exact same
+"malloc+free pair paid on every call when the overwhelming majority of
+calls are small" shape M144 (`asnix_prim_derivation`'s scratch pools),
+M149 (`compiler.c`'s `compile_expr` stack arrays), and M161
+(`asnix_bshared_make_attrs`, this function's own direct template) already
+found and fixed elsewhere in this codebase -- just never ported to this
+specific call site.
+
+A fresh instrumentation pass on `d.nix` (a temporary per-size histogram
+in `json_encode_attrs_ctx` itself, reverted after measuring, per this
+project's standing convention) found 13,617 calls total, with a bimodal
+size distribution: 76.28% of calls have `n <= 8` (dominated by `n <= 1`,
+the common case of a small structured-attrs env entry), then a second,
+much smaller cluster at `n` in `[29, 51]` (fixed-shape derivation
+attrsets -- `env`, `outputs`, etc.). Cumulative coverage at `n <= 32` is
+78.39%.
+
+**The fix**, following M161's own hybrid shape directly: for `n <=
+ASNIX_JSON_ATTRS_SORT_STACK_MAX` (32 -- reusing the same threshold value
+M161 and `compiler.c`'s `ASNIX_COMPILE_SCRATCH_MAX`/
+`ASNIX_ATTRSET_SORT_INSERTION_MAX` already settled on, redefined locally
+in this file rather than shared via a header since all three sorts
+operate on unrelated data), sort a `JsonAttrEntry entries_stack[32]` array
+in place on the stack -- no `malloc`. Above the threshold, the existing
+`malloc` + insertion-sort + `free` path is untouched (unlike M161, this
+function's sort was already a plain insertion sort at every size, not a
+qsort, so there was no second algorithm to preserve -- only the
+allocation strategy changes). `free(entries)` is now conditioned on
+`!on_stack` so the stack buffer is never passed to `free`.
+
+**Correctness.** `make test`, `make test-e2e`, `make test-conformance`
+all green. `make test-nix-conformance NIX_CONFORMANCE_DIR=/tmp/nix-
+conformance`: `pass=655 fail=3 skip=148`, the same 3 pre-existing
+position-tracking failures (`eval-okay-getattrpos-functionargs.nix`,
+`eval-okay-getattrpos.nix`, `eval-okay-inherit-attr-pos.nix`). `make
+test-nixpkgs-hash`: `pass=148 fail=0` (one earlier run on this shared,
+contended machine reported `go.drvPath(crash)`, i.e. a 120s timeout, not
+a real failure -- reran twice more immediately after with no code
+changes and got `pass=148 fail=0` both times; the fix is not the cause).
+`./asnix d.nix` output unchanged:
+`/nix/store/29iacg6h530yx7rxz4k1fhvi0kxxhsam-ffmpeg-9.0.1-bin`.
+
+A hand-written differential test against real `nix-instantiate --eval`
+(not part of the permanent suite) ran `builtins.toJSON` over attrsets at
+sizes `0, 1, 2, 7, 8, 9, 16, 30, 31, 32, 33, 34, 50, 64, 100` -- straddling
+the new threshold on both sides -- with keys inserted in randomized
+(non-sorted) order so the sort itself is actually exercised. `nix-
+instantiate --eval --strict --json` and both the pre-fix and post-fix
+`./asnix` binaries produced byte-identical JSON at every size (verified
+both "after == real Nix" and "after == before", confirming the malloc-
+avoidance change didn't alter ordering, escaping, or formatting at all).
+
+**Measured, interleaved, 20 trials** (`perf stat -e cpu_core/
+instructions/,cpu_core/cycles/`, `taskset -c 0`, strict before/after
+alternation):
+
+| | mean | median | min |
+|---|---|---|---|
+| instructions before | 6,189,440,693 | 6,188,802,535 | 6,188,409,427 |
+| instructions after | 6,188,469,862 | 6,188,295,382 | 6,187,822,823 |
+| cycles before | 3,493,777,433 | 3,481,397,225 | -- |
+| cycles after | 3,488,136,584 | 3,475,383,800 | -- |
+
+Instructions: -0.016% mean, -0.008% median, -0.009% min-to-min --
+consistently in the improving direction across all three estimators, but
+small enough (before's own run-to-run stdev is ~1.8M, i.e. the same order
+of magnitude as the ~971K-instruction mean delta) that it sits close to
+this machine's noise floor for a single-eval measurement. Cycles show a
+larger, same-direction -0.16% to -0.17% in this initial 20-trial run.
+
+**Independent verification found the cycles claim above does not
+reproduce.** A separate adversarial-verify pass ran its own 2 independent
+20-trial batches (40 trials total, byte-identical output on every one).
+Instructions: -0.009% mean combined, closely matching this milestone's
+own median (-0.008%) but roughly half the mean claimed above -- a real,
+reproducible, small effect in the claimed direction, just smaller than
+the headline mean suggested. Cycles: the verify pass found NO
+improvement at all -- both of its independent batches measured a small
+(not statistically significant) move in the OPPOSITE direction (+0.07%
+to +0.28%), directly contradicting the -0.16%/-0.17% improvement claimed
+above. Per this project's own established practice for resolving a
+magnitude discrepancy (M157/M161 precedent) and its standing finding that
+cycles are the noisier, less trustworthy signal on this shared machine
+(M152/M157/M158), **the number to trust is instructions, at
+approximately -0.009%** (not the larger -0.016% mean above), and **the
+cycles-axis improvement should be treated as unconfirmed, not shipped
+as a real finding** -- the correctness and instructions-direction
+conclusions below are unaffected.
+
+The instruction-count delta's size is consistent with a back-of-envelope
+estimate from the call-count data above: ~78% of 13,617 calls (~10,600)
+now skip one `malloc`+`free` pair each; at a plausible ~90-100
+instructions per pair for mimalloc's fast path, that predicts roughly
+~1.0-1.1M fewer instructions, which lines up with the measured ~971K mean
+/ ~587K min delta from this milestone's own first measurement (and with
+the independently-verified ~-0.009% figure once the measurement is
+redone more rigorously). Shipped anyway, same reasoning as M161: the
+effect is real, consistently in the right direction (instructions) over
+60 combined interleaved trials across two independent measurement
+efforts, a direct structural match for an already-proven pattern
+(M144/M149/M161), strictly simpler than what it replaces (one fewer
+allocation on the common path, no new abstraction), and carries zero
+correctness risk (differential-tested byte-for-byte against real Nix at
+16 sizes straddling the threshold, by both this milestone and its
+independent verifier) -- not a speculative rewrite that would need a
+bigger win to justify its own risk. It is, however, honestly a much
+smaller win than M161's -0.5%-to-0.63%: this call site's total
+instruction share of the whole eval is simply much smaller than
+`asnix_bshared_make_attrs`'s (13,617 calls here vs 52,442 there, and only
+a fraction of real-world evals even touch `__structuredAttrs`), so the
+absolute ceiling for this particular fix was always going to be modest.
+
+Files: `src/c/builtins_compare.c` (`json_encode_attrs_ctx` given a
+small-N stack-array fast path below the new
+`ASNIX_JSON_ATTRS_SORT_STACK_MAX` threshold; the existing `malloc` +
+insertion-sort path unchanged above it).

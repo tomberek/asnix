@@ -569,9 +569,32 @@ typedef struct {
  * collect-then-sort split `iets`'s own `lexicographic_order()`
  * (`src/print.rs:112-120`) uses, ported verbatim: one `name()` lookup per
  * entry, period, with the sort comparing already-resolved byte spans. */
+/* M171 perf: below this threshold, sort a plain JsonAttrEntry array
+ * on the stack instead of malloc()ing the scratch array -- the same
+ * small-N stack-array technique already applied to
+ * asnix_bshared_make_attrs (builtins_shared.c's
+ * ASNIX_MAKE_ATTRS_SORT_INSERTION_MAX) and compiler.c's AST_ATTRSET
+ * case (ASNIX_COMPILE_SCRATCH_MAX/ASNIX_ATTRSET_SORT_INSERTION_MAX),
+ * just never ported to this call site. Reuses the same constant value
+ * (32) those two already settled on, rather than inventing a new one;
+ * not shared via a header since all three sorts operate on unrelated
+ * data and this file has no other reason to depend on the other two.
+ * Measured directly on a real nixpkgs eval (`./asnix d.nix`,
+ * ffmpeg.outPath, via reverted ad hoc histogram instrumentation):
+ * json_encode_attrs_ctx fires 13,617 times, with a bimodal size
+ * distribution -- 76.28% of calls have n <= 8 (mostly n<=1, the common
+ * case of small structured-attrs env entries), then a second cluster
+ * at n in [29,51] (fixed-shape derivation attrsets). Using the
+ * project's standard 32 threshold rather than a tighter one (e.g. 8)
+ * catches that n in [29,32] tail too (78.39% cumulative) for a
+ * negligible extra 768 bytes of stack. */
+#define ASNIX_JSON_ATTRS_SORT_STACK_MAX 32
+
 static void json_encode_attrs_ctx(Value v, JsonBuf *out, AsnixStringContext *ctx) {
     int64_t n = asnix_bshared_attrs_count(v);
-    JsonAttrEntry *entries = n > 0 ? malloc((size_t)n * sizeof(JsonAttrEntry)) : NULL;
+    JsonAttrEntry entries_stack[ASNIX_JSON_ATTRS_SORT_STACK_MAX];
+    int on_stack = (n <= ASNIX_JSON_ATTRS_SORT_STACK_MAX);
+    JsonAttrEntry *entries = on_stack ? entries_stack : (n > 0 ? malloc((size_t)n * sizeof(JsonAttrEntry)) : NULL);
     for (int64_t i = 0; i < n; i++) {
         entries[i].name = asnix_sym_name(asnix_bshared_attrs_sym(v, i), &entries[i].len);
         entries[i].idx = i;
@@ -593,7 +616,7 @@ static void json_encode_attrs_ctx(Value v, JsonBuf *out, AsnixStringContext *ctx
         json_encode_ctx(asnix_force_for_print(asnix_bshared_attrs_value(v, entries[i].idx)), out, ctx);
     }
     jb_putc(out, '}');
-    free(entries);
+    if (!on_stack) free(entries);
 }
 
 /* M80: `ctx` (NULL from every pre-existing call site, see this
