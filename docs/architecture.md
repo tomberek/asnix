@@ -19580,3 +19580,101 @@ the implementation existed in the tree and reverted along with it, since
 describing dispatch machinery that no longer exists would be actively
 misleading rather than merely stale. Files: `docs/architecture.md`,
 `docs/irop-compaction-proposal.md` only.
+
+## M171: `ib_finish`'s shrink-to-fit `realloc()` on `ops`/`pool` -- routed through `arena.h`'s bump allocator instead, since neither array is ever freed
+
+Directed candidate: `irbuild.c`'s `ib_finish` (the IrBuilder -> IrProgram
+conversion that runs once per compiled function/thunk/attrset-element/
+etc. -- 585,631 times across a real nixpkgs eval per M132's own measured
+count). Its shrink-to-fit `realloc()` on `ops`/`pool` (pre-M100 era,
+tuned further by M96) exists purely as a MEMORY fix: `ib_emit`/
+`ib_pool_add` grow both arrays by doubling from a 24-slot initial guess
+(M132), so without this trim, every builder would permanently carry
+however much doubling slack it happened to land on when built -- M86's
+own comment on this call site called that "hundreds of MB" across a full
+nixpkgs eval. A fresh instruction-weighted profile (`perf record`, DWARF
+unwinding) found `mi_theap_realloc` at 2.87% self-time overall, with
+2.53 of those 2.87 points landing specifically under `ib_finish` (vs
+only 0.71% under `ib_emit`'s own growth-realloc path, which only fires
+15k-16k times, not 585k) -- confirmed via temporary, reverted
+instrumentation, not just symbol-name guessing. M149 had explicitly
+flagged this exact call site as open and out of scope at the time
+("a different technique, if any, would be needed there"); no milestone
+between M150 and M170 picked it up.
+
+Read `ib_finish` and the surrounding growth code before picking a
+technique (`ib_new`/`ib_emit`/`ib_pool_add`, same file). The average
+builder emits only ~5.3 ops / ~5.8 pool entries (M132's own measured
+figure) against a 24-slot initial allocation, so almost every one of
+these 585,631 `realloc()`-to-shrink calls crosses a mimalloc size-class
+boundary (e.g. ~85 bytes down from 384 for `ops`) -- not a cheap
+in-place truncation, a real alloc-new+copy+free-old round trip under the
+hood, done 585,631 times for arrays that are then **never freed again**:
+`ib_finish` hands `ops`/`pool` straight to a freshly `calloc`'d
+`IrProgram` that lives for the rest of the process (grep `irbuild.c`/
+`ir.h`/`bytecode.c` -- there is no `free_program()` anywhere in the
+tree; the one other place an `IrProgram`'s `ops`/`pool` get built,
+`asnix_bytecode_deserialize` in `bytecode.c`, has the same "never freed"
+property and uses plain `malloc`, not `realloc`-shrink, since it already
+knows the exact final op count up front per M137).
+
+That "allocated once, lives forever, never freed" lifetime is exactly
+what `asnix/arena.h`'s never-free bump allocator already exists for --
+it's used throughout the rest of the runtime (`builtins_shared.c`,
+`attrs_update.c`, `builtins_list.c`, etc.) for precisely this shape of
+allocation. Changed `ib_finish`'s shrink step: instead of
+`realloc(b->ops, b->len * sizeof(IrOp))`, allocate the exact final size
+via `asnix_arena_alloc`, `memcpy` the live prefix into it, then `free()`
+the old oversized scratch buffer and repoint `b->ops` at the arena copy
+(same treatment for `pool`). `asnix_arena_alloc` is a handful of
+instructions -- bump-pointer-and-bounds-check, no mimalloc size-class
+lookup, no free-list search (`src/asm/arena.S`) -- so this trades one
+mimalloc-internal alloc+copy+free (the realloc) for one plain mimalloc
+`free()` (strictly simpler than a shrinking realloc) plus one bump
+allocation plus an explicit `memcpy`. The `b->len == b->cap` (no slack)
+case is untouched: it was never reallocated before this change either
+(nothing to shrink), so it still carries its original malloc'd buffer
+forever, exactly as before. `asnix_arena_init(0)` (uncapped) is called
+once at process start (`main.c`), so there is no `ASNIX_MAX_MEMORY`
+interaction to worry about here.
+
+Built clean; `make test`, `make test-e2e`, `make test-conformance` all
+green; `make test-nix-conformance NIX_CONFORMANCE_DIR=/tmp/nix-conformance`
+reported `pass=655 fail=3 skip=148` (the same 3 known pre-existing
+position-tracking gaps, unchanged); `make test-nixpkgs-hash` reported
+`pass=148 fail=0`; `./asnix d.nix` stayed byte-identical to the expected
+store path (`/nix/store/29iacg6h530yx7rxz4k1fhvi0kxxhsam-ffmpeg-9.0.1-bin`).
+
+**Measured both axes this candidate explicitly asked for** -- instruction
+count AND peak RSS, both via **10** interleaved trials on `d.nix`
+(real nixpkgs/ffmpeg eval), `taskset -c 0`, alternating before/after,
+never batched. Instructions/cycles via `perf stat -e
+cpu_core/instructions/,cpu_core/cycles/`; peak RSS via `/usr/bin/time -v`
+`Maximum resident set size`:
+
+```
+instructions: before avg 6,185,243,459.0   after avg 6,132,424,692.6   (-52,818,766.4, -0.854%)
+cycles:       before avg 3,563,036,351.5   after avg 3,488,215,996.2   (-74,820,355.3, -2.10%)
+peak RSS:     before 521,488 KB            after 509,344 KB            (-12,144 KB, -2.33%)
+```
+
+Instructions: every single one of the 10 after-trials was lower than
+every single one of the 10 before-trials (ranges didn't overlap at
+all) -- a clean, one-directional signal, not noise. Peak RSS was
+bit-for-bit identical across all 10 trials on each side (521,488 KB
+every time before, 509,344 KB every time after) -- fully deterministic
+for this workload, so a single pair of measurements would have sufficed
+for RSS specifically, but it was measured 10 times anyway per this
+session's own interleaving discipline. Peak RSS went down, not up: the
+arena's 8-byte-aligned bump allocation has less per-object rounding
+waste than mimalloc's small-object size classes do at these odd sizes
+(~85 bytes for the average `ops` array, ~46 bytes for the average
+`pool` array), so packing these 585,631 x 2 never-freed allocations into
+dense 2 MiB arena chunks instead of mimalloc's own size-classed bins
+ends up using *less* memory overall, not more -- the open tension this
+candidate was framed around (CPU win vs. memory regression) didn't
+actually materialize; both axes improved together.
+
+**Conclusion**: shipped. A genuine, cleanly-reproduced win on both of
+the metrics this candidate cared about, with no tradeoff to report
+either way. Files: `src/c/irbuild.c`, `docs/architecture.md`.
