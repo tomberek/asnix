@@ -172,20 +172,28 @@ static int byte_pos_to_line(uint32_t pos) {
     return line;
 }
 
-/* M191: prints the actual nixpkgs source text of the line containing
- * byte offset `pos`, as its own row immediately above the first op of
- * a same-line run (see dump_program's run-start check below -- never
- * once per op, that would just repeat the identical line and defeat
- * the point). M188/M189 already map an op back to a line NUMBER; the
- * actual motivation for doing that at all was letting a human scanning
- * for nixpkgs code worth hand-optimizing see what's there WITHOUT
- * separately opening the file -- a number alone still requires that
- * round trip, the source text doesn't. Leading indentation is trimmed
- * so the snippet lines up with the op rows under it instead of
- * inheriting the source file's own indentation; very long lines
- * (minified/generated Nix) are capped so one pathological line can't
- * blow out the dump. */
-static void print_source_snippet(uint32_t pos) {
+/* M191 (revised): formats the actual nixpkgs source text of the line
+ * containing byte offset `pos` into `buf`, for display as a trailing
+ * column on the first op row of a same-line run (see dump_program's
+ * run-start check below -- never once per op in the run, that would
+ * just repeat the identical line and defeat the point). M188/M189
+ * already map an op back to a line NUMBER; the actual motivation for
+ * doing that at all was letting a human scanning for nixpkgs code
+ * worth hand-optimizing see what's there WITHOUT separately opening
+ * the file -- a number alone still requires that round trip, the
+ * source text doesn't. Leading indentation is trimmed so the snippet
+ * doesn't carry the source file's own indentation into the column.
+ *
+ * Originally printed on its own row above the run with a 160-char cap
+ * (plenty of room on a dedicated line); now that it rides at the end
+ * of an already-populated op row instead, SNIPPET_CAP is much
+ * tighter -- the row ahead of it (index/line:count/mnemonic/b=/the
+ * `;`-annotation/any `<<<` pass-firing markers) is already variable
+ * and can run 60-100+ chars on its own, so a long snippet needs a
+ * short leash to keep the combined line within a normal terminal's
+ * width instead of wrapping. */
+enum { SNIPPET_CAP = 48 };
+static void format_source_snippet(uint32_t pos, char *buf, size_t bufsz) {
     const char *s = g_dump_src;
     uint32_t start = pos;
     while (start > 0 && s[start - 1] != '\n') start--;
@@ -193,9 +201,9 @@ static void print_source_snippet(uint32_t pos) {
     while (s[end] && s[end] != '\n') end++;
     while (start < end && (s[start] == ' ' || s[start] == '\t')) start++;
     uint32_t len = end - start;
-    int capped = len > 160;
-    if (capped) len = 160;
-    printf("        | %.*s%s\n", (int)len, s + start, capped ? "..." : "");
+    int capped = len > SNIPPET_CAP;
+    if (capped) len = SNIPPET_CAP;
+    snprintf(buf, bufsz, "%.*s%s", (int)len, s + start, capped ? "..." : "");
 }
 
 static void dump_program(IrProgram *prog, int id, SeenVec *seen, Worklist *work) {
@@ -264,12 +272,19 @@ static void dump_program(IrProgram *prog, int id, SeenVec *seen, Worklist *work)
         } else {
             snprintf(lc_buf, sizeof lc_buf, "?:1");
         }
-        /* M191: a new run (this op's line differs from the previous
-         * op's, or this is the program's first op) gets the actual
-         * source line printed once, right above it -- see
-         * print_source_snippet's own comment. */
+        /* M191 (revised): a new run (this op's line differs from the
+         * previous op's, or this is the program's first op) gets the
+         * actual source line formatted once, for display in this row's
+         * trailing column below -- never recomputed for every op in the
+         * run, that would just repeat the identical text and defeat the
+         * point (same reasoning as the original one-line-above-the-run
+         * version, just relocated to the end of the row instead of a
+         * row of its own). Empty string means "no snippet for this
+         * row" -- either mid-run (line unchanged from the previous op)
+         * or no tracked position at all. */
+        char snippet_buf[SNIPPET_CAP + 8] = "";
         if (i < n_ops && line_no[i] != 0 && (i == 0 || line_no[i] != line_no[i - 1])) {
-            print_source_snippet(prog_lines[i]);
+            format_source_snippet(prog_lines[i], snippet_buf, sizeof snippet_buf);
         }
         printf("  [%4lld] %-8s %-20s b=%-8lld", (long long)i, lc_buf, op_names[id_of], (long long)op->b);
 
@@ -380,6 +395,12 @@ static void dump_program(IrProgram *prog, int id, SeenVec *seen, Worklist *work)
                 else printf("   <<< %s fired here (x%zu)", asnix_irpass_name(pi), fire_counts_here[pi]);
             }
         }
+        /* M191 (revised): the run's source snippet, if any, rides as
+         * the LAST thing on the row -- after every other annotation --
+         * so it reads as a final "here's the source" column rather
+         * than interrupting the regular op-row fields that come
+         * before it. */
+        if (snippet_buf[0]) printf("   | %s", snippet_buf);
         printf("\n");
         if (id_of == OP_RET || id_of == OP_HALT) break;
     }

@@ -21384,7 +21384,7 @@ Nix int value can represent).
 Files: `src/c/irpass_constprop.c`/`.h` (new pass), `src/c/irpass_cfold.c`
 (overflow-check fix), `src/c/main.c`/`src/c/irdump.c` (registration).
 
-## M191: `irdump` now prints the actual source line, not just its number, above each run of ops it compiled from
+## M191: `irdump` prints the actual source line next to each run of ops it compiled from
 
 Follow-up to M189's `lineno:count` compaction, prompted by a direct
 observation mid-review: once `irdump` tracks a byte offset per op and
@@ -21394,19 +21394,40 @@ stated goal (scanning for real nixpkgs code worth hand-optimizing) --
 a number still requires a human to go open the file and find that
 line; the text doesn't.
 
-**What changed.** A new `print_source_snippet(uint32_t pos)` slices
+**What changed (revised).** M191 originally printed the resolved
+source text as its OWN row, immediately above the first op of each
+same-line run. Review feedback: a standalone row breaks up the visual
+flow of the op listing -- readers scanning a run of `[idx] lineno:count
+OP b=...` rows don't want it interrupted by an unrelated row shape.
+
+Revised to attach the snippet to the END of that first op's own row
+instead, as a trailing `| <snippet>` column, rather than a row of its
+own. `format_source_snippet(uint32_t pos, char *buf, size_t bufsz)`
+(renamed from `print_source_snippet`, which printed directly) slices
 `g_dump_src` back to the previous `\n` and forward to the next one,
-trims leading indentation (so the snippet lines up with the op rows
-under it rather than inheriting the source file's own indent), and
-caps pathologically long lines at 160 chars. `dump_program` calls it
-exactly once per run of consecutive same-line ops -- at the run's
-first op, reusing the run-boundary check M189 already computes --
-never once per op (that would just repeat the identical line
-`line_run[i])` times and defeat the point).
+trims leading indentation, and formats the result into a caller-owned
+buffer instead of printing it. `dump_program` still calls it exactly
+once per run of consecutive same-line ops -- at the run's first op,
+reusing the run-boundary check M189 already computes -- buffering the
+result until that row's other fields (mnemonic, `b=`, the `;`
+annotation, any `<<<` pass-firing markers) have all been printed, then
+appending `   | <snippet>` as the last thing on the line before the
+trailing `\n`. Never once per op in the run -- that would just repeat
+the identical text and defeat the point, same reasoning as the
+original design.
+
+The length cap dropped from 160 to `SNIPPET_CAP = 48`: the 160-char cap
+made sense when the snippet had a whole row to itself, but the row it
+now rides at the end of is already variable-length (60-100+ chars with
+a populated `;` annotation plus any pass-firing markers), so a long
+snippet needs a much shorter leash to keep the combined line within a
+normal terminal width instead of wrapping.
 
 Lines with no tracked position (`line_no[i] == 0`, i.e.
-compiler-synthesized nodes) print no snippet, same as they print `?`
-instead of a line number.
+compiler-synthesized nodes) get no snippet column, same as they print
+`?` instead of a line number; rows mid-run (same line as the previous
+op) also get no snippet column, since it would just repeat the first
+row's text.
 
 **Correctness.** Full ladder green: `make test`, `make test-e2e`
 (300/300), `make test-conformance`, `make test-nix-conformance`
@@ -21414,5 +21435,5 @@ instead of a line number.
 test-nixpkgs-hash` (`pass=148 fail=0`). `./asnix d.nix` output hash
 unchanged; diff touches only `src/c/irdump.c`.
 
-Files: `src/c/irdump.c` (`print_source_snippet`, the run-start call
-site in `dump_program`).
+Files: `src/c/irdump.c` (`format_source_snippet`, `SNIPPET_CAP`, the
+run-start buffering and end-of-row print in `dump_program`).
