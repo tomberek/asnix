@@ -21437,3 +21437,66 @@ unchanged; diff touches only `src/c/irdump.c`.
 
 Files: `src/c/irdump.c` (`format_source_snippet`, `SNIPPET_CAP`, the
 run-start buffering and end-of-row print in `dump_program`).
+
+## M192: follow-up to M169/M170 -- does `IrOp.b`'s real skew toward small/zero values open a sub-16-byte layout? Built in full, measured, declined
+
+A follow-on question after M170's decline: nearly all `IrOp.b` values
+*look* small or zero by inspection -- does that open an angle M170
+didn't consider? Investigated in two passes; the second pass built and
+measured a real candidate, the same discipline M169/M170 both used.
+Full writeup in `docs/irop-compaction-proposal.md`'s new "Follow-up:
+does `b`'s real skew... open a sub-16-byte `IrOp`?" section -- summary
+here.
+
+**A naturally-aligned `IrOp` cannot shrink below 16 bytes regardless of
+how narrow `a`/`b` get** (the struct's pointer member forces 8-byte
+struct alignment, so `8 + X` always rounds up to 16 for any `0 < X <=
+8`) -- but an EXPLICIT `__attribute__((packed))` layout genuinely can
+(confirmed by compiling it: 12 bytes). A real per-opcode `(a,b)`
+distribution survey against the live `d.nix`/ffmpeg eval (3,116,004
+ops, matching M169's own figure) confirmed the original observation for
+most op kinds (pushes, frame ops, calls, plain jumps, pool indices --
+all comfortably fit `int16_t`), but found 5 ops carry a bare global
+symbol id directly as an immediate (`OP_SELECT.a`, `OP_HAS_ATTR.a`,
+`OP_WITH_TRY.b`, `OP_SELECT_OR.b`, `OP_HAS_ATTR_IF.b`), and the real
+eval interns ≥77,230 distinct identifiers -- `OP_SELECT` alone (the
+single highest-volume symbol-bearing op, 316,410 compiled occurrences)
+exceeds 16 bits in ~30% of its real occurrences. This kills pure-16-bit-
+narrowing and "16-bit common case + rare escape hatch" candidates
+outright (the "outlier" case is 30-65% of `OP_SELECT`'s own occurrences,
+not a rare edge case) -- but leaves one real candidate: reroute only
+those 5 symbol-id fields through the constant pool (mirroring
+`OP_PUSH_INT`'s own M169 escape hatch exactly), in a packed 12-byte
+`IrOp`.
+
+**Built in full and measured.** Packed 12-byte `IrOp`, the 5 fields
+rerouted through the pool, loud-abort range checks on every other
+field (mirroring `OP_PUSH_INT`'s `ASNIX_INT_MIN`/`MAX` precedent), every
+`src/asm/ops/*.S` handler's load width narrowed, `bytecode.c`'s wire
+format bumped (`ASNXBC03` -> `ASNXBC04`), `irdump.c` updated, 3 test
+fixtures fixed. Full ladder green: `make test`, `test-e2e` (300/300),
+`test-nix-conformance` (`pass=655 fail=3 skip=148`), `test-nixpkgs-hash`
+(`pass=148 fail=0`).
+
+**Measured** (15 interleaved `perf stat` trials + 3 interleaved
+`/usr/bin/time -v` trials, `taskset -c 0`, real `d.nix`/ffmpeg eval):
+
+| | before (16B) | after (12B packed) | delta |
+|---|---|---|---|
+| instructions | 5,440,541,479.4 | 5,487,274,922.5 | **+0.859%**, 15/15 regressed |
+| cycles | 3,347,265,623.0 | 3,347,812,393.0 | +0.016% (flat, noise) |
+| peak RSS | 512,160 KB | 503,712 KB | **-1.65%** (real, consistent) |
+
+**Conclusion: declined.** The memory win is real, but the instructions
+regression is consistent across all 15 trials and larger than M170's
+own declined +0.616% -- by this project's own standing practice of
+trusting instruction count over memory/cycles on this shared machine,
+not a trade worth taking. A real contributing factor was measured, not
+assumed: pass 1's cost estimate used each symbol-id op's STATIC
+compiled-op count, but 3 of the 5 rerouted ops dispatch far more at
+RUNTIME than their static count suggested (e.g. `OP_HAS_ATTR`: 284
+compiled vs 156,956 real dispatches) -- the same static-vs-dynamic risk
+M170's own writeup flagged. Fully reverted: no source files changed,
+`IrOp` stays the 16-byte layout M169 shipped.
+
+Files: `docs/irop-compaction-proposal.md` only (no source changed).
