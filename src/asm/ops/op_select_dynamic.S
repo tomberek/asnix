@@ -20,9 +20,8 @@
     .globl asnix_op_select_dynamic
     .type asnix_op_select_dynamic, @function
 asnix_op_select_dynamic:
-    subq $8, %r12
-    movq (%r12), %rcx                   // name raw (pushed last, popped first)
-    subq $8, %r12
+    subq $16, %r12                      // pop both operands with one address computation
+    movq 8(%r12), %rcx                  // name raw (pushed last, popped first)
     movq (%r12), %rax                   // target raw
 
     pushq %rsi                          // save IP

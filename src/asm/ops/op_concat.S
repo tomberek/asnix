@@ -14,9 +14,8 @@
     .globl asnix_op_concat
     .type asnix_op_concat, @function
 asnix_op_concat:
-    subq $8, %r12
-    movq (%r12), %rcx                   // rhs (tagged)
-    subq $8, %r12
+    subq $16, %r12                      // pop both operands with one address computation
+    movq 8(%r12), %rcx                  // rhs (tagged)
     movq (%r12), %rax                   // lhs (tagged)
 
     pushq %rsi                          // save IP

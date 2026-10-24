@@ -42,9 +42,8 @@
     .globl asnix_op_eq
     .type asnix_op_eq, @function
 asnix_op_eq:
-    subq $8, %r12
-    movq (%r12), %rcx                   // rhs raw
-    subq $8, %r12
+    subq $16, %r12                      // pop both operands with one address computation
+    movq 8(%r12), %rcx                  // rhs raw
     movq (%r12), %rax                   // lhs raw
 
     pushq %rsi                          // save IP
@@ -69,9 +68,8 @@ asnix_op_eq:
     .globl asnix_op_neq
     .type asnix_op_neq, @function
 asnix_op_neq:
-    subq $8, %r12
-    movq (%r12), %rcx                   // rhs raw
-    subq $8, %r12
+    subq $16, %r12                      // pop both operands with one address computation
+    movq 8(%r12), %rcx                  // rhs raw
     movq (%r12), %rax                   // lhs raw
 
     pushq %rsi                          // save IP
@@ -96,9 +94,8 @@ asnix_op_neq:
     .globl asnix_op_lt
     .type asnix_op_lt, @function
 asnix_op_lt:
-    subq $8, %r12
-    movq (%r12), %rcx                   // rhs raw
-    subq $8, %r12
+    subq $16, %r12                      // pop both operands with one address computation
+    movq 8(%r12), %rcx                  // rhs raw
     movq (%r12), %rax                   // lhs raw
     movq %rax, %r8
     andq $ASNIX_TAG_MASK, %r8
@@ -134,9 +131,8 @@ asnix_op_lt:
     .globl asnix_op_gt
     .type asnix_op_gt, @function
 asnix_op_gt:
-    subq $8, %r12
-    movq (%r12), %rcx
-    subq $8, %r12
+    subq $16, %r12                      // pop both operands with one address computation
+    movq 8(%r12), %rcx
     movq (%r12), %rax
     movq %rax, %r8
     andq $ASNIX_TAG_MASK, %r8
@@ -172,9 +168,8 @@ asnix_op_gt:
     .globl asnix_op_le
     .type asnix_op_le, @function
 asnix_op_le:
-    subq $8, %r12
-    movq (%r12), %rcx
-    subq $8, %r12
+    subq $16, %r12                      // pop both operands with one address computation
+    movq 8(%r12), %rcx
     movq (%r12), %rax
     movq %rax, %r8
     andq $ASNIX_TAG_MASK, %r8
@@ -210,9 +205,8 @@ asnix_op_le:
     .globl asnix_op_ge
     .type asnix_op_ge, @function
 asnix_op_ge:
-    subq $8, %r12
-    movq (%r12), %rcx
-    subq $8, %r12
+    subq $16, %r12                      // pop both operands with one address computation
+    movq 8(%r12), %rcx
     movq (%r12), %rax
     movq %rax, %r8
     andq $ASNIX_TAG_MASK, %r8

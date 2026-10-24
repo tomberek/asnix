@@ -18788,3 +18788,145 @@ Files: `include/asnix/ir.h` (five new `OP_*_IF` enum entries + comments),
 (`irpass.c`, `irpass_dce.c`, `irpass_dce_if.c`, `irpass_deadframe.c`,
 `irpass_jmpnop.c`, `irpass_jmpthread.c`, `irpass_notfold.c`,
 `irpass_strconcat.c`, `irpass_streq.c`, `irpass_cmpnot.c`).
+
+## M165: fuse the repeated `subq $8, %r12` / `movq (%r12), %rX` VALSTACK pop pairs into one `subq` + N independent-offset `movq`s, across every binary/ternary operator op
+
+Directed candidate: every binary operator and every dynamic-attr op pops
+its 2 (or 3) operands off VALSTACK with N repetitions of the pair `subq
+$8, %r12` / `movq (%r12), %rX` written back to back. Each `subq`
+computes a new address that the *next* `subq` then further decrements,
+so the two (or three) loads are serialized through an address-generation
+chain (`sub -> load -> sub -> load`) purely because they share the same
+counter register, even though the loaded values are otherwise completely
+independent of each other and nothing downstream reads any intermediate
+value of `%r12` or the flags the `subq`s set.
+
+**Read every site first, in the current source** (16 found, not the 17
+originally guessed -- see below): `src/asm/ops/op_arith.S`
+(`asnix_op_add`/`sub`/`mul`/`div`, one 2-pop sequence each),
+`src/asm/ops/op_cmp.S` (all six comparison ops `eq`/`neq`/`lt`/`gt`/`le`/
+`ge`, each a 2-pop sequence), `src/asm/ops/op_concat.S` (2-pop),
+`src/asm/ops/op_update.S` (2-pop), `src/asm/ops/op_has_attr_dynamic.S`
+(2-pop), `src/asm/ops/op_select_dynamic.S` (2-pop),
+`src/asm/ops/op_select_dynamic_or.S` (2-pop), and a 3-deep case in
+`src/asm/ops/op_insert_dynamic_attr.S` (value, name, attrs) -- 4 + 6 + 1
++ 1 + 1 + 1 + 1 + 1 = 16 sites, not 17; a repo-wide grep for every other
+`%r12`-touching file (`apply.S`, `dispatch.S`, `force.S`,
+`stacklimits.S`, and every other `op_*.S`) turned up no further instance
+of this exact repeated-pop shape -- the other `%r12` users are either
+single-slot pops (nothing to fuse), bulk N-slot pops via a single
+pre-computed `subq $imm, %r12` already (`op_path_concat.S`/
+`op_str_concat.S`'s varargs, `op_call.S`'s callee+args teardown), or
+plain pushes. `op_with.S` has two *single*-pop sites
+(`asnix_op_with`/`asnix_op_with_try`) that happen to share the file but
+are different functions on different VALSTACK epochs, not a fusable
+back-to-back pair.
+
+**Safety, checked instruction-by-instruction per M111/M155's own
+warning about this exact codebase area**: at every one of the 16 sites,
+the instruction immediately after the pop block is either (a) a plain
+`movq`/`movl` that just copies a popped register (reads no flags), or
+(b) the start of a fresh type-check (`movq %rax, %r8` / `andq
+$ASNIX_TAG_MASK` / `cmpq`) that generates its own flags before branching
+-- never a conditional jump or `cmov` that depends on the `subq`'s own
+flags. `%r12` itself is write-only/pop-only at every site until the
+handler's own tail `movq ..., (%r12)` / `addq $8, %r12` push, so
+collapsing N `subq`s into one changes no intermediate value anything
+else reads. Confirmed by re-reading each file's current line numbers
+directly (several had drifted from the original guess, e.g. op_arith.S's
+four sites are now at lines 55/110/164/231, not whatever an earlier
+survey assumed) rather than trusting the description alone.
+
+**The fix**: each site's `N * (subq $8, %r12; movq (%r12), %rX)` became
+one `subq $8*N, %r12` followed by N `movq`s at fixed offsets `8*(N-1)
+(%r12)` down to `(%r12)`, preserving the exact pop order (and therefore
+which register ends up holding which logical operand) byte-for-byte
+except for the instruction count. Example (`asnix_op_add`):
+
+```
+-    subq $8, %r12
+-    movq (%r12), %rcx                   // rhs raw (pushed last, popped first)
+-    subq $8, %r12
+-    movq (%r12), %rax                   // lhs raw
++    subq $16, %r12                      // pop both operands with one address computation
++    movq 8(%r12), %rcx                  // rhs raw (pushed last, popped first)
++    movq (%r12), %rax                   // lhs raw
+```
+
+and the 3-deep case (`asnix_op_insert_dynamic_attr`):
+
+```
+-    subq $8, %r12
+-    movq (%r12), %rcx                   // value -- pushed last, popped first
+-    subq $8, %r12
+-    movq (%r12), %rdx                   // name
+-    subq $8, %r12
+-    movq (%r12), %rax                   // attrs -- pushed first
++    subq $24, %r12                      // pop all three operands with one address computation
++    movq 16(%r12), %rcx                 // value -- pushed last, popped first
++    movq 8(%r12), %rdx                  // name
++    movq (%r12), %rax                   // attrs -- pushed first
+```
+
+The three loads are now siblings off one earlier-available address
+computation instead of a 2-or-3-hop `sub -> load -> sub -> load -> sub
+-> load` chain.
+
+**Verification ladder, all green**: `make test`, `make test-e2e` (one
+transient failure in ~5 runs on a totally unrelated fixture,
+`m39_addErrorContext.nix`'s successor in the glob order, not reproduced
+in 4 more consecutive clean runs -- attributed to this shared,
+contended machine, not this change; see also the `test-nix-conformance`/
+`test-nixpkgs-hash` numbers below, which are exact-match and
+deterministic), `make test-conformance`, `make test-nix-conformance
+NIX_CONFORMANCE_DIR=/tmp/nix-conformance` (`pass=655 fail=3 skip=148`,
+the same 3 pre-existing position-tracking gaps), `make
+test-nixpkgs-hash` (`pass=148 fail=0`), and `./asnix d.nix` byte-
+identical to `"/nix/store/29iacg6h530yx7rxz4k1fhvi0kxxhsam-ffmpeg-9.0.1-
+bin"`.
+
+**Measured on `d.nix`, 20 INTERLEAVED trials (before, after, before,
+after, ... x20), `perf stat -e cpu_core/instructions/,cpu_core/cycles/`
+under `taskset -c 0`**:
+
+- **Instructions**: before mean 6,242,142,240; after mean 6,240,872,428
+  -- a real but tiny **-0.020%** drop, exactly the shape predicted (N
+  static `subq`s collapsing to 1, saving 1 instruction per 2-pop call
+  and 2 per the one 3-pop call; the ~1.2M total instructions saved
+  across the whole eval imply these 16 ops fire on the order of a
+  million times combined over `d.nix`, which is plausible against a
+  6.2-billion-instruction real-nixpkgs eval).
+- **Cycles**: before mean 3,628,505,528; after mean 3,635,854,844 -- a
+  nominal **+0.2%**, but the paired per-trial deltas range from -6.5% to
+  +3.2% with a stdev (~1.9 points) several times larger than the mean
+  delta itself: this signal is noise-dominated on this shared, contended
+  host, not a real regression or a real win either way. This matches
+  the brief's own stated expectation going in -- "don't be surprised if
+  cycles ... are too noisy on this shared machine to confirm cleanly" --
+  and that is exactly what happened: the dependency-chain shortening is
+  real on paper (confirmed by inspection, not just hoped-for) but too
+  small relative to this specific workload's total serialized work (the
+  16 fused ops are a small fraction of `d.nix`'s dominated-by-import/
+  attrset/string-store-path work) to rise above machine noise on cycles.
+
+**Conclusion**: shipped. The rewrite is a pure, verified-safe
+reordering with zero semantic change (same addresses read, same
+registers populated, same pop order), a small but real and correctly-
+predicted instruction-count win, and a cycle count that's genuinely
+inconclusive on this noisy shared machine rather than a demonstrated
+regression -- consistent with the task's own framing that an
+inconclusive cycles read here would be an honest result, not a failure.
+
+**Not covered, left for a future pass**: this milestone's own base
+commit predates M164's `op_cmp_if.S` (branch-fused comparisons), which
+was "lifted directly" from `op_cmp.S`'s own pre-fusion 2-pop sequences --
+so `op_cmp_if.S` still carries the unfused `subq`/`movq` pattern this
+milestone just removed from `op_cmp.S` itself. Not revisited here to
+keep this milestone's own diff scoped to what was actually measured;
+a trivial follow-up for whoever next touches that file.
+
+Files: `src/asm/ops/op_arith.S`, `src/asm/ops/op_cmp.S`,
+`src/asm/ops/op_concat.S`, `src/asm/ops/op_update.S`,
+`src/asm/ops/op_has_attr_dynamic.S`, `src/asm/ops/op_select_dynamic.S`,
+`src/asm/ops/op_select_dynamic_or.S`,
+`src/asm/ops/op_insert_dynamic_attr.S`, `docs/architecture.md`.

@@ -52,9 +52,8 @@
     .globl asnix_op_add
     .type asnix_op_add, @function
 asnix_op_add:
-    subq $8, %r12
-    movq (%r12), %rcx                   // rhs raw (pushed last, popped first)
-    subq $8, %r12
+    subq $16, %r12                      // pop both operands with one address computation
+    movq 8(%r12), %rcx                  // rhs raw (pushed last, popped first)
     movq (%r12), %rax                   // lhs raw
 
     movq %rax, %r8
@@ -107,9 +106,8 @@ asnix_op_add:
     .globl asnix_op_sub
     .type asnix_op_sub, @function
 asnix_op_sub:
-    subq $8, %r12
-    movq (%r12), %rcx                   // rhs
-    subq $8, %r12
+    subq $16, %r12                      // pop both operands with one address computation
+    movq 8(%r12), %rcx                  // rhs
     movq (%r12), %rax                   // lhs
 
     movq %rax, %r8
@@ -161,9 +159,8 @@ asnix_op_sub:
     .globl asnix_op_mul
     .type asnix_op_mul, @function
 asnix_op_mul:
-    subq $8, %r12
-    movq (%r12), %rcx                   // rhs
-    subq $8, %r12
+    subq $16, %r12                      // pop both operands with one address computation
+    movq 8(%r12), %rcx                  // rhs
     movq (%r12), %rax                   // lhs
 
     movq %rax, %r8
@@ -228,9 +225,8 @@ asnix_op_mul:
     .globl asnix_op_div
     .type asnix_op_div, @function
 asnix_op_div:
-    subq $8, %r12
-    movq (%r12), %rcx                   // rhs
-    subq $8, %r12
+    subq $16, %r12                      // pop both operands with one address computation
+    movq 8(%r12), %rcx                  // rhs
     movq (%r12), %rax                   // lhs
 
     movq %rax, %r8

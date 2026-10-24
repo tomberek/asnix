@@ -17,11 +17,9 @@
     .globl asnix_op_insert_dynamic_attr
     .type asnix_op_insert_dynamic_attr, @function
 asnix_op_insert_dynamic_attr:
-    subq $8, %r12
-    movq (%r12), %rcx                   // value (tagged) -- pushed last, popped first
-    subq $8, %r12
-    movq (%r12), %rdx                   // name (tagged)
-    subq $8, %r12
+    subq $24, %r12                      // pop all three operands with one address computation
+    movq 16(%r12), %rcx                 // value (tagged) -- pushed last, popped first
+    movq 8(%r12), %rdx                  // name (tagged)
     movq (%r12), %rax                   // attrs (tagged) -- pushed first
 
     pushq %rsi                          // save IP
