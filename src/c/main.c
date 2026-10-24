@@ -15,6 +15,7 @@
 #include "flake_eval.h" /* M126: --flake DIR[#attr.path] */
 #include "irpass_cfold.h" /* M118: ASNIX_IR_OPT -- see this file's own hook below */
 #include "irpass_cmpnot.h"
+#include "irpass_constprop.h"
 #include "irpass_dce.h"
 #include "irpass_dce_if.h"
 #include "irpass_jmpnop.h"
@@ -632,6 +633,7 @@ int main(int argc, char **argv) {
     if (getenv("ASNIX_IR_OPT")) asnix_irpass_register_streq();
     if (getenv("ASNIX_IR_OPT")) asnix_irpass_register_notfold();
     if (getenv("ASNIX_IR_OPT")) asnix_irpass_register_deadframe();
+    if (getenv("ASNIX_IR_OPT")) asnix_irpass_register_constprop();
 
     const char *file_path = NULL;
     const char *flake_ref = NULL; /* M126: --flake DIR[#attr.path], see flake_eval.h */

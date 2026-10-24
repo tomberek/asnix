@@ -39,9 +39,23 @@ static int fold_constant_int_binop(IrOp *ops, size_t *len, int64_t **pool, size_
         int64_t result = 0;
         int is_bool = 0, ok = 1;
         switch (op_id) {
-            case OP_ADD: result = a + b; break;
-            case OP_SUB: result = a - b; break;
-            case OP_MUL: result = a * b; break;
+            /* `__builtin_*_overflow`, not plain `+`/`-`/`*` -- found by
+             * actually running the pipeline, not assumed safe: this
+             * switch originally used plain C int64 arithmetic with NO
+             * overflow check at all, a real latent miscompile bug since
+             * M120 (`fold always succeeds, even when the real runtime op
+             * would have aborted`), simply never triggered before because
+             * nothing upstream ever produced two adjacent OP_PUSH_INT ops
+             * around ADD/SUB/MUL from a non-literal source -- confirmed on
+             * the real nix-conformance corpus: `let a = 4294967297; in a *
+             * a * a` (eval-fail-overflowing-mul.nix) WRONGLY succeeded
+             * under ASNIX_IR_OPT=1 before this fix, once this session's
+             * own constprop pass started feeding it exactly that shape.
+             * Mirrors compiler.c's own try_fold_const_binop (M136) exactly
+             * -- same three builtins, same bounds check below. */
+            case OP_ADD: if (__builtin_add_overflow(a, b, &result)) ok = 0; break;
+            case OP_SUB: if (__builtin_sub_overflow(a, b, &result)) ok = 0; break;
+            case OP_MUL: if (__builtin_mul_overflow(a, b, &result)) ok = 0; break;
             case OP_DIV:
                 if (b == 0) { ok = 0; break; }
                 if (a == INT64_MIN && b == -1) { ok = 0; break; }
@@ -55,6 +69,13 @@ static int fold_constant_int_binop(IrOp *ops, size_t *len, int64_t **pool, size_
             case OP_GE: result = (a >= b); is_bool = 1; break;
             default: ok = 0; break;
         }
+        /* The narrower ASNIX_INT_MIN/MAX tagged-value window, same
+         * as compiler.c's try_fold_const_binop -- a result that survives
+         * the int64-overflow check above can still fall outside what a
+         * real Nix int VALUE can represent (op_arith.S's own range check,
+         * see value.h), which must also still reach the runtime op and
+         * abort, not be silently folded into an out-of-range constant. */
+        if (ok && !is_bool && (result < ASNIX_INT_MIN || result > ASNIX_INT_MAX)) ok = 0;
         if (!ok) continue;
         if (is_bool) {
             ops[i].handler = (void *)(intptr_t)(result ? OP_PUSH_TRUE : OP_PUSH_FALSE);

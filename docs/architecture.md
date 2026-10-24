@@ -21330,3 +21330,56 @@ a standalone dev tool outside the production build path.
 Files: `src/c/irdump.c` (`dump_program`'s line/op-count pre-pass, the
 new `lineno:count` print, freeing the two new per-program scratch
 arrays).
+
+## M190: new `constprop` IR pass (frame-slot constant propagation, opt-in) -- zero real-world firings on nixpkgs by design, but exposed and fixed a real latent overflow miscompile bug in `cfold`
+
+A directive asked for more IR passes, with permission to park anything
+too expensive for the default pipeline in an "offline" group. This
+added `constprop` (`irpass_constprop.c`/`.h`) to the existing
+`ASNIX_IR_OPT=1` opt-in group (M118): when a frame slot is set to a
+bare compile-time constant (`PUSH_INT`/`TRUE`/`FALSE`/`NULL`) and never
+reassigned, every later same-scope `VAR_REF` read of that slot is
+rewritten to the same push directly. Safety rests on three things:
+tracking frame-nesting level (only same-scope reads are touched),
+invalidating on reassignment or cell-materialization, and precomputing
+a jump-target bitset so no replacement can be reached by a jump that
+skipped the recording `FRAME_SET`. Its own cost turned out cheap (two
+linear scans per program) -- it did not need the "offline" gate the
+directive allowed for; joined the existing opt-in group instead.
+
+**Correctness.** Diffed `ASNIX_IR_OPT=1` vs. unset (stdout+exit code)
+across all 319 e2e/conformance fixtures AND the full real 806-file
+numtide/nix-conformance lang corpus -- 0 divergences. Full ladder green
+on the unmodified (flag-unset) production path: `make test`, `make
+test-e2e` (300/300), `make test-conformance`, `make
+test-nix-conformance` (`pass=655 fail=3 skip=148`, same 3 known
+pre-existing failures), `make test-nixpkgs-hash` (`pass=148 fail=0`).
+
+**Real-world yield: zero firings on the real eval, by structural
+design, not a bug.** On the actual `d.nix`/ffmpeg eval: 0 firings --
+every attrset field is its own separately-thunked `IrProgram`, so this
+same-array-only pass structurally cannot see constants reused across
+the thunk boundaries real nixpkgs code has everywhere. It does fire on
+same-program straight-line reuse (`let x = 5; in x + x + x`, verified
+directly). A genuinely expensive candidate that WOULD see real
+nixpkgs-shaped reuse -- propagating constants across `MK_THUNK`/
+`OP_LAMBDA` boundaries, i.e. whole-closure-tree analysis -- is flagged
+as real future work for the "offline" gate the original directive
+anticipated, not attempted here.
+
+**Real bug found and fixed, exposed by this pass but not introduced by
+it.** `irpass_cfold.c`'s `ADD`/`SUB`/`MUL` cases used plain C `int64_t`
+arithmetic with ZERO overflow checking (unlike `compiler.c`'s own
+`try_fold_const_binop`, M136) -- a latent miscompile bug present since
+M118/M120, simply never triggered before because nothing upstream ever
+fed `cfold` two adjacent `PUSH_INT` ops around `ADD`/`SUB`/`MUL` from a
+non-literal source. `constprop` was the first thing to do exactly that:
+`eval-fail-overflowing-mul.nix` (`let a = 4294967297; in a * a * a`)
+WRONGLY succeeded under `ASNIX_IR_OPT=1` before this fix. Fixed by
+mirroring `try_fold_const_binop` exactly: `__builtin_*_overflow` checks
+plus the narrower `ASNIX_INT_MIN`/`MAX` tagged-value-range check (a
+result that survives int64-overflow can still fall outside what a real
+Nix int value can represent).
+
+Files: `src/c/irpass_constprop.c`/`.h` (new pass), `src/c/irpass_cfold.c`
+(overflow-check fix), `src/c/main.c`/`src/c/irdump.c` (registration).

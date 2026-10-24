@@ -31,6 +31,7 @@
 #include "compiler.h"
 #include "irpass_cfold.h" /* M118: ASNIX_IR_OPT -- see main() below */
 #include "irpass_cmpnot.h"
+#include "irpass_constprop.h"
 #include "irpass_dce.h"
 #include "irpass_dce_if.h"
 #include "irpass_jmpnop.h"
@@ -398,6 +399,7 @@ static void register_all_passes(void) {
     asnix_irpass_register_streq();
     asnix_irpass_register_notfold();
     asnix_irpass_register_deadframe();
+    asnix_irpass_register_constprop();
 }
 
 int main(int argc, char **argv) {
