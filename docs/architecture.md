@@ -21283,3 +21283,50 @@ irpass.h` + `src/c/irpass.c` (`asnix_irpass_set_line_array`, the
 (line printing, `byte_pos_to_line`), `Makefile`
 (`IRDUMP_LINE_TRACKING_SRCS`/`_OBJS`, the irdump-variant `%.irdump.o`
 rule).
+
+## M189: `irdump` output simplified -- "(line NNN) ... a=X b=Y" collapsed to a single compact `lineno:count` column
+
+M188 added per-op source-line annotation to `irdump` specifically to
+help a human scanning its output map hot IR back to the real nixpkgs
+source line that generated it. In practice the result was still noisy:
+`(line NNN    ) MNEMONIC   a=X        b=Y       ` spends three
+separate, wide, mostly-empty-looking fields on what a scanning human
+actually wants to compare at a glance.
+
+**What changed.** The old `(line %-5d)` column plus the bare `a=%-8lld`
+column are replaced by one compact token, `lineno:count` (e.g. `321:2`),
+printed where `(line NNN)` used to sit. `b=%-8lld` is unchanged and
+still printed after the mnemonic.
+
+**What `count` means.** Not the op's `a` operand -- that reading was
+considered and rejected. `count` is the length of the run of
+*consecutive* ops that share this exact source line (computed by a new
+one-pass, O(n) run-length precomputation in `dump_program`, using the
+same per-op resolved line numbers M188 already computes). The reasoning
+mirrors M188's own stated goal: the directive isn't "show me this op's
+raw operand," it's "help me find which nixpkgs source lines are worth
+hand-optimizing." A source line that compiles to a long consecutive run
+of IR ops is exactly that signal, and it is now visible as a single
+number without the reader having to count repeated `(line NNN)` rows by
+eye. The `a` operand itself isn't lost where it matters: every op kind
+that gives `a` real semantic meaning (`VAR_REF`'s depth, `SELECT`'s
+sym, a jump's target, `MK_ATTRS`'s count, etc.) already re-prints it in
+the existing per-op `;`-comment annotation below the line; it just no
+longer gets a redundant, unlabeled column of its own for ops where it
+carried no useful signal (`FRAME_ALLOC`, `ADD`, `EQ`, ...).
+
+Unknown-line ops (compiler-synthesized nodes with no tracked
+`src_pos`) still participate in the same run-length computation and
+print as `?:N`.
+
+**Correctness.** Full ladder green: `make test`, `make test-e2e`
+(300/300), `make test-conformance`, `make test-nix-conformance`
+(`pass=655 fail=3 skip=148`, same 3 known pre-existing failures), `make
+test-nixpkgs-hash` (`pass=148 fail=0`). `./asnix d.nix` output hash
+unchanged, and the diff touches only `src/c/irdump.c` -- `asnix`'s own
+object files (`main.o`, `libasnix.a`) are untouched, since `irdump` is
+a standalone dev tool outside the production build path.
+
+Files: `src/c/irdump.c` (`dump_program`'s line/op-count pre-pass, the
+new `lineno:count` print, freeing the two new per-program scratch
+arrays).

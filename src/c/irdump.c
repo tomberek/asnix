@@ -177,6 +177,50 @@ static void dump_program(IrProgram *prog, int id, SeenVec *seen, Worklist *work)
      * before ib_enable_line_tracking() was ever called -- see
      * irbuild.h's asnix_ib_lookup_program_lines comment. */
     const uint32_t *prog_lines = asnix_ib_lookup_program_lines(prog);
+
+    /* M189: pre-pass to find this program's op count (same terminator
+     * rule as the print loop below: stop at RET/HALT, or at the last
+     * recognized op if the cap is hit first) so we can precompute, per
+     * op, a resolved source line plus "how many consecutive ops in a
+     * row share this exact line" -- printed together as one compact
+     * `lineno:count` token below, replacing the old separate "(line
+     * NNN)" + "a=X" columns.
+     *
+     * `count` == consecutive-same-line run length, not the op's `a`
+     * operand: M188's whole point is spotting which NIX SOURCE LINES
+     * are worth hand-optimizing, and a run of many ops sharing one line
+     * is exactly the "this line compiled to a lot of IR" signal a human
+     * scanning the dump wants to notice at a glance. The raw `a` value
+     * is still visible wherever it's semantically meaningful (sym=,
+     * depth=/slot=, jump target, etc. in the per-op ';' annotations
+     * below) -- it just no longer gets a bare, unlabeled column of its
+     * own. */
+    int64_t end_idx = -1; /* index of last recognized op (terminator or cap) */
+    for (int64_t i = 0; i < IRDUMP_MAX_OPS; i++) {
+        int id_of = op_id_of(prog->ops[i].handler);
+        if (id_of < 0) break;
+        end_idx = i;
+        if (id_of == OP_RET || id_of == OP_HALT) break;
+    }
+    int64_t n_ops = end_idx + 1;
+    int *line_no = n_ops ? malloc(sizeof(int) * (size_t)n_ops) : NULL; /* 0 == unknown line */
+    int *line_run = n_ops ? malloc(sizeof(int) * (size_t)n_ops) : NULL;
+    for (int64_t i = 0; i < n_ops; i++) {
+        line_no[i] = (prog_lines && prog_lines[i] != 0) ? byte_pos_to_line(prog_lines[i]) : 0;
+    }
+    /* One-pass run-length encode: for each run of consecutive ops
+     * sharing the same line_no[], scan ahead once to find its length
+     * and stamp that length onto every op in the run -- O(n) total
+     * despite the nested loop (the outer cursor `i` always jumps
+     * straight to the next run's start). */
+    for (int64_t i = 0; i < n_ops;) {
+        int64_t j = i + 1;
+        while (j < n_ops && line_no[j] == line_no[i]) j++;
+        int run_len = (int)(j - i);
+        for (int64_t k = i; k < j; k++) line_run[k] = run_len;
+        i = j;
+    }
+
     for (int64_t i = 0; i < IRDUMP_MAX_OPS; i++) {
         IrOp *op = &prog->ops[i];
         int id_of = op_id_of(op->handler);
@@ -185,13 +229,15 @@ static void dump_program(IrProgram *prog, int id, SeenVec *seen, Worklist *work)
                    op->handler);
             break;
         }
-        if (prog_lines && prog_lines[i] != 0) {
-            printf("  [%4lld] (line %-5d) %-20s a=%-8lld b=%-8lld", (long long)i, byte_pos_to_line(prog_lines[i]),
-                   op_names[id_of], (long long)op->a, (long long)op->b);
+        char lc_buf[24];
+        if (i < n_ops && line_no[i] != 0) {
+            snprintf(lc_buf, sizeof lc_buf, "%d:%d", line_no[i], line_run[i]);
+        } else if (i < n_ops) {
+            snprintf(lc_buf, sizeof lc_buf, "?:%d", line_run[i]);
         } else {
-            printf("  [%4lld] (line %-5s) %-20s a=%-8lld b=%-8lld", (long long)i, "?", op_names[id_of],
-                   (long long)op->a, (long long)op->b);
+            snprintf(lc_buf, sizeof lc_buf, "?:1");
         }
+        printf("  [%4lld] %-8s %-20s b=%-8lld", (long long)i, lc_buf, op_names[id_of], (long long)op->b);
 
         switch (id_of) {
             case OP_PUSH_INT: /* M169: literal lives in the pool now, not inline in `a` */
@@ -303,6 +349,8 @@ static void dump_program(IrProgram *prog, int id, SeenVec *seen, Worklist *work)
         printf("\n");
         if (id_of == OP_RET || id_of == OP_HALT) break;
     }
+    free(line_no);
+    free(line_run);
 }
 
 /* Re-lexes+re-parses+re-compiles `src` from scratch and dumps the result
