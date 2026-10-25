@@ -3,6 +3,9 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "compiler.h" /* lazy-thunk-compile experiment: asnix_lazy_thunk_enabled,
+                        * see asnix_ast_enter_retained's own comment below. */
+
 /* perf: Ast nodes used to come from the main never-free bump arena, same
  * as every runtime value -- but an AST is pure compile-time scratch:
  * once asnix_compile() walks it into an IrProgram, nothing downstream
@@ -25,6 +28,38 @@ typedef struct AstChunk {
 } AstChunk;
 
 static AstChunk *g_ast_chunks = NULL;
+
+/* MEASUREMENT-ONLY (see ast.h's own comment on asnix_ast_enter_retained):
+ * a second, parallel chunk list that asnix_ast_arena_reset() below never
+ * frees -- simulates the permanent retention a real lazy-compile stub's
+ * deferred subtree would need, with zero change to compile ORDER or
+ * scope-resolution correctness. */
+static AstChunk *g_ast_retained_chunks = NULL;
+static int g_ast_redirect_retained = 0;
+
+/* Gated on `asnix_lazy_thunk_enabled` (compiler.h) -- not the measurement-
+ * only toggle's original unconditional form. Found by direct measurement
+ * (taskset -c 0 /usr/bin/time -v, real d.nix/ffmpeg eval): with the
+ * unconditional form, parse_atom's TOK_LBRACE/TOK_REC calls (and, after
+ * this same pass's own parse_binding_stmt fix, every `let` binding too)
+ * redirected Ast nodes into the never-freed retained chunk list
+ * REGARDLESS of whether the runtime flag was ever set, inflating the
+ * DEFAULT (flag-unset) path's own peak RSS by +5.53% against a from-
+ * scratch baseline with none of this experiment's code at all -- a real
+ * cost paid by every caller NOT opting into the experiment, contradicting
+ * this doc's/compiler.h's own "the default (unset) path is unchanged"
+ * claim. Gating here (rather than at each of parser.c's call sites)
+ * keeps every call site's own reasoning about WHAT to retain unchanged
+ * and fixes WHETHER to retain at all in one place. */
+int asnix_ast_enter_retained(void) {
+    int prev = g_ast_redirect_retained;
+    if (asnix_lazy_thunk_enabled) g_ast_redirect_retained = 1;
+    return prev;
+}
+
+void asnix_ast_leave_retained(int prev_state) {
+    g_ast_redirect_retained = prev_state;
+}
 
 /* perf (M128): this chunk used to be `calloc`'d whole (1 MiB) instead of
  * `malloc`'d -- correctness NEEDS every Ast node to start zero-filled
@@ -69,14 +104,15 @@ static AstChunk *g_ast_chunks = NULL;
  * that does. */
 Ast *asnix_ast_new(AstKind kind) {
     size_t need = sizeof(Ast);
-    if (!g_ast_chunks || g_ast_chunks->used + need > AST_CHUNK_SIZE) {
+    AstChunk **chunks = g_ast_redirect_retained ? &g_ast_retained_chunks : &g_ast_chunks;
+    if (!*chunks || (*chunks)->used + need > AST_CHUNK_SIZE) {
         AstChunk *c = malloc(sizeof(AstChunk));
-        c->next = g_ast_chunks;
+        c->next = *chunks;
         c->used = 0;
-        g_ast_chunks = c;
+        *chunks = c;
     }
-    Ast *n = (Ast *)(g_ast_chunks->data + g_ast_chunks->used);
-    g_ast_chunks->used += need;
+    Ast *n = (Ast *)((*chunks)->data + (*chunks)->used);
+    (*chunks)->used += need;
     memset(n, 0, need);
     n->kind = kind;
     return n;

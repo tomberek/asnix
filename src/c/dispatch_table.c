@@ -65,6 +65,7 @@ extern void asnix_op_neq_if(void);
 extern void asnix_op_lt_if(void);
 extern void asnix_op_ge_if(void);
 extern void asnix_op_has_attr_if(void);
+extern void asnix_op_lazy_thunk_body(void);
 
 void *asnix_handler_table[OP_COUNT] = {
     [OP_PUSH_INT] = (void *)asnix_op_push_int,
@@ -124,6 +125,7 @@ void *asnix_handler_table[OP_COUNT] = {
     [OP_LT_IF] = (void *)asnix_op_lt_if,
     [OP_GE_IF] = (void *)asnix_op_ge_if,
     [OP_HAS_ATTR_IF] = (void *)asnix_op_has_attr_if,
+    [OP_LAZY_THUNK_BODY] = (void *)asnix_op_lazy_thunk_body,
 };
 
 void ir_link(IrOp *ops, size_t n) {

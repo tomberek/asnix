@@ -323,4 +323,23 @@ static inline Ast *asnix_ast_new_at(AstKind kind, uint32_t src_pos) {
  * why that's always safe. */
 void asnix_ast_arena_reset(void);
 
+/* MEASUREMENT-ONLY experiment (docs/lazy-thunk-compile-proposal.md's
+ * "Sizing the new retention cost" / "Four-stage plan, revised" step 1):
+ * redirects every asnix_ast_new()/asnix_ast_new_at() call made while
+ * active into a SEPARATE chunk list that asnix_ast_arena_reset() never
+ * touches -- i.e. permanently retained for the rest of the process,
+ * simulating the memory a real lazy-compile stub's deferred Ast subtree
+ * would keep alive. No opcode, no compile-deferral, no scope-correctness
+ * change at all -- every binding is still compiled eagerly, in the exact
+ * same order, by the exact same code; only WHICH chunk list physically
+ * holds some of the nodes changes. parser.c's own call sites toggle this
+ * around exactly the subtree this proposal would actually defer (an
+ * attrset literal binding's value expression, `dyn_out != NULL`'s own
+ * existing signal for "this is an attrset literal, not a `let` block").
+ * Returns the previous state (nested-safe: a `let`/attrset nested INSIDE
+ * an already-redirected value expression must stay redirected for its
+ * own nested attrset fields too, not fall back to off). */
+int asnix_ast_enter_retained(void);
+void asnix_ast_leave_retained(int prev_state);
+
 #endif /* ASNIX_AST_H */

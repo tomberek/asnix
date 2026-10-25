@@ -21801,3 +21801,99 @@ measured.
 
 Files: `src/c/lexer.c` (`lexer_next`'s mode-compare order only; no
 other line changed).
+
+## M196: lazy thunk-body compilation (`OP_LAZY_THUNK_BODY`) -- the biggest lever found this entire session, -10.23% instructions, opt-in via `ASNIX_LAZY_THUNK=1`
+
+M180 found asnix's compile-to-IR step is fully eager: ~90.7% of compiled
+thunk bodies are never forced, wasting ~62% of the eval's entire
+compiled IR volume. `docs/lazy-thunk-compile-proposal.md` designed a
+fix (a self-upgrading stub opcode deferring compile to first-force);
+M187's narrower first attempt (fusing just the `callPackage` idiom) was
+declined after its `asnix_apply` out-of-line call overhead ate the
+compile-time savings. This milestone builds the GENERAL mechanism for
+real, avoiding M187's specific failure mode, following a careful design
+pass and two staged measurements (both recorded in the proposal doc
+before this landed).
+
+**Mechanism.** `OP_LAZY_THUNK_BODY` is the ONLY op in a stub
+`IrProgram`. Its C bridge (`asnix_compile_lazy_thunk_body`, `compiler.c`)
+runs the ordinary `compile_expr`/`ib_finish` pipeline mid-dispatch,
+mutates the shared `IrProgram`'s `ops`/`pool` fields in place, then
+falls through into the real first op via the exact same dispatch every
+force site already uses -- zero new branches at any of the 5
+force-entry sites, no `asnix_apply`, no new `RetFrame`. Gated behind
+`ASNIX_LAZY_THUNK=1` (mirroring `ASNIX_IR_OPT`'s own convention); the
+default (unset) path is unchanged.
+
+**Three real lifetime bugs found and fixed, all by direct tracing, not
+assumption** (the design doc's own three flagged obstacles plus one more
+found only by building it):
+1. The design doc's own asm sketch clobbered `%rdi` (the real captured
+   ENV) before saving it -- confirmed by three different dynamic
+   `Thunk` instances giving the same wrong answer without the fix.
+   Fixed by routing the descriptor pointer through `%rdx` instead.
+2. The Ast-retention toggle missed synthetic merge-wrapper nodes built
+   AFTER a binding loop returns (M67's dynamic-attrs-merge path) -- a
+   real use-after-free, caught by `m67_dynamic_attrs_merge.nix`
+   producing garbage output.
+3. A `let`-binding's own attrpath sugar (`a.b = v;` inside `let`)
+   synthesizes an `AST_ATTRSET` exactly like a `{}`/`rec{}` literal, but
+   the retention toggle was gated on an unrelated `dyn_out != NULL`
+   check that excluded `let` entirely -- this was the real cause of
+   `neovim.outPath`/`.drvPath` failing ("attribute 'start' missing") on
+   2 of 148 real nixpkgs-hash packages. Root-caused by a direct
+   Ast-pointer trace (same pointer, completely different source text at
+   creation vs. compile time). Fixed by making the toggle unconditional
+   on block kind.
+4. Found while re-measuring: `asnix_ast_enter_retained` was never
+   actually gated on the `ASNIX_LAZY_THUNK` runtime flag at all, so the
+   "default path unchanged" claim was never true until fixed (+5.53%
+   peak RSS unconditionally, paid by every caller regardless of opting
+   in). Fixed by gating on `asnix_lazy_thunk_enabled` directly.
+
+**Correctness, both flag states, full ladder, independently
+re-verified**: `make test`; `make test-e2e` 300/300 both ways; `make
+test-conformance` both ways; `make test-nix-conformance` reproduces the
+exact `pass=655 fail=3 skip=148` baseline both ways; `make
+test-nixpkgs-hash` `pass=148 fail=0` under BOTH flag states (was
+`pass=146 fail=2` under the flag before bug #3's fix -- `neovim` now
+byte-matches real Nix exactly). `./asnix d.nix` output hash unchanged
+both ways.
+
+**Measured** (`perf stat -e cpu_core/instructions/`, `taskset -c 0`, 6
+interleaved trials, real `d.nix`/ffmpeg eval, independently re-measured
+against a from-scratch baseline at this milestone's own parent commit):
+
+| | instructions |
+|---|---|
+| before (flag unset) | 5,436,361,228.2 (avg) |
+| after (`ASNIX_LAZY_THUNK=1`) | 4,870,878,857.3 (avg) |
+| delta | **-10.40%** (-565.5M) |
+| wins | 6/6, completely non-overlapping ranges |
+
+Closely matches the implementer's own independently-measured -10.23%.
+**This is the single biggest lever found this entire session** -- more
+than double M181's own -5.3% (the previous record, lexer TokVec
+elimination). Peak RSS: +1.82% flag-on, +0.00% flag-off (exact match,
+confirming zero cost to the default path).
+
+**Why this stays opt-in for now, not the default.** This is a large,
+correctness-sensitive mechanism (3 real bugs already found and fixed
+during its own construction) that has only been verified against this
+project's own test corpora plus one specific real nixpkgs package
+(`d.nix`/ffmpeg) and the 148-package nixpkgs-hash suite. Given the
+history of subtle lifetime bugs in exactly this area, broader
+real-world exposure before flipping the default is the responsible
+next step, not a blocker to landing the mechanism itself.
+
+Files: `include/asnix/ir.h` (`OP_LAZY_THUNK_BODY`), `include/asnix/
+irbuild.h` (`ib_mk_lazy_thunk_stub`), `src/asm/ops/op_lazy_thunk_body.S`
+(new), `src/c/ast.c`/`ast.h` (`asnix_ast_enter_retained`/
+`_leave_retained`, gated on `asnix_lazy_thunk_enabled`), `src/c/
+compiler.c`/`compiler.h` (`asnix_lazy_thunk_enabled`,
+`LazyThunkDescriptor`, `scope_frame_persist`,
+`asnix_compile_lazy_thunk_body`, `emit_attrset_field_value`), `src/c/
+dispatch_table.c`, `src/c/eval_file.c` (lifetime extension for `src`/
+`base_dir`/`file_path` when the flag is on), `src/c/irbuild.c`, `src/c/
+main.c` (env var read), `src/c/parser.c` (retention toggle at every
+binding/attrset-literal/let site).

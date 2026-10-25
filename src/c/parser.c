@@ -889,7 +889,55 @@ static Ast *build_dynamic_chain_value(AttrSeg *segs, size_t start, size_t count,
  * checks entirely, which exist only for names a *user* could write). */
 static int g_inherit_hidden_counter = 0;
 
+/* Lazy-thunk-compile experiment (see ast.h's own comment on
+ * asnix_ast_enter_retained): wraps the real parse_binding_stmt_inner
+ * below so every Ast node it builds for ANY binding -- attrset-literal
+ * OR `let` -- is redirected into the permanently-retained arena instead
+ * of the normal per-file resettable one. A single toggle around the
+ * whole inner call (not just the value-expression parse) correctly
+ * covers BOTH this binding's own value subtree and any `inherit`-sugar
+ * Ast nodes synthesized above it, with no risk of missing one of the
+ * inner function's several exit paths (the `return` inside the
+ * `inherit` branch, the natural fall-through at the end, and the fatal
+ * `exit(1)` parse-error paths, which need no cleanup since the process
+ * is terminating anyway).
+ *
+ * Previously gated on `dyn_out != NULL` (true for the 3 attrset-literal
+ * call sites, false for the 1 `let` call site, parse_let_bindings
+ * below) on the theory that only an attrset literal's bindings ever
+ * need retaining -- an ordinary `let` binding's own value always
+ * compiles eagerly, so "nothing to retain" seemed right. That reasoning
+ * missed `let a.b = v;`-style ATTRPATH SUGAR: `insert_attrpath`/
+ * `finalize_bt_node` synthesizes a brand-new AST_ATTRSET node for `a`
+ * regardless of whether the enclosing binding list came from a `{}`/
+ * `rec{}` literal or a `let` -- and THAT synthetic attrset's own fields
+ * are just as eligible for compile_expr's ordinary emit_attrset_field_
+ * value deferral as any hand-written literal's. Gating retention on
+ * `dyn_out` conflated two unrelated concerns ("reject dynamic attrs in
+ * a let", still `dyn_out`'s own job inside parse_binding_stmt_inner,
+ * untouched by this change) with "does this binding's value need
+ * retaining" (every binding does, regardless of block kind). A real
+ * nixpkgs `let packpathDirs.myNeovimPackages = expr; in ...` (neovim's
+ * own wrapper.nix) left `expr`'s Ast node, and the synthetic
+ * `packpathDirs` wrapper finalize_bt_vec/finalize_bt_node builds
+ * afterward (parse_let_bindings below also widens its own post-loop
+ * finalize_bt_vec call the same way TOK_LBRACE/TOK_REC already do, to
+ * cover that wrapper node itself), in the normal RESETTABLE arena -- a
+ * real use-after-free once the deferred field fires after this file's
+ * own AST arena reset. Found by a direct trace matching the SAME Ast
+ * pointer's own source-snippet at creation vs. at compile time:
+ * identical pointer, completely different text (the 2-of-148 nixpkgs-
+ * hash failure, `neovim.outPath`: "attribute 'start' missing,
+ * aborting", traced to exactly this). */
+static void parse_binding_stmt_inner(Parser *p, BTVec *out, DynBindingVec *dyn_out);
+
 static void parse_binding_stmt(Parser *p, BTVec *out, DynBindingVec *dyn_out) {
+    int prev = asnix_ast_enter_retained();
+    parse_binding_stmt_inner(p, out, dyn_out);
+    asnix_ast_leave_retained(prev);
+}
+
+static void parse_binding_stmt_inner(Parser *p, BTVec *out, DynBindingVec *dyn_out) {
     if (cur(p).kind == TOK_INHERIT) {
         advance(p);
         Ast *src_expr = NULL;
@@ -1371,6 +1419,16 @@ static Ast *parse_atom(Parser *p) {
             advance(p);
             BTVec bt = { 0 };
             DynBindingVec dyn = { 0 };
+            /* Lazy-thunk-compile experiment: the per-binding toggle inside
+             * parse_binding_stmt covers each binding's OWN value subtree,
+             * but NOT the branch-merge wrapper nodes finalize_bt_vec/
+             * merge_bt_dyn_into build AFTER the loop (e.g. a "regrettable"
+             * dynamic-attr merge, M67's reopen_attrset_into) -- those also
+             * become part of a deferred field's `body`, so this wider
+             * toggle covers the whole literal's parse, not just each
+             * binding. Found by a real use-after-free bug (M67's own
+             * dynamic-attrs-merge e2e fixture), not assumed safe. */
+            int lt_prev_lbrace = asnix_ast_enter_retained();
             while (cur(p).kind != TOK_RBRACE) parse_binding_stmt(p, &bt, &dyn);
             advance(p); /* '}' */
             BindingVec bindings = { 0 };
@@ -1383,6 +1441,7 @@ static Ast *parse_atom(Parser *p) {
             merge_bt_dyn_into(&bt, &dyn); /* M67 */
             n->as.attrset.dyn_bindings = finalize_dyn_vec(&dyn);
             n->as.attrset.dyn_count = dyn.len;
+            asnix_ast_leave_retained(lt_prev_lbrace);
             return n;
         }
         case TOK_REC: {
@@ -1390,6 +1449,7 @@ static Ast *parse_atom(Parser *p) {
             expect(p, TOK_LBRACE, "'{'");
             BTVec bt = { 0 };
             DynBindingVec dyn = { 0 };
+            int lt_prev_rec = asnix_ast_enter_retained(); /* see TOK_LBRACE's own comment above */
             while (cur(p).kind != TOK_RBRACE) parse_binding_stmt(p, &bt, &dyn);
             advance(p); /* '}' */
             BindingVec bindings = { 0 };
@@ -1402,6 +1462,7 @@ static Ast *parse_atom(Parser *p) {
             merge_bt_dyn_into(&bt, &dyn); /* M67 */
             n->as.attrset.dyn_bindings = finalize_dyn_vec(&dyn);
             n->as.attrset.dyn_count = dyn.len;
+            asnix_ast_leave_retained(lt_prev_rec);
             return n;
         }
         default:
@@ -1841,7 +1902,17 @@ static Ast *parse_let_bindings(Parser *p) {
         exit(1);
     }
     BindingVec bindings = { 0 };
+    /* Lazy-thunk-compile experiment: same reasoning as TOK_LBRACE/
+     * TOK_REC's own identical wrap in parse_atom (see
+     * parse_binding_stmt's own comment above for the full story) --
+     * finalize_bt_vec is where any attrpath-sugar's synthetic
+     * AST_ATTRSET wrapper node actually gets allocated (finalize_bt_
+     * node, above), strictly AFTER the while-loop above has already
+     * returned, so the per-binding toggle inside parse_binding_stmt
+     * cannot reach it on its own. */
+    int lt_prev_let_finalize = asnix_ast_enter_retained();
     finalize_bt_vec(&bt, &bindings);
+    asnix_ast_leave_retained(lt_prev_let_finalize);
     VEC_TRIM(bindings, AstBinding);
 
     Ast *n = asnix_ast_new_at(AST_LET, cur(p).start);
@@ -1942,6 +2013,7 @@ static Ast *parse_expr(Parser *p) {
             advance(p); /* '{' */
             BTVec bt = { 0 };
             DynBindingVec dyn = { 0 };
+            int lt_prev_letbrace = asnix_ast_enter_retained(); /* see TOK_LBRACE's own comment above */
             while (cur(p).kind != TOK_RBRACE) parse_binding_stmt(p, &bt, &dyn);
             advance(p); /* '}' */
             BindingVec bindings = { 0 };
@@ -1954,6 +2026,7 @@ static Ast *parse_expr(Parser *p) {
             merge_bt_dyn_into(&bt, &dyn); /* M67 */
             attrs->as.attrset.dyn_bindings = finalize_dyn_vec(&dyn);
             attrs->as.attrset.dyn_count = dyn.len;
+            asnix_ast_leave_retained(lt_prev_letbrace);
             Ast *n = asnix_ast_new_at(AST_SELECT, cur(p).start);
             n->as.select.target = attrs;
             n->as.select.attr = "body";

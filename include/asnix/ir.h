@@ -484,6 +484,12 @@ enum {
     OP_HAS_ATTR_IF, /* a = byte delta to else (patched via ib_patch_delta); b = symbol id
                       * (same a/b roles as OP_WITH_TRY/OP_SELECT_OR) -- pops a value, same
                       * never-forces/never-fatal-on-non-attrset semantics as plain OP_HAS_ATTR */
+    OP_LAZY_THUNK_BODY, /* lazy-thunk-compile experiment (docs/lazy-thunk-compile-proposal.md):
+                      * b = pool index of a LazyThunkDescriptor* (compiler.c). The ONLY op in
+                      * a stub IrProgram -- entered exactly like any other thunk body (same
+                      * dispatch, same already-pushed RETFRAME), compiles the deferred subtree
+                      * for real, mutates the shared IrProgram in place, falls through into the
+                      * now-real ops[0] in the SAME dispatch context (no asnix_apply). */
     OP_COUNT
 };
 

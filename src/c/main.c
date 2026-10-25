@@ -11,6 +11,7 @@
 #include "asnix/stats.h"
 #include "asnix/value.h"
 #include "builtins_shared.h" /* M57i: asnix_bshared_attrs_* / make_attrs, CLI --arg/-A support */
+#include "compiler.h" /* lazy-thunk-compile experiment: asnix_lazy_thunk_enabled */
 #include "eval_file.h"
 #include "flake_eval.h" /* M126: --flake DIR[#attr.path] */
 #include "irpass_cfold.h" /* M118: ASNIX_IR_OPT -- see this file's own hook below */
@@ -623,6 +624,7 @@ int main(int argc, char **argv) {
      * env-var-flag convention as ASNIX_SHOW_STATS below -- off by
      * default, so this changes nothing about a normal run. See
      * asnix/irpass.h. */
+    asnix_lazy_thunk_enabled = getenv("ASNIX_LAZY_THUNK") != NULL; /* lazy-thunk-compile experiment */
     if (getenv("ASNIX_IR_OPT")) asnix_irpass_register_cfold();
     if (getenv("ASNIX_IR_OPT")) asnix_irpass_register_cmpnot();
     if (getenv("ASNIX_IR_OPT")) asnix_irpass_register_dce();

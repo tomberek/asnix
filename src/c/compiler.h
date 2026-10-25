@@ -41,4 +41,29 @@ IrProgram *asnix_compile(Ast *root, const char *base_dir, const char *file_path)
 IrProgram *asnix_compile_scoped(Ast *root, const char *base_dir, const char *file_path,
                                  const char **extra_names, size_t *extra_lens, size_t extra_count);
 
+/* Lazy-thunk-compile experiment (docs/lazy-thunk-compile-proposal.md):
+ * 0 by default (every binding still compiles eagerly, byte-identical to
+ * before this experiment existed); set once from main() via
+ * `getenv("ASNIX_LAZY_THUNK")`, mirroring ASNIX_IR_OPT's own convention.
+ * When set, `compile_expr`'s AST_ATTRSET case defers an ordinary field's
+ * value to first-force instead of compiling it immediately, AND
+ * eval_file.c's `free(src)` call sites skip freeing the source buffer
+ * (hazard #3's simple-but-correct fix: a deferred subtree's Ast string
+ * fields still alias `src`, so it must outlive the file's own compile
+ * call for as long as any of its stubs might still fire -- this
+ * experiment keeps it alive for the whole process rather than deep-
+ * copying referenced bytes, a deliberate simplification for measurement,
+ * not the production-grade fix the proposal doc's own hazard #3 section
+ * recommends). */
+extern int asnix_lazy_thunk_enabled;
+
+/* C bridge for OP_LAZY_THUNK_BODY's handler (src/asm/ops/
+ * op_lazy_thunk_body.S) -- takes the opaque LazyThunkDescriptor* pool
+ * entry, compiles its deferred subtree for real, mutates the shared
+ * IrProgram in place, and returns it (same pointer, now carrying real
+ * ops/pool). Takes `void *` for the same opaque-pointer reason
+ * ib_mk_lazy_thunk_stub does (irbuild.h) -- LazyThunkDescriptor is
+ * defined in compiler.c only, nothing outside it needs the layout. */
+IrProgram *asnix_compile_lazy_thunk_body(void *desc);
+
 #endif /* ASNIX_COMPILER_H */

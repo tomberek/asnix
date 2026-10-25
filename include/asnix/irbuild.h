@@ -120,6 +120,13 @@ size_t ib_select_dynamic(IrBuilder *b);
  * runs -- same pool-travels-with-it rationale as ib_lambda. */
 size_t ib_mk_thunk(IrBuilder *b, IrProgram *body_prog);
 
+/* Lazy-thunk-compile experiment: emits the single OP_LAZY_THUNK_BODY op
+ * that makes up a whole stub IrProgram -- `desc` is a LazyThunkDescriptor*
+ * (compiler.c), taken here as an opaque `void*` so this header and
+ * irbuild.c don't need to know that type's layout (ir.h's own pool
+ * convention already stores IrProgram* pointers the same opaque way). */
+size_t ib_mk_lazy_thunk_stub(IrBuilder *b, void *desc);
+
 /* Recursion support (letrec / rec attrsets): allocate a new Env frame with
  * `nslots` slots and install it as the current ENV (OP_FRAME_ALLOC), store
  * the value on top of VALSTACK into slot `slot` of the current ENV

@@ -211,6 +211,11 @@ size_t ib_mk_thunk(IrBuilder *b, IrProgram *body_prog) {
     return ib_emit(b, OP_MK_THUNK, 0, (int64_t)pool_idx);
 }
 
+size_t ib_mk_lazy_thunk_stub(IrBuilder *b, void *desc) {
+    size_t pool_idx = ib_pool_add(b, (int64_t)(intptr_t)desc);
+    return ib_emit(b, OP_LAZY_THUNK_BODY, 0, (int64_t)pool_idx);
+}
+
 size_t ib_frame_alloc(IrBuilder *b, int64_t nslots) {
     return ib_emit(b, OP_FRAME_ALLOC, nslots, 0);
 }

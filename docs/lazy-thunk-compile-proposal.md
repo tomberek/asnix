@@ -779,6 +779,122 @@ evaluated output, not just `.outPath`) to actually find this bug,
 before even considering fixing hazard #3 "for real" (the byte-copy
 fix) or bringing this anywhere near master.
 
+### The neovim bug, root-caused and fixed: a fourth lifetime hazard, same family as #2 -- a `let`-binding's own attrpath sugar was never covered by the Ast-retention toggle
+
+The real root cause, found by direct tracing (not inspection or
+minimization alone): `neovim.outPath`/`.drvPath`'s "attribute 'start'
+missing" had nothing to do with `lib.partition`/`foldl'` (both
+previously suspected, both actually innocent -- `lib.partition` is a
+native primop, builds its `{right;wrong;}` result in C, never touches
+`compile_expr` at all). The real trigger is neovim's own
+`wrapper.nix`, inside a `let ... in` block:
+
+```nix
+packpathDirs.myNeovimPackages = vimPackageInfo.vimPackage;
+finalPackdir = neovimUtils.packDir packpathDirs;
+```
+
+`packpathDirs.myNeovimPackages = expr;` is attrpath-sugar for
+`packpathDirs = { myNeovimPackages = expr; };` -- parser.c's
+`insert_attrpath`/`finalize_bt_node` synthesizes a brand-new
+`AST_ATTRSET` node for this at parse time, exactly as it would for the
+identical sugar written inside a `{}`/`rec{}` literal. `compile_expr`'s
+AST_ATTRSET case doesn't care how a literal was spelled -- it deferred
+`myNeovimPackages`'s own field value (`vimPackageInfo.vimPackage`, not
+thunk-free, not a bare var ref) exactly like any other ordinary
+attrset field.
+
+The bug: stage 1's own Ast-retention toggle (`asnix_ast_enter_retained`/
+`_leave_retained`, widened by hazard #2's fix to cover a whole literal's
+parse) was gated on `dyn_out != NULL` in `parse_binding_stmt` --
+`parser.c`'s own signal for "this binding came from a `{}`/`rec{}`
+literal, not a `let` block" (the `let` call site passes `dyn_out = NULL`
+specifically to reject dynamic attrs there, an entirely unrelated
+check). That gate conflated two different questions: "should dynamic
+attrs be rejected here" (yes, exactly for `let`) and "does this
+binding's value need retaining" (yes, REGARDLESS of block kind, since a
+`let` binding's value can itself be -- or attrpath-sugar synthesize --
+an attrset literal whose own fields get deferred the same as any other).
+`parse_let_bindings` itself never toggled retention at all, for any
+reason. Net effect: a `let`-bound attrpath-sugar binding's Ast nodes --
+both the right-hand-side expression (`vimPackageInfo.vimPackage`) and
+the synthetic wrapper `finalize_bt_vec` builds afterward -- landed in
+the normal, per-file RESETTABLE arena. Once `vimPackageInfo.vimPackage`
+got lazily force-compiled (correctly deferred, just pointing at memory
+that was no longer valid), it read back a different, reused Ast node
+at the same address -- confirmed by direct instrumentation printing
+each deferred node's own source snippet at creation time vs. at
+force-compile time: same pointer, completely different text. A real
+use-after-free, same family as hazard #2 (both are "the retention
+toggle's coverage was narrower than the compiler's actual deferral
+surface"), just one level further out: hazard #2 missed a literal's own
+post-loop merge step; this one missed an entire OTHER kind of binding
+block (`let`) that can produce the exact same synthetic-attrset shape.
+
+**The fix** (`src/c/parser.c`, `src/c/ast.c`): `parse_binding_stmt`'s
+toggle is now unconditional (every binding's value subtree is retained,
+regardless of block kind -- `dyn_out`'s own NULL-ness still
+independently controls the unrelated dynamic-attrs-rejection check, read
+by `parse_binding_stmt_inner`, untouched). `parse_let_bindings` now also
+wraps its own post-loop `finalize_bt_vec` call in the toggle, mirroring
+TOK_LBRACE/TOK_REC's existing wrap exactly. A second, independent bug
+surfaced while re-measuring the fix's own cost: `asnix_ast_enter_retained`
+had NEVER been gated on `asnix_lazy_thunk_enabled` (the runtime flag) at
+all -- every `{}`/`rec{}` literal (and, after the fix above, every
+`let` binding) redirected Ast nodes into the never-freed retained arena
+UNCONDITIONALLY, even with the flag unset, contradicting this doc's own
+"the default (unset) path is unchanged" claim (confirmed by direct
+measurement: a from-scratch baseline at +5.53% peak RSS higher than it
+should have been, entirely attributable to this). Fixed by gating
+`asnix_ast_enter_retained` itself on `asnix_lazy_thunk_enabled`
+(`ast.c` now includes `compiler.h` for the flag) -- the default path's
+peak RSS now matches a from-scratch, no-lazythunk-code-at-all baseline
+EXACTLY (512,160 KB both ways, not just approximately).
+
+**Re-verified, full ladder, both flag states**: `make test`; `make
+test-e2e` 300/300 (flag-on AND flag-off); `make test-conformance`
+(both, 0 failures); `make test-nix-conformance` (both --
+`pass=655 fail=3 skip=148`, the exact pre-existing baseline, identical
+3 known failures); `make test-nixpkgs-hash` flag-off `pass=148 fail=0`
+(one transient `fzf.outPath(crash)` on a load-contended re-run, NOT
+reproducible on a clean re-run -- a harness timeout, not a real
+failure); **flag-ON `pass=148 fail=0`, reproduced twice in a row** --
+the previously-failing `neovim.outPath`/`.drvPath` now match real
+Nix's own output exactly, confirmed directly (`/nix/store/3b53qbk...-
+neovim-0.12.5` and `/nix/store/s834i6z...-neovim-0.12.5.drv`, both
+flag-on and flag-off, byte-identical).
+
+**Re-measured** (same methodology as stage 2's own table above -- `perf
+stat`/`/usr/bin/time -v`, `taskset -c 0`, 6 interleaved instruction
+trials + 3 interleaved RSS trials, real `d.nix`/ffmpeg eval, against a
+fresh from-scratch baseline at this experiment's own parent commit):
+
+| | instructions | peak RSS (flag-on) | peak RSS (flag-off) |
+|---|---|---|---|
+| before | 5,430,504,530.3 (avg) | 512,160 KB | 512,160 KB |
+| after | 4,874,974,466.3 (avg) | 521,488 KB | 512,160 KB |
+| delta | **-10.23%** (-555.5M) | **+1.82%** (+9.3 MB) | **+0.00%** |
+| wins | 6/6, non-overlapping | 3/3, consistent | exact match |
+
+The win survives the correctness fix essentially intact: -10.23% vs.
+the earlier -10.55% (a small, expected give-back -- the fix retains
+slightly MORE than before, since `let`-bound attrpath-sugar bindings
+are now correctly covered too), still comfortably the single biggest
+lever found this session. The flag-on peak-RSS cost grew slightly
+(+1.82% vs. the earlier +1.42%, same reason), but the flag-off
+(default, production) path's peak RSS is now proven byte-for-byte
+IDENTICAL to a build with none of this experiment's code at all --
+strictly better than before this fix, where that same path silently
+cost +5.53% nobody had measured.
+
+**Verdict: ship-ready.** All four of this doc's own stage-2 gates are
+now met for real: the full ladder is green on both flag states, the
+previously-failing 2-of-148 nixpkgs-hash packages now pass, the win is
+re-confirmed intact after the fix (not just assumed), and the default
+path's own "unchanged" claim is now actually true rather than merely
+asserted. Left on `lazythunk-stage2` for the orchestrating session's
+own review and merge decision, per this project's standing practice.
+
 Committed on its own disposable branch (`lazythunk-stage2`, not
 pushed/merged), parent commit the same as stage 1's own measurement.
 
