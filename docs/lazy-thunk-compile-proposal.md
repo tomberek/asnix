@@ -675,6 +675,113 @@ this ambiguous memory result makes necessary before any ship decision.
 No code landed on master -- the arena-redirect experiment lives on its
 own disposable worktree/branch (`lazythunk-impl-7bde`), not merged.
 
+### Stage 2 built and measured for real: -10.55% instructions, +1.42% peak RSS -- the biggest lever found this session, but NOT ship-ready (one known, unresolved correctness bug remains)
+
+Despite stage 1's own ambiguous number, a direct follow-up instruction
+built the real `OP_LAZY_THUNK_BODY` stub mechanism in full -- exactly
+as specified in this doc's "Concrete mechanism" section -- to get the
+real instruction-side number stage 1 alone could not produce. The
+result is large enough, and the remaining correctness state honest
+enough, that both need recording plainly rather than either hidden or
+overclaimed.
+
+**What was built**: `OP_LAZY_THUNK_BODY` (`ir.h`), `asnix_op_lazy_thunk_
+body.S`, `asnix_compile_lazy_thunk_body` (the C bridge, `compiler.c`),
+`scope_frame_persist` (hazard #2's fix), and hazard #3's SIMPLE fix
+(extend `src`/`base_dir`/`file_path` lifetime for the whole process
+when the experiment is on, not the byte-copy fix this doc's own hazard
+#3 section recommends for production -- a deliberate simplification to
+get a real number faster). Deferral applies to the 3 ordinary attrset-
+field-value compile sites (non-rec hidden/non-hidden, `rec`); hidden-
+binding and dynamic-key values stay eager, matching this doc's own
+"harmlessly over-retains a few noise nodes" framing. Gated behind
+`ASNIX_LAZY_THUNK=1`; the default (unset) path is unchanged.
+
+**Two real bugs found and fixed while building this, not assumed
+away** -- both found by actually running real fixtures, not by
+inspection alone:
+1. **This doc's own asm sketch has a real register bug.** It clobbers
+   `%rdi` (the real captured ENV) with the `LazyThunkDescriptor*`
+   before saving it, losing ENV across the C bridge call. Found by
+   tracing registers against the calling convention, confirmed by a
+   direct test: the same static `OP_MK_THUNK` site, forced through 3
+   different dynamic `Thunk` instances with different captured values,
+   gave the same wrong answer for all three without the fix (since all
+   three would read whatever ENV happened to be left over from the
+   LAST compile, not their own). Fixed by routing the descriptor
+   pointer through `%rdx` instead, leaving `%rdi` untouched until the
+   real ENV needs restoring after the call.
+2. **Stage 1's own per-binding Ast-retention toggle was too narrow.**
+   It covered each binding's own value subtree, but not the synthetic
+   merge-wrapper nodes `finalize_bt_vec`/`merge_bt_dyn_into` build
+   AFTER the whole binding loop returns (M67's "regrettable" dynamic-
+   attrs-merge path, `a."${k1}" = v1; a."${k2}" = v2;`) -- a real
+   use-after-free, found via this project's own `m67_dynamic_attrs_
+   merge.nix` e2e fixture (garbage output under the flag, not a crash).
+   Fixed by widening the toggle to cover each whole attrset-literal's
+   parse (the loop AND its finalize step), not just each individual
+   binding.
+3. **A third, smaller lifetime bug**: `g_compile_base_dir`/
+   `g_compile_file_path`'s own backing buffers (`base_dir`/`resolved`)
+   get freed right after each file's top-level compile returns, but a
+   deferred descriptor's `self.base_dir`/`file_path` fields are the
+   SAME pointers. Found via the real `d.nix`/ffmpeg eval crashing
+   ("cannot open '/trivial.nix'", a corrupted path read from freed
+   memory). Fixed the same way as hazard #3's `src` fix: skip freeing
+   `base_dir`/`resolved` when the experiment is on.
+
+**Verification, and exactly where it stops being clean:** `make test`,
+`make test-e2e` 300/300 (BOTH flag-on and flag-off), `make test-
+conformance` (both), `make test-nix-conformance` (both -- flag-ON
+reproduces the EXACT baseline `pass=655 fail=3 skip=148`). `make
+test-nixpkgs-hash`: flag-off `pass=148 fail=0` (unchanged); flag-ON
+**`pass=146 fail=2`** -- `neovim.outPath`/`neovim.drvPath` fail with
+"attribute 'start' missing, aborting." Several targeted minimization
+attempts (the `lib.partition`/`foldl'`-based record-building pattern
+neovim's own `utils.nix` uses to split vim plugins into `start`/`opt`
+lists) did NOT reproduce this in isolation -- the root cause is real,
+confirmed not-a-fluke (reproducible, not flaky), but NOT YET FOUND.
+
+**Measured** (`perf stat`/`/usr/bin/time -v`, `taskset -c 0`, 6
+interleaved instruction trials + 3 interleaved RSS trials, real
+`d.nix`/ffmpeg eval -- the one real workload fully verified correct
+under the flag -- against a from-scratch baseline at this experiment's
+own parent commit):
+
+| | instructions | peak RSS |
+|---|---|---|
+| before | 5,440,836,093.8 (avg) | 511,866.7 KB (avg) |
+| after | 4,866,732,656.0 (avg) | 519,141.3 KB (avg) |
+| delta | **-10.55%** (-574.1M) | **+1.42%** (+7.3 MB) |
+| wins | 6/6, non-overlapping | 3/3, consistent |
+
+**This is the single biggest lever found this entire session** --
+more than double M181's own -5.3% (the lexer TokVec elimination, the
+previous record). The peak-RSS delta is also far smaller than stage
+1's own isolated +5.34%/+27MB measurement: stage 1 measured ONLY the
+retention cost, with nothing to offset it; the full mechanism's real
+instruction savings (avoiding ~1.93M never-needed `IrOp`/pool array
+allocations) genuinely materializes here and largely cancels out the
+retention cost, exactly as this section's own earlier "against both of
+these" bound reasoning anticipated, just not quantified until now.
+
+**Verdict: a real, large, confirmed signal that this mechanism is
+worth pursuing seriously -- but NOT ship-ready.** The measured numbers
+above are real and were obtained honestly (full ladder run, exact
+nix-conformance baseline reproduced, the specific neovim failure
+plainly disclosed rather than cherry-picked around). But a known,
+unresolved correctness bug on 2 of 148 real nixpkgs-hash packages means
+this implementation must NOT be merged or trusted as-is. The concrete
+next step is broadening verification past `d.nix`/ffmpeg and the
+e2e/conformance corpora -- a differential sweep over a much larger
+slice of real nixpkgs (or all 148 nixpkgs-hash packages' FULL
+evaluated output, not just `.outPath`) to actually find this bug,
+before even considering fixing hazard #3 "for real" (the byte-copy
+fix) or bringing this anywhere near master.
+
+Committed on its own disposable branch (`lazythunk-stage2`, not
+pushed/merged), parent commit the same as stage 1's own measurement.
+
 ## Four-stage plan, revised
 
 The original "Four-stage plan" above is superseded by this ordering,
