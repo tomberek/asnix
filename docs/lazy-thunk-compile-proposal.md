@@ -7,6 +7,28 @@ section for the measured sizing data this proposal is built on, and
 history. Nothing in this document should be treated as decided until
 the measurements it calls for actually happen.
 
+**Update (follow-on design pass, read this before the sections below).**
+A dedicated design pass worked out a concrete mechanism for the general
+`OP_LAZY_THUNK_BODY` stub -- specifically targeting the failure mode
+that sank M187's narrower `callPackage`-fusion attempt (the
+`asnix_apply` out-of-line call overhead) -- and a concrete lifetime
+scheme for the two obstacles this doc already names, plus a THIRD real
+hazard this doc did not name, found only by reading the already-shipped
+milestone that introduced it (see "A third lifetime hazard" below). No
+code was changed on master or any other branch: the dispatch-side
+mechanism is concrete enough to specify exactly, register-by-register
+and byte-offset by byte-offset, against the real assembly it would hook
+into -- but the lifetime fix touches enough call sites across
+`parser.c`/`ast.c`/`compiler.c`, and interacts with the freeing logic of
+THREE separately-shipped milestones at once, that building and
+verifying it correctly was judged to need its own dedicated pass, not a
+tack-on to this one -- consistent with this doc's own prior "Recommended
+sequencing" section judging the full general opcode larger than one
+shot, and with M187's own lesson that the mechanism matters as much as
+the idea. See "Sizing the new retention cost" below for exactly what
+measurement should happen before any of this is built, and the new
+"Four-stage plan, revised" at the end for the recommended next step.
+
 ## Motivation
 
 M180 measured that asnix's `compile_expr` compiles every binding's
@@ -197,3 +219,426 @@ as real and worth designing around.
   instrumentation), even a cheap branch multiplies; this needs to be
   measured against the ~1.93M-op savings directly, not assumed to be
   negligible.
+
+## Concrete mechanism: the self-upgrade needs ZERO new branches at the five force-entry sites, not one
+
+Re-reading `force.S`, `op_var_ref.S` (`op_select.S`/`op_select_or.S`/
+`op_with.S` all follow the identical shape) against the actual IR
+dispatch ABI (`docs/abi.md`, `include/asnix/ir.h`) finds this project's
+existing dispatch mechanism is already exactly the hook this design
+needs, for free -- no edit to any of the five sites is actually
+required, which is a stronger result than this doc's original "exactly
+one new branch each" estimate.
+
+**Why.** `asnix` is a direct-threaded interpreter: `IrOp` is `{void
+*handler; int32_t a; int32_t b}` (`ir.h:179-183`), and `ir_link()`
+rewrites every op's `handler` word in place from a small integer op-id
+to the real machine address of that op's handler, once, right when the
+owning `IrProgram` is finished (`ib_finish`, `irbuild.c:384`). Every one
+of the five force-entry sites enters a thunk's body the exact same way,
+confirmed directly in the current code (`op_var_ref.S:77-91`, the
+`UNFORCED` branch):
+
+```asm
+movq ASNIX_IRPROG_OFF_POOL(%rcx), %r13   // r13 = POOL  (prog->pool)
+movq ASNIX_IRPROG_OFF_OPS(%rcx), %rsi    // rsi = IP    (prog->ops)
+movq ASNIX_THUNK_OFF_ENV(%rax), %rdi     // rdi = ENV   (thunk's captured scope)
+...
+movq (%rsi), %rax                        // rax = ops[0].handler
+jmp  *%rax                               // dispatch into whatever that handler is
+```
+
+`%rcx` here is "the clean prog pointer" -- the shared `IrProgram*`
+every dynamic `Thunk` cell at one static `OP_MK_THUNK` site points at
+(`ASNIX_THUNK_OFF_STATE`, M103). The final `movq (%rsi),%rax; jmp
+*%rax` does not care, and has never had to care, WHAT `ops[0].handler`
+actually is -- it is already a fully generic computed jump into
+whichever handler `ir_link` installed there. This is, by construction,
+already "the branch" the original design called for: the existing
+dispatch step itself distinguishes stub-vs-real with zero marginal
+cost, the same way it already distinguishes `OP_ADD` from `OP_CALL`
+from anything else.
+
+**So the entire mechanism is one new op and one new handler, nothing
+else.** Add `OP_LAZY_THUNK_BODY` to the `ir.h` enum and
+`asnix_handler_table` (`dispatch_table.c`) exactly like every other op.
+Its pool entry (`b` = pool index, same convention `OP_MK_THUNK`/
+`OP_PUSH_CONST` already use) holds one pointer: a `LazyThunkDescriptor*`
+(new struct, `ir.h` or a new small header) with four fields:
+
+```c
+typedef struct LazyThunkDescriptor {
+    IrProgram *self;       /* the SAME shared IrProgram this stub's own
+                             * OP_MK_THUNK pool entry points at -- this is
+                             * exactly what gets mutated in place on
+                             * upgrade. Sibling of ASNIX_THUNK_OFF_STATE's
+                             * pointer, not a new indirection. */
+    Ast *body;              /* the deferred subtree -- see the lifetime
+                             * sections below for why this is safe to
+                             * still be valid when this fires */
+    ScopeFrame *scope;       /* persisted (arena-owned, not C-stack) copy
+                             * of the scope chain compile_expr would have
+                             * been called with */
+    const char *file_path;   /* g_compile_file_path at defer time */
+    const char *base_dir;    /* g_compile_base_dir at defer time */
+} LazyThunkDescriptor;
+```
+
+A stub program is built through the EXISTING `IrBuilder` pipeline,
+unchanged -- no hand-rolled `IrProgram` construction, no separate
+`ir_link` call to remember:
+
+```c
+IrBuilder *stub_b = ib_new();
+LazyThunkDescriptor *desc = /* allocate + fill, see above */;
+size_t pool_idx = ib_pool_add(stub_b, (int64_t)(intptr_t)desc);
+ib_emit(stub_b, OP_LAZY_THUNK_BODY, 0, (int64_t)pool_idx);
+IrProgram *stub_prog = ib_finish(stub_b);   /* runs ir_link() on this 1-op
+                                             * array exactly like any other
+                                             * program -- nothing special */
+desc->self = stub_prog;                     /* self-reference, set once */
+ib_mk_thunk(b, stub_prog);                  /* unchanged -- ib_mk_thunk
+                                             * already just pool-adds
+                                             * whatever IrProgram* it's
+                                             * handed */
+```
+
+The new handler, `asnix_op_lazy_thunk_body` (`src/asm/ops/
+op_lazy_thunk_body.S`, picked up automatically by the Makefile's
+existing `$(wildcard src/asm/ops/*.S)`), is entered with exactly the
+same register state every other op handler is entered with (`%rsi` =
+this stub's own 1-op `ops` array, `%r13` = this stub's own 1-entry
+`pool`, `%rdi`/`%r12`/`%r14` = the calling thunk's ENV / the live
+VALSTACK / the live RETSP, all already correctly set up by whichever of
+the five force-sites got here -- a RETFRAME pointing back to the real
+caller, with `force_target` set to the `Thunk*`, was ALSO already
+pushed by that site before the jump, exactly as for any other thunk
+body). Mirroring the existing save/restore convention every other
+C-calling op handler already uses (`op_mk_thunk.S:14-15`, `docs/
+abi.md`'s "Calls to `asnix_arena_alloc`" section: push IP/ENV, call,
+pop):
+
+```asm
+asnix_op_lazy_thunk_body:
+    movl  ASNIX_IROP_OFF_B(%rsi), %ecx
+    movq  (%r13, %rcx, 8), %rdi      // rdi = LazyThunkDescriptor*
+    pushq %rsi                        // save IP (dead anyway, but mirror
+    pushq %rdi                        // the project's 2-push convention)
+    call  asnix_compile_lazy_thunk_body   // C bridge, see below -- returns
+                                            // the SAME IrProgram* (desc->self),
+                                            // now upgraded in place
+    popq  %rdi                        // restored (unused below, but keeps
+    popq  %rsi                        // the stack-discipline identical to
+                                       // every other call site)
+    movq  %rax, %rcx                  // rcx = desc->self, now carrying REAL
+                                       // ops/pool
+    movq  ASNIX_IRPROG_OFF_POOL(%rcx), %r13
+    movq  ASNIX_IRPROG_OFF_OPS(%rcx), %rsi
+    movq  (%rsi), %rax
+    jmp   *%rax                       // fall into the real first op, in
+                                       // the SAME dispatch context -- no
+                                       // asnix_apply, no new RETFRAME
+```
+
+This is the exact property M187's own "Conclusion" section asked for: a
+real fix "would need an inline trampoline reusing the ALREADY-active
+dispatch context instead of an out-of-line `asnix_apply` call." Here
+that trampoline falls out for free, because unlike the `callPackage`
+fusion (which had to turn stored *data* -- a path and an override
+attrset -- into a live function application, a genuinely different
+runtime shape needing `asnix_apply`'s general call machinery), this
+stub upgrades into the literal SAME `IrProgram` an eager compile would
+have produced on day one. There is no semantic gap to bridge at
+force-time, only a compile call that happens to run late -- so falling
+through is just "keep running this thunk's body," identical in shape to
+every other force in the interpreter, not a new kind of control
+transfer.
+
+**The C bridge**, `asnix_compile_lazy_thunk_body` (`compiler.c`, new,
+small):
+
+```c
+IrProgram *asnix_compile_lazy_thunk_body(LazyThunkDescriptor *desc) {
+    const char *saved_base_dir = g_compile_base_dir;
+    const char *saved_file_path = g_compile_file_path;
+    g_compile_base_dir = desc->base_dir;
+    g_compile_file_path = desc->file_path;
+
+    IrBuilder *b = ib_new();
+    compile_expr(b, desc->body, desc->scope);
+    ib_ret(b);
+    IrProgram *real = ib_finish(b);
+
+    g_compile_base_dir = saved_base_dir;
+    g_compile_file_path = saved_file_path;
+
+    desc->self->ops = real->ops;    /* mutate the SHARED struct in place --
+    desc->self->pool = real->pool;   * every dynamic Thunk cell from this
+                                      * static site already points at
+                                      * desc->self, never at `real` */
+    free(real);                      /* the 16-byte IrProgram wrapper
+                                      * ib_finish handed back is now
+                                      * redundant -- its two fields were
+                                      * copied out, desc->self IS the
+                                      * permanent record */
+    return desc->self;
+}
+```
+
+Grepping `compiler.c` confirms `g_compile_base_dir`/`g_compile_file_path`
+(lines 34/40) are the ONLY two file-scope mutable globals `compile_expr`
+depends on beyond its explicit `IrBuilder*`/`Ast*`/`ScopeFrame*`
+parameters -- so this save/restore pair is a complete fix for obstacle
+#2 from this doc's own "Real obstacles" section above (not a partial
+one), and `compile_expr`/`ib_new`/`ib_finish`/the symbol table are all
+ordinary, reentrant C functions with no other hidden call-scoped state
+that would make calling them mid-dispatch (nested inside an active
+`asnix_eval`, not from `eval_file.c`'s top-level driver) unsafe. The
+bridge touches only compile-time bookkeeping (`malloc`-backed `IrOp`/
+pool arrays) -- it never touches the runtime `Env`/`Value` arena, so
+there is no reentrancy hazard with the live dispatch loop it is called
+from.
+
+One honest residual to verify, not yet done: whether the opt-in
+`ASNIX_IR_OPT=1` pass pipeline (`irpass_run`, invoked unconditionally
+inside `ib_finish`) tolerates a 1-op/1-pool-entry program whose single
+op is an id none of the existing passes recognize. Expected to be inert
+(every pass scans for its own specific op shapes and should simply find
+none), but this is a "confirm, don't assume" item for whoever
+implements this, not a design risk.
+
+## A third lifetime hazard: `src`, the raw source-text buffer
+
+This doc's original "Real obstacles" section named two: M109/M110's
+Ast-arena freeing, and `ScopeFrame`'s C-stack lifetime. Reading
+`docs/architecture.md`'s M115 section directly (not assumed from this
+doc's own earlier framing) found a third, real one neither this doc nor
+the task that commissioned this pass had named:
+
+**`Ast` string fields point directly into the file's raw source buffer,
+not into independently-owned memory.** M115's own comment states this
+explicitly: `AstBinding.name`/`AstFormal.name` (and, by the same
+mechanism, `AstVar.name`, string-literal/path-literal text, `AST_SELECT`
+`attr` fields, etc.) are byte-range pointers into `src`, the `char*`
+`read_file` returns -- never copied out. M115 made this buffer's
+lifetime explicit and tied it to exactly one `asnix_compile`/
+`asnix_compile_scoped` call, freeing it right after (the same point
+M109/M110 resets the `Ast` arena), after measuring the pre-M115 leak at
+**~24.41 MB of logical bytes summed across the real `d.nix`/ffmpeg
+closure's ~1,057 imported files**.
+
+This means persisting the `Ast` NODES of a deferred subtree (fixing
+hazard #1) and persisting the `ScopeFrame` STRUCTS of its scope chain
+(fixing hazard #2) is not sufficient on its own: every name/string field
+either structure holds is still a dangling pointer into a buffer M115
+already frees at the exact same moment. Any design that stops at "keep
+the nodes and frames alive" has a latent use-after-free baked in,
+invisible until a real multi-file eval reuses the freed `src` buffer's
+address for something else (the same "never hit the tiny fixture suite,
+only the real workload" shape M109/M110's own prior bug had, per that
+section's post-mortem) -- a sharp reminder that `git grep`ing this
+doc's own two named obstacles is not the same as re-deriving them
+against the CURRENT code.
+
+**Two fix candidates, and why one is clearly better for this specific
+workload:**
+
+1. *Extend `src`'s own lifetime* whenever at least one still-unupgraded
+   stub might reference it. Simple (no byte-copying needed, since
+   existing Ast nodes already just alias into `src` as-is), but far too
+   coarse: a single deferred attrset field anywhere in a file keeps that
+   file's ENTIRE source buffer alive, and virtually every real nixpkgs
+   file has at least one attrset literal. This would give back close to
+   the FULL ~24.41 MB M115 measured saving, for nearly all 1,057 files
+   in the real closure -- not a marginal cost, a near-total reversal of
+   an already-shipped, already-measured win. Rejected.
+2. *Deep-copy only the referenced bytes*, at the exact same parse-time
+   moment hazard #1's own fix (below) redirects node allocation -- i.e.
+   whenever the parser is building a name/string/path field while
+   "inside a deferred subtree," copy the underlying bytes into the same
+   persistent store instead of aliasing `src`. Bounded by the actual
+   identifier/string-literal content length of just the deferred
+   subtrees, not by whole-file size -- a small, measurable fraction of
+   the ~24.41 MB figure, not comparable to it. Recommended.
+
+Candidate 2 needs one new small helper (`deferred_strdup_or_alias` or
+similar) and touches every `parser.c` construction site that currently
+captures a `cur(p).start`-based substring destined for a long-lived
+`Ast` field (plausibly on the same order as the "46 real construction
+sites" M188 already enumerated for a related reason, `asnix_ast_new_at`'s
+`src_pos` threading) -- real, bounded surface area, not a single-line
+fix, and exactly the kind of multi-site mechanical change this pass's
+own conclusion judges worth a dedicated follow-up rather than a
+same-shot patch.
+
+## Lifetime mechanism: redirect allocation at parse time, don't deep-copy at compile time
+
+Two ways to keep a deferred subtree's `Ast` nodes alive past M109/M110's
+per-file arena reset were considered:
+
+- **(A) Deep-copy the subtree at the moment `compile_expr` decides to
+  defer it** (walk `bind->value`'s already-parsed tree, reallocate each
+  node into a long-lived arena).
+- **(B) Redirect `asnix_ast_new`'s allocation target at PARSE time**,
+  for exactly the dynamic extent of parsing one attrset binding's value
+  expression, via a single global flag (the same pattern
+  `g_compile_base_dir`/`g_compile_file_path` already use for
+  call-scoped state) toggled around the relevant `parse_expr` call(s)
+  inside `parse_binding_stmt` -- which is shared, unchanged, by both
+  `let` and attrset-literal parsing today, so the toggle happens only at
+  the attrset-literal call sites, never at the `let` one.
+
+**(B) is the right choice, and the reason is central to this whole
+proposal's own stated goal, not a minor implementation preference.**
+(A) walks and reallocates the ENTIRE subtree of EVERY attrset field,
+unconditionally, the moment `compile_expr` reaches it -- which is
+exactly the ~91%-never-forced population this proposal exists to stop
+doing eager work for. A node-shaped deep copy is cheaper per byte than
+full IR compilation, but it is still `O(subtree size)` eager work paid
+for every field whether or not it is ever forced, which only shrinks
+the wasted-work problem, not eliminates it. (B) costs nothing extra:
+the parser already walks every node exactly once to build it in the
+first place; redirecting WHERE that one, already-necessary allocation
+lands is free. The same reasoning applies to the string-copy fix for
+hazard #3 above -- copy the bytes once, during the parse that was going
+to touch them anyway, never a second pass.
+
+**Nesting is handled correctly by construction, not by a special case.**
+The toggle flag should be saved and restored around the one call (not
+force-set/force-cleared), so an attrset literal nested inside another
+deferred field's value stays deferred into the SAME persistent arena --
+consistent with the fact that forcing the outer field's stub will need
+to recursively compile the inner one too, exactly mirroring how eager
+`compile_expr` already recurses into nested attrset literals today with
+no extra plumbing. `compile_expr`'s own `AST_ATTRSET` case applies the
+"defer this field's value" rule locally and unconditionally wherever it
+fires, including on a subtree reached via a now-deferred compile call --
+so recursive deferral falls out of the existing code structure, not a
+new mechanism.
+
+**Scope of what gets redirected.** The flag's dynamic extent is "while
+parsing one binding's value inside `parse_binding_stmt`," which, because
+that function is shared with `inherit`-sugar and attrpath-sugar
+handling, also harmlessly over-retains a few already-eagerly-consumed
+nodes (a dynamic key's own `${expr}`, an `inherit (expr) ...;` clause's
+shared `src_expr`) in the persistent arena instead of the per-file one.
+This is a correctness no-op (compiler.c still compiles those parts
+eagerly, exactly as today, regardless of which arena their nodes
+happen to sit in) and a small, bounded memory cost, not the dominant
+one -- a later refinement could narrow the toggle to only the exact
+value sub-`parse_expr` call if this noise turns out to matter, but
+measuring the DOMINANT cost (the field-value subtrees themselves) first
+is the right order of operations.
+
+**`ScopeFrame` persistence is a separate, smaller step on top of (B).**
+`ScopeFrame` itself is never parser-owned (it's built by `compiler.c`,
+not `parser.c`), so it needs its own explicit persist step, run once at
+the exact point `compile_expr`'s `AST_ATTRSET` case decides to defer a
+field instead of calling `ib_mk_thunk(b, ib_finish(thunk_b))` eagerly:
+
+```c
+/* new: deep-copies the chain (walking ->up), allocating each frame AND
+ * a fresh copy of its names[]/name_lens[] arrays from a dedicated,
+ * non-resettable arena -- critically, copying the STRING BYTES each
+ * name points to as well (hazard #3), not just aliasing the Ast-owned
+ * pointer, since the enclosing attrset literal node that currently owns
+ * those bytes is not necessarily itself part of the deferred subtree
+ * and will NOT survive M109/M110's ordinary per-file reset. */
+ScopeFrame *scope_frame_persist(ScopeFrame *stack_scope);
+```
+
+This chain is short (bounded by real lexical nesting depth, not by
+file size) and each frame small, so this step's absolute cost should be
+negligible relative to the Ast-retention cost above -- but it is still
+a real, currently-unmeasured allocation that should be counted in the
+same measurement pass, not assumed free.
+
+## Sizing the new retention cost -- the single most important thing to measure before building this
+
+This proposal's core trade is: stop compiling ~1.93M IR ops (M180) that
+are thrown away anyway, in exchange for keeping SOME amount of `Ast`
+memory (plus now, per hazard #3, some `src`-buffer bytes, plus
+`ScopeFrame` copies) alive for the ~90.7% of deferred thunks that never
+force, for the rest of the process -- memory M109/M110/M115 each
+already measured as a real, deliberate win to free promptly. This is
+exactly the kind of trade-off this project has now hit twice this
+session already (the IrOp-compaction lookup-table question, and M187's
+own declined `callPackage` fusion): an instruction-count win that can
+hide a memory cost an instructions-only measurement would never catch.
+
+**What is already known, as bounds, not as the answer:**
+- M110 measured freeing the WHOLE file's `Ast` tree (every node, not
+  just attrset-field values) at **~6.2% peak RSS** on `d.nix`/ffmpeg
+  (736,920 KB -> 691,780 KB, ~45 MB). The attrset-field-value-only
+  subset this proposal would keep alive is a FRACTION of that whole
+  tree's node count/bytes -- bounded above by ~45 MB, but the real
+  fraction is unmeasured. M180's own framing text ("forcing one package
+  forces compilation of every sibling binding in the same file (let/
+  attrset scope)") suggests attrset fields plausibly dominate the
+  469,859-thunk-body population by count, which would push this
+  fraction toward the higher end of that bound, not the lower one --
+  a real, continuing to describe this as a wash would be hand-waving.
+- M115 measured freeing `src` buffers at **~24.41 MB** summed across the
+  real closure. Candidate 2 above (copy only referenced bytes) bounds
+  the new cost to a small multiple of total identifier/string-literal
+  byte length inside deferred subtrees specifically -- plausibly much
+  smaller than 24.41 MB, but again, not measured.
+- Against both of these: the ~1.93M-op compile-avoidance itself has its
+  own memory-side benefit not yet quantified either -- fewer `IrOp`/pool
+  arrays allocated means less `malloc` overhead/fragmentation on top of
+  the raw byte count, something M170's own `ib_finish`-shrink investigation
+  already showed matters in practice on this exact code path.
+
+**The concrete next step, before writing any of the asm/compiler.c
+changes above**: build ONLY the measurement half -- redirect parser.c's
+attrset-field-value `Ast` allocation into a separate, deliberately
+UN-resettable arena (exactly the mechanism recommended above, minus the
+actual `OP_LAZY_THUNK_BODY` opcode/compile-deferral machinery) and
+measure peak RSS on the real `d.nix`/ffmpeg eval with THAT alone,
+compared against current master. This isolates and directly answers
+"how much of M109/M110's ~45 MB win does deferral actually give back,"
+with no new opcode, no new dispatch-side risk, and no scope-correctness
+risk at all (the file still compiles every binding eagerly in the exact
+same order as today -- only WHICH arena temporarily holds some of the
+now-permanently-retained `Ast` nodes changes). If that number alone is
+already a wash or a regression against the ~1.93M-op savings' own
+(separately real, but partial) memory benefit, the general opcode is
+not worth building at all, and this proposal should say so plainly
+rather than proceeding on hope. If it is comfortably favorable, THEN
+the `OP_LAZY_THUNK_BODY` dispatch mechanism above (lower-risk, now fully
+specified, no `asnix_apply` cost) is the next real step, followed by the
+`src`-buffer byte-copy fix for hazard #3, in that order -- cheapest and
+most informative measurement first, highest-risk mechanical change last.
+
+## Four-stage plan, revised
+
+The original "Four-stage plan" above is superseded by this ordering,
+now that the mechanism and lifetime design are concrete:
+
+1. **Measure retention cost in isolation** (the `Ast`-arena-redirect-only
+   experiment just above) -- no opcode, no compiler.c change beyond the
+   arena redirect, answers the single open question that determines
+   whether anything further is worth building.
+2. **If favorable**: implement `OP_LAZY_THUNK_BODY` plus
+   `asnix_compile_lazy_thunk_body` exactly as specified above, behind a
+   build-time check (this project's standing discipline for fragile
+   layout/invariant changes, e.g. M188's variant-build precedent) --
+   deferring ONLY attrset field values (not let-bindings, list
+   elements, or call arguments, matching this doc's original scoping
+   rationale), with two targeted correctness tests: a known-dead
+   attrset field's body never runs `compile_expr` at all (instrument
+   and assert zero calls), and a field forced through two different
+   dynamic `Thunk` instances at the same static site compiles exactly
+   once (assert the second force sees `ops[0].handler` already real,
+   never re-enters the stub handler).
+3. **Fix hazard #3** (the `src`-buffer byte-copy, candidate 2 above) in
+   the same pass, not as a follow-up -- shipping without it is a latent
+   use-after-free, not a smaller, separately-landable milestone.
+4. **Measure for real** on the full `d.nix`/ffmpeg eval with interleaved
+   `perf stat` (instructions) AND `/usr/bin/time -v` (peak RSS), plus
+   the full verification ladder (`make test`, `make test-e2e` 300/300,
+   `make test-conformance`, `make test-nix-conformance` expecting
+   `pass=655 fail=3 skip=148`, `make test-nixpkgs-hash` expecting
+   `pass=148 fail=0`, and `./asnix d.nix`'s output hash unchanged) --
+   both numbers matter equally, per this session's own repeated lesson
+   that one without the other is not a real result.
