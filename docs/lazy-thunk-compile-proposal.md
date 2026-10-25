@@ -610,6 +610,71 @@ specified, no `asnix_apply` cost) is the next real step, followed by the
 `src`-buffer byte-copy fix for hazard #3, in that order -- cheapest and
 most informative measurement first, highest-risk mechanical change last.
 
+### Stage 1 measured: real, not comfortably favorable -- stopping here, not proceeding to stage 2 unauthorized
+
+Built exactly the measurement-only experiment above: `ast.c` gained a
+second, parallel chunk list (`g_ast_retained_chunks`) that
+`asnix_ast_arena_reset()` never frees, plus a toggle
+(`asnix_ast_enter_retained`/`asnix_ast_leave_retained`, nested-safe --
+returns/restores the previous state rather than hard-coding on/off, so
+an attrset literal nested inside another already-redirected value stays
+redirected). `parser.c`'s `parse_binding_stmt` became a thin wrapper
+(`parse_binding_stmt_inner` holds the original unchanged body) that
+toggles redirection on exactly when `dyn_out != NULL` -- this file's own
+existing signal for "this is an attrset literal, not a `let` block" (the
+3 attrset-literal call sites pass `&dyn`; the 1 `let` call site passes
+`NULL` specifically to reject dynamic attrs). No opcode, no compiler.c
+change, no scope-correctness change at all -- every binding still
+compiles eagerly, in the same order, by the same code; only which chunk
+list physically holds the nodes differs.
+
+**Correctness**: `make test`, `make test-e2e` (300/300),
+`make test-nix-conformance` (`pass=655 fail=3 skip=148`, same 3 known
+pre-existing failures), `make test-nixpkgs-hash` (`pass=148 fail=0`),
+`./asnix d.nix` output hash unchanged -- confirming this redirect-only
+change is behaviorally invisible, as designed.
+
+**Measured** (`/usr/bin/time -v`, 3 interleaved trials, real
+`d.nix`/ffmpeg eval, against a from-scratch baseline built at this
+proposal's own design-doc-extension commit):
+
+| | peak RSS |
+|---|---|
+| before (no redirect) | 511,808 KB (avg) |
+| after (attrset-field-value `Ast` retained) | 539,146.7 KB (avg) |
+| delta | **+5.34%** (+27,338.7 KB, ~+26.7 MB) |
+
+This is a real, non-trivial retention cost -- roughly the same order of
+magnitude as the naive memory-avoidance estimate for skipping 1.93M
+`IrOp` array allocations alone (1.93M x 16 bytes/op, post-M169, is
+~31 MB), meaning the memory side of this trade is genuinely AMBIGUOUS
+on this number alone, not "comfortably favorable" the way this
+section's own decision rule requires before proceeding to stage 2. It
+is also not a clean regression that kills the idea outright (the two
+numbers are close enough that a real net memory effect, once the
+`IrOp`-array avoidance is also accounted for, could land either way).
+
+**Decision: stopping at stage 1, not proceeding to build
+`OP_LAZY_THUNK_BODY` in the same pass.** This isolated number alone
+cannot settle the ship/no-ship call -- that requires the INSTRUCTION
+side of the trade (the primary, larger motivation: avoiding ~1.93M
+wasted IR-op compiles, likely several percent of total eval
+instructions), which only the real stub mechanism from stage 2 can
+produce. Building stage 2 -- a new opcode, a C bridge mutating a shared
+`IrProgram` in place, hooking into all 5 force-entry sites' existing
+dispatch, plus the `src`-buffer byte-copy fix for hazard #3 -- is
+exactly the kind of correctness-sensitive, multi-file mechanical change
+this proposal's own prior sections already judged needs its own
+dedicated pass, not a tack-on once stage 1's number turned out
+ambiguous rather than clearly favorable. Recorded here as the real
+answer to "how much does deferral cost in isolation," per this
+section's own stated purpose -- the next step is building stage 2 for
+real, as its own dedicated pass, to get the instruction-side number
+this ambiguous memory result makes necessary before any ship decision.
+
+No code landed on master -- the arena-redirect experiment lives on its
+own disposable worktree/branch (`lazythunk-impl-7bde`), not merged.
+
 ## Four-stage plan, revised
 
 The original "Four-stage plan" above is superseded by this ordering,
