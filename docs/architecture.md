@@ -21551,3 +21551,123 @@ unchanged; diff touches only `src/c/irdump.c`.
 
 Files: `src/c/irdump.c` (`dump_program`'s row-prefix `printf` format
 string, `SNIPPET_CAP`).
+
+## M194: investigated extending M184's span-authority trick to `builtins.split`'s `nsub==0` path -- declined, real yield too small to matter
+
+Direct follow-up to M184's own explicit scope cut (see that section's
+last paragraph): could `split2_impl`'s `nsub == 0` branch (plain,
+capture-group-free patterns -- the one case M184 deliberately left on
+the unmodified `regexec()`-driven loop) safely adopt the same tri-state
+verify-then-trust scheme M184 built for `match`? Investigated in three
+parts -- real nixpkgs usage, the actual safety argument (tested
+adversarially against real `nix-instantiate`, not just reasoned about),
+and real dynamic profiling on this project's own `d.nix`/ffmpeg
+benchmark -- before writing any production code.
+
+**Part 1: real nixpkgs usage, quantified.** `grep -rn 'builtins\.split\b'`
+across a live nixpkgs checkout finds exactly 24 distinct direct call
+sites (not counting the dominant indirect path, `lib.strings.
+splitString`/`splitStringBy`, ~290 + ~21 call sites respectively --
+`splitStringBy` doesn't even use `builtins.split` at all, a pure
+character-walking loop, and `splitString` always calls `escapeRegex` on
+its separator first, i.e. by construction every pattern it ever passes
+to `builtins.split` is `nsub==0` AND metacharacter-free). Of the 24
+direct sites, classifying each pattern by capture-group count and
+top-level-alternation: 13 are `nsub==0` plain literals (`-`, `/`, `:`,
+`\.`, `\{}`, `\n`), 2 are `nsub==0` character classes/quantifiers with
+no alternation (`[[:alpha:]]+`, `[^a-zA-Z0-9_.\-]+`), 1 is `nsub==0`
+with trivial single-character top-level alternation (`" |\t"`, FreeBSD's
+`lib/default.nix` -- a 1-char-vs-1-char alternative, no repetition
+adjacency at all), and the remaining 8 all have at least one capture
+group (`(.*)(T.*)`, `([A-Z0-9]+)`, `https://([^/]*)(/?.*)`, etc.) and
+are therefore already on M68's unconditional full-custom-engine route,
+untouched by this question. **Zero of the 24 real call sites combine
+`nsub==0` with the specific repetition-adjacent-to-alternation shape
+M184's writeup worried about** -- confirming (with real grep data, not
+just trusting M184's own prose) that "real nixpkgs split usage is
+overwhelmingly literal" was accurate.
+
+**Part 2: is the specific risk even constructible for `nsub==0`
+patterns?** M184's own worked counterexample for `nsub>0` (`(x*)(xy)?`
+on `"xy"`: libstdc++ commits `x*` to its greedy max and never backtracks
+it to let the optional `(xy)?` match more, giving 3 fragmented matches
+where POSIX/glibc would find one 2-character match) fundamentally needs
+a *multi-character optional component* -- and POSIX ERE's quantifier
+suffixes (`?`/`*`/`{m,n}`) only ever attach to a single atom (one
+ordinary character, `.`, a bracket expression, or a parenthesized
+group). There is no ERE syntax for "optional 2+-character literal"
+without wrapping it in `(...)`, which by definition makes it a capture
+group (`nsub>0`, already on M68's unconditional route). The only other
+way to introduce branching without parentheses is top-level alternation
+`A|B` -- tested this adversarially against real `nix-instantiate`
+instead of assuming it extends the same way:
+
+```
+split "x*xy|x*" "xxy"            -> ["",[],"",[],""]   (2 matches, longest-wins)
+split "x+xy|x+" "xxy"             -> ["",[],""]          (1 match, full 3 chars)
+split "x*xyz|x*xy|x*" "xxyz"      -> ["",[],"",[],""]
+split "a{2,}ab|a{2,}" "aaab"      -> ["",[],""]          (1 match, full 4 chars -- a{2,} backtracks 3->2 to let "ab" fit)
+split "[ab]*ab|[ab]*" "aabb"      -> ["",[],"",[],""]
+split "a|aa" "aaa"  vs  "aa|a" "aaa" -> IDENTICAL (both pick "aa", the longer alternative, regardless of which is written first)
+```
+
+Every one agrees with plain POSIX leftmost-longest (the longer
+alternative wins outright, same as glibc would give), not the
+ordered-first-wins behavior quirk 1 documented for `match`. This isn't
+a coincidence: `regex_engine.c`'s own search-mode `RN_ALT` handling
+(`asnix_regex_search`, confirmed by reading the code directly --
+"explore every branch to completion, keep whichever reaches furthest")
+was already built by M68 specifically to reproduce this, and the
+`a|aa`-vs-`aa|a` pair directly confirms libstdc++'s *unanchored* search
+does the same (unlike `match`'s anchored quirk-1 case, where a
+downstream capture-group requirement forces a specific decomposition
+regardless of length -- no such forcing exists for a bare top-level
+alternation with nothing after it). **Conclusion: for genuinely
+`nsub==0` patterns, the specific span-divergence mechanism M184 flagged
+as the hard, unbounded risk appears to be structurally impossible in
+POSIX ERE syntax**, not just empirically rare -- a sharper result than
+M184's own cautious "COULD plausibly extend... but harder to bound."
+The *other* residual risk M184 kept for `match` (plain parser bugs in
+`regex_engine.c`'s own grammar, orthogonal to ambiguity) still applies
+here unchanged, and would still need the same verify-N-times tri-state
+discipline, not an unconditional switch.
+
+**Part 3: real dynamic yield, measured directly (not estimated).**
+Temporary instrumentation in `split2_impl`'s `nsub==0` loop (per-
+distinct-pattern call/regexec counters, reverted before this commit --
+no source changed) run against the real `d.nix`/ffmpeg eval found
+**exactly 5 distinct patterns** ever reach this branch over the whole
+closure: `-`, ` `, `:`, `/`, `\.` -- 460 `split` calls, 589 total
+`regexec()` invocations, **zero of them anything but a single-character
+literal**. No alternation, no character class, no quantifier is
+dynamically exercised at all in this project's own canonical benchmark.
+`perf record` (`cpu_core/instructions/`, `-c 150000`, `--call-graph
+dwarf,4096`, `taskset -c 0`) on the current (post-M184) binary shows
+combined regex-family glibc self-time (`regexec`+`re_search_internal`+
+`re_acquire_state`+`sift_states_backward`) at **~0.13% of total
+instructions**, shared between `split`'s entire `nsub==0` loop (589
+calls, all trivial 1-byte-literal DFA executions -- already near the
+cheapest possible `regexec` invocation, nothing like a backtracking
+search to skip) and `match`'s own residual verification-window calls.
+Even a hypothetically free elimination of 100% of `split`'s share of
+that 0.13% would be far below M184's own already-marginal -0.547%
+instructions win for `match` (which needed 6 interleaved trials to
+measure confidently above this shared machine's noise floor, and
+benefited from richer, non-literal patterns like `mirror://([a-z]+)/
+(.*)` that `split`'s real `nsub==0` usage here never contains).
+
+**Conclusion: declined.** Not because the safety story doesn't bound --
+it turns out to bound *more* cleanly than M184 feared, for the specific
+`nsub==0` subset -- but because the real yield on real nixpkgs usage,
+confirmed both statically (grep) and dynamically (instrumented profiling
+on the real benchmark), is bounded by a fraction of an already-tiny
+~0.13% ceiling, concentrated entirely in trivial single-character
+literal patterns where `regexec` is already near its cheapest possible
+execution. Implementing the tri-state verify-then-trust machinery (a
+second cache field, sequence-level comparison instead of a single
+boolean, a new test battery mirroring `test_regex_span_authoritative.c`)
+would add real, permanent complexity for a win that would not be
+measurable above this shared machine's own run-to-run noise. No source
+files changed; `src/c/builtins_regex.c` stays exactly as M184 left it.
+
+Files: `docs/architecture.md` only (no source changed).
