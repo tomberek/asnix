@@ -1113,17 +1113,54 @@ static Token lex_normal(Lexer *lx) {
  * `iets`'s own `Lexer::next_token` dispatch (~/gnix/iets/src/syntax/
  * lexer.rs), minus its separate-functions-called-directly-by-the-parser
  * detail (asnix keeps every token, including string/path content chunks,
- * flowing through this single entry point instead, unchanged from M135). */
+ * flowing through this single entry point instead, unchanged from M135).
+ *
+ * M194: the mode compare below now tests MODE_NORMAL FIRST, not last.
+ * A follow-up candidate flagged by M182/M183's own investigation was
+ * porting iets's structure literally -- having `parser.c` call
+ * `lex_normal`/`lex_dquote_run`/`lex_indented_run`/`lex_path_run`
+ * directly at each call site, bypassing this dispatcher for the
+ * overwhelming majority of calls. Investigated and found NOT safely
+ * portable as-is: iets's parser (~/gnix/iets/src/syntax/parser.rs)
+ * keeps `tok`/`next` as LAZY `Option<Token>` slots, only calling
+ * `next_token()` on demand (`peek()`'s `None` branch) -- its
+ * `parse_string_parts`/`parse_ind_string` both `debug_assert!(self.tok.
+ * is_none() && self.next.is_none())` on entry specifically because nothing
+ * has pre-fetched past the opening delimiter yet. asnix's `Parser.tok`/
+ * `.next` (parser.c, M181) are the opposite: an EAGERLY always-full
+ * 2-slot buffer, refilled unconditionally by every `advance()` --
+ * exactly the design M181 built, and measured as a major win, specifically
+ * so `cur()`/`peek2()` could be plain field reads with zero calls into
+ * lexer.c at all. Because of that, by the time `parser.c` ever "knows"
+ * it's about to read string/path content, the lookahead slot for it has
+ * ALREADY been fetched through this same generic dispatcher one
+ * `advance()` call earlier -- there is no call site in `parser.c` where
+ * skipping this dispatcher doesn't also mean re-deriving, per call site,
+ * which of the 4 lexer step functions that fetch is secretly going to
+ * need (a correctness-sensitive, whole-file audit of every `advance()`/
+ * `expect()` site, the exact kind of change this file's own fragility
+ * history -- 9+ prior milestones -- argues against for an estimated
+ * ~0.2-0.3% win). What IS safe and captures the same flagged cost without
+ * touching `parser.c`, the pending-slot convention, or the eager-lookahead
+ * invariant at all: `mode_top(lx) == MODE_NORMAL` is true for the
+ * overwhelming majority of real tokens (string/path literal content is a
+ * small minority of any real Nix file) yet was tested LAST, after two
+ * guaranteed-false compares against MODE_STRING/MODE_ISTRING on every
+ * single ordinary token. Reordering to test it first turns the common
+ * case into exactly one compare instead of three, with the mode-stack
+ * semantics, pending-buffer contract, and every byte of per-mode scanning
+ * logic completely unchanged -- a pure dispatch-order fix, not a
+ * structural one. */
 Token lexer_next(Lexer *lx) {
     if (lx->has_pending) {
         lx->has_pending = 0;
         return lx->pending;
     }
     LexMode mode = mode_top(lx);
+    if (mode == MODE_NORMAL) return lex_normal(lx);
     if (mode == MODE_STRING) return lex_dquote_run(lx);
     if (mode == MODE_ISTRING) return lex_indented_run(lx);
-    if (mode == MODE_PATH) return lex_path_run(lx);
-    return lex_normal(lx);
+    return lex_path_run(lx);
 }
 
 Lexer *lexer_new(const char *src) {

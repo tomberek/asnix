@@ -21671,3 +21671,133 @@ measurable above this shared machine's own run-to-run noise. No source
 files changed; `src/c/builtins_regex.c` stays exactly as M184 left it.
 
 Files: `docs/architecture.md` only (no source changed).
+
+## M195: `lexer_next`'s per-token mode dispatch now tests the common case (`MODE_NORMAL`) first -- the literal iets-style multi-entry-point port investigated and found unsafe, a narrower equivalent landed instead
+
+A follow-up candidate flagged by M182's own profiling pass (never
+measured, only estimated at ~0.2-0.3% of total instructions): `iets`
+(`~/gnix/iets/src/syntax/lexer.rs`) avoids mode-dispatch overhead
+entirely for its dominant case because its *parser*
+(`~/gnix/iets/src/syntax/parser.rs`) calls different lexer methods
+directly depending on grammar context -- `next_token()` for ordinary
+code, `lex_str_chunk`/`lex_ind_chunk`/`lex_path_part` (called only from
+`parse_string_parts`/`parse_ind_string`/`parse_path`) for string/
+indented-string/path content -- rather than funneling every token
+through one mode-checking entry point the way asnix's `lexer_next()`
+(M175/M181) does.
+
+**Investigated: is the literal port safe?** Read `iets`'s parser in
+full alongside asnix's `parser.c` (M181). The two designs differ at a
+load-bearing point, not a superficial one. `iets`'s `Parser.tok`/`.next`
+are LAZY `Option<Token>` slots -- `peek()` only calls `next_token()` on
+its `None` branch, and `bump()` just sets `self.tok = None` rather than
+eagerly refilling it. Its `parse_string_parts`/`parse_ind_string` both
+open with `debug_assert!(self.tok.is_none() && self.next.is_none())`,
+documenting exactly why the direct-call design works: nothing has
+pre-fetched past the opening delimiter yet, so calling
+`lex_str_chunk`/`lex_ind_chunk` directly, with the lexer's own cursor
+sitting right where the parser left it, is unambiguous.
+
+asnix's `Parser.tok`/`.next` (M181) are the opposite: an EAGERLY
+always-full 2-slot buffer, unconditionally refilled by every
+`advance()` call via one `lexer_next(p->lx)`. That design is not
+incidental -- it's the specific thing M181 built, and measured as a
+major win (-5.315% instructions), precisely so `cur()`/`peek2()` could
+become plain `Parser` field reads with zero calls into `lexer.c` at
+all, "only `advance()` ever calls `lexer_next()`... no cross-TU-
+inlining concern". Because of that eager invariant, by the time any
+code in `parser.c` "knows" it's about to read string/path content
+(`cur(p).kind == TOK_STR_START`, etc.), the lookahead slot needed for
+that read has ALREADY been fetched one `advance()` call earlier,
+generically, through this same dispatcher -- there is no point in
+`parser.c` where skipping the dispatcher doesn't also require correctly
+guessing, per call site, which of the 4 step functions that particular
+fetch secretly needs. That guess is derivable (every mode-stack push/
+pop in `lexer.c` is well-formed-by-construction, so which of
+`lex_normal`/`lex_dquote_run`/`lex_indented_run`/`lex_path_run` a given
+`advance()`/`expect()` call site's OWN internal fetch will land on is
+in principle a static fact about that call site), but extracting it
+correctly means auditing every `advance()`/`expect()` site in a 2099-
+line file this project's own history treats as fragile (9+ milestones:
+M129/130/135/138/141/147/158/176/177/181/183) -- a large, correctness-
+sensitive restructuring in service of a ~0.2-0.3% ESTIMATED win that was
+never actually measured. **Verdict: the literal port is not attempted.**
+Not because it's impossible, but because the actual cost it targets has
+a strictly smaller, equally-correct fix available (below), and this
+project's own M135/M166/M156/M163/M192/M187 precedents are to decline a
+large, fragile change once a smaller one captures the same real cost.
+
+**The actual cost, and the safe equivalent that captures it.** The
+cost iets's design avoids isn't "a multi-entry-point parser" as such --
+it's that asnix's `lexer_next()` pays a `has_pending` check PLUS up to
+3 mode comparisons (`MODE_STRING`, `MODE_ISTRING`, `MODE_PATH`, in that
+order, falling through to `lex_normal` only once all three fail) on
+EVERY call, even though `MODE_NORMAL` -- tested LAST, as the implicit
+"none of the above" case -- is the mode for the overwhelming majority
+of real tokens (string/path literal content is a small minority of any
+real Nix file's token stream). Reordering the compare to test
+`MODE_NORMAL` first turns the common case into exactly ONE comparison
+instead of three guaranteed-false ones, with the mode-stack semantics,
+the pending-buffer contract, and every byte of per-mode scanning logic
+completely unchanged -- a pure dispatch-ORDER fix, zero risk to any of
+the invariants M177/M181's own writeups document (`.cur` mirror,
+`lexer_save`/`lexer_restore`'s re-sync of it, the pending-token
+unconditional-pair convention). No `parser.c` change at all.
+
+```c
+Token lexer_next(Lexer *lx) {
+    if (lx->has_pending) { lx->has_pending = 0; return lx->pending; }
+    LexMode mode = mode_top(lx);
+    if (mode == MODE_NORMAL) return lex_normal(lx);   /* was tested last */
+    if (mode == MODE_STRING) return lex_dquote_run(lx);
+    if (mode == MODE_ISTRING) return lex_indented_run(lx);
+    return lex_path_run(lx);                           /* was MODE_PATH, tested 3rd */
+}
+```
+
+**Correctness.** Full ladder green: `make test` (all unit/asm/ir/c
+tests), `make test-e2e` (300/300, zero `FAIL`), `make test-conformance`
+(all `OK`). `make test-nix-conformance NIX_CONFORMANCE_DIR=/tmp/nix-
+conformance`: exact baseline match, `pass=655 fail=3 skip=148` (same 3
+pre-existing position-tracking gaps: `eval-okay-getattrpos-
+functionargs.nix`, `eval-okay-getattrpos.nix`, `eval-okay-inherit-attr-
+pos.nix`). `make test-nixpkgs-hash`: `pass=148 fail=0`. `./asnix d.nix`
+output hash unchanged (`/nix/store/29iacg6h530yx7rxz4k1fhvi0kxxhsam-
+ffmpeg-9.0.1-bin`, checked on every one of the 12 trials below, zero
+mismatches).
+
+**Measured** (`perf stat -e cpu_core/instructions/,cpu_core/cycles/`,
+`taskset -c 0`, 12 interleaved trials (before,after,before,after,...)
+on the real cold `d.nix`/ffmpeg eval, from-scratch baseline binary
+built at the exact parent commit (`e6c974b`, M193) in a separate git
+worktree):
+
+| | instructions | cycles |
+|---|---|---|
+| before (M193 baseline) | 5,436,259,983 (avg) | 3,308,733,287 (avg) |
+| after (M195) | 5,429,844,264 (avg) | 3,319,343,674 (avg) |
+| delta | **-0.118%** (~6.4M instructions) | +0.32% (noise) |
+| wins | 12/12, completely non-overlapping ranges | 5/12 |
+
+Instructions: completely non-overlapping across all 12 pairs (every
+BEFORE trial 5,434.4M-5,438.6M, every AFTER trial 5,429.1M-5,431.3M) --
+small but real and repetition-independent. Cycles are the expected
+noisy, non-confirming signal on this shared machine (this project's
+own established "trust instructions over cycles" rule, M154/M181/M182);
+not a concern given the instruction-count signal's cleanliness.
+
+**Honest sizing.** This is roughly HALF of M182/M183's own ~0.2-0.3%
+estimate for the full port, which makes sense: the estimate was for
+eliminating the `has_pending` check AND all 3 mode compares (every
+`advance()` call becoming a direct, dispatch-free call into exactly the
+right step function); this fix only eliminates 2 of the 3 compares for
+the common case, keeping the `has_pending` check and one `MODE_NORMAL`
+compare on every call. The remaining gap is real but, per the
+investigation above, not safely closeable without the large `parser.c`
+restructuring this milestone declined. A real, small, fully-verified
+win -- landed as the right-sized capture of a candidate that was
+flagged as an estimate and is now, for the first time, actually
+measured.
+
+Files: `src/c/lexer.c` (`lexer_next`'s mode-compare order only; no
+other line changed).
