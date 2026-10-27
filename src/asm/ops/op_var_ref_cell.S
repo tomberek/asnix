@@ -7,6 +7,21 @@
 // the point, and forcing would defeat it (e.g. `let x = [x]; in x`'s
 // list element would blackhole instead of lazily aliasing `x`'s own
 // not-yet-finished binding).
+//
+// M-skip-cell: `ll`'s own op_var_ref.c carries a "skip the Cell when the
+// slot is already populated and not a function" fast path (same idea,
+// with a compile-time ScopeFrame.has_overrides gate in compiler.c for a
+// `rec{}` __overrides hazard, plus a runtime Closure/PrimOp tag check
+// for an `==`-identity hazard -- see that file's own long comment for
+// both). Measured HERE specifically (callgrind, matched -O3) it is a
+// net LOSS, not a win: +1.47% instructions on ffmpeg-full, reproducible
+// across repeated runs -- the extra tag-check branches cost more in
+// this hand-tuned dispatch than the avoided allocation saves, the
+// opposite of `ll`'s own clang-compiled result. Deliberately NOT
+// ported here; this file stays exactly the original always-build-Cell
+// version. (compiler.c's has_overrides gate stays harmless either way
+// -- a no-op difference without this op's own fast path to protect --
+// kept for frontend parity with `ll`, not because asnix needs it.)
 #include "asnix/env.h"
 #include "asnix/ir.h"
 #include "asnix/stackcheck.h"
