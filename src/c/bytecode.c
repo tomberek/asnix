@@ -375,6 +375,31 @@ static size_t program_op_count(IrProgram *prog) {
     for (; n < 10000000; n++) {
         int op_id = handler_to_op_id(prog->ops[n].handler);
         if (op_id < 0) return (size_t)-1;
+        /* Lazy-thunk-compile experiment (compiler.h's own comment on
+         * asnix_lazy_thunk_enabled): an un-upgraded stub IrProgram's
+         * ONLY op is OP_LAZY_THUNK_BODY, with no OP_RET/OP_HALT
+         * terminator after it (the stub is meant to be upgraded IN
+         * PLACE on first force, replacing its own ops/pool with the
+         * real compiled body's -- it's never meant to run to
+         * completion as-is). Without this check, this loop would walk
+         * straight off the end of the stub's real 1-entry ops array
+         * into whatever memory happens to follow it -- undefined
+         * behavior that, before this fix, happened to usually (not
+         * reliably) return a safe "unknown op" failure purely because
+         * garbage bytes read as a handler pointer rarely match a real
+         * table entry, not because of any actual bounds check. Explicit
+         * refusal here is the correct fix regardless: this format has
+         * no representation at all for a LazyThunkDescriptor's cross-
+         * process state (its `body`/`scope` are compile-time-only Ast/
+         * ScopeFrame pointers, meaningless in a process that didn't
+         * build them) -- caching a file containing an unresolved stub
+         * was never going to work, this just makes that refusal
+         * explicit and bounded instead of an accidental out-of-bounds
+         * read. Same observable outcome as before (asnix_bytecode_
+         * cache_store's own documented "refused -- skip caching"
+         * contract, see that function's own comment), now via a real
+         * check instead of relying on garbage memory not matching. */
+        if (op_id == OP_LAZY_THUNK_BODY) return (size_t)-1;
         if (op_id == OP_HALT || op_id == OP_RET) return n + 1;
     }
     return (size_t)-1;
