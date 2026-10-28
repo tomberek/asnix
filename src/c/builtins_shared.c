@@ -301,6 +301,62 @@ Value asnix_bshared_attrs_resolve(Value v) {
 
     int64_t nleaves = -count;
     const Value *leaves = (const Value *)(base + ASNIX_ATTRS_UNION_OFF_LEAVES);
+
+    /* M-big-leaf-merge: a plain BALANCED pairwise tree (below) pays for a
+     * disproportionately large leaf's own size at EVERY tree level (up to
+     * log2(ASNIX_ATTRS_UNION_MAX_LEAVES)=6 times for a 64-leaf union),
+     * not once -- real nixpkgs's classic `foldl' (acc: x: acc // x) {}
+     * bigList` anti-pattern produces exactly this shape: leaves[0] is
+     * always the ever-growing accumulator (asnix_attrs_update's
+     * make_union_header always appends the NEW leaf after the EXISTING
+     * ones, so the oldest/biggest leaf is always leftmost), while
+     * leaves[1..] are single-entry leaves from each fold step. Confirmed
+     * super-linear growth measuring this exact shape (instructions grew
+     * 6.58x then 10.68x for each 4x increase in N=2000/8000/32000) --
+     * caused by this materialize step being paid for repeatedly as the
+     * 64-leaf cap keeps getting hit against an ever-larger base (see
+     * attrs_update.c's own ASNIX_ATTRS_UNION_MAX_LEAVES comment for that
+     * part of the story), with THIS function's own log2(64)-times
+     * overpayment as a real, independent multiplier on top.
+     *
+     * Special case: if the biggest leaf alone outweighs every other leaf
+     * combined, merge the small leaves together first (cheap bottom-up
+     * tree, since they're small) into one combined leaf, then do exactly
+     * ONE direct 2-way merge of (big leaf, combined-small-leaves) --
+     * O(big_size) paid once, not O(big_size * log2(nleaves)). Correctness:
+     * restricted to leaves[0] specifically (not "whichever leaf happens
+     * to be biggest") because that's the ONLY position construction
+     * guarantees is safe to special-case here -- asnix_attrs_eager_merge's
+     * right-biased collision rule (rhs always wins) needs the big leaf on
+     * the lhs and everything newer-and-combined on the rhs, which is only
+     * guaranteed correct when the big leaf is the OLDEST (lowest-
+     * priority) one, i.e. leaves[0]. The small-leaves-merge below reuses
+     * the exact same bottom-up pairwise algorithm on leaves[1..] alone,
+     * so their own relative priority order (newest-of-the-rest wins) is
+     * preserved exactly as it would be by the unmodified code path. */
+    if (nleaves >= 3) {
+        int64_t leaf0_count = *(const int64_t *)((leaves[0].raw & ~(uint64_t)0x7ULL) + ASNIX_ATTRS_OFF_COUNT);
+        int64_t rest_count = 0;
+        for (int64_t i = 1; i < nleaves; i++) {
+            rest_count += *(const int64_t *)((leaves[i].raw & ~(uint64_t)0x7ULL) + ASNIX_ATTRS_OFF_COUNT);
+        }
+        if (leaf0_count > rest_count) {
+            Value rest_work[ASNIX_ATTRS_UNION_MAX_LEAVES];
+            for (int64_t i = 1; i < nleaves; i++) rest_work[i - 1] = leaves[i];
+            int64_t rn = nleaves - 1;
+            while (rn > 1) {
+                int64_t out_n = 0;
+                int64_t i = 0;
+                for (; i + 1 < rn; i += 2) rest_work[out_n++] = asnix_attrs_eager_merge(rest_work[i], rest_work[i + 1]);
+                if (i < rn) rest_work[out_n++] = rest_work[i];
+                rn = out_n;
+            }
+            Value acc = asnix_attrs_eager_merge(leaves[0], rest_work[0]);
+            *(Value *)((char *)base + ASNIX_ATTRS_UNION_OFF_FLATCACHE) = acc;
+            return acc;
+        }
+    }
+
     /* Leaves are guaranteed flat by construction (asnix_attrs_update,
      * attrs_update.c, always resolves a would-be leaf before storing it).
      *
@@ -321,7 +377,9 @@ Value asnix_bshared_attrs_resolve(Value v) {
      * more-recently-layered, higher-priority side, since `leaves` is
      * stored lowest-priority-first) as the winning operand, and pairing
      * adjacent elements bottom-up preserves that same relative priority
-     * order all the way up the tree. */
+     * order all the way up the tree. This is the FALLBACK path for every
+     * shape the big-leaf special case above doesn't cover (no leaf
+     * dominates, or fewer than 3 leaves). */
     Value work[ASNIX_ATTRS_UNION_MAX_LEAVES];
     for (int64_t i = 0; i < nleaves; i++) work[i] = leaves[i];
     int64_t n = nleaves;
