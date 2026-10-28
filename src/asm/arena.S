@@ -7,6 +7,7 @@
     .equ ASNIX_SYS_MMAP,       9
     .equ ASNIX_SYS_MADVISE,    28
     .equ ASNIX_MADV_HUGEPAGE,  14
+    .equ ASNIX_MADV_POPULATE_WRITE, 23
     .equ ASNIX_PROT_READ,      0x1
     .equ ASNIX_PROT_WRITE,     0x2
     .equ ASNIX_MAP_PRIVATE,    0x02
@@ -106,18 +107,32 @@ asnix_arena_alloc:                      // void *asnix_arena_alloc(uint64_t n)
     jl .Labort_mmap                      // raw syscall error: rax = -errno (always negative)
 
     popq %r8                             // r8 = chunk_size (pushed before the mmap syscall)
+    // asnix_huge_pages_available() -- gate BOTH madvise calls below on
+    // this: transparent_hugepage/defrag=madvise (confirmed via /sys)
+    // means a huge page the kernel has no free block for gets built by
+    // DIRECT (synchronous) compaction in this thread -- the fragmented-
+    // box regression iets's own sys/linux.rs documents hitting (read
+    // directly, not guessed). hugepage_check.c checks /proc/buddyinfo
+    // once and caches the answer -- the one C dependency these asm
+    // files carry, kept to this single narrow helper. rax/r8 (new_chunk,
+    // chunk_size) are caller-saved and must survive the call.
+    pushq %rax
+    pushq %r8
+    call asnix_huge_pages_available
+    popq %r8
+    popq %rax
+    testl %eax, %eax
+    jz .Lno_hugepage_hint                // kernel has no free 2 MiB+ blocks -- skip both hints
+
     // madvise(new_chunk, chunk_size, MADV_HUGEPAGE) -- hint only, return
-    // value ignored: this kernel's transparent_hugepage/enabled is
-    // "madvise", not "always" (confirmed via /sys), so ASNIX_ARENA_CHUNK_
-    // SIZE's own 2 MiB chunks -- exactly one x86-64 huge page -- silently
-    // stay 512 separate 4 KiB pages, each its own minor page fault on
-    // first touch, unless explicitly hinted here. A real, measured
-    // contributor to this evaluator's much higher page-fault count vs
-    // iets (every single heap object funnels through this one bump
-    // allocator). Failure (no THP support at all) just forgoes the
-    // speedup, never a correctness problem, so the return value is never
-    // checked. rax currently holds new_chunk (the mmap result); both it
-    // and chunk_size (r8) must survive the syscall's own clobbers.
+    // value ignored: without it, ASNIX_ARENA_CHUNK_SIZE's own 2 MiB
+    // chunks -- exactly one x86-64 huge page -- silently stay 512
+    // separate 4 KiB pages, each its own minor page fault on first
+    // touch. A real, measured contributor to this evaluator's much
+    // higher page-fault count vs iets (every single heap object funnels
+    // through this one bump allocator). rax currently holds new_chunk
+    // (the mmap result); both it and chunk_size (r8) must survive the
+    // syscall's own clobbers.
     pushq %rax
     pushq %r8
     movq %rax, %rdi
@@ -125,9 +140,29 @@ asnix_arena_alloc:                      // void *asnix_arena_alloc(uint64_t n)
     movq $ASNIX_MADV_HUGEPAGE, %rdx
     movq $ASNIX_SYS_MADVISE, %rax
     syscall
+
+    // madvise(new_chunk, chunk_size, MADV_POPULATE_WRITE) -- the hint
+    // above is not enough on its own: huge-page promotion for a
+    // MADV_HUGEPAGE region under defrag=madvise is attempted lazily,
+    // one 4 KiB fault at a time as the bump cursor advances -- unreliable
+    // for actually landing a huge page. Eagerly populating the WHOLE
+    // chunk now, in one syscall, gives the kernel the full 2 MiB extent
+    // up front instead of discovering it fault-by-fault, which is what
+    // actually makes promotion land reliably. Still hint-only (return
+    // value ignored). An earlier UNGATED attempt at this measured a
+    // real net loss on this repo specifically (+40% task-clock,
+    // reverted) -- retried here now that it's properly gated on actual
+    // free-block availability, since the ungated regression may well
+    // have BEEN exactly the fragmented-box compaction cost this gate
+    // exists to avoid; re-measure independently before trusting either
+    // result. %rdi/%rsi are already new_chunk/chunk_size from above.
+    movq $ASNIX_MADV_POPULATE_WRITE, %rdx
+    movq $ASNIX_SYS_MADVISE, %rax
+    syscall
     popq %r8                             // restore chunk_size
     popq %rax                            // restore new_chunk pointer
 
+.Lno_hugepage_hint:
     leaq asnix_arena(%rip), %rcx
     leaq (%rax, %r8), %rdx
     movq %rdx, ASNIX_ARENA_OFF_END(%rcx) // end = new_chunk + chunk_size
