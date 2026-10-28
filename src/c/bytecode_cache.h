@@ -112,29 +112,67 @@ IrProgram *asnix_bytecode_cache_lookup_verify(const char *resolved_path, const c
 void asnix_bytecode_cache_store(const char *resolved_path, const char *source, size_t source_len, int64_t mtime_sec,
                                  int64_t mtime_nsec, int64_t size, IrProgram *prog);
 
-/* M92: opt-in background prefetch -- ASNIX_BYTECODE_PRODUCER=1 (on top
- * of ASNIX_BYTECODE_CACHE=1, which it requires) scans a freshly parsed
- * AST for statically-literal `import "<path>"`-shaped call targets not
- * already cached, and fork()s one child process per discovery to
- * compile-and-cache each in the background while the parent continues
- * evaluating. Deliberately a forked PROCESS, not a pthread: the global
- * arena (asnix_arena, src/asm/arena.S) and symbol table (symtab.c) have
- * no synchronization at all, and retrofitting that safely was judged
- * out of scope for this pass (see docs/architecture.md's M92 notes) --
- * fork()'s copy-on-write address-space duplication gives the same
- * "separate core, separate L1/L2 pointer-chasing, dedicated parser"
- * property the threading hypothesis wants, with zero risk of the parent
- * and child's compile-time allocators racing, since after fork() they
- * are simply two independent processes that happen to share no mutable
- * state at all. The child writes its result to the same on-disk cache
- * asnix_bytecode_cache_store would, then exits; the parent only ever
- * reads that cache through the ordinary asnix_bytecode_cache_lookup
- * path, so there is no cross-process pointer handoff of any kind.
+/* M-io_uring-pool: opt-in background prefetch -- ASNIX_BYTECODE_PRODUCER=1
+ * (on top of ASNIX_BYTECODE_CACHE=1, which it requires) scans a freshly
+ * parsed AST for statically-literal `import "<path>"`-shaped call targets
+ * not already cached, and dispatches each discovery to a PERSISTENT pool
+ * of worker processes (bytecode_cache.c, forked ONCE, lazily, on first
+ * call -- never per file) to compile-and-cache each in the background
+ * while the parent continues evaluating.
+ *
+ * Supersedes the original M92 design, which forked a fresh one-shot
+ * child PROCESS per discovered import and reaped it with waitpid() --
+ * correct, but its setup/teardown cost (fork + eventual waitpid, one
+ * full process lifecycle) scaled with the NUMBER OF FILES, capped at
+ * MAX_OUTSTANDING=64 concurrent children for exactly that reason. This
+ * design instead forks a small, FIXED-size pool once; teardown is one
+ * waitpid() per pool worker at process exit, not per file.
+ *
+ * Still deliberately PROCESSES, not pthreads, for the same reason M92
+ * gave: the global arena (asnix_arena, src/asm/arena.S) and symbol table
+ * (symtab.c) have no synchronization at all, and retrofitting that
+ * safely remains out of scope. Each worker's own arena/symtab diverges
+ * independently after the pool's one-time fork, same as M92's children
+ * did -- this is provably safe because bytecode.c's own (de)serialize
+ * format already stores every symbol BY NAME and re-interns on load
+ * (confirmed directly: bytecode.c's reader calls asnix_intern on every
+ * name it reads), so a worker's own locally-assigned symbol ids never
+ * need to mean anything to any other process, including the consumer.
+ *
+ * Within each worker, I/O now overlaps with compute: each worker runs
+ * its own small io_uring instance (set up once, for its whole process
+ * lifetime -- see bytecode_cache.c's worker_main) and keeps up to a
+ * handful of already-opened files' reads in flight concurrently, so
+ * while it's lexing/parsing/compiling one file, the kernel is already
+ * reading the next few for that same worker -- real overlap of I/O wait
+ * and CPU work, not just the old design's "N processes happen to run on
+ * N cores" parallelism (which this design keeps too, across the small
+ * fixed worker count). A completed io_uring read hands its buffer
+ * straight to asnix_prefetch_compile_and_cache_buf below, skipping a
+ * second, redundant synchronous read of the same bytes.
+ *
+ * The child writes its result to the same on-disk cache
+ * asnix_bytecode_cache_store would, then loops for the next job (never
+ * exits, until the pool is torn down at process exit); the parent only
+ * ever reads that cache through the ordinary asnix_bytecode_cache_lookup
+ * path, so there is still no cross-process pointer handoff of any kind.
  * No-op (does nothing, returns immediately) unless both env vars are
  * set. Safe to call on every parsed file; internally no-ops on anything
  * that isn't a plain, already-cached-checked, statically-resolvable
  * import target. */
 void asnix_bytecode_prefetch_imports(Ast *root, const char *base_dir);
+
+/* M-io_uring-pool: variant of asnix_prefetch_compile_and_cache (below)
+ * that takes already-read source bytes instead of reading `path` itself
+ * -- used by the prefetch pool's worker_main once its own io_uring read
+ * has already pulled the bytes into a buffer, so the worker doesn't pay
+ * a second, redundant synchronous read for the same file. `src` must be
+ * NUL-terminated at `src_len` (same convention read_file() itself
+ * produces); ownership of `src` stays with the caller (a worker reuses a
+ * fixed buffer slot across jobs rather than allocating fresh per call),
+ * this function only frees its own internally-resolved path/dir strings.
+ * Exported by eval_file.c, same as asnix_prefetch_compile_and_cache. */
+void asnix_prefetch_compile_and_cache_buf(const char *path, const char *src, size_t src_len);
 
 /* Waits for (reaps) any outstanding prefetch children this process
  * started whose target path matches `resolved_path` -- called right

@@ -4,6 +4,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -13,6 +14,8 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+#include <liburing.h>
 
 #include "ast.h"
 #include "bytecode.h"
@@ -433,25 +436,380 @@ void asnix_bytecode_cache_store(const char *resolved_path, const char *source, s
 }
 
 /* ---------------------------------------------------------------------
- * M92: fork-based prefetch producer -- see bytecode_cache.h's own
- * header comment for why this is a process, not a thread.
+ * M-io_uring-pool: persistent-pool prefetch producer, superseding M92's
+ * fork-one-child-per-file design. See bytecode_cache.h's own header
+ * comment on asnix_bytecode_prefetch_imports for the full rationale
+ * (still processes, not threads, for the same shared-arena/symtab
+ * reason M92 gave; still safe across independently-diverging per-
+ * process symbol tables, now confirmed via bytecode.c's by-name
+ * serialize/re-intern-on-load format) and worker_main below for how
+ * io_uring is used inside each worker.
+ *
+ * IPC shape: one job pipe per worker (main -> that worker only) plus
+ * one SHARED "done" pipe (every worker -> main), each message a
+ * uint32_t length prefix followed by that many path bytes, capped well
+ * under PIPE_BUF (4096) so POSIX guarantees a single write() of one
+ * whole message is atomic -- concurrent workers writing to the shared
+ * done pipe can never interleave mid-message, so no locking is needed
+ * on that pipe despite multiple writers.
  * --------------------------------------------------------------------- */
-#define MAX_OUTSTANDING 64
-typedef struct {
-    char *path;
-    pid_t pid;
-} Outstanding;
-static Outstanding g_outstanding[MAX_OUTSTANDING];
+/* M-recursive-prefetch: raised from M92's original 64 -- that cap
+ * bounded CONCURRENT CHILD PROCESSES there (one per outstanding path);
+ * here it only bounds how many distinct paths this dedup table tracks
+ * at once, which is far cheaper (a strdup'd pointer, not a process),
+ * and recursive discovery (a worker's own compile step finding MORE
+ * imports, see g_is_worker's comment below) can legitimately have far
+ * more than 64 distinct files in flight across a real nixpkgs closure
+ * (eval_file.c's own M65 comment cites 1057 distinct files on one real
+ * ffmpeg eval). Hitting this cap is still always just a missed
+ * prefetch opportunity, never a correctness issue. */
+#define MAX_OUTSTANDING 256
+#define ASNIX_PREFETCH_WORKERS 3
+#define ASNIX_PREFETCH_MSG_MAX 4000
+#define ASNIX_PREFETCH_INFLIGHT 4
+#define ASNIX_PREFETCH_READ_BUF (256 * 1024)
+#define ASNIX_PREFETCH_RING_DEPTH 8
+
+static char *g_outstanding[MAX_OUTSTANDING];
 static int g_outstanding_count = 0;
+
+/* Set once at the top of worker_main (never in the main process) --
+ * tells walk_for_imports which half of the recursive-prefetch protocol
+ * it's running: the MAIN process dispatches a discovered target
+ * directly to a worker's job pipe (prefetch_dispatch below); a WORKER
+ * process has no authoritative view of g_outstanding (its own copy is
+ * a stale snapshot from fork time) and no other worker's job-pipe fd at
+ * all (closed at fork, see ensure_pool's cleanup loop) -- so it instead
+ * reports the discovery back to the one process that does, over the
+ * same done pipe it already uses for completion signaling, tagged 'F'
+ * (found) instead of 'D' (done). This is how recursive prefetch (a
+ * file a worker just compiled can itself import more files) reaches
+ * the shared queue without any new cross-worker IPC. */
+static int g_is_worker = 0;
+static int g_worker_done_wfd = -1;
 
 /* Exported by eval_file.c -- resolves, reads, lexes, parses, and
  * compiles `path` exactly like asnix_eval_file would, then stores the
  * result via asnix_bytecode_cache_store, all self-contained there since
  * eval_file.c already has every static helper this needs in scope. Does
- * nothing (silently) on any failure -- a prefetch child that can't
- * compile its target just exits having cached nothing, identical to
- * never having been forked at all from the consumer's point of view. */
+ * nothing (silently) on any failure -- a prefetch job that can't
+ * compile its target just finishes having cached nothing, identical to
+ * never having been dispatched at all from the consumer's point of
+ * view. asnix_prefetch_compile_and_cache_buf (bytecode_cache.h) is the
+ * variant worker_main uses when it already has the bytes in hand from
+ * its own io_uring read. */
 void asnix_prefetch_compile_and_cache(const char *path);
+void asnix_prefetch_compile_and_cache_buf(const char *path, const char *src, size_t src_len);
+
+/* Length-prefixed message helpers shared by the job and done pipes --
+ * see this section's header comment for the atomicity argument that
+ * makes these safe with no locking across multiple writer processes. */
+static int prefetch_read_exact(int fd, void *buf, size_t n) {
+    size_t got = 0;
+    while (got < n) {
+        ssize_t r = read(fd, (char *)buf + got, n - got);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            return 0;
+        }
+        if (r == 0) return 0; /* EOF */
+        got += (size_t)r;
+    }
+    return 1;
+}
+
+static int prefetch_read_message(int fd, char *out, size_t cap) {
+    uint32_t len;
+    if (!prefetch_read_exact(fd, &len, sizeof len)) return 0;
+    if (len >= cap) return 0; /* malformed/oversized -- defensive, shouldn't happen */
+    if (!prefetch_read_exact(fd, out, len)) return 0;
+    out[len] = '\0';
+    return 1;
+}
+
+static int prefetch_write_message(int fd, const char *path) {
+    size_t len = strlen(path);
+    if (len >= ASNIX_PREFETCH_MSG_MAX - sizeof(uint32_t)) return 0; /* too long to fit one atomic write -- skip, same "a missed prefetch is always safe" rule as every other failure path here */
+    char buf[ASNIX_PREFETCH_MSG_MAX];
+    uint32_t len32 = (uint32_t)len;
+    memcpy(buf, &len32, sizeof len32);
+    memcpy(buf + sizeof len32, path, len);
+    ssize_t w = write(fd, buf, sizeof(len32) + len);
+    return w == (ssize_t)(sizeof(len32) + len);
+}
+
+/* Message wire format on the shared done pipe only: one tag byte ('D'
+ * done / 'F' found), then the same length-prefixed path
+ * prefetch_write_message/prefetch_read_message already produce for the
+ * (untagged -- always a job) job pipes. See g_is_worker's own comment
+ * below for why the done pipe carries both kinds. */
+static int prefetch_write_tagged(int fd, char tag, const char *path) {
+    size_t len = strlen(path);
+    if (len >= ASNIX_PREFETCH_MSG_MAX - sizeof(uint32_t) - 1) return 0;
+    char buf[ASNIX_PREFETCH_MSG_MAX];
+    buf[0] = tag;
+    uint32_t len32 = (uint32_t)len;
+    memcpy(buf + 1, &len32, sizeof len32);
+    memcpy(buf + 1 + sizeof len32, path, len);
+    size_t total = 1 + sizeof(len32) + len;
+    ssize_t w = write(fd, buf, total);
+    return w == (ssize_t)total;
+}
+
+static int prefetch_read_tagged(int fd, char *out_tag, char *out_path, size_t cap) {
+    char tag;
+    if (!prefetch_read_exact(fd, &tag, 1)) return 0;
+    uint32_t len;
+    if (!prefetch_read_exact(fd, &len, sizeof len)) return 0;
+    if (len >= cap) return 0;
+    if (!prefetch_read_exact(fd, out_path, len)) return 0;
+    out_path[len] = '\0';
+    *out_tag = tag;
+    return 1;
+}
+
+/* One persistent worker's main loop: owns ASNIX_PREFETCH_INFLIGHT
+ * reusable buffer slots and its own io_uring ring, set up once for its
+ * whole process lifetime (no per-file ring setup/teardown, unlike M92's
+ * per-file fork/waitpid). Pulls job paths from `job_rfd` (its own
+ * dedicated pipe), opens each synchronously (cheap; not the bottleneck
+ * -- see bytecode_cache.h's header comment), then overlaps the ACTUAL
+ * read with other queued files' compile work: it only blocks waiting
+ * for a new job when it truly has nothing else in flight, otherwise it
+ * tops up empty slots non-blockingly and keeps up to
+ * ASNIX_PREFETCH_INFLIGHT reads in the ring at once. A completed read's
+ * bytes go straight to asnix_prefetch_compile_and_cache_buf, skipping a
+ * second synchronous read of the same file. Falls back to the plain
+ * synchronous asnix_prefetch_compile_and_cache(path) whenever a read
+ * fails or hits the fixed buffer's cap (never silently truncates a
+ * larger-than-expected file) -- correctness-preserving, just forgoes
+ * the overlap for that one file. Exits (falls out of this function,
+ * caller does _exit(0)) once its job pipe hits EOF (the pool shutdown
+ * path closes every worker's write end) AND every in-flight slot has
+ * drained -- never leaves a read dangling. */
+static void worker_main(int job_rfd, int done_wfd) {
+    /* Must be set before the FIRST compile call below -- eval_file.c's
+     * prefetch_compile_and_store calls back into
+     * asnix_bytecode_prefetch_imports on every file it compiles (the
+     * recursive-prefetch extension), and walk_for_imports's own
+     * dispatch-vs-report branch reads g_is_worker to decide which half
+     * of the protocol applies. See g_is_worker's own comment above. */
+    g_is_worker = 1;
+    g_worker_done_wfd = done_wfd;
+
+    struct io_uring ring;
+    if (io_uring_queue_init(ASNIX_PREFETCH_RING_DEPTH, &ring, 0) != 0) {
+        /* io_uring unavailable (old kernel, seccomp, etc.) -- degrade to
+         * a plain synchronous per-job loop, still correct, just without
+         * the I/O-vs-compute overlap this pool exists to add. */
+        for (;;) {
+            char path[ASNIX_PREFETCH_MSG_MAX];
+            if (!prefetch_read_message(job_rfd, path, sizeof path)) break;
+            asnix_prefetch_compile_and_cache(path);
+            prefetch_write_tagged(done_wfd, 'D', path);
+        }
+        return;
+    }
+
+    char *bufs[ASNIX_PREFETCH_INFLIGHT];
+    for (int i = 0; i < ASNIX_PREFETCH_INFLIGHT; i++) bufs[i] = malloc(ASNIX_PREFETCH_READ_BUF);
+    struct {
+        char path[ASNIX_PREFETCH_MSG_MAX];
+        int fd;
+        int active;
+    } slots[ASNIX_PREFETCH_INFLIGHT];
+    for (int i = 0; i < ASNIX_PREFETCH_INFLIGHT; i++) slots[i].active = 0;
+    int eof_seen = 0;
+
+    for (;;) {
+        int any_active = 0;
+        for (int i = 0; i < ASNIX_PREFETCH_INFLIGHT; i++) if (slots[i].active) any_active = 1;
+
+        if (!eof_seen) {
+            for (int i = 0; i < ASNIX_PREFETCH_INFLIGHT; i++) {
+                if (slots[i].active) continue;
+                int must_block = !any_active;
+                if (!must_block) {
+                    struct pollfd pfd;
+                    pfd.fd = job_rfd;
+                    pfd.events = POLLIN;
+                    pfd.revents = 0;
+                    if (poll(&pfd, 1, 0) <= 0 || !(pfd.revents & POLLIN)) break; /* nothing more queued right now -- go process what we have */
+                }
+                if (!prefetch_read_message(job_rfd, slots[i].path, sizeof slots[i].path)) {
+                    eof_seen = 1;
+                    break;
+                }
+                int fd = open(slots[i].path, O_RDONLY);
+                if (fd < 0) continue; /* silently skip -- same semantics as every other failure path here */
+                struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+                if (!sqe) {
+                    /* Ring momentarily full (shouldn't happen --
+                     * ASNIX_PREFETCH_INFLIGHT < ASNIX_PREFETCH_RING_DEPTH
+                     * -- but handle it rather than assume): fall back
+                     * to a synchronous compile for this one file. */
+                    close(fd);
+                    asnix_prefetch_compile_and_cache(slots[i].path);
+                    prefetch_write_tagged(done_wfd, 'D', slots[i].path);
+                    continue;
+                }
+                io_uring_prep_read(sqe, fd, bufs[i], ASNIX_PREFETCH_READ_BUF, 0);
+                sqe->user_data = (uint64_t)i;
+                slots[i].fd = fd;
+                slots[i].active = 1;
+                any_active = 1;
+            }
+        }
+
+        if (!any_active) {
+            if (eof_seen) break;
+            continue; /* nothing in flight, not EOF yet -- loop back and block on the next job */
+        }
+
+        io_uring_submit(&ring);
+        struct io_uring_cqe *cqe;
+        if (io_uring_wait_cqe(&ring, &cqe) != 0) break;
+        do {
+            int i = (int)cqe->user_data;
+            long long res = cqe->res;
+            io_uring_cqe_seen(&ring, cqe);
+            close(slots[i].fd);
+            if (res < 0 || (size_t)res >= ASNIX_PREFETCH_READ_BUF) {
+                /* Read error, or hit the buffer cap -- the file may be
+                 * larger than ASNIX_PREFETCH_READ_BUF (rare for .nix
+                 * source, but never silently truncated): fall back to
+                 * the ordinary full resolve+read+parse+compile path,
+                 * which handles any size correctly. */
+                asnix_prefetch_compile_and_cache(slots[i].path);
+            } else {
+                bufs[i][res] = '\0';
+                asnix_prefetch_compile_and_cache_buf(slots[i].path, bufs[i], (size_t)res);
+            }
+            prefetch_write_tagged(done_wfd, 'D', slots[i].path);
+            slots[i].active = 0;
+        } while (io_uring_peek_cqe(&ring, &cqe) == 0);
+    }
+
+    for (int i = 0; i < ASNIX_PREFETCH_INFLIGHT; i++) free(bufs[i]);
+    io_uring_queue_exit(&ring);
+}
+
+/* Pool lifecycle: forked ONCE, lazily, on the first prefetch call --
+ * never per file. `g_pool_state`: 0 = not yet attempted, 1 = ready,
+ * -1 = setup failed (degrades to "prefetching does nothing", exactly
+ * like `prefetch_enabled()` being false from every caller's point of
+ * view -- never a hard failure). */
+static int g_pool_state = 0;
+static pid_t g_worker_pid[ASNIX_PREFETCH_WORKERS];
+static int g_job_wfd[ASNIX_PREFETCH_WORKERS];
+static int g_done_rfd = -1;
+static int g_rr = 0;
+
+static void prefetch_pool_shutdown(void) {
+    /* Teardown cost is O(ASNIX_PREFETCH_WORKERS), paid once at process
+     * exit -- not O(files), unlike M92's per-child waitpid(). Closing
+     * each worker's job-pipe write end signals EOF to that worker's
+     * blocking read, which drains any in-flight slots and exits
+     * cleanly (see worker_main's own EOF handling) before this
+     * waitpid() call returns. */
+    for (int i = 0; i < ASNIX_PREFETCH_WORKERS; i++) {
+        if (g_job_wfd[i] >= 0) {
+            close(g_job_wfd[i]);
+            g_job_wfd[i] = -1;
+        }
+    }
+    for (int i = 0; i < ASNIX_PREFETCH_WORKERS; i++) {
+        if (g_worker_pid[i] > 0) {
+            int status;
+            waitpid(g_worker_pid[i], &status, 0);
+            g_worker_pid[i] = -1;
+        }
+    }
+    if (g_done_rfd >= 0) {
+        close(g_done_rfd);
+        g_done_rfd = -1;
+    }
+}
+
+static void ensure_pool(void) {
+    if (g_pool_state != 0) return;
+    g_pool_state = -1; /* pessimistic default; flipped to 1 only on full success below */
+    int done_pipe[2];
+    if (pipe(done_pipe) != 0) return;
+    int job_pipe[ASNIX_PREFETCH_WORKERS][2];
+    for (int i = 0; i < ASNIX_PREFETCH_WORKERS; i++) {
+        if (pipe(job_pipe[i]) != 0) {
+            job_pipe[i][0] = -1;
+            job_pipe[i][1] = -1;
+        }
+    }
+    for (int i = 0; i < ASNIX_PREFETCH_WORKERS; i++) {
+        if (job_pipe[i][0] < 0) {
+            g_worker_pid[i] = -1;
+            g_job_wfd[i] = -1;
+            continue;
+        }
+        pid_t pid = fork();
+        if (pid == 0) {
+            /* Close every fd this worker doesn't need: every OTHER
+             * worker's job-pipe fds (inherited via fork, since each
+             * worker is created sequentially from a parent that still
+             * has all earlier pipes open), and the done pipe's read
+             * end (only the main process reads completions). */
+            for (int k = 0; k < ASNIX_PREFETCH_WORKERS; k++) {
+                if (k == i) {
+                    if (job_pipe[k][1] >= 0) close(job_pipe[k][1]);
+                } else {
+                    if (job_pipe[k][0] >= 0) close(job_pipe[k][0]);
+                    if (job_pipe[k][1] >= 0) close(job_pipe[k][1]);
+                }
+            }
+            close(done_pipe[0]);
+            worker_main(job_pipe[i][0], done_pipe[1]);
+            _exit(0);
+        } else if (pid > 0) {
+            close(job_pipe[i][0]);
+            g_job_wfd[i] = job_pipe[i][1];
+            g_worker_pid[i] = pid;
+        } else {
+            /* fork() failed (resource limits) -- run with fewer
+             * workers rather than failing the whole pool; still
+             * correct, just less parallel. */
+            close(job_pipe[i][0]);
+            close(job_pipe[i][1]);
+            g_job_wfd[i] = -1;
+            g_worker_pid[i] = -1;
+        }
+    }
+    close(done_pipe[1]);
+    g_done_rfd = done_pipe[0];
+    int any_worker = 0;
+    for (int i = 0; i < ASNIX_PREFETCH_WORKERS; i++) if (g_job_wfd[i] >= 0) any_worker = 1;
+    if (!any_worker) {
+        close(g_done_rfd);
+        g_done_rfd = -1;
+        return; /* every fork() failed -- stay disabled, g_pool_state left at -1 */
+    }
+    atexit(prefetch_pool_shutdown);
+    g_pool_state = 1;
+}
+
+static int prefetch_outstanding_contains(const char *path) {
+    for (int i = 0; i < g_outstanding_count; i++) {
+        if (strcmp(g_outstanding[i], path) == 0) return 1;
+    }
+    return 0;
+}
+
+static void prefetch_outstanding_remove(const char *path) {
+    for (int i = 0; i < g_outstanding_count; i++) {
+        if (strcmp(g_outstanding[i], path) == 0) {
+            free(g_outstanding[i]);
+            g_outstanding[i] = g_outstanding[--g_outstanding_count];
+            return;
+        }
+    }
+}
 
 static int resolve_literal_target(Ast *arg, const char *base_dir, char *out, size_t out_cap) {
     if (arg->kind != AST_PATH) return -1;
@@ -473,31 +831,141 @@ static int resolve_literal_target(Ast *arg, const char *base_dir, char *out, siz
     return (n > 0 && (size_t)n < out_cap) ? 0 : -1;
 }
 
+/* MAIN-process-only: try to send `target` to the next worker (round
+ * robin), recording it in g_outstanding on success. Shared by the
+ * top-level asnix_bytecode_prefetch_imports call (new top-level file)
+ * and the 'F' (found) message handler in asnix_bytecode_prefetch_wait
+ * below (a nested import discovered by a worker while compiling
+ * something else). Silently does nothing if already outstanding, the
+ * pool isn't ready, every worker's pipe is unusable, or the
+ * MAX_OUTSTANDING tracking cap is reached -- all "missed prefetch
+ * opportunity, never a correctness issue", same as every other
+ * best-effort path in this file. */
+static void prefetch_dispatch(const char *target) {
+    if (g_pool_state != 1) return;
+    if (g_outstanding_count >= MAX_OUTSTANDING) return;
+    if (prefetch_outstanding_contains(target)) return;
+    for (int tries = 0; tries < ASNIX_PREFETCH_WORKERS; tries++) {
+        int wi = (g_rr + tries) % ASNIX_PREFETCH_WORKERS;
+        if (g_job_wfd[wi] >= 0 && prefetch_write_message(g_job_wfd[wi], target)) {
+            g_rr = (wi + 1) % ASNIX_PREFETCH_WORKERS;
+            g_outstanding[g_outstanding_count++] = strdup(target);
+            return;
+        }
+    }
+}
+
+/* Walks `node` for literal `import "<path>"` call targets, exactly as
+ * M92's original version did (same conservative/shallow recursion --
+ * see the switch below), but the ACTION taken per discovery now
+ * depends on g_is_worker (see its own comment above): the main
+ * process dispatches directly (prefetch_dispatch); a worker reports
+ * the discovery back to main instead of dispatching itself. Called
+ * from two places: the main process's own asnix_bytecode_prefetch_imports
+ * (top-level file, or any file compiled synchronously on a cache miss),
+ * and -- this is the recursive-prefetch extension -- from INSIDE a
+ * worker's own compile step (eval_file.c's prefetch_compile_and_store
+ * calls this same asnix_bytecode_prefetch_imports entry point on every
+ * file it compiles, worker or not), so a file's own nested imports are
+ * discovered and queued the moment THAT file finishes compiling, not
+ * just once, one level deep, from the original top-level file -- this
+ * is what lets prefetch actually reach a module-system tree shaped
+ * like NixOS's module-list.nix (one file importing hundreds of others,
+ * many of which immediately import more). */
+/* M-race-fix: cheap freshness probe used to skip dispatching a target
+ * that's already fully, freshly cached -- avoids paying the IPC round
+ * trip (pipe write, worker wakeup, open, io_uring read, parse, compile,
+ * store, done message) for a file some EARLIER discovery already had
+ * compiled and stored. Found needed after broadening discovery
+ * (callPackage/import-lists) multiplied the number of speculative
+ * compile attempts far more than it multiplied real hits -- a target
+ * discovered from many different call sites (common for shared files
+ * like lib/default.nix, or for module-list.nix's own many entries once
+ * any one of them is already warm from a previous run) was getting
+ * redispatched on every single discovery, not just the first.
+ *
+ * Reuses the exact same on-disk format cache_file_path/mmap_whole_file/
+ * parse_header_from_buf already define for the real lookup path, but
+ * deliberately does NOT touch g_stat_hits/g_stat_misses (this is a
+ * dispatch-time probe, not a real cache lookup the user-visible
+ * ASNIX_BYTECODE_CACHE_STATS summary should count) and does NOT
+ * deserialize the body at all -- one stat() plus one small mmap/munmap
+ * of the cache entry's own header, both O(1) regardless of either
+ * file's size, versus the full compile this replaces when it fires. */
+static int prefetch_target_already_fresh(const char *target) {
+    struct stat st;
+    if (stat(target, &st) != 0) return 0; /* can't stat -- let the ordinary dispatch/consumer path handle it as before */
+    char *path = cache_file_path(target);
+    size_t total_len;
+    const uint8_t *map = mmap_whole_file(path, &total_len);
+    free(path);
+    if (!map) return 0;
+    CacheHeader hdr;
+    int fresh = 0;
+    if (parse_header_from_buf(map, total_len, &hdr) == 0) {
+        fresh = (hdr.mtime_sec == (int64_t)st.st_mtim.tv_sec && hdr.mtime_nsec == (int64_t)st.st_mtim.tv_nsec &&
+                 hdr.size == (int64_t)st.st_size);
+    }
+    munmap((void *)map, total_len);
+    return fresh;
+}
+
+/* Shared by every discovery site below (literal `import`, `callPackage`,
+ * and bare path-list elements): resolves `arg` against `base_dir` via
+ * resolve_literal_target and, if that succeeds, dispatches/reports it
+ * exactly like an ordinary `import` target. A no-op if `arg` isn't a
+ * literal path (same silent-skip convention resolve_literal_target
+ * already has), or if it's already freshly cached (prefetch_target_
+ * already_fresh above). Called from inside workers too (a worker's own
+ * compile step discovers its file's own nested imports the same way --
+ * see g_is_worker's comment), so this check also cuts down on redundant
+ * 'F' (found) reports flooding the shared done pipe, not just redundant
+ * dispatches in the main process. */
+static void try_prefetch_target(Ast *arg, const char *base_dir) {
+    char target[4096];
+    if (resolve_literal_target(arg, base_dir, target, sizeof target) != 0) return;
+    if (prefetch_target_already_fresh(target)) return;
+    if (g_is_worker) {
+        prefetch_write_tagged(g_worker_done_wfd, 'F', target);
+    } else {
+        prefetch_dispatch(target);
+    }
+}
+
 static void walk_for_imports(Ast *node, const char *base_dir) {
-    if (!node || g_outstanding_count >= MAX_OUTSTANDING) return;
-    if (node->kind == AST_APP && node->as.app.fn->kind == AST_VAR && node->as.app.fn->as.var.name_len == 6 &&
-        memcmp(node->as.app.fn->as.var.name, "import", 6) == 0) {
-        char target[4096];
-        if (resolve_literal_target(node->as.app.arg, base_dir, target, sizeof target) == 0) {
-            int already = 0;
-            for (int i = 0; i < g_outstanding_count; i++) {
-                if (strcmp(g_outstanding[i].path, target) == 0) already = 1;
-            }
-            if (!already) {
-                pid_t pid = fork();
-                if (pid == 0) {
-                    asnix_prefetch_compile_and_cache(target);
-                    _exit(0);
-                } else if (pid > 0) {
-                    g_outstanding[g_outstanding_count].path = strdup(target);
-                    g_outstanding[g_outstanding_count].pid = pid;
-                    g_outstanding_count++;
-                }
-                /* fork() < 0 (resource limits): silently skip prefetching
-                 * this one target -- the consumer's own ordinary
-                 * synchronous fallback covers it exactly as if
-                 * prefetching had never been attempted. */
-            }
+    if (!node) return;
+    if (node->kind == AST_APP) {
+        if (node->as.app.fn->kind == AST_VAR && node->as.app.fn->as.var.name_len == 6 &&
+            memcmp(node->as.app.fn->as.var.name, "import", 6) == 0) {
+            try_prefetch_target(node->as.app.arg, base_dir);
+        } else if (node->as.app.fn->kind == AST_APP) {
+            /* M-callpackage-detect: `callPackage path args` (or
+             * `scope.callPackage path args`) parses as TWO nested
+             * applications -- this outer one's own `fn` is the inner
+             * `callPackage path` application, and ITS `arg` is the
+             * literal path. callPackage's own real `import` call
+             * (lib/customisation.nix: `f = if isFunction fn then fn
+             * else import fn;`) happens inside a library function body
+             * the static walker never traces into -- without this
+             * explicit check, confirmed directly against real nixpkgs
+             * source, the ENTIRE callPackage-declared package tree
+             * (how nearly every package in nixpkgs is declared) would
+             * be completely invisible to prefetch, in both this design
+             * and M92's original. Matches the bare identifier
+             * "callPackage" (11 bytes) or a static `.callPackage`
+             * select off any target (`pkgs.callPackage`/
+             * `self.callPackage`/etc.) -- same best-effort philosophy
+             * as the plain `import` check above: a differently-named
+             * alias won't be caught, and that's an accepted miss, not
+             * a bug. */
+            Ast *inner_fn = node->as.app.fn->as.app.fn;
+            Ast *inner_arg = node->as.app.fn->as.app.arg;
+            int is_call_package =
+                (inner_fn->kind == AST_VAR && inner_fn->as.var.name_len == 11 &&
+                 memcmp(inner_fn->as.var.name, "callPackage", 11) == 0) ||
+                (inner_fn->kind == AST_SELECT && inner_fn->as.select.attr_expr == NULL &&
+                 inner_fn->as.select.attr_len == 11 && memcmp(inner_fn->as.select.attr, "callPackage", 11) == 0);
+            if (is_call_package) try_prefetch_target(inner_arg, base_dir);
         }
     }
     /* Recurse into every Ast* field that can itself contain a nested
@@ -524,7 +992,27 @@ static void walk_for_imports(Ast *node, const char *base_dir) {
             for (size_t i = 0; i < node->as.attrset.count; i++) walk_for_imports(node->as.attrset.bindings[i].value, base_dir);
             return;
         case AST_LIST:
-            for (size_t i = 0; i < node->as.list.count; i++) walk_for_imports(node->as.list.elems[i], base_dir);
+            /* M-modulelist-detect: nixos/modules/module-list.nix (and
+             * similarly-shaped files elsewhere) is a bare list of path
+             * literals (`[ ./a.nix ./b.nix ... ]`), never written as
+             * literal `import` calls -- each entry is imported later,
+             * deep inside NixOS's module-evaluation machinery
+             * (nixos/lib/modules.nix), invisible to this static walker
+             * otherwise. Confirmed directly against real nixpkgs
+             * source. Speculatively treat a bare path-literal list
+             * element as a prefetch target too: harmless even when
+             * wrong (a path that was never meant to be imported this
+             * way just fails to parse/compile in the worker's
+             * background attempt, same "any failure here is silently
+             * a no-op" guarantee every other prefetch target already
+             * has), and "a list made entirely of path literals" has no
+             * common real use in nixpkgs OTHER than this import-list
+             * idiom. */
+            for (size_t i = 0; i < node->as.list.count; i++) {
+                Ast *elem = node->as.list.elems[i];
+                if (elem->kind == AST_PATH) try_prefetch_target(elem, base_dir);
+                walk_for_imports(elem, base_dir);
+            }
             return;
         default:
             return; /* AST_VAR/AST_INT/.../AST_LAMBDA body etc: not followed --
@@ -534,31 +1022,65 @@ static void walk_for_imports(Ast *node, const char *base_dir) {
 
 void asnix_bytecode_prefetch_imports(Ast *root, const char *base_dir) {
     if (!prefetch_enabled()) return;
+    if (!g_is_worker) {
+        ensure_pool();
+        if (g_pool_state != 1) return;
+    }
     walk_for_imports(root, base_dir);
 }
 
-void asnix_bytecode_prefetch_wait(const char *resolved_path) {
-    if (!prefetch_enabled()) return;
-    for (int i = 0; i < g_outstanding_count; i++) {
-        if (strcmp(g_outstanding[i].path, resolved_path) == 0) {
-            int status;
-            waitpid(g_outstanding[i].pid, &status, 0);
-            free(g_outstanding[i].path);
-            g_outstanding[i] = g_outstanding[--g_outstanding_count];
-            return;
+/* Drains whatever's currently waiting on the shared done pipe WITHOUT
+ * blocking, handling both message kinds: 'D' (a dispatched job
+ * finished -- remove it from g_outstanding) and 'F' (a worker
+ * discovered a nested import while compiling something else -- route
+ * it through the exact same prefetch_dispatch a top-level discovery
+ * would use). If `want` is non-NULL and a 'D' message for it is seen,
+ * sets `*found`. Main-process-only (workers never read this fd -- see
+ * ensure_pool's per-child close() of done_pipe[0]). */
+static void prefetch_drain_nonblocking(const char *want, int *found) {
+    for (;;) {
+        struct pollfd pfd;
+        pfd.fd = g_done_rfd;
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+        if (poll(&pfd, 1, 0) <= 0 || !(pfd.revents & POLLIN)) return;
+        char tag, path[ASNIX_PREFETCH_MSG_MAX];
+        if (!prefetch_read_tagged(g_done_rfd, &tag, path, sizeof path)) return; /* EOF/malformed -- shouldn't happen before shutdown */
+        if (tag == 'D') {
+            prefetch_outstanding_remove(path);
+            if (found && want && strcmp(path, want) == 0) *found = 1;
+        } else if (tag == 'F') {
+            prefetch_dispatch(path);
         }
     }
-    /* Opportunistically reap anything else that already finished, so a
-     * long-running process (unusual for this CLI, but cheap to handle)
-     * doesn't accumulate zombies while waiting on unrelated paths. */
-    for (int i = 0; i < g_outstanding_count;) {
-        int status;
-        pid_t r = waitpid(g_outstanding[i].pid, &status, WNOHANG);
-        if (r > 0) {
-            free(g_outstanding[i].path);
-            g_outstanding[i] = g_outstanding[--g_outstanding_count];
-        } else {
-            i++;
+}
+
+void asnix_bytecode_prefetch_wait(const char *resolved_path) {
+    if (!prefetch_enabled() || g_pool_state != 1) return;
+    if (!prefetch_outstanding_contains(resolved_path)) {
+        prefetch_drain_nonblocking(NULL, NULL); /* opportunistic hygiene -- see this function's own original comment */
+        return;
+    }
+    int found = 0;
+    prefetch_drain_nonblocking(resolved_path, &found);
+    if (found) return;
+    /* Bounded wait: up to ~50ms total (10 x 5ms), matching the original
+     * "short timeout, not indefinite" semantic -- if the worker pool
+     * hasn't finished this path yet, give up and let the caller fall
+     * back to its own ordinary synchronous compile, exactly as before. */
+    for (int tries = 0; tries < 10 && !found; tries++) {
+        struct pollfd pfd;
+        pfd.fd = g_done_rfd;
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+        if (poll(&pfd, 1, 5) <= 0) continue;
+        char tag, path[ASNIX_PREFETCH_MSG_MAX];
+        if (!prefetch_read_tagged(g_done_rfd, &tag, path, sizeof path)) break;
+        if (tag == 'D') {
+            prefetch_outstanding_remove(path);
+            if (strcmp(path, resolved_path) == 0) found = 1;
+        } else if (tag == 'F') {
+            prefetch_dispatch(path);
         }
     }
 }

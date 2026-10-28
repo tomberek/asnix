@@ -71,6 +71,27 @@ MIMALLOC_LDLIBS := -lmimalloc -lpthread
 endif
 endif
 
+# M-io_uring-pool: bytecode_cache.c's persistent prefetch-worker pool uses
+# liburing for its per-worker ring. Same devShell-env-var-handoff
+# convention as ASNIX_MIMALLOC_LIB above (explicit path wins), falling
+# back to a link probe for a system liburing-dev. Hard build dependency,
+# not optional like mimalloc -- a failed probe is a build error with a
+# clear message rather than a silently-degraded build.
+ifdef ASNIX_LIBURING_INC
+INC += -I$(ASNIX_LIBURING_INC)
+endif
+ifdef ASNIX_LIBURING_LIBDIR
+LIBURING_LDFLAGS := -L$(ASNIX_LIBURING_LIBDIR) -Wl,-rpath,$(ASNIX_LIBURING_LIBDIR) -luring
+else
+LIBURING_PROBE := $(shell printf '#include <liburing.h>\nint main(void){struct io_uring r; return io_uring_queue_init(8,&r,0);}' | $(CC) $(INC) -xc - -luring -o /dev/null 2>/dev/null && echo yes)
+ifeq ($(LIBURING_PROBE),yes)
+LIBURING_LDFLAGS := -luring
+endif
+endif
+ifndef LIBURING_LDFLAGS
+$(error liburing not found -- set ASNIX_LIBURING_INC/ASNIX_LIBURING_LIBDIR, e.g. to the nix store paths for liburing's dev/lib outputs)
+endif
+
 MAKEFLAGS    += -j$(shell nproc 2>/dev/null || echo 4)
 
 ASM_SRCS     := $(wildcard src/asm/*.S src/asm/ops/*.S)
@@ -142,7 +163,7 @@ endif
 # that sets ASNIX_MIMALLOC_LIB, without an explicit `make clean`, must
 # not silently keep a stale link of `asnix` from the other configuration.
 OPT_STAMP := .opt-stamp
-STAMP_KEY := $(EFFECTIVE_OPT)|$(MIMALLOC_LDLIBS)
+STAMP_KEY := $(EFFECTIVE_OPT)|$(MIMALLOC_LDLIBS)|$(LIBURING_LDFLAGS)
 $(shell last=$$(cat $(OPT_STAMP) 2>/dev/null); \
 	if [ "$$last" != "$(STAMP_KEY)" ]; then \
 		rm -f $(ALL_OBJS) $(DEPS) asnix libasnix.a $(TEST_ASM_BINS) $(TEST_IR_BINS) $(TEST_C_BINS) irdump $(IRDUMP_SRC:.c=.o) $(IRDUMP_LINE_TRACKING_OBJS); \
@@ -152,14 +173,14 @@ $(shell last=$$(cat $(OPT_STAMP) 2>/dev/null); \
 .PHONY: all release debug test test-e2e test-conformance test-flake test-nix-conformance test-nixpkgs-hash clean watch
 all: asnix
 
-release: OPT := -O2
+release: OPT := -O3
 release: asnix
 
 debug: OPT := -O0
 debug: asnix
 
 asnix: $(MAIN_OBJ) libasnix.a
-	$(CC) $(LDFLAGS) -o $@ $(MAIN_OBJ) -L. -lasnix $(MIMALLOC_LDLIBS)
+	$(CC) $(LDFLAGS) -o $@ $(MAIN_OBJ) -L. -lasnix $(MIMALLOC_LDLIBS) $(LIBURING_LDFLAGS)
 
 libasnix.a: $(LIB_OBJS)
 	ar rcs $@ $(LIB_OBJS)
@@ -175,7 +196,7 @@ libasnix.a: $(LIB_OBJS)
 # ib_finish/etc. win over libasnix.a's plain versions of the same
 # symbols, and the archive is never asked to supply them.
 irdump: $(IRDUMP_SRC:.c=.o) $(IRDUMP_LINE_TRACKING_OBJS) libasnix.a
-	$(CC) $(LDFLAGS) -o $@ $(IRDUMP_SRC:.c=.o) $(IRDUMP_LINE_TRACKING_OBJS) -L. -lasnix
+	$(CC) $(LDFLAGS) -o $@ $(IRDUMP_SRC:.c=.o) $(IRDUMP_LINE_TRACKING_OBJS) -L. -lasnix $(LIBURING_LDFLAGS)
 
 # .S files are cpp-preprocessed by `cc` (capital S => real #include of
 # include/asnix/*.h, shared verbatim with the C side -- zero constant drift).
@@ -220,13 +241,13 @@ test: $(RUN_TEST_BINS)
 	@set -e; for t in $(RUN_TEST_BINS); do echo "== $$t =="; ./$$t; done
 
 tests/asm/%: tests/asm/%.c libasnix.a
-	$(CC) $(CFLAGS) -o $@ $< -L. -lasnix
+	$(CC) $(CFLAGS) -o $@ $< -L. -lasnix $(LIBURING_LDFLAGS)
 
 tests/ir/%: tests/ir/%.c libasnix.a
-	$(CC) $(CFLAGS) -o $@ $< -L. -lasnix
+	$(CC) $(CFLAGS) -o $@ $< -L. -lasnix $(LIBURING_LDFLAGS)
 
 tests/c/%: tests/c/%.c libasnix.a
-	$(CC) $(CFLAGS) -o $@ $< -L. -lasnix
+	$(CC) $(CFLAGS) -o $@ $< -L. -lasnix $(LIBURING_LDFLAGS)
 
 # Tier-2: real .nix source through the full lexer/parser/compiler/evaluator,
 # diffed against a .expected sidecar. Not run by default `make test` --

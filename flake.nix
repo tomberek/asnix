@@ -18,6 +18,7 @@
             valgrind
             openssl     # dlopen target for hash shims (M8)
             mimalloc    # static-link-time allocator override (M146)
+            liburing    # bytecode_cache.c's persistent prefetch-worker pool
             entr         # optional `make watch` loop
           ];
           shellHook = ''
@@ -40,6 +41,13 @@
             # runtime like ASNIX_LIBCRYPTO_LIB above -- this is a build-time
             # link input, not a dlopen target.
             export ASNIX_MIMALLOC_LIB="${pkgs.mimalloc}/lib/libmimalloc.a"
+            # M-io_uring-pool: bytecode_cache.c's persistent prefetch-
+            # worker pool links against liburing (see Makefile's
+            # ASNIX_LIBURING_INC/ASNIX_LIBURING_LIBDIR) -- same explicit-
+            # path-wins-over-probe convention as ASNIX_MIMALLOC_LIB above.
+            # Headers live in the `.dev` output, the shared lib in `.out`.
+            export ASNIX_LIBURING_INC="${pkgs.liburing.dev}/include"
+            export ASNIX_LIBURING_LIBDIR="${pkgs.liburing.out}/lib"
           '';
         };
       });

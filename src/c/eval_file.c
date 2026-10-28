@@ -588,18 +588,83 @@ Value asnix_eval_file(const char *path) {
  * (file doesn't exist, parse/compile error, cache store refused) just
  * means this child exits having cached nothing -- identical, from the
  * parent's point of view, to never having been forked at all. */
+/* Shared tail of asnix_prefetch_compile_and_cache/_buf below: parse,
+ * compile, store to the on-disk cache, reset the AST arena. Must run
+ * AFTER `src` is in hand and BEFORE `resolved`/`base_dir` are freed --
+ * asnix_compile's own IrProgram can embed raw pointers into them (e.g.
+ * AST_CURPOS's `file` field), but nothing reads that IrProgram after
+ * asnix_bytecode_cache_store returns (both callers discard it
+ * immediately), so freeing resolved/base_dir right after this call
+ * returns is safe either way -- same reasoning as asnix_eval_file's own
+ * ordering. Does NOT itself free resolved/base_dir/src -- callers do
+ * that, gated the same `asnix_lazy_thunk_enabled` way asnix_eval_file
+ * already is (see compiler.h's own comment on that flag: under the
+ * lazy-thunk-compile experiment, compiled thunk bodies can retain raw
+ * pointers into `src` past this call, so freeing it here would be
+ * wrong whenever that experiment is active, not just here). */
+static void prefetch_compile_and_store(char *resolved, char *base_dir, const struct stat *st, const char *src,
+                                        size_t src_len) {
+    Ast *ast = asnix_parse(src);
+    IrProgram *prog = asnix_compile(ast, base_dir, resolved);
+    asnix_bytecode_cache_store(resolved, src, src_len, (int64_t)st->st_mtim.tv_sec, (int64_t)st->st_mtim.tv_nsec,
+                                (int64_t)st->st_size, prog);
+    /* M-recursive-prefetch: walk THIS file's own AST for further
+     * literal `import` targets before it's torn down below -- without
+     * this, prefetch only ever reaches one level deep (files the TOP-
+     * LEVEL file imports directly), never files THOSE files import in
+     * turn, which is exactly the module-list.nix-style shape (one file
+     * importing hundreds of others, many of which immediately import
+     * more) real nixpkgs/NixOS closures actually have. Safe to call
+     * unconditionally: asnix_bytecode_prefetch_imports itself no-ops
+     * when prefetching is disabled, and -- when called from inside a
+     * pool worker (bytecode_cache.c's g_is_worker) -- routes each
+     * discovery back to the main process instead of trying to dispatch
+     * it directly (a worker has no other worker's job-pipe fd and no
+     * authoritative dedup state of its own; see g_is_worker's comment
+     * in bytecode_cache.c). Must run BEFORE asnix_ast_arena_reset()
+     * below, which destroys `ast`. */
+    asnix_bytecode_prefetch_imports(ast, base_dir);
+    asnix_ast_arena_reset(); /* perf: ast is dead past this point -- see ast.c */
+}
+
 void asnix_prefetch_compile_and_cache(const char *path) {
     struct stat st;
     char *resolved = resolve_file_path(path, &st);
     char *base_dir = dir_of(resolved);
     size_t src_len;
     char *src = read_file(resolved, &src_len);
-    Ast *ast = asnix_parse(src);
-    IrProgram *prog = asnix_compile(ast, base_dir, resolved);
-    asnix_bytecode_cache_store(resolved, src, src_len, (int64_t)st.st_mtim.tv_sec, (int64_t)st.st_mtim.tv_nsec,
-                                (int64_t)st.st_size, prog);
-    asnix_ast_arena_reset(); /* perf: ast is dead past this point -- see ast.c (also moot -- this forked child exits right after) */
-    if (!asnix_lazy_thunk_enabled) free(src); /* perf: see asnix_eval_file's identical free(src) comment (also moot here) */
+    prefetch_compile_and_store(resolved, base_dir, &st, src, src_len);
+    /* M-io_uring-pool: this used to be a one-shot forked child that
+     * _exit(0)'d right after returning, so leaking resolved/base_dir/src
+     * here was harmless (the OS reclaimed everything at process exit).
+     * Now called repeatedly, in a loop, by a long-lived pool worker
+     * (bytecode_cache.c's worker_main) -- freeing properly here (outside
+     * the lazy-thunk experiment, which is off by default -- see this
+     * function's own comment above) is a real correctness requirement
+     * this redesign introduces, not optional cleanup; left un-freed
+     * under the experiment, matching every other call site's own
+     * existing convention, since fixing that interaction is outside
+     * this change's scope (the experiment doesn't default on). */
+    if (!asnix_lazy_thunk_enabled) free(src);
+    if (!asnix_lazy_thunk_enabled) free(base_dir);
+    if (!asnix_lazy_thunk_enabled) free(resolved);
+}
+
+void asnix_prefetch_compile_and_cache_buf(const char *path, const char *src, size_t src_len) {
+    struct stat st;
+    char *resolved = resolve_file_path(path, &st);
+    char *base_dir = dir_of(resolved);
+    prefetch_compile_and_store(resolved, base_dir, &st, src, src_len);
+    /* `src` here is the pool worker's own reusable buffer slot, not an
+     * allocation this function owns -- never freed here regardless of
+     * asnix_lazy_thunk_enabled, same as asnix_prefetch_compile_and_cache
+     * never frees anything it didn't itself allocate. See this file's
+     * own worker_main (bytecode_cache.c) for why reusing that buffer
+     * for the NEXT job is unsafe whenever the lazy-thunk experiment is
+     * active -- flagged there, not fixed here (the experiment is off by
+     * default, out of scope for this change). */
+    if (!asnix_lazy_thunk_enabled) free(base_dir);
+    if (!asnix_lazy_thunk_enabled) free(resolved);
 }
 
 /* M58: the one caller that needs make_root_env_ex's cycle-breaking
