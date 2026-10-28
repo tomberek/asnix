@@ -451,7 +451,18 @@ void asnix_bytecode_cache_store(const char *resolved_path, const char *source, s
  * under PIPE_BUF (4096) so POSIX guarantees a single write() of one
  * whole message is atomic -- concurrent workers writing to the shared
  * done pipe can never interleave mid-message, so no locking is needed
- * on that pipe despite multiple writers.
+ * on that pipe despite multiple writers. The write end of each JOB pipe
+ * is O_NONBLOCK (see ensure_pool) so a backed-up worker can never stall
+ * the main eval thread inside write(); atomicity and non-blocking are
+ * separate POSIX guarantees, but since every message here stays under
+ * PIPE_BUF, Linux's pipe(7) makes a non-blocking write at this size
+ * all-or-nothing too (EAGAIN or a full write, never partial), so the
+ * framing stays safe. The done pipe's write end is intentionally left
+ * blocking: it has multiple writers (one per worker) and no
+ * try-next-worker fallback to fall through to, so blocking briefly for
+ * the main process to drain it is the only option and is fine since
+ * main's done-pipe reads aren't gated behind the eval thread the way
+ * job dispatch is.
  * --------------------------------------------------------------------- */
 /* M-recursive-prefetch: raised from M92's original 64 -- that cap
  * bounded CONCURRENT CHILD PROCESSES there (one per outstanding path);
@@ -741,7 +752,26 @@ static void ensure_pool(void) {
         if (pipe(job_pipe[i]) != 0) {
             job_pipe[i][0] = -1;
             job_pipe[i][1] = -1;
+            continue;
         }
+        /* Write end only, NOT the worker's read end: the main process is
+         * the only writer, and prefetch_dispatch below must never block
+         * synchronously waiting for a backed-up worker to drain its
+         * pipe -- that would stall the eval this whole pool exists to
+         * speed up. A full pipe now makes write() fail fast with EAGAIN
+         * (handled by prefetch_write_message's existing "any non-full
+         * write is a failure" check), so prefetch_dispatch's own
+         * try-next-worker loop takes over exactly as it already does for
+         * every other dispatch failure. Every job message stays well
+         * under PIPE_BUF (ASNIX_PREFETCH_MSG_MAX=4000 < 4096), so per
+         * POSIX/Linux pipe(7) a non-blocking write at this size is still
+         * all-or-nothing -- EAGAIN or a full atomic write, never a
+         * partial one -- so the length-prefix framing this section's own
+         * header comment relies on cannot desync. The worker's read end
+         * is deliberately left blocking: worker_main's own comment above
+         * documents that it wants to block when it has nothing in
+         * flight. */
+        fcntl(job_pipe[i][1], F_SETFL, O_NONBLOCK);
     }
     for (int i = 0; i < ASNIX_PREFETCH_WORKERS; i++) {
         if (job_pipe[i][0] < 0) {
