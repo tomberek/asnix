@@ -52,7 +52,7 @@ static const char *op_names[] = {
     "ASSERT_FAIL", "STR_CONCAT", "WITH", "WITH_TRY", "WITH_MISS", "WITH_EXIT", "HAS_ATTR", "CHECK_FORMALS",
     "SELECT_OR", "SELECT_DYNAMIC", "CONCAT", "DIV", "INSERT_DYNAMIC_ATTR", "SELECT_DYNAMIC_OR",
     "RESOLVE_SEARCH_PATH", "HAS_ATTR_DYNAMIC", "REC_OVERRIDES_MERGE", "VAR_REF_RAW", "PATH_CONCAT",
-    "EQ_IF", "NEQ_IF", "LT_IF", "GE_IF", "HAS_ATTR_IF",
+    "EQ_IF", "NEQ_IF", "LT_IF", "GE_IF", "HAS_ATTR_IF", "LAZY_THUNK_BODY",
 };
 _Static_assert(sizeof(op_names) / sizeof(op_names[0]) == OP_COUNT,
                "irdump.c's op_names[] is out of sync with ir.h's OP_* enum -- update both");
