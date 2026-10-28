@@ -203,6 +203,36 @@ static int print_attrs_seen_mark(const void *base) {
     return 1;
 }
 
+/* M197: the ATTRS print case below used to cap at a fixed-size
+ * stack array of 64 entries ("defensive cap; no attrset in current
+ * fixtures is anywhere near this"), SILENTLY TRUNCATING the printed
+ * output for any attrset with more than 64 keys -- found on the ll side
+ * while stress-testing M196's listToAttrs fix with a 2000-entry list:
+ * `length (attrNames result)` correctly reported 2000, but printing the
+ * result directly showed only 64 "key = val;" pairs, no error, no
+ * indication anything was missing. Confirmed pre-existing in asnix too
+ * (identical code, same cap, same comment) and unrelated to either of
+ * this session's other fixes -- purely a print-path bug, reproduces with
+ * zero duplicate keys involved. Fixed by allocating dynamically above
+ * the same 64 threshold (now just a stack-vs-heap choice, not a
+ * truncation point) and gating the name-sort between an insertion sort
+ * (small counts) and qsort (large counts) the same way make_attrs/
+ * listToAttrs already do -- the old insertion sort was implicitly safe
+ * only because the 64 cap bounded it; removing the cap without this
+ * would turn an unbounded print of a large real attrset into its own
+ * O(n^2) cost. */
+typedef struct { const char *name; size_t name_len; Value val; } PrintAttrEntry;
+
+static int cmp_print_attr_entry(const void *a, const void *b) {
+    const PrintAttrEntry *ea = a, *eb = b;
+    size_t minlen = ea->name_len < eb->name_len ? ea->name_len : eb->name_len;
+    int cmp = minlen > 0 ? memcmp(ea->name, eb->name, minlen) : 0;
+    if (cmp == 0) cmp = (int)ea->name_len - (int)eb->name_len;
+    return cmp;
+}
+
+#define ASNIX_PRINT_ATTRS_SORT_INSERTION_MAX 32
+
 static void print_value_concrete(Value v); /* forward decl -- see print_peel_wrappers/print_value_inner below */
 
 /* M92: peels off Cell/Thunk wrappers one at a time -- rather than a
@@ -410,43 +440,36 @@ static void print_value_concrete(Value v) {
             const char *base = (const char *)(v.raw & ~0x7ULL);
             if (!print_attrs_seen_mark(base)) { printf("«repeated»"); return; }
             int64_t count = *(const int64_t *)(base + ASNIX_ATTRS_OFF_COUNT);
-            const char *names[64];
-            size_t name_lens[64];
-            Value vals[64];
-            int64_t n = count > 64 ? 64 : count; /* defensive cap; no attrset in current fixtures is anywhere near this */
-            for (int64_t i = 0; i < n; i++) {
+            PrintAttrEntry stack_buf[64];
+            PrintAttrEntry *entries = count <= 64 ? stack_buf : malloc((uint64_t)count * sizeof(PrintAttrEntry));
+            for (int64_t i = 0; i < count; i++) {
                 const char *entry = base + ASNIX_ATTRS_OFF_ENTRIES + i * ASNIX_ATTR_SIZE;
                 uint32_t sym = *(const uint32_t *)(entry + ASNIX_ATTR_OFF_SYM);
-                names[i] = asnix_sym_name(sym, &name_lens[i]);
-                vals[i] = *(const Value *)(entry + ASNIX_ATTR_OFF_VALUE);
+                entries[i].name = asnix_sym_name(sym, &entries[i].name_len);
+                entries[i].val = *(const Value *)(entry + ASNIX_ATTR_OFF_VALUE);
             }
-            for (int64_t i = 1; i < n; i++) {
-                int64_t j = i;
-                while (j > 0) {
-                    size_t minlen = name_lens[j - 1] < name_lens[j] ? name_lens[j - 1] : name_lens[j];
-                    int cmp = memcmp(names[j - 1], names[j], minlen);
-                    if (cmp == 0) cmp = (int)name_lens[j - 1] - (int)name_lens[j];
-                    if (cmp <= 0) break;
-                    const char *tn = names[j - 1];
-                    names[j - 1] = names[j];
-                    names[j] = tn;
-                    size_t tl = name_lens[j - 1];
-                    name_lens[j - 1] = name_lens[j];
-                    name_lens[j] = tl;
-                    Value tv = vals[j - 1];
-                    vals[j - 1] = vals[j];
-                    vals[j] = tv;
-                    j--;
+            if (count <= ASNIX_PRINT_ATTRS_SORT_INSERTION_MAX) {
+                for (int64_t i = 1; i < count; i++) {
+                    int64_t j = i;
+                    PrintAttrEntry e = entries[i];
+                    while (j > 0 && cmp_print_attr_entry(&entries[j - 1], &e) > 0) {
+                        entries[j] = entries[j - 1];
+                        j--;
+                    }
+                    entries[j] = e;
                 }
+            } else {
+                qsort(entries, (size_t)count, sizeof(PrintAttrEntry), cmp_print_attr_entry);
             }
             printf("{ ");
-            for (int64_t i = 0; i < n; i++) {
-                print_attr_name(names[i], name_lens[i]);
+            for (int64_t i = 0; i < count; i++) {
+                print_attr_name(entries[i].name, entries[i].name_len);
                 printf(" = ");
-                print_value_inner(vals[i]);
+                print_value_inner(entries[i].val);
                 printf("; ");
             }
             printf("}");
+            if (entries != stack_buf) free(entries);
             /* no print_active_pop() here -- ATTRS dedup is whole-print-
              * call scoped (print_attrs_seen_mark), never popped, see
              * that function's own comment above. */
