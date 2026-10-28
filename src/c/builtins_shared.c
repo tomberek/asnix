@@ -606,6 +606,32 @@ Value asnix_bshared_make_attrs(uint32_t *syms, Value *vals, int64_t count) {
     return (Value){ .raw = (uint64_t)(uintptr_t)mem | ASNIX_TAG_ATTRS };
 }
 
+typedef struct {
+    uint32_t sym;
+    int64_t idx;
+} OverrideSymIdx;
+
+static int cmp_override_sym_idx(const void *a, const void *b) {
+    uint32_t x = ((const OverrideSymIdx *)a)->sym, y = ((const OverrideSymIdx *)b)->sym;
+    return x < y ? -1 : (x > y ? 1 : 0);
+}
+
+/* perf (follow-up): building+sorting `sym_order` UNCONDITIONALLY measured
+ * as a real, reproducible regression on ll's own ffmpeg-full/plasma-
+ * system benchmarks (callgrind) -- real `rec{}` blocks with `__overrides`
+ * overwhelmingly have few static bindings, where the malloc+sort setup
+ * costs more than the linear scan it replaces. Gated on the PRODUCT
+ * `n * ocount` (same calibration lesson as builtins_attrs.c's
+ * removeAttrs fix, ASNIX_REMOVE_ATTRS_PRODUCT_MAX -- gating on `n`
+ * alone still pays sort overhead for a "few static bindings, many
+ * override entries" shape where the OLD per-override linear scan was
+ * already cheap because `n` itself was small) -- below that, skip the
+ * index and fall back to the original O(n * ocount) linear-scan-per-
+ * override behavior (byte-for-byte the old cost); only once the
+ * product crosses it does the sorted-index path actually pay for
+ * itself. */
+#define ASNIX_REC_OVERRIDES_PRODUCT_MAX 2048
+
 Value asnix_bshared_rec_overrides_merge(Env *env, int64_t n, const int64_t *meta) {
     int64_t overrides_slot = meta[n];
     Value overrides_val = asnix_force_for_print(env->values[overrides_slot]);
@@ -627,13 +653,63 @@ Value asnix_bshared_rec_overrides_merge(Env *env, int64_t n, const int64_t *meta
         syms[i] = (uint32_t)meta[i];
         vals[i] = env->values[i];
     }
+    /* perf: was an O(n) linear rescan of `syms[0..n)` PER override entry
+     * (O(n * ocount) overall) -- real rec{} blocks with many static
+     * bindings and multiple __overrides entries pay this quadratically.
+     * Fixed the same way this session's other quadratic-rescan bugs
+     * were: sort (sym, original-slot-index) pairs ONCE, then binary-
+     * search per override instead. Safe here specifically because
+     * `syms[0..n)` never changes once built above (only entries at
+     * index >= n get appended, by the override loop below, after every
+     * lookup already happened) -- attribute names within one rec{} are
+     * unique (duplicate static bindings are a parse-time error), so
+     * there is at most one matching index for any given sym, same as
+     * the old linear scan's first-and-only match. OBSERVABLE behavior
+     * (which slot gets overwritten, read-after-write ordering across
+     * overrides, env->values propagation to sibling self-references)
+     * is unchanged -- only how `match` is located. Gated on the product
+     * (see ASNIX_REC_OVERRIDES_PRODUCT_MAX's own comment above) -- below
+     * that, `sym_order` is never built and the loop below falls back to
+     * the original linear scan untouched. */
+    int use_sorted = n * ocount > ASNIX_REC_OVERRIDES_PRODUCT_MAX;
+    OverrideSymIdx *sym_order = NULL;
+    if (use_sorted) {
+        sym_order = malloc((size_t)n * sizeof(OverrideSymIdx));
+        for (int64_t i = 0; i < n; i++) {
+            sym_order[i].sym = syms[i];
+            sym_order[i].idx = i;
+        }
+        if (n <= ASNIX_MAKE_ATTRS_SORT_INSERTION_MAX) {
+            for (int64_t i = 1; i < n; i++) {
+                OverrideSymIdx key = sym_order[i];
+                int64_t j = i - 1;
+                while (j >= 0 && sym_order[j].sym > key.sym) {
+                    sym_order[j + 1] = sym_order[j];
+                    j--;
+                }
+                sym_order[j + 1] = key;
+            }
+        } else {
+            qsort(sym_order, (size_t)n, sizeof(OverrideSymIdx), cmp_override_sym_idx);
+        }
+    }
     int64_t total = n;
     for (int64_t oi = 0; oi < ocount; oi++) {
         uint32_t osym = asnix_bshared_attrs_sym(overrides_val, oi);
         Value oval = asnix_bshared_attrs_value(overrides_val, oi);
         int64_t match = -1;
-        for (int64_t i = 0; i < n; i++) {
-            if (syms[i] == osym) { match = i; break; }
+        if (use_sorted) {
+            int64_t lo = 0, hi = n - 1;
+            while (lo <= hi) {
+                int64_t mid = lo + (hi - lo) / 2;
+                if (sym_order[mid].sym == osym) { match = sym_order[mid].idx; break; }
+                else if (sym_order[mid].sym < osym) lo = mid + 1;
+                else hi = mid - 1;
+            }
+        } else {
+            for (int64_t i = 0; i < n; i++) {
+                if (syms[i] == osym) { match = i; break; }
+            }
         }
         if (match >= 0) {
             vals[match] = oval;
@@ -647,6 +723,7 @@ Value asnix_bshared_rec_overrides_merge(Env *env, int64_t n, const int64_t *meta
     Value out = asnix_bshared_make_attrs(syms, vals, total);
     free(syms);
     free(vals);
+    free(sym_order);
     return out;
 }
 
