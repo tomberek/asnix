@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# Adapter for github.com/numtide/nix-conformance's `./run` protocol (see
+# that repo's README.md, "Writing an adapter"): invoked as
+# `ADAPTER OP FILE [FLAG...]` from the conformance repo's own root. Must
+# exit 3 for anything this implementation does not support, so the
+# runner counts the case as skipped rather than failed -- never guess at
+# unimplemented behavior.
+set -u
+op=${1:-}
+file=${2:-}
+shift 2 2> /dev/null || true
+
+root=$(cd "$(dirname "$(realpath "$0")")/.." && pwd)
+bin="${ASNIX_BIN:-$root/asnix}"
+
+case "$op" in
+  eval)
+    # asnix's own CLI flags (--arg/--argstr/-A/--flake, see main.c) are a
+    # different namespace from nix-instantiate's own flags (the FLAGs a
+    # case's .flags sidecar supplies here, e.g.
+    # --extra-experimental-features/--max-call-depth) -- none of the
+    # lang/ cases need -A (they evaluate the whole file), so any FLAGs at
+    # all mean this case needs something asnix's CLI has no equivalent
+    # for. Honestly unsupported, not guessed at.
+    [ "$#" -eq 0 ] || exit 3
+    exec "$bin" "$file"
+    ;;
+  *)
+    # parse/check/nar/drv/flake/eval-xml/wire: not implemented.
+    exit 3
+    ;;
+esac

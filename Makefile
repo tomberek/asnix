@@ -297,94 +297,38 @@ test-flake: asnix
 		done; \
 	done
 
-# Tier-4: sweeps the FULL numtide/nix-conformance corpus (`lang/eval-okay-
-# *.nix`/`eval-fail-*.nix`, ~800 files), not just the handful of cases
-# mined into tests/conformance/ above. This is an external, un-checked-in
-# dependency -- clone https://github.com/numtide/nix-conformance to
-# NIX_CONFORMANCE_DIR first (default /tmp/nix-conformance), or pass
-# NIX_CONFORMANCE_DIR=/path/to/it on the command line. Does NOT `exit 1`
-# on failure (unlike test-e2e/test-conformance above) -- this corpus has
-# known, documented gaps (see docs/architecture.md's M5x scope-notes
-# sections), so a nonzero fail count is the expected steady state, not a
-# build-breaking regression; this target's job is to report the count and
-# the failing-file list, not to gate the build.
+# Tier-4: runs the real github.com/numtide/nix-conformance corpus
+# (`lang/`, ~800 eval-okay-*.nix/eval-fail-*.nix/parse-*-*.nix files)
+# through tests/nix-conformance-adapter, via that project's own `run`
+# script -- not a reimplementation of its comparison logic (an earlier
+# version of this target was exactly that hand-rolled reimplementation;
+# replaced because the real `run` script already handles the adapter
+# protocol, the `/pwd` path substitution, and the pass/fail/known/skip
+# accounting correctly, see the adapter's own header comment and
+# numtide/nix-conformance's README.md "Writing an adapter" section).
+# This is an external, un-checked-in dependency -- clone
+# https://github.com/numtide/nix-conformance to NIX_CONFORMANCE_DIR
+# first (default /tmp/nix-conformance), or pass
+# NIX_CONFORMANCE_DIR=/path/to/it on the command line.
 #
-# A `.flags` sidecar marks a case needing CLI flags/features this target
-# doesn't attempt to pass (counted as skipped, not failed). `eval-okay-*`
-# cases compare stdout against the `.exp` sidecar exactly, same as
-# test-e2e/test-conformance. `eval-fail-*` cases only check for a nonzero
-# exit (not the exact error text, matching this project's standing
-# convention of matching an error's *class*, not its wording) -- a crash
-# (signal, e.g. a segfault) also counts as "pass" here, same coincidental-
-# pass caveat already documented for a few mined fixtures in
-# tests/conformance/, not a true clean-error pass.
-# M64: two env/comparison details, both matching numtide/nix-conformance's
-# own documented adapter protocol (README.md's "Writing an adapter"
-# section) exactly, rather than inventing a separate convention here:
-#   - HOME=/fake-home is one of the fixed env vars the protocol says every
-#     adapter is invoked with -- needed for `~`-prefixed path literals
-#     (eval-okay-home-path-not-normalised.nix, eval-okay-path-string-
-#     interpolation.nix's "home" field); no other currently-passing case
-#     in this corpus references $HOME at all (grepped), so this can only
-#     ever change a currently-FAILING comparison, never break a passing one.
-#   - The repo root -> "/pwd" substitution mirrors the corpus's own `run`
-#     script (`printf '%s\n' "${out//$root//pwd}"`) -- several `.exp` files
-#     (e.g. eval-okay-path-string-interpolation.exp, eval-okay-short-path-
-#     literal-warn.exp) bake in that placeholder for a relative path
-#     literal's resolved absolute form, which this target previously had
-#     no way to match (see docs/architecture.md's old "not mechanically
-#     comparable yet" note on those cases -- superseded by this). Safe for
-#     the same reason as above: a `.exp` file can never itself contain this
-#     clone's literal local path, so this substitution is a no-op on every
-#     comparison that wasn't already going to fail.
-#
-# M67: `TEST_VAR=foo` -- the real numtide/nix-conformance `run` script
-# exports this (plus `NIX_PATH`/`HOME`, not replicated here -- nothing in
-# this sweep needs them yet) before running any case (its own
-# `run:173`/README.md:84); eval-okay-getenv.nix reads it. Without this,
-# that one test's `.exp` ("foobar") can never match either implementation
-# -- confirmed directly: real `nix-instantiate --eval` on that same file,
-# run without TEST_VAR set, also gives a different result ("bar") -- an
-# environment-setup artifact of this lightweight sweep script, not an
-# asnix bug.
+# tests/nix-conformance-known-failures.txt lists the cases this
+# evaluator fails on purpose (currently 3, all position-tracking gaps --
+# see that file's own header comment). `run --known` counts those as
+# "known" rather than "fail" and, conversely, fails the build if one of
+# them starts PASSING (a sign the list has gone stale) -- so, unlike the
+# old hand-rolled version, this target's exit code IS a real pass/fail
+# gate, suitable for CI.
 NIX_CONFORMANCE_DIR ?= /tmp/nix-conformance
 test-nix-conformance: asnix
-	@dir="$(NIX_CONFORMANCE_DIR)/lang"; \
-	bin="$(CURDIR)/asnix"; \
-	if [ ! -d "$$dir" ]; then \
-		echo "test-nix-conformance: '$$dir' not found -- clone" \
+	@if [ ! -d "$(NIX_CONFORMANCE_DIR)/lang" ]; then \
+		echo "test-nix-conformance: '$(NIX_CONFORMANCE_DIR)/lang' not found -- clone" \
 		     "https://github.com/numtide/nix-conformance to $(NIX_CONFORMANCE_DIR)" \
 		     "(or pass NIX_CONFORMANCE_DIR=/path/to/it) first" >&2; \
 		exit 1; \
-	fi; \
-	export HOME=/fake-home; \
-	root="$(NIX_CONFORMANCE_DIR)"; \
-	pass=0; fail=0; skip=0; failed=""; \
-	cd "$$dir" && \
-	export TEST_VAR=foo; \
-	for f in eval-okay-*.nix; do \
-		base="$${f%.nix}"; \
-		if [ -f "$$base.flags" ]; then skip=$$((skip+1)); continue; fi; \
-		exp="$$base.exp"; \
-		if [ ! -f "$$exp" ]; then skip=$$((skip+1)); continue; fi; \
-		got=$$(timeout 10 "$$bin" "$$f" 2>/dev/null); \
-		got="$${got//$$root//pwd}"; \
-		want=$$(cat "$$exp"); \
-		if [ "$$got" = "$$want" ]; then pass=$$((pass+1)); \
-		else fail=$$((fail+1)); failed="$$failed $$f"; fi; \
-	done; \
-	for f in eval-fail-*.nix; do \
-		base="$${f%.nix}"; \
-		if [ -f "$$base.flags" ]; then skip=$$((skip+1)); continue; fi; \
-		timeout 10 "$$bin" "$$f" >/dev/null 2>/dev/null; rc=$$?; \
-		if [ "$$rc" -ne 0 ] && [ "$$rc" -ne 124 ]; then pass=$$((pass+1)); \
-		else fail=$$((fail+1)); failed="$$failed $$f"; fi; \
-	done; \
-	echo "pass=$$pass fail=$$fail skip=$$skip"; \
-	if [ -n "$$failed" ]; then \
-		echo "failed:"; \
-		for f in $$failed; do echo "  $$f"; done; \
 	fi
+	ASNIX_BIN=$(CURDIR)/asnix "$(NIX_CONFORMANCE_DIR)/run" \
+		--known $(CURDIR)/tests/nix-conformance-known-failures.txt \
+		$(CURDIR)/tests/nix-conformance-adapter lang
 
 # Real-nixpkgs derivation-hash correctness sweep (added post-M76, see
 # tests/nixpkgs-hash/attrs.txt's own header comment for why): every
