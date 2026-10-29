@@ -1,7 +1,3 @@
-// M2: bump arena allocator. Never-free: nothing handed out by
-// asnix_arena_alloc is ever individually freed. Uses raw Linux x86-64
-// syscalls directly (no libc dependency) since this is core runtime, not a
-// C-boundary routine.
 #include "asnix/arena.h"
 
     .equ ASNIX_SYS_MMAP,       9
@@ -19,10 +15,10 @@
     .globl asnix_arena
     .type asnix_arena, @object
 asnix_arena:
-    .quad 0 // cur
-    .quad 0 // end
-    .quad 0 // total_allocated
-    .quad 0 // max_memory
+    .quad 0
+    .quad 0
+    .quad 0
+    .quad 0
     .size asnix_arena, 32
 
     .section .rodata
@@ -37,7 +33,7 @@ asnix_arena:
 
     .globl asnix_arena_init
     .type asnix_arena_init, @function
-asnix_arena_init:                       // void asnix_arena_init(uint64_t max_memory_bytes)
+asnix_arena_init:
     .cfi_startproc
     leaq asnix_arena(%rip), %rax
     movq $0, ASNIX_ARENA_OFF_CUR(%rax)
@@ -50,51 +46,48 @@ asnix_arena_init:                       // void asnix_arena_init(uint64_t max_me
 
     .globl asnix_arena_alloc
     .type asnix_arena_alloc, @function
-asnix_arena_alloc:                      // void *asnix_arena_alloc(uint64_t n)
+asnix_arena_alloc:
     .cfi_startproc
-    pushq %rbx                          // callee-saved; we use it to hold n8 across this call
+    pushq %rbx
     addq $7, %rdi
-    andq $-8, %rdi                      // %rdi = n8 = round_up_8(n)
+    andq $-8, %rdi
     movq %rdi, %rbx
 
     leaq asnix_arena(%rip), %rax
     movq ASNIX_ARENA_OFF_MAX(%rax), %rcx
     testq %rcx, %rcx
-    jz .Lno_cap_check                   // max_memory == 0 => uncapped
+    jz .Lno_cap_check
     movq ASNIX_ARENA_OFF_TOTAL(%rax), %rdx
     addq %rbx, %rdx
     cmpq %rcx, %rdx
-    jbe .Lno_cap_check                  // total_allocated + n8 <= max_memory => ok
+    jbe .Lno_cap_check
     jmp .Labort_cap
 
 .Lno_cap_check:
-    movq ASNIX_ARENA_OFF_CUR(%rax), %rcx // rcx = cur
-    movq ASNIX_ARENA_OFF_END(%rax), %rdx // rdx = end
-    leaq (%rcx, %rbx), %rsi               // rsi = cur + n8 (candidate new cur)
+    movq ASNIX_ARENA_OFF_CUR(%rax), %rcx
+    movq ASNIX_ARENA_OFF_END(%rax), %rdx
+    leaq (%rcx, %rbx), %rsi
     cmpq %rdx, %rsi
-    ja .Lgrow                            // cur + n8 > end => current chunk doesn't fit
+    ja .Lgrow
 
-    // Fast path: the allocation fits in the current chunk.
     movq %rsi, ASNIX_ARENA_OFF_CUR(%rax)
     movq ASNIX_ARENA_OFF_TOTAL(%rax), %rdx
     addq %rbx, %rdx
     movq %rdx, ASNIX_ARENA_OFF_TOTAL(%rax)
-    movq %rcx, %rax                      // return pointer = old cur
+    movq %rcx, %rax
     popq %rbx
     ret
 
 .Lgrow:
-    // chunk_size = max(round_up_page(n8), ASNIX_ARENA_CHUNK_SIZE)
     movq %rbx, %r8
     addq $(ASNIX_PAGE_SIZE - 1), %r8
     andq $-ASNIX_PAGE_SIZE, %r8
     movq $ASNIX_ARENA_CHUNK_SIZE, %r9
     cmpq %r9, %r8
-    cmovbe %r9, %r8                      // r8 = chunk_size
+    cmovbe %r9, %r8
 
-    pushq %r8                            // save chunk_size across the syscall
+    pushq %r8
 
-    // mmap(NULL, chunk_size, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0)
     xorq %rdi, %rdi
     movq %r8, %rsi
     movq $(ASNIX_PROT_READ | ASNIX_PROT_WRITE), %rdx
@@ -104,35 +97,17 @@ asnix_arena_alloc:                      // void *asnix_arena_alloc(uint64_t n)
     movq $ASNIX_SYS_MMAP, %rax
     syscall
     testq %rax, %rax
-    jl .Labort_mmap                      // raw syscall error: rax = -errno (always negative)
+    jl .Labort_mmap
 
-    popq %r8                             // r8 = chunk_size (pushed before the mmap syscall)
-    // asnix_huge_pages_available() -- gate BOTH madvise calls below on
-    // this: transparent_hugepage/defrag=madvise (confirmed via /sys)
-    // means a huge page the kernel has no free block for gets built by
-    // DIRECT (synchronous) compaction in this thread -- the fragmented-
-    // box regression iets's own sys/linux.rs documents hitting (read
-    // directly, not guessed). hugepage_check.c checks /proc/buddyinfo
-    // once and caches the answer -- the one C dependency these asm
-    // files carry, kept to this single narrow helper. rax/r8 (new_chunk,
-    // chunk_size) are caller-saved and must survive the call.
+    popq %r8
     pushq %rax
     pushq %r8
     call asnix_huge_pages_available
     popq %r8
     popq %rax
     testl %eax, %eax
-    jz .Lno_hugepage_hint                // kernel has no free 2 MiB+ blocks -- skip both hints
+    jz .Lno_hugepage_hint
 
-    // madvise(new_chunk, chunk_size, MADV_HUGEPAGE) -- hint only, return
-    // value ignored: without it, ASNIX_ARENA_CHUNK_SIZE's own 2 MiB
-    // chunks -- exactly one x86-64 huge page -- silently stay 512
-    // separate 4 KiB pages, each its own minor page fault on first
-    // touch. A real, measured contributor to this evaluator's much
-    // higher page-fault count vs iets (every single heap object funnels
-    // through this one bump allocator). rax currently holds new_chunk
-    // (the mmap result); both it and chunk_size (r8) must survive the
-    // syscall's own clobbers.
     pushq %rax
     pushq %r8
     movq %rax, %rdi
@@ -141,51 +116,37 @@ asnix_arena_alloc:                      // void *asnix_arena_alloc(uint64_t n)
     movq $ASNIX_SYS_MADVISE, %rax
     syscall
 
-    // madvise(new_chunk, chunk_size, MADV_POPULATE_WRITE) -- the hint
-    // above is not enough on its own: huge-page promotion for a
-    // MADV_HUGEPAGE region under defrag=madvise is attempted lazily,
-    // one 4 KiB fault at a time as the bump cursor advances -- unreliable
-    // for actually landing a huge page. Eagerly populating the WHOLE
-    // chunk now, in one syscall, gives the kernel the full 2 MiB extent
-    // up front instead of discovering it fault-by-fault, which is what
-    // actually makes promotion land reliably. Still hint-only (return
-    // value ignored). An earlier UNGATED attempt at this measured a
-    // real net loss on this repo specifically (+40% task-clock,
-    // reverted) -- retried here now that it's properly gated on actual
-    // free-block availability, since the ungated regression may well
-    // have BEEN exactly the fragmented-box compaction cost this gate
-    // exists to avoid; re-measure independently before trusting either
-    // result. %rdi/%rsi are already new_chunk/chunk_size from above.
     movq $ASNIX_MADV_POPULATE_WRITE, %rdx
     movq $ASNIX_SYS_MADVISE, %rax
     syscall
-    popq %r8                             // restore chunk_size
-    popq %rax                            // restore new_chunk pointer
+    popq %r8
+    popq %rax
 
 .Lno_hugepage_hint:
     leaq asnix_arena(%rip), %rcx
     leaq (%rax, %r8), %rdx
-    movq %rdx, ASNIX_ARENA_OFF_END(%rcx) // end = new_chunk + chunk_size
+    movq %rdx, ASNIX_ARENA_OFF_END(%rcx)
 
-    movq %rax, %rsi                      // rsi = result pointer = new_chunk
-    addq %rbx, %rax                      // rax = new_chunk + n8
+    movq %rax, %rsi
+    addq %rbx, %rax
     movq %rax, ASNIX_ARENA_OFF_CUR(%rcx)
     movq ASNIX_ARENA_OFF_TOTAL(%rcx), %rdx
     addq %rbx, %rdx
     movq %rdx, ASNIX_ARENA_OFF_TOTAL(%rcx)
 
-    movq %rsi, %rax                      // return pointer
+    movq %rsi, %rax
     popq %rbx
     ret
 
 .Labort_mmap:
     leaq .Lmsg_mmap(%rip), %rdi
     movq $ASNIX_MSG_MMAP_LEN, %rsi
-    jmp asnix_fatal                      // never returns; no stack cleanup needed
+    jmp asnix_fatal
 
 .Labort_cap:
     leaq .Lmsg_cap(%rip), %rdi
     movq $ASNIX_MSG_CAP_LEN, %rsi
-    jmp asnix_fatal                      // never returns; no stack cleanup needed
+    jmp asnix_fatal
     .cfi_endproc
     .size asnix_arena_alloc, . - asnix_arena_alloc
+

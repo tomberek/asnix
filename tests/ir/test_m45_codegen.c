@@ -1,8 +1,3 @@
-/* M4.5 acceptance test: for every fixture this milestone's codegen
- * supports, the native-compiled path must produce a result byte-identical
- * to both the expected literal and the M3/M4 threaded-interpreter path --
- * three-way agreement, per docs/architecture.md's M4.5 acceptance
- * criterion (lambda/call fixtures are out of scope here; see codegen.h). */
 #include <stdio.h>
 #include <string.h>
 
@@ -32,10 +27,8 @@ static Ast *parse_source(const char *src) {
 static void check_fixture(const char *name, const char *src, int64_t expected) {
     Ast *ast = parse_source(src);
 
-    IrProgram *prog = asnix_compile(ast, ".", NULL); /* no path literals in these fixtures; base_dir is unused */
-    Env *root = asnix_env_alloc(NULL, 0); /* M118: Env.up is now a dedicated-arena-relative
-                                            * compressed offset -- must come from the real
-                                            * allocator, not a hand-rolled general-arena alloc */
+    IrProgram *prog = asnix_compile(ast, ".", NULL);
+    Env *root = asnix_env_alloc(NULL, 0);
     Value interpreted = asnix_eval(prog, root);
 
     AsnixNativeFn fn = asnix_codegen(ast);
@@ -68,3 +61,4 @@ int main(void) {
     printf("test_m45_codegen: all checks passed\n");
     return 0;
 }
+

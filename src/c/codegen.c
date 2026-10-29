@@ -6,16 +6,6 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
-/*
- * Every byte sequence emitted below was cross-checked against `as`+`objdump`
- * for the equivalent hand-written instruction before being hard-coded here
- * (see the session's enc_check*.S scratch files) -- this file hand-encodes
- * x86-64 directly rather than extracting relocations from compiled .o
- * files (the fuller technique sketched in docs/architecture.md's M4.5
- * section), which is the scope tradeoff that kept this milestone tractable;
- * see codegen.h for exactly what's covered.
- */
-
 typedef struct {
     uint8_t *buf;
     size_t len, cap;
@@ -61,9 +51,6 @@ static void emit_load_rsp_disp32_rax(CodeBuf *cb, int32_t disp) {
     emit_bytes(cb, b, 8);
 }
 
-/* Returns the byte offset of the 4-byte rel32 *field itself* (not the
- * instruction start) so patch_rel32's "field_offset+4" math is uniform
- * across differently-sized opcodes. */
 static size_t emit_jne_rel32_placeholder(CodeBuf *cb) {
     emit_bytes(cb, (uint8_t[]){ 0x0F, 0x85, 0, 0, 0, 0 }, 6);
     return cb->len - 4;
@@ -77,11 +64,6 @@ static void patch_rel32(CodeBuf *cb, size_t field_offset, size_t target_offset) 
     memcpy(cb->buf + field_offset, &rel, 4);
 }
 
-/* Let-bound values live as plain native-stack slots (no heap Env needed --
- * this subset has no closures to capture one). `stack_index` is the
- * binding's absolute 0-indexed position from the bottom of this function's
- * stack region; resolving a read means knowing how many slots are
- * currently live (`depth`) to compute the %rsp-relative displacement. */
 typedef struct ScopeFrame2 {
     struct ScopeFrame2 *up;
     const char *name;
@@ -127,17 +109,6 @@ static void codegen_expr(CodeBuf *cb, Ast *node, ScopeFrame2 *scope, size_t dept
             codegen_var(cb, node, scope, depth);
             return;
         case AST_LET: {
-            /* compiler.c's AST_LET is now genuinely recursive (letrec) via
-             * a heap Env frame -- out of scope for this native path (see
-             * codegen.h: no closures/heap Env here). This path keeps its
-             * original, deliberately simpler semantics: each binding is
-             * pushed, strictly, in source order onto the native stack, so
-             * a binding can only see bindings *before* it (no self/sibling
-             * recursion) -- equivalent to what the old nested-single-
-             * binding desugaring produced, just iterating one multi-
-             * binding AST_LET node instead of recursing through n nested
-             * ones. `inherit` isn't supported here (M5+ feature, same as
-             * strings/lists/attrsets below). */
             size_t n = node->as.let1.count;
             AstBinding *bindings = node->as.let1.bindings;
             ScopeFrame2 *frames = malloc(n * sizeof(ScopeFrame2));
@@ -149,40 +120,40 @@ static void codegen_expr(CodeBuf *cb, Ast *node, ScopeFrame2 *scope, size_t dept
                             "asnix: M4.5 native codegen does not support 'inherit'\n");
                     exit(1);
                 }
-                codegen_expr(cb, bindings[i].value, cur_scope, cur_depth); /* net +1 */
+                codegen_expr(cb, bindings[i].value, cur_scope, cur_depth);
                 frames[i] = (ScopeFrame2){ .up = cur_scope, .name = bindings[i].name,
                                             .name_len = bindings[i].name_len,
                                             .stack_index = cur_depth };
                 cur_scope = &frames[i];
                 cur_depth++;
             }
-            codegen_expr(cb, node->as.let1.body, cur_scope, cur_depth); /* net +1 */
-            emit_pop_rax(cb);                      /* rax = body result */
-            emit_add_rsp_imm8(cb, (uint8_t)(n * 8)); /* discard the now-dead bound values */
-            emit_push_rax(cb);                      /* net effect of the whole AST_LET: +1 */
+            codegen_expr(cb, node->as.let1.body, cur_scope, cur_depth);
+            emit_pop_rax(cb);
+            emit_add_rsp_imm8(cb, (uint8_t)(n * 8));
+            emit_push_rax(cb);
             free(frames);
             return;
         }
         case AST_IF: {
-            codegen_expr(cb, node->as.if1.cond, scope, depth); /* +1 */
-            emit_pop_rax(cb);                                   /* -1, net 0 so far */
+            codegen_expr(cb, node->as.if1.cond, scope, depth);
+            emit_pop_rax(cb);
             emit_shr3_rax(cb);
             emit_cmp_imm8_rax(cb, ASNIX_IMM_TRUE);
-            size_t jne_site = emit_jne_rel32_placeholder(cb); /* branch to else unless truthy */
-            codegen_expr(cb, node->as.if1.then_, scope, depth); /* +1 */
+            size_t jne_site = emit_jne_rel32_placeholder(cb);
+            codegen_expr(cb, node->as.if1.then_, scope, depth);
             size_t jmp_site = emit_jmp_rel32_placeholder(cb);
             size_t else_pos = cb->len;
             patch_rel32(cb, jne_site, else_pos);
-            codegen_expr(cb, node->as.if1.else_, scope, depth); /* +1 */
+            codegen_expr(cb, node->as.if1.else_, scope, depth);
             size_t end_pos = cb->len;
             patch_rel32(cb, jmp_site, end_pos);
-            return; /* both branches leave the stack at depth+1: net +1 either way */
+            return;
         }
         case AST_BINOP:
-            codegen_expr(cb, node->as.binop.lhs, scope, depth);     /* +1 */
-            codegen_expr(cb, node->as.binop.rhs, scope, depth + 1); /* +1 */
-            emit_pop_rcx(cb); /* rhs */
-            emit_pop_rax(cb); /* lhs -- net -2 so far, depth back to original */
+            codegen_expr(cb, node->as.binop.lhs, scope, depth);
+            codegen_expr(cb, node->as.binop.rhs, scope, depth + 1);
+            emit_pop_rcx(cb);
+            emit_pop_rax(cb);
             emit_sar3_rax(cb);
             emit_sar3_rcx(cb);
             switch (node->as.binop.op) {
@@ -192,7 +163,7 @@ static void codegen_expr(CodeBuf *cb, Ast *node, ScopeFrame2 *scope, size_t dept
             }
             emit_shl3_rax(cb);
             emit_or1_rax(cb);
-            emit_push_rax(cb); /* net +1 overall */
+            emit_push_rax(cb);
             return;
         case AST_LAMBDA:
         case AST_APP:
@@ -206,7 +177,7 @@ static void codegen_expr(CodeBuf *cb, Ast *node, ScopeFrame2 *scope, size_t dept
         case AST_SELECT:
         case AST_HAS_ATTR:
         case AST_PATH:
-        case AST_FLOAT: /* M51: heap-boxed, same "interpreter-only so far" reason as the rest of this group */
+        case AST_FLOAT:
             fprintf(stderr,
                     "asnix: M4.5 native codegen does not yet support strings/lists/attrsets/paths "
                     "(M5+ feature, interpreter-only so far -- see docs/architecture.md)\n");
@@ -236,7 +207,6 @@ AsnixNativeFn asnix_codegen(Ast *root) {
     memcpy(mem, cb.buf, cb.len);
     free(cb.buf);
 
-    /* W^X: never hold PROT_WRITE and PROT_EXEC simultaneously. */
     if (mprotect(mem, maplen, PROT_READ | PROT_EXEC) != 0) {
         fprintf(stderr, "asnix: mprotect failed in M4.5 codegen\n");
         exit(1);
@@ -244,3 +214,4 @@ AsnixNativeFn asnix_codegen(Ast *root) {
 
     return (AsnixNativeFn)mem;
 }
+

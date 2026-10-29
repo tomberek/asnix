@@ -1,8 +1,3 @@
-// M1: value/tagging primitives. These are the C-callable, directly testable
-// boundary -- the hot evaluator core (M3+) inlines these bit tricks directly
-// in op handlers rather than paying a `call` per tag check; these routines
-// exist for the C side (compiler, debug printing, tests) and as the proven
-// reference implementation the inlined copies must match.
 #include "asnix/value.h"
 
     .section .rodata
@@ -12,19 +7,9 @@
 
     .text
 
-    /* M56: every C call site that builds a Value int (builtins.add/sub/
-     * mul/div -- builtins_m23.c; fromTOML's own integer-literal parsing
-     * -- toml.c; asnix_add_values's int+int fallback -- value_util.c;
-     * etc.) funnels through here, so checking the ±2^60 ASNIX_INT_MIN/
-     * MAX window once in this single reference implementation covers
-     * all of them without duplicating the check at each call site. The
-     * hot inlined-asm copies of this same bit trick (op_push_int,
-     * op_arith.S's add/sub/mul/div) carry their own copy of this check
-     * instead, per this file's own header comment on why they don't
-     * just `call` this function. */
     .globl asnix_make_int
     .type asnix_make_int, @function
-asnix_make_int:                        // Value asnix_make_int(int64_t n)
+asnix_make_int:
     .cfi_startproc
     movq %rdi, %rax
     movq $ASNIX_INT_MAX, %r9
@@ -45,21 +30,19 @@ asnix_make_int:                        // Value asnix_make_int(int64_t n)
 
     .globl asnix_int_value
     .type asnix_int_value, @function
-asnix_int_value:                       // int64_t asnix_int_value(Value v)
+asnix_int_value:
     .cfi_startproc
     movq %rdi, %rax
-    sarq $ASNIX_TAG_BITS, %rax         // arithmetic shift: sign-preserving
+    sarq $ASNIX_TAG_BITS, %rax
     ret
     .cfi_endproc
     .size asnix_int_value, . - asnix_int_value
 
     .globl asnix_make_imm
     .type asnix_make_imm, @function
-asnix_make_imm:                        // Value asnix_make_imm(int subtag)
+asnix_make_imm:
     .cfi_startproc
-    movl %edi, %eax                    // zero-extends into rax; the SysV ABI
-                                        // leaves rdi's upper 32 bits undefined
-                                        // for a 32-bit int argument
+    movl %edi, %eax
     salq $ASNIX_TAG_BITS, %rax
     orq  $ASNIX_TAG_IMM, %rax
     ret
@@ -68,17 +51,17 @@ asnix_make_imm:                        // Value asnix_make_imm(int subtag)
 
     .globl asnix_imm_subtag
     .type asnix_imm_subtag, @function
-asnix_imm_subtag:                      // int asnix_imm_subtag(Value v)
+asnix_imm_subtag:
     .cfi_startproc
     movq %rdi, %rax
-    shrq $ASNIX_TAG_BITS, %rax         // subtag is always non-negative
+    shrq $ASNIX_TAG_BITS, %rax
     ret
     .cfi_endproc
     .size asnix_imm_subtag, . - asnix_imm_subtag
 
     .globl asnix_tag_of
     .type asnix_tag_of, @function
-asnix_tag_of:                          // int asnix_tag_of(Value v)
+asnix_tag_of:
     .cfi_startproc
     movq %rdi, %rax
     andq $ASNIX_TAG_MASK, %rax
@@ -88,7 +71,7 @@ asnix_tag_of:                          // int asnix_tag_of(Value v)
 
     .globl asnix_is_thunk
     .type asnix_is_thunk, @function
-asnix_is_thunk:                        // int asnix_is_thunk(Value v)
+asnix_is_thunk:
     .cfi_startproc
     movq %rdi, %rax
     andq $ASNIX_TAG_MASK, %rax
@@ -98,3 +81,4 @@ asnix_is_thunk:                        // int asnix_is_thunk(Value v)
     ret
     .cfi_endproc
     .size asnix_is_thunk, . - asnix_is_thunk
+

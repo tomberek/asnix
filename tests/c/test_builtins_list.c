@@ -1,20 +1,3 @@
-/*
- * Validates builtins_list.c's map/filter/foldl'/elemAt/concatLists/tail/
- * head against hand-built fixtures, run through the *real* dispatch loop
- * (asnix_eval + OP_CALL, via the same IrBuilder API the compiler uses) --
- * not by calling the static prim_* functions directly -- because the
- * curried stages' self-capture trick (see builtins_list.c's header
- * comment) relies on an invariant of op_call.S's primop call path
- * (args[-1] == the callee's own tagged Value) that only holds for
- * ordinary Nix-level application, not for a C test calling a raw function
- * pointer with a hand-rolled args array. Going through asnix_eval exactly
- * matches how real compiled Nix source invokes these.
- *
- * Every numeric fixture here is also cross-checked against real
- * `nix-instantiate --eval` in the report for this stage (not just
- * transcribed from memory) -- see the e2e fixtures under tests/e2e/
- * m_list_*.nix for the on-disk equivalents.
- */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -22,7 +5,7 @@
 #include "asnix/arena.h"
 #include "asnix/env.h"
 #include "asnix/heap.h"
-#include "asnix/ir.h" /* asnix_force_for_print */
+#include "asnix/ir.h"
 #include "asnix/irbuild.h"
 #include "asnix/value.h"
 #include "builtins_list.h"
@@ -38,9 +21,6 @@ static int failures = 0;
     } while (0)
 
 static Env *root_env(void) {
-    /* M118: Env.up is a dedicated-arena-relative compressed offset --
-     * must come from the real allocator, not a hand-rolled general-
-     * arena alloc. */
     return asnix_env_alloc(NULL, 0);
 }
 
@@ -74,23 +54,21 @@ static Value test_is_even(const Value *args, int64_t argc) {
     return (asnix_int_value(args[0]) % 2 == 0) ? ASNIX_TRUE : ASNIX_FALSE;
 }
 
-/* `a: b: a + b`, two nested arity-1 closures, exactly how every curried
- * user lambda compiles -- used as foldl''s operator. */
 static Value make_add_closure(void) {
     IrBuilder *inner = ib_new();
-    ib_var_ref(inner, 1, 0); /* a, one frame up */
-    ib_var_ref(inner, 0, 0); /* b, this frame */
+    ib_var_ref(inner, 1, 0);
+    ib_var_ref(inner, 0, 0);
     ib_add(inner);
     ib_ret(inner);
     IrProgram *inner_prog = ib_finish(inner);
 
     IrBuilder *outer = ib_new();
-    ib_lambda(outer, 1, inner_prog, 0); /* formals: unused by this test */
+    ib_lambda(outer, 1, inner_prog, 0);
     ib_ret(outer);
     IrProgram *outer_prog = ib_finish(outer);
 
     IrBuilder *top = ib_new();
-    ib_lambda(top, 1, outer_prog, 0); /* formals: unused by this test */
+    ib_lambda(top, 1, outer_prog, 0);
     ib_halt(top);
     IrProgram *prog = ib_finish(top);
     return asnix_eval(prog, root_env());
@@ -115,29 +93,23 @@ static int64_t list_count_of(Value v) {
 static int64_t list_elem_int(Value v, int64_t i) {
     const char *base = (const char *)(uintptr_t)(v.raw & ~(uint64_t)ASNIX_TAG_MASK);
     const Value *elems = (const Value *)(base + ASNIX_LIST_OFF_ELEMS);
-    /* `map`'s result elements are genuinely lazy Thunks (M23 fix -- see
-     * builtins_list.c's prim_map_stage2 comment), so this must force
-     * before reading the raw int, unlike before that fix when `map`
-     * itself had already computed every element eagerly. */
     return asnix_int_value(asnix_force_for_print(elems[i]));
 }
 
-/* map (x: x+1) [1 2 3] == [2 3 4] -- verified against
- * `nix-instantiate --eval -E 'map (x: x + 1) [1 2 3]'` => [ 2 3 4 ]. */
 static void fixture_map(void) {
     Env *frame = asnix_env_alloc(root_env(), 2);
     frame->values[0] = lookup_builtin("map");
     frame->values[1] = make_primop((void *)test_add_one, 1);
 
     IrBuilder *b = ib_new();
-    ib_var_ref(b, 0, 0); /* map */
-    ib_var_ref(b, 0, 1); /* add_one */
-    ib_call(b, 1);       /* map add_one -> stage2 */
+    ib_var_ref(b, 0, 0);
+    ib_var_ref(b, 0, 1);
+    ib_call(b, 1);
     ib_push_int(b, 1);
     ib_push_int(b, 2);
     ib_push_int(b, 3);
     ib_mk_list(b, 3);
-    ib_call(b, 1); /* stage2 [1,2,3] */
+    ib_call(b, 1);
     ib_halt(b);
     IrProgram *prog = ib_finish(b);
     Value v = asnix_eval(prog, frame);
@@ -148,11 +120,6 @@ static void fixture_map(void) {
     CHECK(list_elem_int(v, 2) == 4, "map elem 2 == 4");
 }
 
-/* filter (x: x mod 2 == 0 ...emulated in C) [1 2 3 4] == [2 4] --
- * verified against `nix-instantiate --eval -E
- * 'builtins.filter (x: x / 2 * 2 == x) [1 2 3 4]'` => [ 2 4 ] (no `mod`
- * builtin exists in this project yet, so the test's native predicate
- * directly mirrors "is even"). */
 static void fixture_filter(void) {
     Env *frame = asnix_env_alloc(root_env(), 2);
     frame->values[0] = lookup_builtin("filter");
@@ -177,9 +144,6 @@ static void fixture_filter(void) {
     CHECK(list_elem_int(v, 1) == 4, "filter elem 1 == 4");
 }
 
-/* builtins.foldl' (a: b: a + b) 0 [1 2 3] == 6 -- verified against
- * `nix-instantiate --eval -E "builtins.foldl' (a: b: a + b) 0 [1 2 3]"`
- * => 6. */
 static void fixture_foldl_prime(void) {
     Env *frame = asnix_env_alloc(root_env(), 2);
     frame->values[0] = lookup_builtin("foldl'");
@@ -204,8 +168,6 @@ static void fixture_foldl_prime(void) {
     CHECK(asnix_int_value(v) == 6, "foldl' (a: b: a+b) 0 [1 2 3] == 6");
 }
 
-/* elemAt [10 20 30] 1 == 20 -- verified against `nix-instantiate --eval
- * -E 'builtins.elemAt [10 20 30] 1'` => 20. */
 static void fixture_elemAt(void) {
     Env *frame = asnix_env_alloc(root_env(), 1);
     frame->values[0] = lookup_builtin("elemAt");
@@ -227,9 +189,6 @@ static void fixture_elemAt(void) {
     CHECK(asnix_int_value(v) == 20, "elemAt [10 20 30] 1 == 20");
 }
 
-/* concatLists [[1 2] [3] [] [4]] == [1 2 3 4] -- verified against
- * `nix-instantiate --eval -E 'builtins.concatLists [[1 2] [3] [] [4]]'`
- * => [ 1 2 3 4 ]. */
 static void fixture_concatLists(void) {
     Env *frame = asnix_env_alloc(root_env(), 1);
     frame->values[0] = lookup_builtin("concatLists");
@@ -244,7 +203,7 @@ static void fixture_concatLists(void) {
     ib_mk_list(b, 0);
     ib_push_int(b, 4);
     ib_mk_list(b, 1);
-    ib_mk_list(b, 4); /* [[1,2],[3],[],[4]] */
+    ib_mk_list(b, 4);
     ib_call(b, 1);
     ib_halt(b);
     IrProgram *prog = ib_finish(b);
@@ -257,9 +216,6 @@ static void fixture_concatLists(void) {
     CHECK(list_elem_int(v, 3) == 4, "concatLists elem 3 == 4");
 }
 
-/* head [5 6 7] == 5; tail [5 6 7] == [6 7] -- verified against
- * `nix-instantiate --eval -E 'builtins.head [5 6 7]'` => 5 and
- * `nix-instantiate --eval -E 'builtins.tail [5 6 7]'` => [ 6 7 ]. */
 static void fixture_head_tail(void) {
     Value list = make_int_list3(5, 6, 7);
 
@@ -304,3 +260,4 @@ int main(void) {
     printf("test_builtins_list: all checks passed\n");
     return 0;
 }
+

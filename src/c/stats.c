@@ -43,3 +43,4 @@ void asnix_stats_print(void) {
             (unsigned long)asnix_stats_string,
             (unsigned long)asnix_stats_primop, (unsigned long)asnix_stats_path);
 }
+

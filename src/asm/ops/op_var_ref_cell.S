@@ -1,27 +1,3 @@
-// M92: see OP_VAR_REF_CELL's own comment in ir.h and heap.h's
-// ASNIX_CELL_MARKER comment for the full rationale. Same De Bruijn
-// depth/slot walk as op_var_ref.S's asnix_op_var_ref, but instead of
-// reading+forcing the slot's VALUE, this computes the slot's own ADDRESS
-// and wraps it in a Cell (asnix_make_cell_value, value_util.c) -- no
-// forcing happens here at all, deliberately: aliasing the slot is exactly
-// the point, and forcing would defeat it (e.g. `let x = [x]; in x`'s
-// list element would blackhole instead of lazily aliasing `x`'s own
-// not-yet-finished binding).
-//
-// M-skip-cell: `ll`'s own op_var_ref.c carries a "skip the Cell when the
-// slot is already populated and not a function" fast path (same idea,
-// with a compile-time ScopeFrame.has_overrides gate in compiler.c for a
-// `rec{}` __overrides hazard, plus a runtime Closure/PrimOp tag check
-// for an `==`-identity hazard -- see that file's own long comment for
-// both). Measured HERE specifically (callgrind, matched -O3) it is a
-// net LOSS, not a win: +1.47% instructions on ffmpeg-full, reproducible
-// across repeated runs -- the extra tag-check branches cost more in
-// this hand-tuned dispatch than the avoided allocation saves, the
-// opposite of `ll`'s own clang-compiled result. Deliberately NOT
-// ported here; this file stays exactly the original always-build-Cell
-// version. (compiler.c's has_overrides gate stays harmless either way
-// -- a no-op difference without this op's own fast path to protect --
-// kept for frontend parity with `ll`, not because asnix needs it.)
 #include "asnix/env.h"
 #include "asnix/ir.h"
 #include "asnix/stackcheck.h"
@@ -30,32 +6,31 @@
 
     .globl asnix_op_var_ref_cell
     .type asnix_op_var_ref_cell, @function
-asnix_op_var_ref_cell:                  // a = depth, b = slot
-    movq %rdi, %rcx                     // rcx = env, walked up `depth` hops
-    movl ASNIX_IROP_OFF_A(%rsi), %edx   // rdx = depth
+asnix_op_var_ref_cell:
+    movq %rdi, %rcx
+    movl ASNIX_IROP_OFF_A(%rsi), %edx
 .Lvar_ref_cell_walk:
     testq %rdx, %rdx
     jz .Lvar_ref_cell_done
-    movl ASNIX_ENV_OFF_UP(%rcx), %ecx    // M118: zero-extends into %rcx; decompress below
+    movl ASNIX_ENV_OFF_UP(%rcx), %ecx
     addq asnix_env_arena_base(%rip), %rcx
-    andq $-2, %rcx                      // mask off ASNIX_ENV_WITH_TAG in case this hop is a with-frame
+    andq $-2, %rcx
     decq %rdx
     jmp .Lvar_ref_cell_walk
 .Lvar_ref_cell_done:
-    movl ASNIX_IROP_OFF_B(%rsi), %edx   // rdx = slot
-    leaq ASNIX_ENV_OFF_VALUES(%rcx, %rdx, 8), %rbx // rbx = &env->values[slot] (callee-saved,
-                                         // survives the call below)
+    movl ASNIX_IROP_OFF_B(%rsi), %edx
+    leaq ASNIX_ENV_OFF_VALUES(%rcx, %rdx, 8), %rbx
 
-    pushq %rsi                          // save IP
-    pushq %rdi                          // save ENV (2 pushes, stays 16-byte aligned)
+    pushq %rsi
+    pushq %rdi
 
-    movq %rbx, %rdi                     // arg1 = target
+    movq %rbx, %rdi
     call asnix_make_cell_value
 
-    popq %rdi                           // restore ENV (pushed last, popped first)
-    popq %rsi                           // restore IP
+    popq %rdi
+    popq %rsi
 
-    ASNIX_CHECK_VALSTACK %rcx           // %rcx dead (held the slot index, unused since)
+    ASNIX_CHECK_VALSTACK %rcx
     movq %rax, (%r12)
     addq $8, %r12
 
@@ -63,3 +38,4 @@ asnix_op_var_ref_cell:                  // a = depth, b = slot
     movq (%rsi), %rax
     jmp *%rax
     .size asnix_op_var_ref_cell, . - asnix_op_var_ref_cell
+

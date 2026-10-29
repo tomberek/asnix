@@ -12,7 +12,7 @@
 
     .globl asnix_op_if
     .type asnix_op_if, @function
-asnix_op_if:                            // a = byte delta to jump when condition is false
+asnix_op_if:
     subq $8, %r12
     movq (%r12), %rax
     movq %rax, %rcx
@@ -25,8 +25,6 @@ asnix_op_if:                            // a = byte delta to jump when condition
     cmpq $ASNIX_IMM_TRUE, %rax
     jne .Lif_type_error
 
-    // true: fall through into the "then" branch, which starts immediately
-    // after this record.
     addq $ASNIX_IROP_SIZE, %rsi
     movq (%rsi), %rax
     jmp *%rax
@@ -45,9 +43,10 @@ asnix_op_if:                            // a = byte delta to jump when condition
 
     .globl asnix_op_jmp
     .type asnix_op_jmp, @function
-asnix_op_jmp:                           // a = unconditional byte delta
+asnix_op_jmp:
     movslq ASNIX_IROP_OFF_A(%rsi), %rax
     addq %rax, %rsi
     movq (%rsi), %rax
     jmp *%rax
     .size asnix_op_jmp, . - asnix_op_jmp
+

@@ -1,6 +1,3 @@
-/* M5 validation, same strategy as M3: exercise the new asm ops via
- * hand-fed IR before any parser grammar depends on them, so a bug is
- * isolated to the asm side, not tangled up with parser/compiler changes. */
 #include <stdio.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -23,9 +20,6 @@ static int failures = 0;
     } while (0)
 
 static Env *root_env(void) {
-    /* M118: Env.up is a dedicated-arena-relative compressed offset --
-     * must come from the real allocator, not a hand-rolled general-
-     * arena alloc. */
     return asnix_env_alloc(NULL, 0);
 }
 
@@ -57,7 +51,7 @@ static void fixture_mk_attrs_and_select(void) {
     uint32_t sym_a = asnix_intern("a", 1);
     uint32_t sym_b = asnix_intern("b", 1);
     uint32_t sorted[2];
-    uint32_t vals[2]; /* keep push order matching the sorted symbol order */
+    uint32_t vals[2];
     if (sym_a < sym_b) {
         sorted[0] = sym_a;
         sorted[1] = sym_b;
@@ -68,8 +62,6 @@ static void fixture_mk_attrs_and_select(void) {
     (void)vals;
 
     IrBuilder *b = ib_new();
-    /* Push values in the SAME order as `sorted` (ascending symbol id),
-     * matching what the real compiler will do for `{a=1; b=2;}`. */
     ib_push_int(b, sorted[0] == sym_a ? 1 : 2);
     ib_push_int(b, sorted[0] == sym_a ? 2 : 1);
     ib_mk_attrs(b, 2, sorted);
@@ -95,7 +87,7 @@ static void fixture_select_missing_aborts(void) {
         ib_halt(b);
         IrProgram *prog = ib_finish(b);
         asnix_eval(prog, root_env());
-        _exit(42); /* reaching here means the missing-attr abort didn't fire */
+        _exit(42);
     }
     int status = 0;
     waitpid(pid, &status, 0);
@@ -114,3 +106,4 @@ int main(void) {
     printf("test_m5_fixtures: all checks passed\n");
     return 0;
 }
+

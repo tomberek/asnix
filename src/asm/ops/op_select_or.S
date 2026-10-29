@@ -1,31 +1,3 @@
-// `expr.attr or default` -- real Nix's select-with-default. Modeled
-// directly on op_with_try.S's OP_WITH_TRY (same binary-search + delta-jump
-// shape) with one behavioral difference: a non-attrset target is NOT
-// fatal here (confirmed against real nix-instantiate: `(5).foo or 10`
-// => 10, same "not even an attrset simply means not found" rule
-// op_has_attr.S's OP_HAS_ATTR already established for `?`), whereas
-// OP_WITH_TRY's non-attrset `with`-value IS fatal (a `with` value is only
-// ever consulted once something inside actually needs it, so by the time
-// OP_WITH_TRY runs, the type error is real and immediate).
-//
-// a = byte delta to jump to (not found / wrong type); b = symbol id.
-// Pops the select target off VALSTACK. On a hit: forces the matching
-// entry if it's an unforced thunk (same re-entrant mechanism as
-// OP_SELECT/OP_WITH_TRY -- attrset binding values are lazy) and falls
-// through with it on top of VALSTACK, landing past the compiler-emitted
-// default expression's IR (compiler.c's AST_SELECT case, when a default
-// is present, always emits the default's code followed by the point this
-// falls through to -- no separate OP_JMP needed here, unlike OP_WITH_TRY,
-// since there's only one "level" to try, not a chain).
-//
-// Scope cut (documented, see docs/architecture.md): this only protects
-// the single select this op corresponds to. `a.b.c or 5` compiles as
-// nested selects (see compiler.c's AST_SELECT), and this op is only used
-// for the OUTERMOST (last) one -- an earlier segment missing (e.g. `.b`
-// not existing on `a`) is still a fatal plain OP_SELECT abort, not caught
-// by the trailing `or`. Real Nix's `or` catches a missing/wrong-type
-// value at ANY point along a multi-segment path; asnix's current scope
-// only covers the last segment.
 #include "asnix/heap.h"
 #include "asnix/ir.h"
 #include "asnix/stackcheck.h"
@@ -45,96 +17,63 @@
     .type asnix_op_select_or, @function
 asnix_op_select_or:
     subq $8, %r12
-    movq (%r12), %rax                   // rax = target value
+    movq (%r12), %rax
     movq %rax, %rcx
     andq $ASNIX_TAG_MASK, %rcx
     cmpq $ASNIX_TAG_ATTRS, %rcx
-    jne .Lselect_or_not_found           // not even an attrset -- not fatal, see header comment
+    jne .Lselect_or_not_found
 
-    // M88 (lazy `//` union-layering, heap.h): a UnionHdr has a NEGATIVE
-    // `count` at offset 0 -- a single sign-bit check (no call overhead
-    // paid) on the common already-flat case.
-    //
-    // M154 (unionhdr-probe, generalizing M111's op_select.S-only fork):
-    // the union case used to call asnix_bshared_attrs_resolve, which
-    // ALWAYS fully flattens + caches every leaf merged together before
-    // this function's own single-key binary search ever runs, even
-    // though `.b or default` only ever wants ONE value. Now calls
-    // asnix_bshared_attrs_probe instead -- see op_select.S's matching
-    // comment and asnix_bshared_attrs_probe's own comment
-    // (builtins_shared.c) for the full reasoning.
-    movq %rax, %r9                      // r9 = tagged value, kept across the maybe-call below
-    andq $-8, %rax                      // rax = real Attrs* (untagged)
-    movq ASNIX_ATTRS_OFF_COUNT(%rax), %r8 // r8 = count (maybe negative -- union header)
+    movq %rax, %r9
+    andq $-8, %rax
+    movq ASNIX_ATTRS_OFF_COUNT(%rax), %r8
     testq %r8, %r8
     jns .Lselect_or_resolved
-    pushq %rsi                          // save IP
-    pushq %rdi                          // save ENV
-    subq $16, %rsp                      // 16-byte-aligned scratch slot for out_value (only
-                                         // 8 used -- keeps the call's own stack-alignment
-                                         // requirement simple alongside the 2 pushes above)
-    movq %r9, %rdi                      // arg1 = tagged attrs value
-    movl ASNIX_IROP_OFF_B(%rsi), %esi   // arg2 = symbol id (read before clobbering %rsi below)
-    movq %rsp, %rdx                     // arg3 = &out_value (the scratch slot just reserved)
+    pushq %rsi
+    pushq %rdi
+    subq $16, %rsp
+    movq %r9, %rdi
+    movl ASNIX_IROP_OFF_B(%rsi), %esi
+    movq %rsp, %rdx
     call asnix_bshared_attrs_probe
-    movq (%rsp), %r9                    // r9 = probed value (meaningful only if found; cheap
-                                         // to load unconditionally rather than branch around)
+    movq (%rsp), %r9
     addq $16, %rsp
     popq %rdi
     popq %rsi
-    // M154: `testl %eax, %eax` MUST be the LAST thing before `jz` -- see
-    // op_select.S's matching comment for the real bug this ordering
-    // avoids (an intervening `addq $16, %rsp` between the test and the
-    // branch silently clobbers the flags `testl` just set, found by
-    // direct repro on this exact file during this milestone).
     testl %eax, %eax
     jz .Lselect_or_not_found
-    movq %r9, %rax                      // rax = found value -- feed into the SAME thunk-
-                                         // forcing/Cell-check/push logic every other select-or
-                                         // result already goes through, below
+    movq %r9, %rax
     jmp .Lselect_or_resolve
 .Lselect_or_resolved:
 
-    movl ASNIX_IROP_OFF_B(%rsi), %edx   // rdx = target symbol id
-    // %r8 already holds hi = count
-    xorq %rcx, %rcx                     // rcx = lo = 0
+    movl ASNIX_IROP_OFF_B(%rsi), %edx
+    xorq %rcx, %rcx
 .Lselect_or_loop:
     cmpq %r8, %rcx
     jge .Lselect_or_not_found
     movq %rcx, %r9
     addq %r8, %r9
-    shrq $1, %r9                        // r9 = mid
+    shrq $1, %r9
     movq %r9, %r10
-    imulq $ASNIX_ATTR_SIZE, %r10         // r10 = mid * ASNIX_ATTR_SIZE (12 -- not a power of 2)
-    movl ASNIX_ATTRS_OFF_ENTRIES+ASNIX_ATTR_OFF_SYM(%rax, %r10, 1), %r11d // zero-extends; must be
-        // 32-bit -- M103 removed the pad word (see heap.h)
+    imulq $ASNIX_ATTR_SIZE, %r10
+    movl ASNIX_ATTRS_OFF_ENTRIES+ASNIX_ATTR_OFF_SYM(%rax, %r10, 1), %r11d
     cmpq %rdx, %r11
     je .Lselect_or_found
     jl .Lselect_or_go_right
-    movq %r9, %r8                       // hi = mid
+    movq %r9, %r8
     jmp .Lselect_or_loop
 .Lselect_or_go_right:
-    leaq 1(%r9), %rcx                   // lo = mid + 1
+    leaq 1(%r9), %rcx
     jmp .Lselect_or_loop
 .Lselect_or_found:
     movq ASNIX_ATTRS_OFF_ENTRIES+ASNIX_ATTR_OFF_VALUE(%rax, %r10, 1), %rax
 
-.Lselect_or_resolve:                    // M92: re-entered after unwrapping a Cell (see
-                                         // .Lselect_or_check_cell below) -- see op_var_ref.S's
-                                         // matching comment.
-    // M6: force if the selected entry holds an unforced thunk, same as
-    // OP_SELECT.
+.Lselect_or_resolve:
     movq %rax, %rcx
     andq $ASNIX_TAG_MASK, %rcx
     cmpq $ASNIX_TAG_THUNK, %rcx
     jne .Lselect_or_check_cell
 
     andq $-8, %rax
-    // M103: OFF_STATE is tagged now -- UNFORCED: this word IS the clean
-    // IrProgram* (tag bits 0); otherwise: the bare state tag alone.
-    // Extract into %r8 (dead since the binary search above) for
-    // dispatch, keeping %rcx (the possibly-a-pointer original word)
-    // intact for the UNFORCED path below.
     movq ASNIX_THUNK_OFF_STATE(%rax), %rcx
     movq %rcx, %r8
     andq $ASNIX_TAG_MASK, %r8
@@ -149,23 +88,16 @@ asnix_op_select_or:
 
     movq %rsi, %rdx
     addq $ASNIX_IROP_SIZE, %rdx
-    ASNIX_CHECK_RETSP %r8               // %r8 dead (already consumed into the state tag above);
-                                         // %rcx must survive -- it holds the clean prog pointer
+    ASNIX_CHECK_RETSP %r8
     movq %rdx, ASNIX_RETFRAME_OFF_IP(%r14)
     movq %rdi, ASNIX_RETFRAME_OFF_ENV(%r14)
     movq %r13, ASNIX_RETFRAME_OFF_POOL(%r14)
     movq %rax, ASNIX_RETFRAME_OFF_FORCE_TARGET(%r14)
     addq $ASNIX_RETFRAME_SIZE, %r14
 
-    // M103: %rcx already holds the clean prog pointer (read above, tag
-    // bits were 0) -- no second memory read needed (the old separate
-    // OFF_PROG field is gone).
     movq ASNIX_IRPROG_OFF_POOL(%rcx), %r13
     movq ASNIX_IRPROG_OFF_OPS(%rcx), %rsi
-    movq ASNIX_THUNK_OFF_ENV(%rax), %rdi // last read of ENV's original meaning -- safe to repurpose below
-    // M82: push onto the intrusive IN_PROGRESS stack -- see
-    // stacklimits.S's asnix_inprogress_head comment. %rcx is dead here
-    // (overwritten immediately below, same as before this M100 change).
+    movq ASNIX_THUNK_OFF_ENV(%rax), %rdi
     movq asnix_inprogress_head(%rip), %rcx
     movq %rcx, ASNIX_THUNK_OFF_ENV(%rax)
     movq %rax, asnix_inprogress_head(%rip)
@@ -174,86 +106,59 @@ asnix_op_select_or:
 
 .Lselect_or_forced:
     movq ASNIX_THUNK_OFF_ENV(%rax), %rax
-    jmp .Lselect_or_push                  // perf: skip the resolve re-check entirely, see
-                                           // op_var_ref.S's matching .Lvar_ref_forced comment for
-                                           // the invariant proof (a forced thunk's cached value can
-                                           // never be a Thunk or a Cell)
+    jmp .Lselect_or_push
 
-    // M92: not a thunk -- check whether it's a Cell instead (see heap.h's
-    // ASNIX_CELL_MARKER comment). %rcx still holds the tag bits from the
-    // check just above (the only path that reaches this label).
 .Lselect_or_check_cell:
     cmpq $ASNIX_TAG_PTR, %rcx
     jne .Lselect_or_push
     movq %rax, %r8
-    andq $-8, %r8                        // clear the low 3 tag bits...
-    shlq $16, %r8                        // ...and the high 16 bits a packed M118 ThunkMap word's
-    shrq $16, %r8                        // index occupies (a no-op for every other PTR kind --
-                                          // see heap.h's ASNIX_THUNKMAP_MARKER comment) --
-                                          // r8 = masked base pointer
+    andq $-8, %r8
+    shlq $16, %r8
+    shrq $16, %r8
     movq ASNIX_CELL_OFF_MARKER(%r8), %r9
     cmpq $ASNIX_CELL_MARKER, %r9
-    jne .Lselect_or_check_lazyapp        // PTR but not a Cell -- maybe a LazyApp instead
+    jne .Lselect_or_check_lazyapp
 
-    // It's a Cell -- M166: inline Cell-chain walk, same hand-rolled loop
-    // as op_var_ref.S's .Lvar_ref_cell_loop (see that file's comment for
-    // the full rationale). %r8 already holds the masked base pointer of
-    // a CONFIRMED Cell (the check just above); %r9/%r10/%r11/%rdx are
-    // free scratch here (the binary search above is done, and this is a
-    // HIT -- the value was already found before we ever discovered it
-    // was a Cell, so the `or` fallback/default-value path below is not
-    // involved at all: a Cell here is just a pointer to chase, same as
-    // op_var_ref.S's bare-alias case, and only the chase-limit-exceeded
-    // blackhole case diverts away from the ordinary push). Measured on
-    // d.nix: this call site hits 22,490 times (see op_select.S's
-    // matching comment for the combined total across all three sites).
     movq $ASNIX_CELL_CHASE_LIMIT, %rdx
 .Lselect_or_cell_loop:
-    movq ASNIX_CELL_OFF_TARGET(%r8), %r10 // r10 = target pointer (Value* into an Env's values[])
-    movq (%r10), %rax                     // rax = *target -- the actual next raw Value
+    movq ASNIX_CELL_OFF_TARGET(%r8), %r10
+    movq (%r10), %rax
     movq %rax, %rcx
     andq $ASNIX_TAG_MASK, %rcx
     cmpq $ASNIX_TAG_PTR, %rcx
-    jne .Lselect_or_resolve                // not even a PTR -- can't be a Cell, done chasing
+    jne .Lselect_or_resolve
     movq %rax, %r8
     andq $-8, %r8
     shlq $16, %r8
-    shrq $16, %r8                          // r8 = masked base pointer of the new value
+    shrq $16, %r8
     movq ASNIX_CELL_OFF_MARKER(%r8), %r9
     cmpq $ASNIX_CELL_MARKER, %r9
-    jne .Lselect_or_resolve                // PTR but not a Cell -- done, re-dispatch on %rax
+    jne .Lselect_or_resolve
     decq %rdx
     jnz .Lselect_or_cell_loop
-    jmp .Lselect_or_blackhole              // chase limit exceeded -- a genuine alias cycle
+    jmp .Lselect_or_blackhole
 
-    // M113: not a Cell either -- maybe a LazyApp (heap.h's
-    // ASNIX_LAZYAPP_MARKER comment). %r9 already holds the marker value
-    // from the Cell check just above -- see op_var_ref.S's matching
-    // comment.
 .Lselect_or_check_lazyapp:
     cmpq $ASNIX_LAZYAPP_MARKER, %r9
     je .Lselect_or_lazyapp
     cmpq $ASNIX_LAZYAPP_FORCED_MARKER, %r9
     je .Lselect_or_lazyapp
-    jmp .Lselect_or_check_thunkmap       // PTR but not Cell/LazyApp -- maybe a ThunkMap instead
+    jmp .Lselect_or_check_thunkmap
 .Lselect_or_lazyapp:
     pushq %rsi
     pushq %rdi
-    movq %rax, %rdi                      // arg1 = the LazyApp value
+    movq %rax, %rdi
     call asnix_resolve_lazyapp
     popq %rdi
     popq %rsi
     jmp .Lselect_or_resolve
 
-    // M118: not a Cell/LazyApp either -- maybe a ThunkMap (heap.h's
-    // ASNIX_THUNKMAP_MARKER comment) -- see op_var_ref.S's matching
-    // comment.
 .Lselect_or_check_thunkmap:
     cmpq $ASNIX_THUNKMAP_MARKER, %r9
-    jne .Lselect_or_push                 // PTR but not Cell/LazyApp/ThunkMap: a real value
+    jne .Lselect_or_push
     pushq %rsi
     pushq %rdi
-    movq %rax, %rdi                      // arg1 = the ThunkMap value (original, unmasked)
+    movq %rax, %rdi
     call asnix_resolve_thunkmap
     popq %rdi
     popq %rsi
@@ -267,7 +172,7 @@ asnix_op_select_or:
     jmp *%rax
 
 .Lselect_or_not_found:
-    movslq ASNIX_IROP_OFF_A(%rsi), %rax // byte delta from THIS op's own address
+    movslq ASNIX_IROP_OFF_A(%rsi), %rax
     addq %rax, %rsi
     movq (%rsi), %rax
     jmp *%rax
@@ -278,8 +183,8 @@ asnix_op_select_or:
     jmp asnix_fatal
 
 .Lselect_or_reraise:
-    // M82: see op_var_ref.S's matching .Lvar_ref_reraise comment.
     leaq .Lmsg_reeval_failed(%rip), %rdi
     movq $ASNIX_MSG_REEVAL_FAILED_LEN, %rsi
     jmp asnix_tryeval_raise_or_fatal
     .size asnix_op_select_or, . - asnix_op_select_or
+

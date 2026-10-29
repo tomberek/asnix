@@ -11,7 +11,7 @@
 #include "asnix/stats.h"
 #include "asnix/ir.h"
 #include "asnix/irbuild.h"
-#include "attrs_update.h" /* M88: asnix_attrs_eager_merge, for asnix_bshared_attrs_resolve */
+#include "attrs_update.h"
 #include "symtab.h"
 #include "value_util.h"
 
@@ -20,9 +20,6 @@ Value asnix_bshared_make_primop(void *fn, int64_t arity) {
     asnix_stats_primop++;
     *(void **)((char *)mem + ASNIX_PRIMOP_OFF_FN) = fn;
     *(int64_t *)((char *)mem + ASNIX_PRIMOP_OFF_ARITY) = arity;
-    /* ASNIX_PRIMOP_OFF_NOFORCE left at its fresh-arena zero (force args,
-     * the default for every primop except tryEval -- see that field's
-     * own comment, heap.h). */
     return (Value){ .raw = (uint64_t)(uintptr_t)mem | ASNIX_TAG_PRIMOP };
 }
 
@@ -35,34 +32,14 @@ Value asnix_bshared_make_primop_noforce(void *fn, int64_t arity) {
     return (Value){ .raw = (uint64_t)(uintptr_t)mem | ASNIX_TAG_PRIMOP };
 }
 
-/* M80: the ONE canonical marker Value used by every native-builtin-
- * currying helper in this codebase -- see builtins_shared.h's own long
- * comment on the declaration for the full rationale. Lazily built on
- * first use (happens very early, during the one-time builtin-table
- * registration pass that runs before any Nix source is even parsed, let
- * alone compiled) and memoized in a function-local static, the same
- * "compute once, cache in a static" shape this codebase already uses
- * elsewhere (e.g. builtins_attrs.c's prim_hasAttr/prim_getAttr `static
- * IrProgram *inner`). */
 Value asnix_bshared_native_formals_marker(void) {
     static Value marker = { .raw = 0 };
     if (marker.raw == 0) marker = asnix_bshared_make_attrs(NULL, NULL, 0);
     return marker;
 }
 
-/* Ported straight from builtins_misc.c's make_curried_native -- see that
- * file's long header comment for the full rationale (equivalent to
- * compiling the fictitious Nix source `a1: a2: ... aN: __native a1 a2 ... aN`
- * via the same IrBuilder API the real compiler uses for ordinary curried
- * lambdas). */
 Value asnix_bshared_make_curried_native(void *native_fn, int64_t arity) {
     Value native_primop = asnix_bshared_make_primop(native_fn, arity);
-    /* Never a lambda-pattern -- `builtins.functionArgs` on any of these
-     * closures is `{}`, same as real Nix's `functionArgs builtins.add`
-     * (M37). M80: uses the shared canonical marker (see above) instead of
-     * a fresh `asnix_bshared_make_attrs` call so the printer can
-     * recognize these as native-builtin curry stages (still a completely
-     * valid, correct `{ }` for `functionArgs` itself). */
     Value empty_formals = asnix_bshared_native_formals_marker();
 
     IrBuilder *b = ib_new();
@@ -82,17 +59,12 @@ Value asnix_bshared_make_curried_native(void *native_fn, int64_t arity) {
     void *mem = asnix_arena_alloc(ASNIX_CLOSURE_SIZE);
     asnix_stats_closure++;
     *(void **)((char *)mem + ASNIX_CLOSURE_OFF_UP) = NULL;
-    *(IrProgram **)((char *)mem + ASNIX_CLOSURE_OFF_PROG) = prog; /* M100: one pointer, not {ops,pool} */
+    *(IrProgram **)((char *)mem + ASNIX_CLOSURE_OFF_PROG) = prog;
     *(int64_t *)((char *)mem + ASNIX_CLOSURE_OFF_ARITY) = 1;
     *(uint64_t *)((char *)mem + ASNIX_CLOSURE_OFF_FORMALS) = empty_formals.raw;
     return (Value){ .raw = (uint64_t)(uintptr_t)mem | ASNIX_TAG_CLOSURE };
 }
 
-/* M92: see builtins_shared.h's own long comment -- identical to
- * asnix_bshared_make_curried_native just above, except the reassembly
- * loop uses ib_var_ref_raw (no forcing at all) instead of ib_var_ref,
- * and the leaf primop is built NOFORCE (asnix_bshared_make_primop_
- * noforce) instead of force-by-default. */
 Value asnix_bshared_make_curried_native_noforce(void *native_fn, int64_t arity) {
     asnix_stats_closure++;
     Value native_primop = asnix_bshared_make_primop_noforce(native_fn, arity);
@@ -114,7 +86,7 @@ Value asnix_bshared_make_curried_native_noforce(void *native_fn, int64_t arity) 
 
     void *mem = asnix_arena_alloc(ASNIX_CLOSURE_SIZE);
     *(void **)((char *)mem + ASNIX_CLOSURE_OFF_UP) = NULL;
-    *(IrProgram **)((char *)mem + ASNIX_CLOSURE_OFF_PROG) = prog; /* M100: one pointer, not {ops,pool} */
+    *(IrProgram **)((char *)mem + ASNIX_CLOSURE_OFF_PROG) = prog;
     *(int64_t *)((char *)mem + ASNIX_CLOSURE_OFF_ARITY) = 1;
     *(uint64_t *)((char *)mem + ASNIX_CLOSURE_OFF_FORMALS) = empty_formals.raw;
     return (Value){ .raw = (uint64_t)(uintptr_t)mem | ASNIX_TAG_CLOSURE };
@@ -130,17 +102,6 @@ void asnix_bshared_fatal(const char *who, const char *msg) {
     exit(1);
 }
 
-/* OP_SELECT's (op_select.S) static-attribute-missing fatal path -- names
- * the attribute, matching real Nix's own "attribute 'x' missing" wording
- * (confirmed via `nix-instantiate --eval '{ a = 1; }.b'`). Previously a
- * single generic "attribute missing, aborting" line with no indication of
- * *which* attribute or selection site -- found to cost real debugging time
- * (every "attribute missing" abort chasing real nixpkgs needed a one-off
- * gdb session reading the symbol id out of the live IP register to find
- * out). Only ever called immediately before `exit(1)`, so the extra
- * `asnix_sym_name` call/format here costs nothing on the hot (successful
- * select) path -- op_select.S's own `.Lselect_found`/`.Lselect_push`
- * never reach this function at all. */
 _Noreturn void asnix_bshared_select_missing_fatal(uint32_t sym) {
     size_t len;
     const char *name = asnix_sym_name(sym, &len);
@@ -148,23 +109,6 @@ _Noreturn void asnix_bshared_select_missing_fatal(uint32_t sym) {
     exit(1);
 }
 
-/* M50: the "cheap pass" extension of M36's idea -- name the actual VALUE
- * (its type/kind) at every other fatal path that previously said nothing
- * more specific than "is not an attrset"/"is not a function". Reuses the
- * exact same tag -> name mapping builtins.c's `prim_typeOf` already
- * established (int/bool/null/string/path/list/set/lambda), just phrased
- * as a full "a/an X" clause instead of typeOf's bare noun, since every
- * call site below wants to say "...(got X), aborting". Deliberately does
- * NOT force `v` first (unlike typeOf, which relies on OP_CALL having
- * already forced every primop argument, M25): every call site below reads
- * a value already sitting on VALSTACK or passed in from an asm op's own
- * C glue, which by this evaluator's standing invariant (op_call.S's own
- * M23 comment: every value reaching VALSTACK is already forced) is never
- * an unforced Thunk in practice -- the ASNIX_TAG_THUNK case is dead code,
- * kept only so a future violation of that invariant prints something sane
- * instead of misreading raw thunk bits. Declared non-static (in
- * builtins_shared.h) because attrs_update.c's asnix_attrs_insert_dynamic
- * needs it too, not just this file's own dynamic-select fatals below. */
 const char *asnix_bshared_type_name(Value v) {
     switch (asnix_tag_of(v)) {
         case ASNIX_TAG_INT: return "an integer";
@@ -181,59 +125,23 @@ const char *asnix_bshared_type_name(Value v) {
         case ASNIX_TAG_ATTRS: return "an attrset";
         case ASNIX_TAG_CLOSURE:
         case ASNIX_TAG_PRIMOP: return "a function";
-        case ASNIX_TAG_THUNK: return "an unforced thunk"; /* see comment above: dead in practice */
+        case ASNIX_TAG_THUNK: return "an unforced thunk";
         default: return "a value of unknown type";
     }
 }
 
-/* OP_SELECT's (op_select.S) type-error fatal path -- names the actual
- * type of the non-attrset select target, same motivation as
- * asnix_bshared_select_missing_fatal above (M36) applied to the sibling
- * fatal one op up: "asnix: '.' selection target is not an attrset,
- * aborting" gave no indication of what the value actually WAS, forcing
- * the same kind of one-off gdb session M36's own commit message
- * complains about. `v` arrives still tagged (the raw Value popped off
- * VALSTACK, before op_select.S's own `andq $-8` untagging) -- exactly
- * what asnix_bshared_type_name above wants. */
 _Noreturn void asnix_bshared_select_type_fatal(Value v) {
     fprintf(stderr, "asnix: '.' selection target is not an attrset (got %s), aborting\n",
             asnix_bshared_type_name(v));
     exit(1);
 }
 
-/* OP_CALL's (op_call.S) "call target is not a function" fatal path --
- * same idea, one op over: names the actual type of whatever was called.
- * `v` arrives still tagged (read out of the callee's VALSTACK slot
- * before op_call.S's own closure/primop dispatch, which is exactly the
- * point this path is reached from -- neither tag matched). */
 _Noreturn void asnix_bshared_call_type_fatal(Value v) {
     fprintf(stderr, "asnix: call target is not a function (got %s), aborting\n",
             asnix_bshared_type_name(v));
     exit(1);
 }
 
-/* `__functor` protocol (M42): calling an attrset `s` with argument `arg`
- * (`s arg`) is sugar for `s.__functor s arg` when `s` has a `__functor`
- * attribute -- real Nix's exact mechanism, confirmed in
- * `~/nix/src/libexpr/eval.cc`'s `callFunction`: `callFunction(functor,
- * {self_copy, args[0]}, ...)`, i.e. `__functor` is called with the
- * attrset itself as its first argument, then the real argument second
- * (a curried 2-arg function in Nix terms, which this project already
- * represents as two nested arity-1 Closures, so this is just two
- * ordinary `asnix_apply` calls chained). Reached from both `OP_CALL`
- * (op_call.S) and `asnix_apply` (apply.S) ONLY after their own Closure/
- * PrimOp dispatch has already failed to match -- so this never costs
- * anything on the common (plain function call) path. Does not special-
- * case a `__functor` that itself returns another attrset-with-
- * `__functor`; `asnix_apply`'s own ATTRS branch (which this function's
- * second `asnix_apply` call re-enters) already handles that
- * recursively for free, matching real Nix's own `while` loop over
- * `args` in `callFunction`, which re-checks `vCur`'s type after every
- * step. Fatal (same "not a function" message as a plain attrset) if
- * `attrs_val` has no `__functor` attribute at all -- confirmed against
- * real Nix: `{ a = 1; } 5` and `{ __functor = ...; }`-less attrsets
- * both get the identical "attempt to call something which is not a
- * function" error. */
 Value asnix_bshared_call_functor(Value attrs_val, Value arg) {
     uint32_t sym = asnix_intern("__functor", 9);
     int64_t idx = asnix_bshared_attrs_find(attrs_val, sym);
@@ -243,15 +151,6 @@ Value asnix_bshared_call_functor(Value attrs_val, Value arg) {
     return asnix_apply(step1, &arg, 1);
 }
 
-/* OP_CHECK_FORMALS's (op_check_formals.S) two lambda-pattern-mismatch
- * fatal paths -- same idea as the attribute-missing case above (M36),
- * applied to `{a, b, ...}: ...`'s own argument-validation errors: neither
- * "lambda called without a required argument" nor "lambda called with an
- * unexpected argument" said *which* field, which is exactly the
- * information a human needs to fix the call site. `sym` arrives already
- * resolved out of the IR constant pool (missing case, op_check_formals.S's
- * %r15) or out of the given attrset's own entries (extra case, %r11) --
- * both already-interned symbol ids, same asnix_sym_name lookup M36 used. */
 _Noreturn void asnix_bshared_cf_missing_fatal(uint32_t sym) {
     size_t len;
     const char *name = asnix_sym_name(sym, &len);
@@ -290,50 +189,17 @@ Value asnix_bshared_make_list(const Value *elems, int64_t count) {
     return (Value){ .raw = (uint64_t)(uintptr_t)mem | ASNIX_TAG_LIST };
 }
 
-/* M88: see builtins_shared.h's comment and heap.h's UnionHdr layout. */
 Value asnix_bshared_attrs_resolve(Value v) {
     const char *base = (const char *)(uintptr_t)(v.raw & ~(uint64_t)ASNIX_TAG_MASK);
     int64_t count = *(const int64_t *)(base + ASNIX_ATTRS_OFF_COUNT);
-    if (count >= 0) return v; /* already flat -- the common case */
+    if (count >= 0) return v;
 
     Value cached = *(const Value *)(base + ASNIX_ATTRS_UNION_OFF_FLATCACHE);
-    if (cached.raw != 0) return cached; /* materialized by an earlier call */
+    if (cached.raw != 0) return cached;
 
     int64_t nleaves = -count;
     const Value *leaves = (const Value *)(base + ASNIX_ATTRS_UNION_OFF_LEAVES);
 
-    /* M-big-leaf-merge: a plain BALANCED pairwise tree (below) pays for a
-     * disproportionately large leaf's own size at EVERY tree level (up to
-     * log2(ASNIX_ATTRS_UNION_MAX_LEAVES)=6 times for a 64-leaf union),
-     * not once -- real nixpkgs's classic `foldl' (acc: x: acc // x) {}
-     * bigList` anti-pattern produces exactly this shape: leaves[0] is
-     * always the ever-growing accumulator (asnix_attrs_update's
-     * make_union_header always appends the NEW leaf after the EXISTING
-     * ones, so the oldest/biggest leaf is always leftmost), while
-     * leaves[1..] are single-entry leaves from each fold step. Confirmed
-     * super-linear growth measuring this exact shape (instructions grew
-     * 6.58x then 10.68x for each 4x increase in N=2000/8000/32000) --
-     * caused by this materialize step being paid for repeatedly as the
-     * 64-leaf cap keeps getting hit against an ever-larger base (see
-     * attrs_update.c's own ASNIX_ATTRS_UNION_MAX_LEAVES comment for that
-     * part of the story), with THIS function's own log2(64)-times
-     * overpayment as a real, independent multiplier on top.
-     *
-     * Special case: if the biggest leaf alone outweighs every other leaf
-     * combined, merge the small leaves together first (cheap bottom-up
-     * tree, since they're small) into one combined leaf, then do exactly
-     * ONE direct 2-way merge of (big leaf, combined-small-leaves) --
-     * O(big_size) paid once, not O(big_size * log2(nleaves)). Correctness:
-     * restricted to leaves[0] specifically (not "whichever leaf happens
-     * to be biggest") because that's the ONLY position construction
-     * guarantees is safe to special-case here -- asnix_attrs_eager_merge's
-     * right-biased collision rule (rhs always wins) needs the big leaf on
-     * the lhs and everything newer-and-combined on the rhs, which is only
-     * guaranteed correct when the big leaf is the OLDEST (lowest-
-     * priority) one, i.e. leaves[0]. The small-leaves-merge below reuses
-     * the exact same bottom-up pairwise algorithm on leaves[1..] alone,
-     * so their own relative priority order (newest-of-the-rest wins) is
-     * preserved exactly as it would be by the unmodified code path. */
     if (nleaves >= 3) {
         int64_t leaf0_count = *(const int64_t *)((leaves[0].raw & ~(uint64_t)0x7ULL) + ASNIX_ATTRS_OFF_COUNT);
         int64_t rest_count = 0;
@@ -357,29 +223,6 @@ Value asnix_bshared_attrs_resolve(Value v) {
         }
     }
 
-    /* Leaves are guaranteed flat by construction (asnix_attrs_update,
-     * attrs_update.c, always resolves a would-be leaf before storing it).
-     *
-     * IMPORTANT: this is a bottom-up PAIRWISE (binary-tree) merge, NOT a
-     * left-to-right fold (`acc = merge(acc, leaf)` repeated) -- a fold
-     * would re-copy the ALREADY-MERGED, ever-growing accumulator on every
-     * one of the (up to ASNIX_ATTRS_UNION_MAX_LEAVES-1) merge steps,
-     * costing O(total_size * nleaves) instead of O(total_size *
-     * log2(nleaves)). That was an actual bug found measuring this
-     * milestone (see docs/architecture.md's M88 section): with the fold,
-     * repeated materialization cost as much total copying as the eager
-     * `//` path it was meant to avoid, measured via peak RSS on a
-     * synthetic many-small-leaves benchmark (nearly identical memory to
-     * the eager baseline). The pairwise merge below halves the work list
-     * each round (same shape as mergesort's merge phase), preserving
-     * `//`'s right-biased collision semantics: each pairwise
-     * asnix_attrs_eager_merge(work[i], work[i+1]) keeps `work[i+1]` (the
-     * more-recently-layered, higher-priority side, since `leaves` is
-     * stored lowest-priority-first) as the winning operand, and pairing
-     * adjacent elements bottom-up preserves that same relative priority
-     * order all the way up the tree. This is the FALLBACK path for every
-     * shape the big-leaf special case above doesn't cover (no leaf
-     * dominates, or fewer than 3 leaves). */
     Value work[ASNIX_ATTRS_UNION_MAX_LEAVES];
     for (int64_t i = 0; i < nleaves; i++) work[i] = leaves[i];
     int64_t n = nleaves;
@@ -389,7 +232,7 @@ Value asnix_bshared_attrs_resolve(Value v) {
         for (; i + 1 < n; i += 2) {
             work[out_n++] = asnix_attrs_eager_merge(work[i], work[i + 1]);
         }
-        if (i < n) work[out_n++] = work[i]; /* odd one out, carried up unmerged */
+        if (i < n) work[out_n++] = work[i];
         n = out_n;
     }
     Value acc = work[0];
@@ -416,22 +259,6 @@ Value asnix_bshared_attrs_value(Value v, int64_t i) {
     return *(const Value *)(entry + ASNIX_ATTR_OFF_VALUE);
 }
 
-/* fork (unionhdr-probe): search on a value ALREADY KNOWN to be flat
- * (count >= 0) -- shared by asnix_bshared_attrs_probe and (M114)
- * asnix_bshared_attrs_find below, raw-layout version without any
- * resolve call, since every leaf of a union is already guaranteed flat
- * by construction (asnix_attrs_update always resolves a would-be leaf
- * before storing it), and a caller that has already resolved its own
- * `attrs` argument once knows the result is flat too.
- *
- * M-attrs-linear-scan: iets's own get_flat (runtime/value.rs) uses a
- * LINEAR scan, not binary search, whenever the set has 8 or fewer
- * entries -- read directly, not guessed: "binary search over symbol
- * ids; linear for small sets". A sequential scan over a small, tightly-
- * packed entry array beats binary search's O(log n) but branch-heavy,
- * cache-unpredictable jump pattern for small n, and most real nixpkgs
- * attrsets (package metadata, module options) are small. Kept the
- * exact threshold (8) iets itself uses. */
 static int64_t attrs_find_flat_noresolve(Value flat, uint32_t sym) {
     const char *base = (const char *)(uintptr_t)(flat.raw & ~(uint64_t)ASNIX_TAG_MASK);
     int64_t hi = *(const int64_t *)(base + ASNIX_ATTRS_OFF_COUNT);
@@ -454,58 +281,11 @@ static int64_t attrs_find_flat_noresolve(Value flat, uint32_t sym) {
     return -1;
 }
 
-/* M114 perf: was `resolve(attrs)` once + `attrs_count(attrs)` (another
- * internal resolve) to get `hi`, then `attrs_sym(attrs, mid)` per binary-
- * search iteration (which ALSO internally resolves `attrs` on every
- * call, even though `attrs` is loop-invariant and was already resolved
- * on the line above). For a typical nixpkgs-sized attrset that's
- * 1 (direct) + 1 (via count) + ~log2(n) (via sym) resolve() calls per
- * find(), where exactly one suffices: `attrs` is already flat (count >=
- * 0) immediately after the one resolve() call below, so the rest of the
- * search can walk the raw entry array directly via
- * attrs_find_flat_noresolve, exactly like M93's attrs_probe/
- * attrs_find_flat_noresolve pairing already does for the op_select.S
- * fast path (see that function's comment -- this was its flagged,
- * explicitly-out-of-scope-at-the-time follow-up for attrs_find/_count/
- * _sym/_value). */
 int64_t asnix_bshared_attrs_find(Value attrs, uint32_t sym) {
     attrs = asnix_bshared_attrs_resolve(attrs);
     return attrs_find_flat_noresolve(attrs, sym);
 }
 
-/* fork (unionhdr-probe): bounded multi-leaf probe for a SINGLE-KEY
- * lookup on a lazy union (heap.h's UnionHdr, M88/M93). The existing
- * asnix_bshared_attrs_find/_resolve ALWAYS fully materializes+caches
- * every leaf merged together (a pairwise merge across all leaves, same
- * cost as an eager `//`) before doing ANY lookup -- even when the caller
- * only wants ONE key, which is op_select.S's `a.b` access, the single
- * most common real-world attrs operation in compiled Nix code. That
- * means M88's lazy deferral provides essentially zero benefit the
- * moment an attrset is touched even once via a point lookup, which is
- * nearly always, since why build `a // b` and never read from it --
- * found by tracing exactly where every access path routes through
- * asnix_bshared_attrs_resolve unconditionally.
- *
- * Real Nix's own layered Bindings::get() never has this problem: a
- * point lookup walks the layer chain directly (binary-search the top
- * layer, fall through to baseLayer on miss), with no flattened view
- * ever required unless something genuinely needs full iteration. This
- * function is the same idea for asnix's leaf-array union representation
- * -- walk leaves from HIGHEST priority (last-stored, matching `//`'s
- * right-biased override semantics -- heap.h's own comment confirms
- * `leaves` is stored lowest-priority-first) to lowest, binary-search
- * each flat leaf directly, return on first hit. Never touches
- * flat_cache, never allocates, never mutates the union. If the union
- * was ALREADY materialized by some earlier full-iteration caller, probe
- * that cached flat form directly instead (still just one binary search,
- * no leaf-walk needed).
- *
- * Deliberately narrow in scope: only wired into op_select.S's single-key
- * `a.b` path (the hottest, most frequent case) for this one-shot fork,
- * NOT into asnix_bshared_attrs_find/_count/_sym/_value, whose 35+
- * callers expect a stable POSITIONAL index into v's own flat form --
- * changing that contract to avoid materialization too would need
- * auditing every one of those call sites, out of scope here. */
 int asnix_bshared_attrs_probe(Value attrs, uint32_t sym, Value *out_value) {
     const char *base = (const char *)(uintptr_t)(attrs.raw & ~(uint64_t)ASNIX_TAG_MASK);
     int64_t count = *(const int64_t *)(base + ASNIX_ATTRS_OFF_COUNT);
@@ -541,37 +321,8 @@ typedef struct {
     int64_t idx;
 } MakeAttrsEntry;
 
-/* Threshold below which plain insertion sort beats a merge sort's loop/
- * merge overhead, plus any scratch allocation at all -- the exact same
- * tradeoff, and the same constant, as compiler.c's AST_ATTRSET case uses
- * for its own compile-time sort (see that case's
- * ASNIX_ATTRSET_SORT_INSERTION_MAX / ASNIX_COMPILE_SCRATCH_MAX comments;
- * not shared via a header since the two sorts operate on unrelated data
- * and this file has no other reason to depend on compiler.c). M158:
- * instrumentation on a full nixpkgs eval (`./asnix d.nix`) showed 93% of
- * all asnix_bshared_make_attrs calls have count <= 32. */
 #define ASNIX_MAKE_ATTRS_SORT_INSERTION_MAX 32
 
-/* perf: bottom-up (iterative) merge sort over `.sym` alone, specialized
- * for `MakeAttrsEntry` -- replaces a `qsort`+indirect-comparator call for
- * the above-threshold path. Same O(n log n) algorithm `qsort_r` already
- * ran internally (glibc's own `msort_with_tmp`); the win here is not
- * algorithmic, it's removing the two things a type-erased C library sort
- * cannot avoid: an indirect call to `cmp_make_attrs_entry` for every
- * single comparison, and generic byte-range (`memmove`-style) element
- * moves instead of a direct 16-byte struct copy. `iets`'s equivalent
- * (`sort_by_key`/`Vec::sort`, src/runtime/value.rs) pays neither cost --
- * Rust monomorphizes and inlines the key-extraction closure directly into
- * the sort, with no indirection -- so this closes exactly that gap, not a
- * new algorithmic idea. Naturally stable (ties always resolved in favor
- * of the left run, i.e. the earlier original index) by construction, so
- * it reproduces the old `cmp_make_attrs_entry`'s explicit `(sym, idx)`
- * tie-break exactly without ever comparing `.idx` at all -- a duplicate
- * sym's earlier occurrence always stays first, same as insertion sort's
- * `>` (never swaps equal syms) and the same as `iets`'s own `sort_by_key`
- * (also stable). `tmp` must be a second buffer of the same size as `a`;
- * returns whichever of `a`/`tmp` ends up holding the fully-sorted result
- * (alternates each pass, so for odd counts of passes it is `tmp`). */
 static MakeAttrsEntry *merge_sort_make_attrs_entries(MakeAttrsEntry *a, MakeAttrsEntry *tmp, int64_t n) {
     MakeAttrsEntry *src = a, *dst = tmp;
     for (int64_t width = 1; width < n; width *= 2) {
@@ -591,35 +342,6 @@ static MakeAttrsEntry *merge_sort_make_attrs_entries(MakeAttrsEntry *a, MakeAttr
     return src;
 }
 
-/* M89 perf: was an insertion sort (O(n^2) worst case) -- measured on a
- * full nixpkgs evaluation (`./asnix d.nix`, ffmpeg.outPath): 52,539
- * calls, up to 5,234 entries in a single call, ~699,000 total swaps.
- * Switched to qsort over (sym, original-index) pairs, same "resolve
- * once into a sortable key, sort that" approach M88 already used for
- * `sorted_name_order` -- see docs/architecture.md's M88/M89 notes.
- *
- * M158 perf: that switch made EVERY call pay qsort's malloc/free pair
- * and per-comparison indirect call through cmp_make_attrs_entry, even
- * though 93% of real-workload calls have count <= 32 (measured above).
- * Below that threshold, sort a plain index array in place with
- * insertion sort directly on the stack -- no allocation, no indirect
- * comparator call. Insertion sort is stable by construction (the
- * `>` comparison below never swaps equal syms), so it preserves the
- * same "ties keep original relative order" behavior the old insertion
- * sort and cmp_make_attrs_entry's explicit idx tie-break both gave,
- * without needing to track idx as a separate field at all.
- *
- * perf (this milestone): a fresh profile found the ABOVE-threshold path
- * still real: 3,662 calls on the real d.nix/ffmpeg eval (7% of all
- * calls, M161 left this branch unchanged), 171,246 total entries sorted
- * (avg ~47/call, max 5,234), `msort_with_tmp`/`qsort_r` self-time ~0.8%
- * of the whole eval's instructions. Replaced `malloc`+`qsort`+`free`
- * with two `asnix_arena_alloc` scratch buffers (never individually
- * freed -- same "leak it into the never-free bump arena, it's cheap and
- * short-lived" tradeoff M171 already made for IrBuilder's `ops`/`pool`
- * arrays; ~47 entries * 16 bytes * 2 buffers * 3,662 calls ~= 5.5 MB
- * total over the whole eval, trivial against this process's baseline
- * RSS) plus the hand-written `merge_sort_make_attrs_entries` above. */
 Value asnix_bshared_make_attrs(uint32_t *syms, Value *vals, int64_t count) {
     void *mem = asnix_arena_alloc(8 + (uint64_t)count * ASNIX_ATTR_SIZE);
     asnix_stats_attrs++;
@@ -641,8 +363,6 @@ Value asnix_bshared_make_attrs(uint32_t *syms, Value *vals, int64_t count) {
         for (int64_t i = 0; i < count; i++) {
             char *entry = (char *)mem + ASNIX_ATTRS_OFF_ENTRIES + i * ASNIX_ATTR_SIZE;
             int64_t src = order_stack[i];
-            /* M103: must be a 4-byte write -- entry's value bytes now start right after sym (no pad),
-             * so an 8-byte write here would clobber them. */
             *(uint32_t *)(entry + ASNIX_ATTR_OFF_SYM) = syms[src];
             *(Value *)(entry + ASNIX_ATTR_OFF_VALUE) = vals[src];
         }
@@ -674,20 +394,6 @@ static int cmp_override_sym_idx(const void *a, const void *b) {
     return x < y ? -1 : (x > y ? 1 : 0);
 }
 
-/* perf (follow-up): building+sorting `sym_order` UNCONDITIONALLY measured
- * as a real, reproducible regression on ll's own ffmpeg-full/plasma-
- * system benchmarks (callgrind) -- real `rec{}` blocks with `__overrides`
- * overwhelmingly have few static bindings, where the malloc+sort setup
- * costs more than the linear scan it replaces. Gated on the PRODUCT
- * `n * ocount` (same calibration lesson as builtins_attrs.c's
- * removeAttrs fix, ASNIX_REMOVE_ATTRS_PRODUCT_MAX -- gating on `n`
- * alone still pays sort overhead for a "few static bindings, many
- * override entries" shape where the OLD per-override linear scan was
- * already cheap because `n` itself was small) -- below that, skip the
- * index and fall back to the original O(n * ocount) linear-scan-per-
- * override behavior (byte-for-byte the old cost); only once the
- * product crosses it does the sorted-index path actually pay for
- * itself. */
 #define ASNIX_REC_OVERRIDES_PRODUCT_MAX 2048
 
 Value asnix_bshared_rec_overrides_merge(Env *env, int64_t n, const int64_t *meta) {
@@ -699,10 +405,6 @@ Value asnix_bshared_rec_overrides_merge(Env *env, int64_t n, const int64_t *meta
         exit(1);
     }
 
-    /* Working (sym, value) pairs: the n static bindings first (by Env
-     * slot order, matched ones replaced below), then any override-only
-     * extras appended -- asnix_bshared_make_attrs sorts the whole lot by
-     * sym at the end, so this function never needs to track order itself. */
     int64_t ocount = asnix_bshared_attrs_count(overrides_val);
     int64_t cap = n + ocount;
     uint32_t *syms = malloc((size_t)cap * sizeof(uint32_t));
@@ -711,24 +413,6 @@ Value asnix_bshared_rec_overrides_merge(Env *env, int64_t n, const int64_t *meta
         syms[i] = (uint32_t)meta[i];
         vals[i] = env->values[i];
     }
-    /* perf: was an O(n) linear rescan of `syms[0..n)` PER override entry
-     * (O(n * ocount) overall) -- real rec{} blocks with many static
-     * bindings and multiple __overrides entries pay this quadratically.
-     * Fixed the same way this session's other quadratic-rescan bugs
-     * were: sort (sym, original-slot-index) pairs ONCE, then binary-
-     * search per override instead. Safe here specifically because
-     * `syms[0..n)` never changes once built above (only entries at
-     * index >= n get appended, by the override loop below, after every
-     * lookup already happened) -- attribute names within one rec{} are
-     * unique (duplicate static bindings are a parse-time error), so
-     * there is at most one matching index for any given sym, same as
-     * the old linear scan's first-and-only match. OBSERVABLE behavior
-     * (which slot gets overwritten, read-after-write ordering across
-     * overrides, env->values propagation to sibling self-references)
-     * is unchanged -- only how `match` is located. Gated on the product
-     * (see ASNIX_REC_OVERRIDES_PRODUCT_MAX's own comment above) -- below
-     * that, `sym_order` is never built and the loop below falls back to
-     * the original linear scan untouched. */
     int use_sorted = n * ocount > ASNIX_REC_OVERRIDES_PRODUCT_MAX;
     OverrideSymIdx *sym_order = NULL;
     if (use_sorted) {
@@ -771,7 +455,7 @@ Value asnix_bshared_rec_overrides_merge(Env *env, int64_t n, const int64_t *meta
         }
         if (match >= 0) {
             vals[match] = oval;
-            env->values[match] = oval; /* propagate into sibling self-references */
+            env->values[match] = oval;
         } else {
             syms[total] = osym;
             vals[total] = oval;
@@ -793,22 +477,6 @@ void asnix_bshared_string_bytes(Value v, const char **bytes_out, int64_t *len_ou
     *bytes_out = asnix_ptr_bytes(v, len_out);
 }
 
-/* M67: real Nix's `eqValues` (eval.cc) special-cases attrsets that denote
- * a derivation -- `isDerivation(v)` checks for a `type` attribute whose
- * forced value is exactly the string "derivation" -- comparing them by
- * their `outPath` attribute's value (itself a recursive `eqValues` call,
- * not a raw byte-compare) rather than the generic attribute-by-attribute
- * structural walk below. Verified directly against real `nix-instantiate
- * --eval`: two separately-constructed `derivation {...}` calls with
- * identical args are `==` (same outPath) even though they're two
- * different heap attrsets; `derivation {...} // { dummy = 1; }` is still
- * `==` to the original (outPath is unaffected by an unrelated `//`
- * merge); two derivations differing only in `builder` are not `==`
- * (different outPath). Needed because the generic structural walk below
- * would otherwise (a) give the wrong answer whenever a `//` merge changes
- * the attribute count/shape without changing outPath, and (b) risk
- * forcing attributes real Nix never would (e.g. a `throw`-valued
- * attribute merged on afterward) just to decide structural equality. */
 static int value_is_derivation(Value v) {
     if (asnix_tag_of(v) != ASNIX_TAG_ATTRS) return 0;
     uint32_t sym_type = asnix_intern("type", 4);
@@ -821,38 +489,6 @@ static int value_is_derivation(Value v) {
     return len == 10 && memcmp(bytes, "derivation", 10) == 0;
 }
 
-/* M92: real Nix's `eqValues` (eval.cc ~line 2919) starts with `if (&v1 ==
- * &v2) return true` -- comparing the ADDRESS of the Value slot/cell
- * itself, BEFORE forcing either side, not the heap payload either one
- * eventually forces to. asnix has no single uniform "every Value lives in
- * an addressable cell" model the way real Nix does (see heap.h's
- * ASNIX_CELL_MARKER comment) -- the closest equivalents are (a) two Cells
- * (possibly different Cell objects, from two independent OP_VAR_REF_CELL
- * executions) whose `target` fields point at the exact same Env slot, and
- * (b) two Values that are the literal same raw THUNK -- genuinely shared
- * memoization storage, e.g. the same already-forced attrset's entry read
- * twice (`builtins.attrValues x == builtins.attrValues x`). Must run on
- * the RAW, pre-force operands -- forcing loses exactly the identity
- * information being checked (confirmed via numtide/nix-conformance's
- * eval-okay-eq-slot-elem.nix/-identity.nix).
- *
- * Deliberately does NOT do a blanket `a.raw == b.raw` on any already-
- * concrete tag (INT/IMM/PTR/LIST/ATTRS/CLOSURE/PRIMOP): `==`'s own two
- * direct operands (asnix_bshared_value_eq_op) are ALWAYS already fully
- * forced by the ordinary (always-forcing) OP_VAR_REF/OP_SELECT/etc.
- * chokepoint that produced them -- a bare variable used directly as an
- * operand is never Cell-ified (compiler.c's try_cell_ref only fires at
- * `ib_mk_thunk` call sites, never for an ordinary compile_expr(AST_VAR)
- * read) -- so two closures that happen to be bit-identical CONTENT
- * (e.g. `let f = x: x; in f == f`, both reads forced down to the same
- * underlying closure object) are NOT "the same slot" in real Nix's
- * sense (ExprOpEq::eval always copies into a fresh local Value first --
- * see builtins_shared.h's own M80 comment) and must still compare
- * `false` (eval-okay-equal-function-direct-identical.nix) -- exactly
- * the case a blanket raw-equality check would have wrongly short-
- * circuited to `true`. List/Attrs pointer-equality is still handled,
- * correctly, by asnix_bshared_value_eq's own LIST/ATTRS cases below
- * (content equality there IS genuine equality, unlike for a function). */
 static int asnix_bshared_slot_identical(Value a, Value b) {
     if (asnix_value_is_cell(a) && asnix_value_is_cell(b)) return asnix_cell_target(a) == asnix_cell_target(b);
     if (asnix_tag_of(a) == ASNIX_TAG_THUNK && asnix_tag_of(b) == ASNIX_TAG_THUNK) return a.raw == b.raw;
@@ -864,15 +500,6 @@ int asnix_bshared_value_eq(Value a, Value b) {
     a = asnix_force_for_print(a);
     b = asnix_force_for_print(b);
     int ta = asnix_tag_of(a), tb = asnix_tag_of(b);
-    /* M51: a Float on either side -- checked FIRST, before the generic
-     * PTR-vs-PTR string/path byte-compare below (a Float's bytes are a
-     * marker+double, not length-prefixed text, so that branch would
-     * misread them) and before the plain `ta != tb` type-mismatch
-     * rejection (int-vs-float must still compare equal when numerically
-     * equal, matching real Nix's own `==`/eqValues -- confirmed against
-     * `nix-instantiate --eval`: `1 == 1.0` is `true`). Not numeric on
-     * one side and not float-tagged on the other (e.g. a Float vs a
-     * string) simply isn't equal, same as any other cross-type `==`. */
     if (asnix_value_is_float(a) || asnix_value_is_float(b)) {
         double da, db;
         if (asnix_value_is_float(a)) da = asnix_float_value(a);
@@ -922,45 +549,10 @@ int asnix_bshared_value_eq(Value a, Value b) {
             }
             return 1;
         }
-        /* M92: closures/primops (the only tags that can still reach here --
-         * INT/IMM/PTR/LIST/ATTRS are all handled above, and THUNK is
-         * impossible: force_for_print already fully resolved both sides)
-         * are NEVER equal at this point, matching real Nix's `case
-         * nFunction: return false` (eval.cc), which runs unconditionally
-         * once the `&v1==&v2` slot-identity shortcut hasn't already
-         * fired -- and it HAS already been checked, above, on the raw
-         * pre-force operands (asnix_bshared_slot_identical). Previously
-         * this fell back to `a.raw == b.raw` (forced-object pointer
-         * identity), which happened to coincide with real Nix's answer
-         * whenever the SAME Thunk/Cell happened to be read from two
-         * places (there was no other way for asnix to express "same
-         * slot") but gave the WRONG answer (true) whenever two
-         * INDEPENDENTLY-computed closures just happened to evaluate to
-         * the literal same heap object -- e.g. `[(id id)] == [(id id)]`:
-         * each `(id id)` is a fresh, unaliased Thunk that both happen to
-         * evaluate to the very same `id` closure; real Nix says `false`
-         * (confirmed via numtide/nix-conformance's
-         * eval-okay-eq-slot-elem.nix/-identity.nix, which this fixes).
-         * `asnix_bshared_slot_identical` above is what keeps the cases
-         * that DO need `true` (eval-okay-eq-slot-attrs.nix's `g = x: x;`
-         * field, reached twice through the literal same shared Thunk; a
-         * bare-variable aliased pair via a Cell) working. */
         default: return 0;
     }
 }
 
-/* See builtins_shared.h's long M80 comment. M92: also checks the Cell
- * slot-identity shortcut (asnix_bshared_slot_identical) on the RAW,
- * PRE-FORCE `a`/`b` -- before EITHER of this function's own two
- * `force_for_print` calls, which would otherwise discard exactly the
- * aliasing information being checked. In practice `==`'s own two direct
- * operands are compiled via the ordinary (always-forcing) OP_VAR_REF/
- * OP_SELECT/etc. chokepoints, never OP_VAR_REF_CELL (that's only ever
- * emitted at the ten `ib_mk_thunk` call sites, see compiler.c's
- * `try_cell_ref`) -- so a raw Cell basically never reaches here directly
- * -- but checking costs one cheap tag test and keeps this function
- * exactly as correct as `asnix_bshared_value_eq`'s own recursive check,
- * with no special-case asymmetry between the two. */
 int asnix_bshared_value_eq_op(Value a, Value b) {
     if (asnix_bshared_slot_identical(a, b)) return 1;
     Value fa = asnix_force_for_print(a);
@@ -992,17 +584,6 @@ Value asnix_bshared_select_dynamic(Value target, Value name_val) {
     return asnix_force_for_print(asnix_bshared_attrs_value(target, idx));
 }
 
-/* `expr.${nameExpr} or default` (M28) -- OP_SELECT_DYNAMIC_OR's C half.
- * Unlike asnix_bshared_select_dynamic above (fatal on a non-attrset
- * target or a missing key), a non-attrset target here falls through
- * gracefully to the default too (same "not even an attrset simply means
- * not found" rule OP_SELECT_OR/OP_HAS_ATTR already established for `or`/
- * `?`) -- only the name itself being a non-string is still a hard fatal
- * (that's a genuine misuse, not a "not found"). Returns 1 and writes the
- * forced value through `*out` on a hit, 0 (leaving `*out` untouched) on
- * a miss -- the caller (op_select_dynamic_or.S) decides whether to push
- * the value or jump to the default's code, same split OP_SELECT_OR's own
- * inline asm makes for the static case. */
 int asnix_bshared_select_dynamic_or(Value target, Value name_val, Value *out) {
     if (asnix_tag_of(target) != ASNIX_TAG_ATTRS) return 0;
     if (asnix_tag_of(name_val) != ASNIX_TAG_PTR || asnix_value_is_path(name_val) || asnix_value_is_float(name_val)) {
@@ -1049,39 +630,11 @@ int asnix_bshared_value_lt(Value a, Value b, const char *who) {
         if (c != 0) return c < 0;
         return la < lb;
     }
-    /* Lists order lexicographically, recursively comparing elements
-     * pairwise (shorter-is-less on a common prefix) -- verified against
-     * real `nix-instantiate --eval`: `lessThan [1 2] [1 3]` == true,
-     * `lessThan [1] [1 2]` == true, `lessThan [1 2] [1]` == false,
-     * `lessThan [] []` == false, equal-length-equal-elements lists are
-     * neither less (`lessThan [1 2] [1 2]` == false). A type mismatch
-     * between two elements at the first differing index is the same
-     * fatal "cannot compare" error as a top-level mismatch (confirmed:
-     * `lessThan [1] ["a"]` throws "cannot compare an integer with a
-     * string" in real Nix too). */
     if (ta == ASNIX_TAG_LIST && tb == ASNIX_TAG_LIST) {
         int64_t na = asnix_bshared_list_count(a), nb = asnix_bshared_list_count(b);
         const Value *ea = asnix_bshared_list_elems(a), *eb = asnix_bshared_list_elems(b);
         int64_t n = na < nb ? na : nb;
         for (int64_t i = 0; i < n; i++) {
-            /* M92: asnix_bshared_value_eq on the RAW (pre-force) elements
-             * -- NOT force_for_print'd first, same reasoning as `elem`'s
-             * own fix (builtins_list2.c): forcing here would strip
-             * exactly the slot/Cell identity asnix_bshared_value_eq's
-             * own shortcut needs to tell "two bare-var-aliased elements
-             * (e.g. both lists' shared `id`)" apart from "two
-             * independently-equal-content-but-unrelated closures" --
-             * the former must short-circuit "equal, compare the next
-             * element" without ever reaching the fatal "cannot compare
-             * these two values" fallback below, the latter correctly
-             * falls all the way through to it. Found via
-             * numtide/nix-conformance's eval-okay-eq-slot-sort.nix:
-             * `lessThan [id 2] [id 1]`, its shared `id` element, used to
-             * rely on asnix_bshared_value_eq's old default "pointer-
-             * identity" fallback for closures/primops (removed this
-             * same milestone, see that function's own comment) --
-             * forcing first here would have made `id == id` wrongly
-             * fall all the way to "cannot compare". */
             if (asnix_bshared_value_eq(ea[i], eb[i])) continue;
             Value ea_i = asnix_force_for_print(ea[i]);
             Value eb_i = asnix_force_for_print(eb[i]);
@@ -1094,11 +647,3 @@ int asnix_bshared_value_lt(Value a, Value b, const char *who) {
     exit(1);
 }
 
-/* M23's asnix_bshared_make_lazy_call1/_call2 (a shared make_thunk_from
- * helper plus two thin wrappers), and M109's later mapAttrs/zipAttrsWith-
- * specific asnix_bshared_make_call2_shared_env/_make_lazy_call2_indexed
- * variant, used to live here -- all removed by M117 once their last
- * callers (map/mapAttrs/zipAttrsWith) were ported to the lighter-weight
- * LazyApp value kind (asnix_make_lazyapp1/_lazyapp2, value_util.c) --
- * see builtins_shared.h's comment at the old declaration site and
- * heap.h's ASNIX_LAZYAPP_MARKER comment. */

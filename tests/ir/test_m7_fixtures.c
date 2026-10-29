@@ -1,6 +1,3 @@
-/* M7 validation, same strategy as M3/M5/M6: exercise OP_CALL's new
- * primop-dispatch path via a hand-built PrimOp object before any real
- * builtin or compiler wiring depends on it. */
 #include <stdio.h>
 
 #include "asnix/arena.h"
@@ -20,9 +17,6 @@ static int failures = 0;
     } while (0)
 
 static Env *root_env(void) {
-    /* M118: Env.up is a dedicated-arena-relative compressed offset --
-     * must come from the real allocator, not a hand-rolled general-
-     * arena alloc. */
     return asnix_env_alloc(NULL, 0);
 }
 
@@ -44,14 +38,13 @@ static Value make_primop(void *fn, int64_t arity) {
     return v;
 }
 
-/* let f = <primop add_one>; in f 41 == 42 */
 static void fixture_call_primop_unary(void) {
     Value primop_val = make_primop((void *)test_add_one, 1);
     Env *frame = asnix_env_alloc(root_env(), 1);
     frame->values[0] = primop_val;
 
     IrBuilder *b = ib_new();
-    ib_var_ref(b, 0, 0); /* push f */
+    ib_var_ref(b, 0, 0);
     ib_push_int(b, 41);
     ib_call(b, 1);
     ib_halt(b);
@@ -62,8 +55,6 @@ static void fixture_call_primop_unary(void) {
     CHECK(asnix_int_value(v) == 42, "calling a unary primop runs the native fn (41+1==42)");
 }
 
-/* let f = <primop add_two>; in f 3 4 == 7 -- also proves args land
- * contiguously, matching the Closure call path's arg layout. */
 static void fixture_call_primop_binary(void) {
     Value primop_val = make_primop((void *)test_add_two, 2);
     Env *frame = asnix_env_alloc(root_env(), 1);
@@ -92,3 +83,4 @@ int main(void) {
     printf("test_m7_fixtures: all checks passed\n");
     return 0;
 }
+

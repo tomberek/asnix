@@ -6,15 +6,10 @@
 #include "asnix/arena.h"
 #include "asnix/heap.h"
 #include "builtins_shared.h"
-#include "compiler.h" /* marker-reparse addition: asnix_lazy_thunk_descriptor_*/
-                      /* asnix_lazy_scope_push_frame/asnix_make_cached_lazy_thunk_descriptor --
-                       * see PTAG_OP_LAZY_MARKER's own comment below */
+#include "compiler.h"
 #include "symtab.h"
 #include "value_util.h"
 
-/* ---------------------------------------------------------------------
- * Growable write buffer / bounded read cursor.
- * --------------------------------------------------------------------- */
 typedef struct {
     uint8_t *buf;
     size_t len, cap;
@@ -46,37 +41,6 @@ static void wbuf_u8(WBuf *b, uint8_t v) {
     wbuf_bytes(b, &v, 1);
 }
 
-/* M102: variable-width (LEB128-style) integer encoding, replacing the
- * fixed 8-byte int64 every opcode/operand/length/symbol-id field used to
- * burn regardless of magnitude. Measured on a real nixpkgs closure
- * (ffmpeg, 1056 files): the fixed-width cache was 91MB against ~62MB of
- * source text for the same files -- the "compiled" cache was actually
- * LARGER than the source, because most fields here (opcodes, small
- * operand values, string/pool lengths, symbol ids) fit in 1-2 bytes but
- * every one was stored as 8.
- *
- * Checked ~/gnix/iets/src/compile/cache.rs (a sibling Rust Nix
- * reimplementation's own on-disk IR-cache serializer) before picking a
- * scheme: it already uses exactly this -- unsigned LEB128 (`put_u32`/
- * `put_u64`, 7 payload bits + continuation bit per byte) for every
- * count/length/symbol-id/position field in its format, no delta-coding
- * or other trick layered on top. That's independent confirmation this is
- * the right default for "mostly-small-integer" serialization streams
- * like this one, not a novel choice -- adopted here with one addition
- * iets doesn't need: asnix's own `IrOp.a`/`.b` fields and `VTAG_INT`
- * payload are genuinely signed (jump deltas can be negative; a `PUSH_INT`
- * operand is an arbitrary signed 64-bit Nix integer), where iets's own
- * fields (counts, lengths, bit-pattern words) are always unsigned. So
- * this adds a zigzag step (the standard protobuf `sint64` trick: maps
- * 0,-1,1,-2,2,... to 0,1,2,3,4,...) before the same LEB128 varint,
- * folding "signed small magnitude" into "small unsigned", while still
- * correctly round-tripping the full int64_t range (including
- * INT64_MIN/INT64_MAX) at a bounded worst case of 10 bytes -- never
- * truncating, just no longer paying 8 bytes for a value that fits in 1.
- *
- * Every call site below still calls plain wbuf_i64/rcur_i64 with an
- * int64_t -- only these two functions' own wire format changed, so this
- * is the entire diff against the fixed-width encoding. */
 static uint64_t zigzag_encode(int64_t v) {
     return ((uint64_t)v << 1) ^ (uint64_t)(v >> 63);
 }
@@ -124,11 +88,6 @@ static uint8_t rcur_u8(RCur *r) {
     return v;
 }
 
-/* Bounded to 10 bytes (ceil(64/7)) -- a malformed/corrupt entry whose
- * continuation bit never clears within that many bytes is rejected
- * (r->failed = 1) rather than looping or reading out of bounds; the
- * caller's existing "any anomaly -> NULL, never a crash" contract
- * (asnix_bytecode_deserialize) covers the rest. */
 static uint64_t rcur_varu64(RCur *r) {
     uint64_t v = 0;
     int shift = 0;
@@ -147,10 +106,6 @@ static int64_t rcur_i64(RCur *r) {
     return zigzag_decode(rcur_varu64(r));
 }
 
-/* Arena-owned (never freed -- same lifetime convention every other
- * compiled-in string constant already uses) NUL-free byte copy of the
- * next length-prefixed field; `*out_len` is 0 and the cursor is marked
- * failed on any bounds violation. */
 static const char *rcur_bytes_with_len(RCur *r, size_t *out_len) {
     int64_t n = rcur_i64(r);
     if (r->failed || n < 0 || (size_t)n > r->len - r->pos) {
@@ -164,15 +119,6 @@ static const char *rcur_bytes_with_len(RCur *r, size_t *out_len) {
     return mem;
 }
 
-/* ---------------------------------------------------------------------
- * Value (de)serialization -- tag + content, never raw pointer bits.
- * Fails (-1) on any heap-pointer kind that should never appear in a
- * compile-time constant pool (List/Closure/Thunk/PrimOp): compile_expr's
- * every ib_push_const call site is Float, a literal String, a literal
- * Path, or (AST_CURPOS only) a small Attrs built from those -- confirmed
- * by reading every push_const call site in compiler.c. This format
- * refuses to guess at anything else rather than half-support it.
- * --------------------------------------------------------------------- */
 enum { VTAG_INT = 0, VTAG_IMM = 1, VTAG_STRING = 2, VTAG_PATH = 3, VTAG_FLOAT = 4, VTAG_ATTRS = 5 };
 
 static int write_value(WBuf *b, Value v) {
@@ -213,18 +159,9 @@ static int write_value(WBuf *b, Value v) {
         }
         return 0;
     }
-    return -1; /* LIST/CLOSURE/THUNK/PRIMOP: never a real pool constant today */
+    return -1;
 }
 
-/* asnix_bshared_make_attrs unconditionally insertion-sorts its syms/vals
- * arrays in place before building the heap object (builtins_shared.c) --
- * so re-interned, no-longer-sorted-by-new-id entries come out correctly
- * sorted with no extra step needed here. This is the ONE place in this
- * file that's allowed to rely on that -- every other attrset-shaped
- * reconstruction below (OP_MK_ATTRS) does NOT go through
- * asnix_bshared_make_attrs directly (it must also interleave freshly
- * re-ordered value-producing ops into the surrounding bytecode stream,
- * not just build one heap object) and sorts explicitly itself. */
 static int read_value(RCur *r, Value *out) {
     uint8_t tag = rcur_u8(r);
     if (r->failed) return -1;
@@ -282,11 +219,6 @@ static int read_value(RCur *r, Value *out) {
     }
 }
 
-/* ---------------------------------------------------------------------
- * Op-id <-> handler-pointer translation (ir_link's own mapping, reversed
- * here for serialization; re-applied for deserialization via ir_link
- * itself).
- * --------------------------------------------------------------------- */
 static int handler_to_op_id(void *handler) {
     for (int i = 0; i < OP_COUNT; i++) {
         if (asnix_handler_table[i] == handler) return i;
@@ -294,112 +226,24 @@ static int handler_to_op_id(void *handler) {
     return -1;
 }
 
-/* ---------------------------------------------------------------------
- * Program (de)serialization.
- *
- * Pool-referencing ops (every one enumerated in ir.h's own OP_* comments
- * -- OP_PUSH_CONST, OP_MK_ATTRS, OP_MK_THUNK, OP_LAMBDA, OP_ASSERT_FAIL,
- * OP_CHECK_FORMALS, OP_REC_OVERRIDES_MERGE) carry their pool payload
- * INLINE, immediately after the op itself, instead of in a separate pool
- * block: pool indices are assigned by strict append order
- * (irbuild.c's ib_pool_add), so replaying pool-payload emission in the
- * same op order during deserialization reconstructs an equivalent
- * relative layout with no index bookkeeping needed at all.
- *
- * OP_MK_ATTRS is the one case needing more than "copy the referenced
- * pool slots verbatim, substituting names for ids": asnix's own
- * OP_MK_ATTRS (src/asm/ops/op_mk_attrs.S) assumes its pool-stored symbol
- * list AND the immediately-preceding `count` value-pushing ops are
- * BOTH already in the same sorted-by-symbol-id order -- it performs no
- * sort of its own, just pops VALSTACK in reverse and pairs position-for-
- * position with the pool's symbol list (see that file's own comment).
- * Symbol ids are assigned per-process by first-seen order (symtab.c),
- * so re-interning a cached entry's names in a FRESH process does not
- * generally preserve "sorted by id" -- the ids themselves differ, and
- * there is no general way to resort a flat bytecode stream's symbol list
- * without also reordering the exact ops that produced each matching
- * value. Fixed by writing an attrset literal's `count` (name, value-op)
- * pairs as an explicitly grouped, UNSORTED unit (write_program's
- * OP_MK_ATTRS case) and sorting by the freshly interned ids only once
- * loaded (read_program's OP_MK_ATTRS case) -- the one point where "the
- * new ids" actually exist. Verified this grouping is always exactly
- * `count` single ops, directly adjacent, with nothing else interleaved:
- * compiler.c's AST_ATTRSET binding loop emits exactly one op per binding
- * (either a thunk-free literal's own single push op -- M90's
- * is_thunk_free_literal -- or exactly one ib_mk_thunk call wrapping a
- * self-contained child program), never a multi-op inline sequence.
- *
- * OP_CHECK_FORMALS's two symbol lists are independently sortable (no
- * coupling to any other op's execution order -- op_check_formals.S pops
- * an Attrs and pushes nothing back, it doesn't correlate with a
- * preceding value-push sequence the way OP_MK_ATTRS does) and
- * OP_REC_OVERRIDES_MERGE's symbol list is positional, not sorted (its
- * own ir.h comment: "in ORIGINAL (OP_FRAME_SET slot) order, NOT
- * sorted" -- tied to OP_FRAME_SET slot indices assigned earlier in the
- * same block), so both are handled with a simpler name-for-name
- * substitution that preserves list order exactly, no resort needed.
- * --------------------------------------------------------------------- */
-
 enum {
-    PTAG_OP = 0,        /* ordinary op, no pool payload */
-    PTAG_OP_CONST = 1,  /* OP_PUSH_CONST: one Value follows */
-    PTAG_OP_THUNK = 2,  /* OP_MK_THUNK: one child program follows */
-    PTAG_OP_LAMBDA = 3, /* OP_LAMBDA: arity (a) already written as the op's `a`; one child
-                          * program + one Value (formals) follow */
-    PTAG_OP_ASSERT = 4, /* OP_ASSERT_FAIL: one length-prefixed message follows */
-    PTAG_OP_CHECKF = 5, /* OP_CHECK_FORMALS: total_count + two independently-sortable name lists */
-    PTAG_OP_RECOVR = 6, /* OP_REC_OVERRIDES_MERGE: n positional names + one plain int */
-    PTAG_OP_ATTRS = 7,  /* OP_MK_ATTRS: count UNSORTED (name, value-op) pairs, grouped */
-    PTAG_OP_SYM_A = 8,  /* a plain-int `a` operand carries a bare symbol id (not a pool
-                          * index): OP_SELECT, OP_HAS_ATTR -- `a` is written/read as a
-                          * length-prefixed name instead of a raw int; `b` passes through
-                          * unchanged. Found the hard way: without this, a cached
-                          * OP_SELECT's stale symbol id replays verbatim in a fresh
-                          * process and can collide with whatever THAT process's symtab
-                          * happens to assign the same small integer to -- confirmed via
-                          * `builtins.attrNames { y=1; x=2; foo=3; }` failing with
-                          * "attribute 'y' missing" on a cache hit, 'y' being whatever
-                          * this process coincidentally interned at the stale id
-                          * `builtins.attrNames` itself was compiled against. */
-    PTAG_OP_LAZY_MARKER = 11, /* Lazy-thunk + bytecode-cache reconciliation: an OP_MK_THUNK
-                          * whose child is an UNRESOLVED OP_LAZY_THUNK_BODY stub (compiler.c's
-                          * emit_attrset_field_value), written as a portable MARKER instead of
-                          * refusing to cache the whole program (program_op_count's own prior,
-                          * unconditional refusal -- still the fallback here whenever this
-                          * marker can't be built, see write_lazy_thunk_marker). Payload: the
-                          * reparse byte offset (one varint), `file_path`/`base_dir` (two
-                          * length-prefixed byte strings -- needed so a later force's
-                          * asnix_parse_subexpr/compile_expr gets the exact same `import`/
-                          * `__curPos` context the live path's own descriptor would have
-                          * captured), then the ScopeFrame chain the deferred value's lexical
-                          * lookups need, OUTERMOST frame first: frame-count (one varint), then
-                          * per frame: count + is_with + has_overrides (three varints) followed
-                          * by `count` length-prefixed name byte strings. On load, this becomes
-                          * a LazyThunkDescriptor with `body == NULL` -- asnix_compile_lazy_
-                          * thunk_body's own first-force check reparses `file_path`'s source
-                          * text (reopened and memoized once per distinct path, see compiler.c's
-                          * reparse_source_for_file -- NOT the bytecode-cache entry's own mmap,
-                          * which is already unmapped by the time deserialization returns) at
-                          * that byte offset before compiling, instead of using an already-
-                          * parsed Ast it never had. */
-    PTAG_OP_SYM_B = 9,  /* same, but the bare symbol id is in `b` -- OP_WITH_TRY,
-                          * OP_SELECT_OR, OP_HAS_ATTR_IF (M162) (all three also have a real
-                          * jump-delta in `a`, passed through unchanged). */
-    PTAG_OP_PUSHINT = 10, /* M169: OP_PUSH_INT -- one raw (untagged) int64 literal follows,
-                          * written/read exactly like PTAG_OP_CONST except the payload is a
-                          * bare int64 (write_value/read_value's Value.raw encoding), not a
-                          * fully-formed, already-tagged Value -- see irbuild.c's ib_push_int. */
+    PTAG_OP = 0,
+    PTAG_OP_CONST = 1,
+    PTAG_OP_THUNK = 2,
+    PTAG_OP_LAMBDA = 3,
+    PTAG_OP_ASSERT = 4,
+    PTAG_OP_CHECKF = 5,
+    PTAG_OP_RECOVR = 6,
+    PTAG_OP_ATTRS = 7,
+    PTAG_OP_SYM_A = 8,
+    PTAG_OP_LAZY_MARKER = 11,
+    PTAG_OP_SYM_B = 9,
+    PTAG_OP_PUSHINT = 10,
 };
 
 static int write_program(WBuf *b, IrProgram *prog);
 static int write_one_op(WBuf *b, IrOp *op, int64_t *pool);
 
-/* Writes PTAG_OP_LAZY_MARKER for `desc` (an unresolved OP_LAZY_THUNK_BODY
- * stub's descriptor, opaque here -- see compiler.h's own accessor
- * comments) -- returns -1 (write nothing, caller must refuse to cache
- * the whole program, exactly like before this feature existed) whenever
- * `desc`'s deferred value has no real, reparseable source span. See
- * PTAG_OP_LAZY_MARKER's own enum comment for the wire layout. */
 static int write_lazy_thunk_marker(WBuf *b, void *desc) {
     unsigned int pos;
     if (!asnix_lazy_thunk_descriptor_src_pos(desc, &pos)) return -1;
@@ -410,11 +254,6 @@ static int write_lazy_thunk_marker(WBuf *b, void *desc) {
     wbuf_bytes_with_len(b, file_path, strlen(file_path));
     wbuf_bytes_with_len(b, base_dir, strlen(base_dir));
 
-    /* Collect the chain innermost-first (the only order `_up` walking
-     * can produce), then emit it outermost-first (see the enum comment)
-     * -- two small, bounded passes over the same (always shallow: a
-     * handful of enclosing let/rec/lambda/with levels, never remotely
-     * close to a real file's total node count) chain. */
     void *scope = asnix_lazy_thunk_descriptor_scope(desc);
     size_t frame_count = 0;
     for (void *f = scope; f; f = asnix_scope_frame_up(f)) frame_count++;
@@ -443,30 +282,6 @@ static size_t program_op_count(IrProgram *prog) {
     for (; n < 10000000; n++) {
         int op_id = handler_to_op_id(prog->ops[n].handler);
         if (op_id < 0) return (size_t)-1;
-        /* Lazy-thunk-compile experiment (compiler.h's own comment on
-         * asnix_lazy_thunk_enabled): an un-upgraded stub IrProgram's
-         * ONLY op is OP_LAZY_THUNK_BODY, with no OP_RET/OP_HALT
-         * terminator after it (the stub is meant to be upgraded IN
-         * PLACE on first force, replacing its own ops/pool with the
-         * real compiled body's -- it's never meant to run to
-         * completion as-is). Without this check, this loop would walk
-         * straight off the end of the stub's real 1-entry ops array
-         * into whatever memory happens to follow it -- undefined
-         * behavior that, before this fix, happened to usually (not
-         * reliably) return a safe "unknown op" failure purely because
-         * garbage bytes read as a handler pointer rarely match a real
-         * table entry, not because of any actual bounds check. Explicit
-         * refusal here is the correct fix regardless: this format has
-         * no representation at all for a LazyThunkDescriptor's cross-
-         * process state (its `body`/`scope` are compile-time-only Ast/
-         * ScopeFrame pointers, meaningless in a process that didn't
-         * build them) -- caching a file containing an unresolved stub
-         * was never going to work, this just makes that refusal
-         * explicit and bounded instead of an accidental out-of-bounds
-         * read. Same observable outcome as before (asnix_bytecode_
-         * cache_store's own documented "refused -- skip caching"
-         * contract, see that function's own comment), now via a real
-         * check instead of relying on garbage memory not matching. */
         if (op_id == OP_LAZY_THUNK_BODY) return (size_t)-1;
         if (op_id == OP_HALT || op_id == OP_RET) return n + 1;
     }
@@ -477,9 +292,6 @@ static int write_program(WBuf *b, IrProgram *prog) {
     size_t n_ops = program_op_count(prog);
     if (n_ops == (size_t)-1) return -1;
 
-    /* Pass 1: mark op indices consumed by a following OP_MK_ATTRS's
-     * grouped (name, value) pairs, so the main walk below skips emitting
-     * them individually (they're emitted as part of the group instead). */
     uint8_t *consumed = calloc(n_ops, 1);
     if (!consumed) return -1;
     int ok = 1;
@@ -519,14 +331,6 @@ static int write_program(WBuf *b, IrProgram *prog) {
                 size_t name_len;
                 const char *name = asnix_sym_name(sym, &name_len);
                 wbuf_bytes_with_len(b, name, name_len);
-                /* Each pair's value-op is written as a length-prefixed,
-                 * self-contained blob (not inline) so the reader can
-                 * skip/reorder pairs by byte length alone, with no need
-                 * to parse-then-discard one just to find where the next
-                 * starts (which would otherwise leak any nested child
-                 * IrProgram that throwaway parse allocates -- found
-                 * while writing read_one_tagged_op's PTAG_OP_ATTRS case
-                 * below). */
                 WBuf sub = { 0 };
                 rc = write_one_op(&sub, valop, prog->pool);
                 if (rc == 0 && !sub.failed) {
@@ -552,10 +356,6 @@ static int write_one_op(WBuf *b, IrOp *op, int64_t *pool) {
     if (op_id < 0) return -1;
     switch (op_id) {
         case OP_PUSH_INT: {
-            /* M169: pool[op->b] is a raw (untagged) int64 literal, not a
-             * fully-formed Value -- write it directly, no write_value
-             * envelope (that function's encoding is for already-tagged
-             * Value.raw words, e.g. OP_PUSH_CONST's string/etc. constants). */
             wbuf_u8(b, PTAG_OP_PUSHINT);
             wbuf_i64(b, pool[op->b]);
             return 0;
@@ -567,20 +367,7 @@ static int write_one_op(WBuf *b, IrOp *op, int64_t *pool) {
             return write_value(b, v);
         }
         case OP_MK_THUNK: {
-            /* M100: pool[op->b] is now a single IrProgram* (ib_mk_thunk
-             * pushes one pool slot, not a {ops,pool} pair) -- dereference
-             * it directly instead of reading two separate pool slots. */
             IrProgram *child = (IrProgram *)(intptr_t)pool[op->b];
-            /* Lazy-thunk + bytecode-cache reconciliation: a not-yet-
-             * forced child whose ONLY op is OP_LAZY_THUNK_BODY is a
-             * stub (compiler.c's emit_attrset_field_value), not an
-             * ordinary compiled program -- program_op_count would
-             * refuse it (and, by propagation, this whole top-level
-             * write_program call) outright; try the portable marker
-             * encoding first instead. write_lazy_thunk_marker itself
-             * falls back to -1 (same refusal as before) whenever the
-             * stub's own deferred value has no real reparseable source
-             * span -- see that function's own comment. */
             if (handler_to_op_id(child->ops[0].handler) == OP_LAZY_THUNK_BODY) {
                 void *desc = (void *)(intptr_t)child->pool[child->ops[0].b];
                 return write_lazy_thunk_marker(b, desc);
@@ -589,13 +376,10 @@ static int write_one_op(WBuf *b, IrOp *op, int64_t *pool) {
             return write_program(b, child);
         }
         case OP_LAMBDA: {
-            /* M100: same single-IrProgram*-slot layout as OP_MK_THUNK
-             * above; formals moved from pool[op->b+2] to pool[op->b+1]
-             * since the child program no longer occupies two slots. */
             IrProgram *child = (IrProgram *)(intptr_t)pool[op->b];
             Value formals = { .raw = (uint64_t)pool[op->b + 1] };
             wbuf_u8(b, PTAG_OP_LAMBDA);
-            wbuf_i64(b, op->a); /* arity */
+            wbuf_i64(b, op->a);
             if (write_program(b, child) != 0) return -1;
             return write_value(b, formals);
         }
@@ -643,20 +427,13 @@ static int write_one_op(WBuf *b, IrOp *op, int64_t *pool) {
                 const char *name = asnix_sym_name(sym, &len);
                 wbuf_bytes_with_len(b, name, len);
             }
-            wbuf_i64(b, pool[pool_b + n]); /* overrides_slot: plain int, not a symbol */
+            wbuf_i64(b, pool[pool_b + n]);
             return 0;
         }
         case OP_MK_ATTRS:
-            /* Never reached directly -- write_program's own walk always
-             * intercepts OP_MK_ATTRS itself (emitting PTAG_OP_ATTRS) and
-             * marks its `count` preceding ops `consumed` so they never
-             * reach this function individually either. */
             return -1;
         case OP_SELECT:
         case OP_HAS_ATTR: {
-            /* `a` is a bare symbol id, not a pool index -- see this
-             * file's PTAG_OP_SYM_A comment for why this needs its own
-             * case (found via a real failure, not by inspection alone). */
             size_t len;
             const char *name = asnix_sym_name((uint32_t)op->a, &len);
             wbuf_u8(b, PTAG_OP_SYM_A);
@@ -668,8 +445,6 @@ static int write_one_op(WBuf *b, IrOp *op, int64_t *pool) {
         case OP_WITH_TRY:
         case OP_SELECT_OR:
         case OP_HAS_ATTR_IF: {
-            /* `b` is the bare symbol id here; `a` is a real jump delta,
-             * passed through unchanged. See PTAG_OP_SYM_A's comment. */
             size_t len;
             const char *name = asnix_sym_name((uint32_t)op->b, &len);
             wbuf_u8(b, PTAG_OP_SYM_B);
@@ -689,29 +464,6 @@ static int write_one_op(WBuf *b, IrOp *op, int64_t *pool) {
 
 int asnix_bytecode_serialize(IrProgram *prog, uint8_t **out_buf, size_t *out_len) {
     WBuf b = { 0 };
-    /* M102: magic bumped 01 -> 02 -- the wire format of every
-     * opcode/operand/length/symbol-id field changed from fixed 8-byte
-     * int64 to a variable-width (zigzag+LEB128) varint. A stale
-     * ASNXBC01 entry from before this change must never be misread as
-     * ASNXBC02 data (the byte layout no longer lines up at all past the
-     * first field) -- asnix_bytecode_deserialize's own magic check below
-     * rejects it outright, same as any other corrupt/foreign entry,
-     * degrading cleanly to a cache miss (recompile, overwrite) per this
-     * cache's own silent-degrade-to-miss design (bytecode_cache.c).
-     *
-     * M169: magic bumped 02 -> 03 -- OP_PUSH_INT's own wire encoding
-     * changed (new PTAG_OP_PUSHINT, see write_one_op/read_one_tagged_op):
-     * a pre-M169 ASNXBC02 entry wrote OP_PUSH_INT under plain PTAG_OP with
-     * the literal inline in `a` (back when IrOp.a was 64 bits); this
-     * binary's IrOp.a is now only 32 bits, so blindly replaying that old
-     * entry's db_emit(OP_PUSH_INT, a, b) call would SILENTLY TRUNCATE any
-     * literal outside +-2^31 instead of erroring -- not a crash, a wrong
-     * answer. Every other op's wire shape is actually unchanged (the
-     * varint encoding was always value-based, not a raw IrOp struct dump
-     * -- see this function's own M102 comment), but gating on OP_PUSH_INT
-     * alone would mean this format's own version history could no longer
-     * be determined by the magic string alone -- bumping the whole magic
-     * is the simpler, already-established invalidation mechanism. */
     wbuf_bytes(&b, "ASNXBC03", 8);
     if (write_program(&b, prog) != 0 || b.failed) {
         free(b.buf);
@@ -722,15 +474,6 @@ int asnix_bytecode_serialize(IrProgram *prog, uint8_t **out_buf, size_t *out_len
     return 0;
 }
 
-/* ---------------------------------------------------------------------
- * Deserialization: mirrors write_program/write_one_op exactly, emitting
- * a fresh ops[]/pool[] pair (malloc'd, growable the same way
- * irbuild.c's own ib_emit/ib_pool_add grow -- these are handed to
- * ir_link/asnix_eval exactly like ib_finish's own output, so they must
- * use the SAME allocator convention, not the arena: see irbuild.c's
- * IrBuilder for precedent). Returns NULL on ANY anomaly -- no partial
- * programs are ever returned.
- * --------------------------------------------------------------------- */
 typedef struct {
     IrOp *ops;
     size_t len, cap;
@@ -773,13 +516,6 @@ static int64_t db_pool_add(DBuilder *d, int64_t v) {
 
 static int read_program_into(RCur *r, DBuilder *d);
 
-/* Reads `count` length-prefixed names, re-interns each, sorts the
- * resulting ids ascending, and appends them to `d`'s pool in that sorted
- * order -- shared by OP_CHECK_FORMALS's two independently-sortable lists
- * (see that case's own comment for why this sort is necessary at all:
- * op_check_formals.S binary-searches against them, same invariant
- * OP_MK_ATTRS's own grouping logic protects, just without that op's
- * extra "stay in sync with a preceding value-push sequence" wrinkle). */
 static int read_sorted_symbol_list(RCur *r, DBuilder *d, int64_t count) {
     if (count == 0) return 0;
     uint32_t *syms = malloc((size_t)count * sizeof(uint32_t));
@@ -837,8 +573,6 @@ static int read_one_tagged_op(RCur *r, DBuilder *d) {
             return d->failed ? -1 : 0;
         }
         case PTAG_OP_PUSHINT: {
-            /* M169: see write_one_op's matching OP_PUSH_INT case -- the
-             * payload is a bare int64 literal, not a tagged Value. */
             int64_t v = rcur_i64(r);
             if (r->failed) return -1;
             int64_t idx = db_pool_add(d, v);
@@ -856,19 +590,7 @@ static int read_one_tagged_op(RCur *r, DBuilder *d) {
         case PTAG_OP_THUNK: {
             DBuilder child = { 0 };
             if (read_program_into(r, &child) != 0) return -1;
-            /* Every nested program needs its OWN ir_link call -- only
-             * the outermost one gets linked by asnix_bytecode_deserialize
-             * itself. Missing this leaves child.ops[i].handler holding a
-             * raw op-id integer (0, 1, 2, ...) instead of a real handler
-             * function pointer; op_call.S/force.S then `jmp *that`,
-             * jumping to a near-NULL address the instant this thunk is
-             * ever forced -- exactly the segfault this fixes (found via
-             * gdb: "Program received signal SIGSEGV... 0x000000000000000c",
-             * `0xc` being a small op-id, not a code address). */
             ir_link(child.ops, child.len);
-            /* M100: Thunk/Closure's runtime consumer expects ONE pool
-             * slot holding an IrProgram*, not a {ops,pool} pair -- box
-             * the freshly-read child the same way ib_finish does. */
             IrProgram *child_prog = malloc(sizeof(IrProgram));
             child_prog->ops = child.ops;
             child_prog->pool = child.pool;
@@ -877,17 +599,6 @@ static int read_one_tagged_op(RCur *r, DBuilder *d) {
             return d->failed ? -1 : 0;
         }
         case PTAG_OP_LAZY_MARKER: {
-            /* Mirrors PTAG_OP_THUNK's own shape (a self-contained
-             * one-op child program, boxed into its own IrProgram*, then
-             * referenced by an OP_MK_THUNK emitted into the PARENT `d`)
-             * -- see that case's own "every nested program needs its
-             * OWN ir_link call" comment, which applies identically
-             * here: the stub's single op must go through ir_link before
-             * anything ever dispatches through it, exactly like the
-             * live path's own ib_mk_lazy_thunk_stub/ib_finish output
-             * does (that one gets linked later, as part of whatever
-             * encloses it; this one needs it done explicitly, right
-             * here, since nothing else will). */
             int64_t pos = rcur_i64(r);
             size_t fp_len, bd_len;
             const char *fp = rcur_bytes_with_len(r, &fp_len);
@@ -948,7 +659,7 @@ static int read_one_tagged_op(RCur *r, DBuilder *d) {
             int64_t arity = rcur_i64(r);
             DBuilder child = { 0 };
             if (r->failed || read_program_into(r, &child) != 0) return -1;
-            ir_link(child.ops, child.len); /* see PTAG_OP_THUNK's identical comment above */
+            ir_link(child.ops, child.len);
             Value formals;
             if (read_value(r, &formals) != 0) return -1;
             IrProgram *child_prog = malloc(sizeof(IrProgram));
@@ -975,17 +686,6 @@ static int read_one_tagged_op(RCur *r, DBuilder *d) {
                 total_count > 1000000)
                 return -1;
             int64_t idx = db_pool_add(d, total_count);
-            /* Both lists are "sorted ascending by symbol id" per
-             * op_check_formals.S's own header comment (it binary-
-             * searches the given Attrs against them) -- re-interning
-             * does not preserve that order (ids are assigned by first-
-             * seen order per process), so each list is independently
-             * re-sorted by its own freshly interned ids before being
-             * written into the pool, exactly the same bug class
-             * OP_MK_ATTRS's own grouping fix addresses (found the same
-             * way: a real "unexpected argument" failure on a cached
-             * `{ lib, stdenv, callPackage, ... }`-shaped lambda, not by
-             * inspection alone). */
             if (read_sorted_symbol_list(r, d, required_count) != 0) return -1;
             if (total_count >= 0 && read_sorted_symbol_list(r, d, total_count) != 0) return -1;
             db_emit(d, OP_CHECK_FORMALS, required_count, idx);
@@ -1014,13 +714,6 @@ static int read_one_tagged_op(RCur *r, DBuilder *d) {
             if (r->failed || count < 0 || count > 1000000) return -1;
             uint32_t *new_syms = count > 0 ? malloc((size_t)count * sizeof(uint32_t)) : NULL;
             size_t *order = count > 0 ? malloc((size_t)count * sizeof(size_t)) : NULL;
-            /* Each pair's value-op was written as a length-prefixed,
-             * self-contained blob (see write_program's OP_MK_ATTRS
-             * case), so finding where each one starts is a pure byte-
-             * length skip -- no need to parse-then-discard a pair just
-             * to find the next one's offset (which would otherwise leak
-             * any nested child IrProgram that throwaway parse
-             * allocates). */
             size_t *blob_off = count > 0 ? malloc((size_t)count * sizeof(size_t)) : NULL;
             size_t *blob_len = count > 0 ? malloc((size_t)count * sizeof(size_t)) : NULL;
             for (int64_t i = 0; i < count; i++) {
@@ -1047,13 +740,6 @@ static int read_one_tagged_op(RCur *r, DBuilder *d) {
                 r->pos += (size_t)bl;
                 order[i] = (size_t)i;
             }
-            /* Sort `order` by new_syms ascending -- re-establishing the
-             * sorted-by-symbol-id invariant OP_MK_ATTRS's own asm
-             * handler trusts without checking (see this file's header
-             * comment on why this step exists at all). Small counts
-             * (real attrsets are rarely more than a few dozen bindings)
-             * make insertion sort fine, same simplicity call
-             * asnix_bshared_make_attrs itself already makes. */
             for (size_t i = 1; i < (size_t)count; i++) {
                 size_t j = i;
                 while (j > 0 && new_syms[order[j - 1]] > new_syms[order[j]]) {
@@ -1092,28 +778,6 @@ static int read_one_tagged_op(RCur *r, DBuilder *d) {
 static int read_program_into(RCur *r, DBuilder *d) {
     int64_t n_ops = rcur_i64(r);
     if (r->failed || n_ops <= 0 || n_ops > 10000000) return -1;
-    /* perf (M137): `n_ops` is this level's EXACT final `d->len` -- verified
-     * against write_program's own counting (program_op_count, called on
-     * the ORIGINAL uncollapsed op array before OP_MK_ATTRS's grouped
-     * pairs are folded into one PTAG_OP_ATTRS entry) and against
-     * read_program_into's own loop below, which advances `i` by however
-     * many ops a single tagged entry actually emits (PTAG_OP_ATTRS emits
-     * `count+1` for one group entry, every other tag emits exactly 1) --
-     * so by the time this loop finishes, `d->len` always equals `n_ops`
-     * exactly, never more or less. Presizing `d->ops` to `n_ops` up front
-     * (this DBuilder is always freshly `{0}`-initialized by every call
-     * site -- the top-level call in asnix_bytecode_deserialize and both
-     * PTAG_OP_THUNK/PTAG_OP_LAMBDA's own fresh `child = {0}`) replaces
-     * db_emit's usual start-at-16-and-double growth with a SINGLE
-     * allocation and zero growth-reallocs for `ops` at this level,
-     * mirroring M123's lexer TokVec precedent (presize when the final
-     * count is already known, rather than discover it by doubling).
-     * `pool` has no equivalent exact count (OP_CHECK_FORMALS/
-     * OP_REC_OVERRIDES_MERGE can add many pool entries for a single op),
-     * so it's only a heuristic starting guess here -- still correctly
-     * grows via the ordinary doubling path in db_pool_add if exceeded,
-     * same safety as before this change, just a smaller/zero chance of
-     * ever needing to. */
     if (d->cap == 0) {
         d->ops = malloc((size_t)n_ops * sizeof(IrOp));
         if (!d->ops) return -1;
@@ -1128,16 +792,12 @@ static int read_program_into(RCur *r, DBuilder *d) {
     for (int64_t i = 0; i < n_ops;) {
         emitted_before = (int64_t)d->len;
         if (read_one_tagged_op(r, d) != 0) return -1;
-        i += (int64_t)d->len - emitted_before; /* PTAG_OP_ATTRS can net-emit >1 op per group entry */
+        i += (int64_t)d->len - emitted_before;
     }
     return d->failed ? -1 : 0;
 }
 
 IrProgram *asnix_bytecode_deserialize(const uint8_t *buf, size_t len) {
-    /* Also rejects a pre-M102 ASNXBC01 entry (fixed-8-byte-int wire
-     * format) and a pre-M169 ASNXBC02 entry (OP_PUSH_INT's old inline-`a`
-     * encoding) -- see asnix_bytecode_serialize's own comment on the
-     * magic bump. */
     if (len < 8 || memcmp(buf, "ASNXBC03", 8) != 0) return NULL;
     RCur r = { .buf = buf, .len = len, .pos = 8, .failed = 0 };
     DBuilder d = { 0 };
@@ -1152,3 +812,4 @@ IrProgram *asnix_bytecode_deserialize(const uint8_t *buf, size_t len) {
     prog->pool = d.pool;
     return prog;
 }
+

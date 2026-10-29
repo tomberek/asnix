@@ -9,25 +9,11 @@
 
     .text
 
-    /* M56: a literal whose true int64 value falls outside the ±2^60
-     * ASNIX_INT_MIN/MAX window (include/asnix/value.h) used to get
-     * silently corrupted right here -- `salq $ASNIX_TAG_BITS` drops the
-     * literal's own top bits with no check at all, e.g. the literal
-     * `9223372036854775807` (INT64_MAX) round-tripped to `-1`. Checked
-     * inline (not via a `call asnix_make_int`) for the same hot-path
-     * reason this op already inlines the tagging bit trick instead of
-     * calling asnix_make_int -- see value.S's header comment.
-     *
-     * M169: the literal no longer lives inline in `a` (IrOp's operand
-     * fields are only 32 bits now, too narrow for an arbitrary int64 Nix
-     * literal) -- `b` is a pool index instead, exactly like
-     * OP_PUSH_CONST, loaded here before the same range check/tag runs
-     * against the pool-loaded value. */
     .globl asnix_op_push_int
     .type asnix_op_push_int, @function
 asnix_op_push_int:
-    movl ASNIX_IROP_OFF_B(%rsi), %eax   // zero-extended pool index
-    movq (%r13, %rax, 8), %rax          // rax = raw (untagged) int64 literal
+    movl ASNIX_IROP_OFF_B(%rsi), %eax
+    movq (%r13, %rax, 8), %rax
     movq $ASNIX_INT_MAX, %r9
     cmpq %r9, %rax
     jg .Lpush_int_overflow
@@ -36,7 +22,7 @@ asnix_op_push_int:
     jl .Lpush_int_overflow
     salq $ASNIX_TAG_BITS, %rax
     orq $ASNIX_TAG_INT, %rax
-    ASNIX_CHECK_VALSTACK %rcx           // %rcx is unused in this handler
+    ASNIX_CHECK_VALSTACK %rcx
     movq %rax, (%r12)
     addq $8, %r12
     addq $ASNIX_IROP_SIZE, %rsi
@@ -86,7 +72,7 @@ asnix_op_push_null:
 
     .globl asnix_op_push_const
     .type asnix_op_push_const, @function
-asnix_op_push_const:                    // b = pool index of a pre-formed Value.raw
+asnix_op_push_const:
     movl ASNIX_IROP_OFF_B(%rsi), %eax
     movq (%r13, %rax, 8), %rax
     ASNIX_CHECK_VALSTACK %rcx
@@ -96,3 +82,4 @@ asnix_op_push_const:                    // b = pool index of a pre-formed Value.
     movq (%rsi), %rax
     jmp *%rax
     .size asnix_op_push_const, . - asnix_op_push_const
+

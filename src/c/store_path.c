@@ -59,10 +59,11 @@ size_t asnix_make_store_path_from_digest(const uint8_t digest[32], const char *n
     uint8_t compressed[20];
     compress_hash(digest, 32, compressed, sizeof(compressed));
 
-    char hash32[32]; /* asnix_base32_encoded_length(20) == 32, fixed by the format */
+    char hash32[32];
     asnix_base32_encode(compressed, sizeof(compressed), hash32);
 
     int n = snprintf(out, out_cap, "%s/%.32s-%s", ASNIX_STORE_DIR, hash32, name);
     if (n < 0 || (size_t)n >= out_cap) return 0;
     return (size_t)n;
 }
+

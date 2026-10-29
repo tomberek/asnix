@@ -1,37 +1,3 @@
-/* M184: asnix_prim_match2_impl (builtins_regex.c) makes regex_engine.c's
- * own asnix_regex_match_anchored AUTHORITATIVE for the whole-string
- * match/no-match decision itself, not just capture recompute, once a
- * pattern's custom-engine verdict has been empirically proven (over
- * several real calls) to agree with glibc's regexec() -- see that
- * file's top comment and docs/architecture.md's M184 section for the
- * full design.
- *
- * The correctness argument M184 relies on: `match`'s own question --
- * "does the custom engine's pattern match subject[0,slen) EXACTLY,
- * consuming the whole string" -- is a plain EXISTENCE question over a
- * FIXED end position. M68's own quirks (ordered-alternation-wins,
- * greedy-repetition's-trailing-empty-iteration) are specifically about
- * WHICH decomposition a backtracking engine prefers when more than one
- * reaches that exact fixed end position -- never about WHETHER one
- * does. A complete backtracking search (full DFS over every
- * alternative/repetition-count choice, which is what regex_engine.c's
- * `m`/`run_cont`/`match_rep` already is in anchored mode -- no search
- * budget there at all, see asnix_regex_match_anchored's own comment)
- * must therefore agree with ANY other correct engine (including
- * glibc's genuinely-POSIX-leftmost-longest regexec) on pure existence,
- * independent of tie-break convention.
- *
- * This test exercises that claim directly and mechanically: for each
- * (pattern, subject) pair below, compiles the pattern BOTH ways
- * (glibc's regcomp/regexec and regex_engine.c's own
- * asnix_regex_compile/asnix_regex_match_anchored) and asserts the two
- * engines' existence verdicts agree -- deliberately including patterns
- * with ZERO capture groups (nsub == 0), the one class that, before
- * M184, NEVER touched regex_engine.c in production at all (not even
- * for capture recompute, since there's nothing to recompute), so this
- * is the specific class that had the least pre-existing real-world
- * exercise of the custom engine's parser/matcher before this
- * milestone. */
 #include <regex.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -41,11 +7,6 @@
 
 static int fails = 0;
 
-/* 1 if glibc's regexec (anchored to the whole string via the same
- * "does the leftmost-longest match starting at 0 reach the end"
- * trick asnix_prim_match2_impl itself uses) matches `s` against `re`
- * end-to-end, 0 otherwise. Fatal on a regcomp failure -- every pattern
- * in this file's battery is expected to be valid POSIX ERE. */
 static int glibc_whole_match(const char *re, const char *s) {
     regex_t preg;
     int rc = regcomp(&preg, re, REG_EXTENDED);
@@ -78,12 +39,6 @@ static void check_agree(const char *re, const char *s) {
 }
 
 int main(void) {
-    /* Zero-capture-group patterns -- the class that never touched
-     * regex_engine.c in production before M184. Deliberately includes
-     * top-level (unparenthesized) alternation and repetition-adjacent-
-     * to-overlapping-content shapes, the structural ingredients of
-     * M68's own quirks, just without the capture groups that quirk's
-     * own examples happened to use. */
     check_agree("a|ab", "a");
     check_agree("a|ab", "ab");
     check_agree("a|ab", "b");
@@ -102,13 +57,8 @@ int main(void) {
     check_agree("", "a");
     check_agree("a{2,4}a*", "aaaaaa");
     check_agree("a{2,4}a*", "a");
-    check_agree("(ab)*", "ababab");          /* one group, but trivial/unambiguous -- sanity */
+    check_agree("(ab)*", "ababab");
 
-    /* The actual M68 quirk examples, now probed for EXISTENCE agreement
-     * specifically (not capture content, which is a separate, already-
-     * covered concern in test_regex_engine_scratch.c) -- across several
-     * subjects each, including ones that don't reach a full match at
-     * all. */
     check_agree("(aa|a)(aa|a)", "aaa");
     check_agree("(aa|a)(aa|a)", "aaaa");
     check_agree("(aa|a)(aa|a)", "aa");
@@ -131,3 +81,4 @@ int main(void) {
     printf("test_regex_span_authoritative: all checks passed\n");
     return 0;
 }
+

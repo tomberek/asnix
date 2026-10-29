@@ -1,7 +1,3 @@
-/* M6 validation, same strategy as M3/M5: exercise thunk creation, forcing,
- * memoization, and blackhole detection via hand-fed IR (and, for
- * memoization/blackhole, hand-built Thunk cells) before the compiler
- * depends on any of it. */
 #include <stdio.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -22,15 +18,9 @@ static int failures = 0;
     } while (0)
 
 static Env *root_env(void) {
-    /* M118: Env.up is a dedicated-arena-relative compressed offset --
-     * must come from the real allocator, not a hand-rolled general-
-     * arena alloc. */
     return asnix_env_alloc(NULL, 0);
 }
 
-/* Constructing a thunk and halting immediately (never forcing it) proves
- * the defining property of laziness: building a thunk does not run its
- * body. */
 static void fixture_thunk_not_evaluated_until_forced(void) {
     IrBuilder *body = ib_new();
     ib_push_int(body, 999);
@@ -45,8 +35,6 @@ static void fixture_thunk_not_evaluated_until_forced(void) {
 
     CHECK(asnix_tag_of(v) == ASNIX_TAG_THUNK, "unforced thunk keeps its THUNK tag at HALT");
     void *cell = (void *)(v.raw & ~0x7ULL);
-    /* M103: OFF_STATE now doubles as the prog pointer while UNFORCED --
-     * mask to the low tag bits rather than comparing the raw word. */
     int64_t state = *(int64_t *)((char *)cell + ASNIX_THUNK_OFF_STATE) & ASNIX_TAG_MASK;
     CHECK(state == ASNIX_THUNK_STATE_UNFORCED, "constructing a thunk never runs its body");
 }
@@ -62,7 +50,7 @@ static void fixture_force_let(void) {
     IrBuilder *b = ib_new();
     ib_mk_thunk(b, body_prog);
     ib_let(b, 1);
-    ib_var_ref(b, 0, 0); /* forces */
+    ib_var_ref(b, 0, 0);
     ib_halt(b);
     IrProgram *prog = ib_finish(b);
     Value v = asnix_eval(prog, root_env());
@@ -78,9 +66,6 @@ static void fixture_memoization(void) {
     IrProgram *body_prog = ib_finish(body);
 
     void *thunk_mem = asnix_arena_alloc(ASNIX_THUNK_SIZE);
-    /* M103: OFF_STATE doubles as the prog pointer while UNFORCED (tag
-     * bits 0 == UNFORCED, free since body_prog is >=8-byte-aligned) --
-     * one store, not two; see ir.h's comment. */
     *(IrProgram **)((char *)thunk_mem + ASNIX_THUNK_OFF_STATE) = body_prog;
     *(void **)((char *)thunk_mem + ASNIX_THUNK_OFF_ENV) = root_env();
     CHECK((*(int64_t *)((char *)thunk_mem + ASNIX_THUNK_OFF_STATE) & ASNIX_TAG_MASK) == ASNIX_THUNK_STATE_UNFORCED,
@@ -104,11 +89,6 @@ static void fixture_memoization(void) {
     CHECK(asnix_values_equal(cached, result), "memoization: cached raw value matches the returned result");
 }
 
-/* A thunk whose body forces itself (constructed directly, bypassing the
- * compiler -- M6's compiler only emits non-recursive bindings; see
- * docs/architecture.md). This tests the asm-level blackhole mechanism
- * itself: re-entering an IN_PROGRESS thunk must abort cleanly, not loop or
- * corrupt state. */
 static void fixture_blackhole_aborts(void) {
     pid_t pid = fork();
     if (pid == 0) {
@@ -121,19 +101,17 @@ static void fixture_blackhole_aborts(void) {
 
         Env *frame = asnix_env_alloc(root_env(), 1);
         void *thunk_mem = asnix_arena_alloc(ASNIX_THUNK_SIZE);
-        /* M103: OFF_STATE doubles as the prog pointer while UNFORCED --
-         * see fixture_memoization's matching comment above. */
         *(IrProgram **)((char *)thunk_mem + ASNIX_THUNK_OFF_STATE) = body_prog;
-        *(void **)((char *)thunk_mem + ASNIX_THUNK_OFF_ENV) = frame; /* captures its own frame */
+        *(void **)((char *)thunk_mem + ASNIX_THUNK_OFF_ENV) = frame;
         Value thunk_val = { .raw = (uint64_t)(uintptr_t)thunk_mem | ASNIX_TAG_THUNK };
-        frame->values[0] = thunk_val; /* ...at the very slot that references it */
+        frame->values[0] = thunk_val;
 
         IrBuilder *b = ib_new();
         ib_var_ref(b, 0, 0);
         ib_halt(b);
         IrProgram *prog = ib_finish(b);
         asnix_eval(prog, frame);
-        _exit(42); /* reaching here means blackholing failed to trigger */
+        _exit(42);
     }
     int status = 0;
     waitpid(pid, &status, 0);
@@ -153,3 +131,4 @@ int main(void) {
     printf("test_m6_fixtures: all checks passed\n");
     return 0;
 }
+

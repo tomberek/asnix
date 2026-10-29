@@ -1,4 +1,4 @@
-#define _DEFAULT_SOURCE /* lstat()/strdup()/readlink() -- same feature-test macro value_util.c uses */
+#define _DEFAULT_SOURCE
 
 #include "nar.h"
 
@@ -10,7 +10,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include "derivation.h" /* M80: asnix_compute_fixed_output_path, shared with builtins.path's formula */
+#include "derivation.h"
 #include "hash_shim.h"
 #include "store_path.h"
 
@@ -32,17 +32,12 @@ static void nb_bytes(NarBuf *b, const void *p, size_t n) {
     b->len += n;
 }
 
-/* Little-endian 8-byte length, matching real Nix's own
- * `operator<<(Sink&, uint64_t)` (~/nix/src/libutil/include/nix/util/
- * serialise.hh) exactly. */
 static void nb_u64(NarBuf *b, uint64_t n) {
     unsigned char buf[8];
     for (int i = 0; i < 8; i++) buf[i] = (unsigned char)(n >> (8 * i));
     nb_bytes(b, buf, 8);
 }
 
-/* NAR string field: 8-byte length, raw bytes, zero-padded to the next
- * 8-byte boundary (~/nix/src/libutil/serialise.cc's `writeString`). */
 static void nb_str(NarBuf *b, const char *s, size_t n) {
     nb_u64(b, (uint64_t)n);
     nb_bytes(b, s, n);
@@ -63,10 +58,6 @@ static int name_cmp(const void *a, const void *b) {
     return strcmp(*(const char *const *)a, *(const char *const *)b);
 }
 
-/* M80: real Nix's `FileType` names (~/nix/src/libutil/file-system.hh's
- * `InputAccessor::Type` -> `dumpPath`'s own filter calls), used both for
- * `nar_dump`'s own filter calls below and matching exactly what a Nix-
- * level `filter = path: type: ...` function receives. */
 static const char *nar_file_type_name(mode_t mode) {
     if (S_ISREG(mode)) return "regular";
     if (S_ISDIR(mode)) return "directory";
@@ -144,13 +135,6 @@ static void nar_dump(NarBuf *b, const char *path, int depth, AsnixNarFilter filt
         for (size_t i = 0; i < nnames; i++) {
             char child[4096];
             snprintf(child, sizeof(child), "%s/%s", path, names[i]);
-            /* M80: `filter` (NULL from `asnix_copy_path_to_store`'s own
-             * call below -- behaviorally IDENTICAL to this function's
-             * pre-M80 self, every "entry"/"node" pair still emitted
-             * unconditionally) decides whether this child (and, if it's
-             * a directory, its ENTIRE subtree -- simply never recursed
-             * into, same as real Nix's own `PathFilter`) appears in the
-             * NAR at all. */
             if (filter) {
                 struct stat cst;
                 if (lstat(child, &cst) != 0) {
@@ -199,18 +183,6 @@ typedef struct {
 static CopyCacheEntry *g_copy_cache = NULL;
 static size_t g_copy_cache_count = 0, g_copy_cache_cap = 0;
 
-/* perf: open-addressing dedup index parallel to g_copy_cache, same shape
- * as derivation.c's input_ref_add_src/InputRefSet.srcs_index fix (which
- * itself cites this exact anti-pattern) -- asnix_copy_path_to_store is
- * called once per Path-coerced value across a whole eval (M80's
- * `builtins.path`-shaped fixed-output formula plus every bare Path
- * string-context element), so a linear strcmp scan here was O(n) per
- * call / O(n^2) over one eval's full set of distinct copied paths. Local
- * copy of derivation.c's dcc_hash_str (not shared via a header -- this
- * file and derivation.c, and symtab.c's own separate hash_bytes, each
- * keep their own copy of the same small hash already; pure
- * internal bucket-placement hash, never persisted, so each copy is free
- * to diverge). */
 static uint64_t copy_cache_hash_str(const char *s, size_t len) {
     uint64_t h = 0;
     size_t i = 0;
@@ -298,12 +270,6 @@ void asnix_copy_path_to_store(const char *path, char *out, size_t out_cap) {
     }
     free(b.buf);
 
-    /* Real Nix's `baseNameOf` -- the last '/'-separated component,
-     * same as every other `name` this project derives from a path
-     * (e.g. M46's fetchurl-shaped fixed-output derivations use the
-     * URL's own last segment). A trailing slash isn't expected here:
-     * every path reaching this function was already canonicalized by
-     * the parser/OP_PATH_CONCAT (M64) before being coerced. */
     const char *slash = strrchr(path, '/');
     const char *name = slash ? slash + 1 : path;
 
@@ -354,10 +320,6 @@ void asnix_copy_path_to_store_ext(const char *path, const char *name, int recurs
         }
         free(b.buf);
     } else {
-        /* Flat method -- real Nix requires `path` be a regular file
-         * (`builtins.path { recursive = false; ... }` on a directory is
-         * a hard error there); no filter applies (there's nothing to
-         * recurse into). */
         struct stat st;
         if (lstat(path, &st) != 0) {
             fprintf(stderr, "asnix: path '%s' does not exist\n", path);
@@ -392,7 +354,6 @@ void asnix_copy_path_to_store_ext(const char *path, const char *name, int recurs
                                      effective_name, out, out_cap);
 }
 
-/* M82: see nar.h's own comment. */
 int asnix_hash_path_nar_sha256(const char *path, AsnixNarFilter filter, void *filter_ctx, uint8_t out[32]) {
     NarBuf b = { 0 };
     nb_cstr(&b, "nix-archive-1");
@@ -401,3 +362,4 @@ int asnix_hash_path_nar_sha256(const char *path, AsnixNarFilter filter, void *fi
     free(b.buf);
     return rc;
 }
+

@@ -1,29 +1,3 @@
-// `with expr; body`: real Nix semantics -- a `with` only supplies a
-// *fallback* for names that don't resolve lexically (a lexical binding
-// always wins, even one introduced further out than the `with`), resolved
-// at RUNTIME against the with-expression's attrset value, and lazily (the
-// with-expression itself, and each enclosing with-level consulted during a
-// fallback search, is only forced on demand -- see docs/architecture.md's
-// `with` scope notes and the real-nix-instantiate comparisons in
-// tests/e2e/m10_with_*.nix).
-//
-// compiler.c (AST_VAR) resolves each unbound identifier at COMPILE TIME
-// into a short, bounded chain of "try this enclosing with-level" steps --
-// one per lexically enclosing `with`, innermost first -- because the
-// *number* of enclosing withs is a static, compile-time fact even though
-// which one (if any) actually has the key is a runtime fact. Each step is:
-//   OP_VAR_REF(depth_k, 0)   -- push the with-level's attrs value, forcing
-//                               its thunk if unforced (ordinary OP_VAR_REF,
-//                               no new code needed: a with-frame's slot 0
-//                               is addressable exactly like any other
-//                               lexical slot once its compile-time depth is
-//                               known)
-//   OP_WITH_TRY(delta, sym)  -- see below
-//   OP_JMP(end)              -- only reached when OP_WITH_TRY found `sym`
-//                               and fell through; jumps past the remaining
-//                               levels straight to the end of the chain
-// ...repeated per level, terminated by OP_WITH_MISS if every level's
-// OP_WITH_TRY took its "not found" branch.
 #include "asnix/env.h"
 #include "asnix/heap.h"
 #include "asnix/ir.h"
@@ -45,27 +19,17 @@
 
     .text
 
-    // Binds the with-expr thunk (pushed by the OP_MK_THUNK just before this
-    // op, exactly like OP_LET's binding value) into a fresh 1-slot Env
-    // frame, tagging the frame's own `up` field with ASNIX_ENV_WITH_TAG so
-    // OP_WITH_TRY/the var-ref depth walk can recognize it later. Mirrors
-    // OP_LET's nslots=1 case exactly except for that one tag bit.
     .globl asnix_op_with
     .type asnix_op_with, @function
 asnix_op_with:
-    movq %rsi, %rbp                     // save IP (callee-saved, survives the call below)
-    movq %rdi, %r15                     // save current ENV = up-pointer for the new frame
+    movq %rsi, %rbp
+    movq %rdi, %r15
 
-    movq $ASNIX_ENV_OFF_VALUES+8, %rdi  // size = 4 (up) + 1 slot * 8 = 12
+    movq $ASNIX_ENV_OFF_VALUES+8, %rdi
     call asnix_env_arena_alloc
     incq asnix_stats_env(%rip)
-    incq asnix_stats_env_elements(%rip) // always exactly 1 slot
+    incq asnix_stats_env_elements(%rip)
 
-    // M118: OR the tag bit in first, THEN compress -- subtracting the
-    // (even, page-aligned) arena base from an odd tagged address stays
-    // odd, so the tag bit survives compression intact (see env.h).
-    // Unconditional, no NULL-check: same as op_frame.S/op_let.S, ENV is
-    // always live/non-NULL here.
     movq %r15, %rcx
     orq $ASNIX_ENV_WITH_TAG, %rcx
     subq asnix_env_arena_base(%rip), %rcx
@@ -75,39 +39,26 @@ asnix_op_with:
     movq (%r12), %rdx
     movq %rdx, ASNIX_ENV_OFF_VALUES(%rax)
 
-    movq %rax, %rdi                     // ENV = new with-frame
+    movq %rax, %rdi
     movq %rbp, %rsi
     addq $ASNIX_IROP_SIZE, %rsi
     movq (%rsi), %rax
     jmp *%rax
     .size asnix_op_with, . - asnix_op_with
 
-    // a = byte delta to jump to when `b` (the symbol id) isn't present in
-    // this level's attrs; b = symbol id. Pops the attrs value a preceding
-    // OP_VAR_REF already forced and pushed. Fatal if it isn't an attrset
-    // (matches real Nix: a non-attrset with-value only errors once it's
-    // actually consulted -- see the "with 5; 1" vs "with 5; x" comparison
-    // in tests/e2e). On a hit, forces the matching entry if it's an
-    // unforced thunk (same mechanism as OP_SELECT -- attrset binding
-    // values are lazy) and falls through with it on top of VALSTACK;
-    // compiler.c always emits an unconditional OP_JMP right after this op
-    // for exactly that fallthrough to land on.
     .globl asnix_op_with_try
     .type asnix_op_with_try, @function
 asnix_op_with_try:
     subq $8, %r12
-    movq (%r12), %rax                   // rax = attrs value (already forced)
+    movq (%r12), %rax
     movq %rax, %rcx
     andq $ASNIX_TAG_MASK, %rcx
     cmpq $ASNIX_TAG_ATTRS, %rcx
     jne .Lwith_try_type_error
 
-    // M88 (lazy `//` union-layering, heap.h): resolve a UnionHdr (negative
-    // `count`) to its flat form first -- see op_select.S's matching
-    // comment for the full rationale.
-    movq %rax, %r9                      // r9 = tagged value, kept across the maybe-call below
-    andq $-8, %rax                      // rax = real Attrs* (untagged)
-    movq ASNIX_ATTRS_OFF_COUNT(%rax), %r8 // r8 = count (maybe negative)
+    movq %rax, %r9
+    andq $-8, %rax
+    movq ASNIX_ATTRS_OFF_COUNT(%rax), %r8
     testq %r8, %r8
     jns .Lwith_try_resolved
     pushq %rsi
@@ -119,47 +70,38 @@ asnix_op_with_try:
     popq %rsi
     movq %r9, %rax
     andq $-8, %rax
-    movq ASNIX_ATTRS_OFF_COUNT(%rax), %r8 // reload -- now guaranteed non-negative
+    movq ASNIX_ATTRS_OFF_COUNT(%rax), %r8
 .Lwith_try_resolved:
 
-    movl ASNIX_IROP_OFF_B(%rsi), %edx   // rdx = target symbol id
-    // %r8 already holds hi = count
-    xorq %rcx, %rcx                     // rcx = lo = 0
+    movl ASNIX_IROP_OFF_B(%rsi), %edx
+    xorq %rcx, %rcx
 .Lwith_try_loop:
     cmpq %r8, %rcx
     jge .Lwith_try_not_found
     movq %rcx, %r9
     addq %r8, %r9
-    shrq $1, %r9                        // r9 = mid
+    shrq $1, %r9
     movq %r9, %r10
-    imulq $ASNIX_ATTR_SIZE, %r10         // r10 = mid * ASNIX_ATTR_SIZE (12 -- not a power of 2)
-    movl ASNIX_ATTRS_OFF_ENTRIES+ASNIX_ATTR_OFF_SYM(%rax, %r10, 1), %r11d // zero-extends; must be
-        // 32-bit -- M103 removed the pad word (see heap.h)
+    imulq $ASNIX_ATTR_SIZE, %r10
+    movl ASNIX_ATTRS_OFF_ENTRIES+ASNIX_ATTR_OFF_SYM(%rax, %r10, 1), %r11d
     cmpq %rdx, %r11
     je .Lwith_try_found
     jl .Lwith_try_go_right
-    movq %r9, %r8                       // hi = mid
+    movq %r9, %r8
     jmp .Lwith_try_loop
 .Lwith_try_go_right:
-    leaq 1(%r9), %rcx                   // lo = mid + 1
+    leaq 1(%r9), %rcx
     jmp .Lwith_try_loop
 .Lwith_try_found:
     movq ASNIX_ATTRS_OFF_ENTRIES+ASNIX_ATTR_OFF_VALUE(%rax, %r10, 1), %rax
 
-.Lwith_try_resolve:                     // M92: re-entered after unwrapping a Cell (see
-                                         // .Lwith_try_check_cell below) -- see op_var_ref.S's
-                                         // matching comment.
+.Lwith_try_resolve:
     movq %rax, %rcx
     andq $ASNIX_TAG_MASK, %rcx
     cmpq $ASNIX_TAG_THUNK, %rcx
     jne .Lwith_try_check_cell
 
     andq $-8, %rax
-    // M103: OFF_STATE is tagged now -- UNFORCED: this word IS the clean
-    // IrProgram* (tag bits 0); otherwise: the bare state tag alone.
-    // Extract into %r8 (dead since the binary search above) for
-    // dispatch, keeping %rcx (the possibly-a-pointer original word)
-    // intact for the UNFORCED path below.
     movq ASNIX_THUNK_OFF_STATE(%rax), %rcx
     movq %rcx, %r8
     andq $ASNIX_TAG_MASK, %r8
@@ -180,15 +122,9 @@ asnix_op_with_try:
     movq %rax, ASNIX_RETFRAME_OFF_FORCE_TARGET(%r14)
     addq $ASNIX_RETFRAME_SIZE, %r14
 
-    // M103: %rcx already holds the clean prog pointer (read above, tag
-    // bits were 0) -- no second memory read needed (the old separate
-    // OFF_PROG field is gone).
     movq ASNIX_IRPROG_OFF_POOL(%rcx), %r13
     movq ASNIX_IRPROG_OFF_OPS(%rcx), %rsi
-    movq ASNIX_THUNK_OFF_ENV(%rax), %rdi // last read of ENV's original meaning -- safe to repurpose below
-    // M82: push onto the intrusive IN_PROGRESS stack -- see
-    // stacklimits.S's asnix_inprogress_head comment. %rcx is dead here
-    // (overwritten immediately below, same as before this M100 change).
+    movq ASNIX_THUNK_OFF_ENV(%rax), %rdi
     movq asnix_inprogress_head(%rip), %rcx
     movq %rcx, ASNIX_THUNK_OFF_ENV(%rax)
     movq %rax, asnix_inprogress_head(%rip)
@@ -197,90 +133,59 @@ asnix_op_with_try:
 
 .Lwith_try_forced:
     movq ASNIX_THUNK_OFF_ENV(%rax), %rax
-    jmp .Lwith_try_push                   // perf: skip the resolve re-check entirely, see
-                                           // op_var_ref.S's matching .Lvar_ref_forced comment for
-                                           // the invariant proof (a forced thunk's cached value can
-                                           // never be a Thunk or a Cell)
+    jmp .Lwith_try_push
 
-    // M92: not a thunk -- check whether it's a Cell instead (see heap.h's
-    // ASNIX_CELL_MARKER comment). %rcx still holds the tag bits from the
-    // check just above (the only path that reaches this label).
 .Lwith_try_check_cell:
     cmpq $ASNIX_TAG_PTR, %rcx
     jne .Lwith_try_push
     movq %rax, %r8
-    andq $-8, %r8                        // clear the low 3 tag bits...
-    shlq $16, %r8                        // ...and the high 16 bits a packed M118 ThunkMap word's
-    shrq $16, %r8                        // index occupies (a no-op for every other PTR kind --
-                                          // see heap.h's ASNIX_THUNKMAP_MARKER comment) --
-                                          // r8 = masked base pointer
+    andq $-8, %r8
+    shlq $16, %r8
+    shrq $16, %r8
     movq ASNIX_CELL_OFF_MARKER(%r8), %r9
     cmpq $ASNIX_CELL_MARKER, %r9
-    jne .Lwith_try_check_lazyapp         // PTR but not a Cell -- maybe a LazyApp instead
+    jne .Lwith_try_check_lazyapp
 
-    // It's a Cell -- M166: inline Cell-chain walk, same hand-rolled loop
-    // as op_var_ref.S's .Lvar_ref_cell_loop (see that file's comment for
-    // the full rationale). %r8 already holds the masked base pointer of
-    // a CONFIRMED Cell (the check just above); %r9/%r10/%r11/%rdx are
-    // free scratch here (the binary search above is done). This loop
-    // runs entirely within OP_WITH_TRY (asnix_op_with_try), a distinct
-    // function from OP_WITH (asnix_op_with) above it in this file --
-    // the ASNIX_ENV_WITH_TAG frame-tagging logic lives only in
-    // asnix_op_with/asnix_op_with_exit and is never touched here; this
-    // loop only ever reads/writes %rax/%rcx/%rdx/%r8/%r9/%r10, none of
-    // which carry ENV/tag state. Measured on d.nix: this call site hits
-    // only 1,128 times (see op_select.S's matching comment for the
-    // combined total across all three sites) -- by far the coldest of
-    // the three, but still inlined for consistency/to keep the shared
-    // chase-limit bound meaningfully exercised at every former call
-    // site, at zero extra cost on this rare path.
     movq $ASNIX_CELL_CHASE_LIMIT, %rdx
 .Lwith_try_cell_loop:
-    movq ASNIX_CELL_OFF_TARGET(%r8), %r10 // r10 = target pointer (Value* into an Env's values[])
-    movq (%r10), %rax                     // rax = *target -- the actual next raw Value
+    movq ASNIX_CELL_OFF_TARGET(%r8), %r10
+    movq (%r10), %rax
     movq %rax, %rcx
     andq $ASNIX_TAG_MASK, %rcx
     cmpq $ASNIX_TAG_PTR, %rcx
-    jne .Lwith_try_resolve                 // not even a PTR -- can't be a Cell, done chasing
+    jne .Lwith_try_resolve
     movq %rax, %r8
     andq $-8, %r8
     shlq $16, %r8
-    shrq $16, %r8                          // r8 = masked base pointer of the new value
+    shrq $16, %r8
     movq ASNIX_CELL_OFF_MARKER(%r8), %r9
     cmpq $ASNIX_CELL_MARKER, %r9
-    jne .Lwith_try_resolve                  // PTR but not a Cell -- done, re-dispatch on %rax
+    jne .Lwith_try_resolve
     decq %rdx
     jnz .Lwith_try_cell_loop
-    jmp .Lwith_try_blackhole                // chase limit exceeded -- a genuine alias cycle
+    jmp .Lwith_try_blackhole
 
-    // M113: not a Cell either -- maybe a LazyApp (heap.h's
-    // ASNIX_LAZYAPP_MARKER comment). %r9 already holds the marker value
-    // from the Cell check just above -- see op_var_ref.S's matching
-    // comment.
 .Lwith_try_check_lazyapp:
     cmpq $ASNIX_LAZYAPP_MARKER, %r9
     je .Lwith_try_lazyapp
     cmpq $ASNIX_LAZYAPP_FORCED_MARKER, %r9
     je .Lwith_try_lazyapp
-    jmp .Lwith_try_check_thunkmap        // PTR but not Cell/LazyApp -- maybe a ThunkMap instead
+    jmp .Lwith_try_check_thunkmap
 .Lwith_try_lazyapp:
     pushq %rsi
     pushq %rdi
-    movq %rax, %rdi                      // arg1 = the LazyApp value
+    movq %rax, %rdi
     call asnix_resolve_lazyapp
     popq %rdi
     popq %rsi
     jmp .Lwith_try_resolve
 
-    // M118: not a Cell/LazyApp either -- maybe a ThunkMap (heap.h's
-    // ASNIX_THUNKMAP_MARKER comment) -- see op_var_ref.S's matching
-    // comment.
 .Lwith_try_check_thunkmap:
     cmpq $ASNIX_THUNKMAP_MARKER, %r9
-    jne .Lwith_try_push                  // PTR but not Cell/LazyApp/ThunkMap: a real value
+    jne .Lwith_try_push
     pushq %rsi
     pushq %rdi
-    movq %rax, %rdi                      // arg1 = the ThunkMap value (original, unmasked)
+    movq %rax, %rdi
     call asnix_resolve_thunkmap
     popq %rdi
     popq %rsi
@@ -307,16 +212,11 @@ asnix_op_with_try:
     movq $ASNIX_MSG_BLACKHOLE_LEN, %rsi
     jmp asnix_fatal
 .Lwith_try_reraise:
-    // M82: see op_var_ref.S's matching .Lvar_ref_reraise comment.
     leaq .Lmsg_reeval_failed(%rip), %rdi
     movq $ASNIX_MSG_REEVAL_FAILED_LEN, %rsi
     jmp asnix_tryeval_raise_or_fatal
     .size asnix_op_with_try, . - asnix_op_with_try
 
-    // All enclosing `with`s were tried (every OP_WITH_TRY took its
-    // "not found" branch) -- same error a compile-time-unbound variable
-    // gets (see compiler.c's AST_VAR case), just raised at runtime since
-    // whether a `with`'s attrset actually has the key is a runtime fact.
     .globl asnix_op_with_miss
     .type asnix_op_with_miss, @function
 asnix_op_with_miss:
@@ -325,27 +225,15 @@ asnix_op_with_miss:
     jmp asnix_fatal
     .size asnix_op_with_miss, . - asnix_op_with_miss
 
-    // M52: no operands; ENV = ENV->up with ASNIX_ENV_WITH_TAG masked off --
-    // the with-frame counterpart of OP_FRAME_EXIT (op_frame.S). compiler.c's
-    // AST_WITH case emits this right after compiling the `with` body so a
-    // non-tail `with` (e.g. one sibling among several in the same list/
-    // attrset/call-arg position) doesn't leave its 1-slot with-frame
-    // installed as ENV for whatever compiles next -- that leak was M52's
-    // bug: a second, sibling `with`'s OP_MK_THUNK (building its own
-    // with-expr) would capture the first with's leftover frame instead of
-    // the enclosing scope, so every depth-relative OP_VAR_REF inside that
-    // thunk walked one frame too many once the second `with`'s value was
-    // actually forced. Without the mask, ENV would become a tagged (odd)
-    // pointer -- a plain OP_FRAME_EXIT, whose frames are never tagged,
-    // can't be reused here.
     .globl asnix_op_with_exit
     .type asnix_op_with_exit, @function
 asnix_op_with_exit:
-    movl ASNIX_ENV_OFF_UP(%rdi), %edi    // M118: zero-extends into %rdi; decompress below
+    movl ASNIX_ENV_OFF_UP(%rdi), %edi
     addq asnix_env_arena_base(%rip), %rdi
-    andq $-2, %rdi                       // mask off ASNIX_ENV_WITH_TAG (bit 0)
+    andq $-2, %rdi
 
     addq $ASNIX_IROP_SIZE, %rsi
     movq (%rsi), %rax
     jmp *%rax
     .size asnix_op_with_exit, . - asnix_op_with_exit
+

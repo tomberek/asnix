@@ -2,12 +2,6 @@
 
 #include "asnix/ir.h"
 
-/* Each op handler is a GAS jmp-target, not a conventional callable function
- * -- the `extern void ...(void)` declarations below exist purely so we can
- * take their address with ordinary C syntax. Designated initializers (keyed
- * by the enum, not position) mean reordering the enum in ir.h can never
- * silently desynchronize this table from the handlers it names. */
-
 extern void asnix_op_push_int(void);
 extern void asnix_op_push_true(void);
 extern void asnix_op_push_false(void);
@@ -134,3 +128,4 @@ void ir_link(IrOp *ops, size_t n) {
         ops[i].handler = asnix_handler_table[op_id];
     }
 }
+

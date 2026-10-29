@@ -1,27 +1,16 @@
-// OP_HALT is the one genuine `ret`: it unwinds back to asnix_eval's C
-// caller, restoring the callee-saved registers the dispatch core claimed
-// at entry (see src/asm/dispatch.S).
     .text
 
     .globl asnix_op_halt
     .type asnix_op_halt, @function
 asnix_op_halt:
     subq $8, %r12
-    movq (%r12), %rax                   // final result
-    decq asnix_eval_depth(%rip)         // pop -- frees this depth's slot in force_scratch.c's
-                                         // per-depth eval-scratch cache (dispatch.S) for reuse
-                                         // by the NEXT call that reaches this same depth
-    // Restore the enclosing asnix_eval's (if any) VALSTACK/RETSP limits --
-    // see dispatch.S's prologue for why this matters: without it, a nested
-    // asnix_eval returning (e.g. `import`'s eval_file.c -> asnix_eval) would
-    // leave the resumed outer invocation checking its pushes against this
-    // call's now-defunct buffer instead of its own. Popped in reverse of
-    // dispatch.S's push order (RETSP limit was pushed last).
+    movq (%r12), %rax
+    decq asnix_eval_depth(%rip)
     popq %rdx
     movq %rdx, asnix_retsp_limit(%rip)
     popq %rdx
     movq %rdx, asnix_valstack_limit(%rip)
-    addq $8, %rsp                       // undo dispatch.S's alignment padding
+    addq $8, %rsp
     popq %r15
     popq %rbp
     popq %rbx
@@ -30,3 +19,4 @@ asnix_op_halt:
     popq %r12
     ret
     .size asnix_op_halt, . - asnix_op_halt
+

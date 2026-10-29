@@ -1,16 +1,3 @@
-/*
- * Direct unit coverage for toml.c's asnix_toml_parse -- calls the parser
- * straight (not through OP_CALL/builtins_toml.c's PrimOp wrapper, which
- * has nothing of its own to test beyond arg unwrapping), then walks the
- * returned attrset/list Value tree with builtins_shared.c's accessor
- * helpers, the same way every other builtins test in this directory
- * inspects aggregate results. Every expected shape here was additionally
- * cross-checked end-to-end against numtide/nix-conformance's real
- * lang/eval-okay-fromTOML-NNN.exp files (see the shell-loop verification
- * described in docs/architecture.md's "M23 scope notes") -- this file is
- * a convenient, fast, no-external-repo-needed regression net for the
- * same parser, not a replacement for that fuller check.
- */
 #include <stdio.h>
 #include <string.h>
 #include <sys/wait.h>
@@ -68,30 +55,19 @@ static void check_bool(Value v, int want, const char *msg) {
     CHECK(ok, msg);
 }
 
-/* M82 (see docs/architecture.md): forks a child that parses `doc` (a
- * single TOML date/time literal) and expects it to call `toml_fatal`
- * (an unconditional `exit(1)`, same fork()+exit-code pattern established
- * by tests/c/test_abort.c and tests/asm/test_stacklimits.c/test_apply.c
- * for every other fatal path in this codebase) -- see toml.c's
- * `classify_date_or_time`'s own comment for why dates/times are now
- * rejected instead of represented as a `{ _type = "timestamp"; ...}`
- * attrset (the OLD behavior this helper used to check, before M82
- * found the `nix-instantiate` actually installed in this environment
- * rejects every TOML date/time shape unconditionally). */
 static void check_date_time_rejected(const char *doc, const char *msg) {
     pid_t pid = fork();
     if (pid == 0) {
-        close(2); /* silence toml_fatal's own stderr line -- not under test here */
+        close(2);
         asnix_arena_init(0);
         toml(doc);
-        _exit(42); /* reaching here means it wrongly succeeded */
+        _exit(42);
     }
     int status = 0;
     waitpid(pid, &status, 0);
     CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 1, msg);
 }
 
-/* Ground truth: lang/eval-okay-fromTOML-001..005.exp. */
 static void test_integers_and_bools(void) {
     Value v = toml("a = 1\nb = -1\nc = +1\nd = 1_000_000\ne = 0x1f\nf = 0o17\ng = 0b1010\nh = true\ni = false");
     check_int(get(v, "a"), 1, "a = 1");
@@ -105,8 +81,6 @@ static void test_integers_and_bools(void) {
     check_bool(get(v, "i"), 0, "i = false");
 }
 
-/* Ground truth: lang/eval-okay-fromTOML-012..017.exp (basic string
- * escapes) and -016 (\u/\U -> UTF-8). */
 static void test_basic_string_escapes(void) {
     Value v = toml("a = \"tab\\there\"\nb = \"nl\\nhere\"\nc = \"quote\\\"here\"\nd = \"back\\\\slash\"\n"
                     "e = \"\\u00e9\\U0001F600\"\nf = \"\\b\\f\\r\"");
@@ -118,7 +92,6 @@ static void test_basic_string_escapes(void) {
     check_string(get(v, "f"), "\b\f\r", "\\b \\f \\r escapes (raw control bytes)");
 }
 
-/* Ground truth: lang/eval-okay-fromTOML-018..024.exp. */
 static void test_literal_and_multiline_strings(void) {
     Value v = toml("a = 'literal \\n not escaped'\n"
                     "b = \"\"\"\nline one\nline two\"\"\"\n"
@@ -132,7 +105,6 @@ static void test_literal_and_multiline_strings(void) {
     check_string(get(v, "e"), "has \"one\" quote", "multi-line basic: single/double embedded quotes don't end the string");
 }
 
-/* Ground truth: lang/eval-okay-fromTOML-041..047.exp. */
 static void test_tables_and_dotted_keys(void) {
     Value v1 = toml("[t]\nb = 1\n[u]\nc = 2");
     check_int(get(get(v1, "t"), "b"), 1, "[t] b = 1");
@@ -147,8 +119,6 @@ static void test_tables_and_dotted_keys(void) {
     check_int(get(a, "c"), 2, "dotted key a.c = 2, merged across two statements");
 }
 
-/* Ground truth: lang/eval-okay-fromTOML-045..046.exp -- the array-of-
- * tables "step into the last element" rule. */
 static void test_array_of_tables(void) {
     Value v1 = toml("[[a]]\nb = 1\n[[a]]\nb = 2");
     Value a1 = get(v1, "a");
@@ -165,7 +135,6 @@ static void test_array_of_tables(void) {
     check_int(get(asnix_bshared_list_elems(b)[0], "c"), 1, "a[0].b[0].c == 1");
 }
 
-/* Ground truth: lang/eval-okay-fromTOML-025..040.exp. */
 static void test_arrays_and_inline_tables(void) {
     Value v = toml("a = [1, 2, 3]\nb = [[1, 2], [3]]\nc = { d = 1, e = \"two\" }\nf = { g = { h = 1 } }");
     Value arr = get(v, "a");
@@ -184,10 +153,6 @@ static void test_arrays_and_inline_tables(void) {
     check_int(get(get(f, "g"), "h"), 1, "nested inline table f.g.h == 1");
 }
 
-/* Ground truth: lang/eval-okay-fromTOML-048..052/058..059.exp -- quoted/
- * literal/numeric-looking/non-ASCII keys all intern correctly regardless
- * of what the printer later decides about quoting them (main.c's
- * concern, not this parser's). */
 static void test_quoted_and_unusual_keys(void) {
     Value v = toml("\"quoted key\" = 1\n'literal key' = 2\n\"\" = 3\na-b_c = 4\n1234 = 5\na = \"café\"");
     check_int(get(v, "quoted key"), 1, "\"quoted key\" = 1");
@@ -198,9 +163,6 @@ static void test_quoted_and_unusual_keys(void) {
     check_string(get(v, "a"), "caf\xc3\xa9", "non-ASCII string value");
 }
 
-/* Ground truth: lang/eval-fail-fromTOML-timestamps.err.exp (M82) -- see
- * check_date_time_rejected's own comment for why this no longer checks
- * a `{ _type = "timestamp"; ...}` shape. */
 static void test_timestamps(void) {
     check_date_time_rejected("a = 1979-05-27", "local date rejected");
     check_date_time_rejected("a = 07:32:00.5", "local time rejected");
@@ -209,7 +171,6 @@ static void test_timestamps(void) {
     check_date_time_rejected("a = 1979-05-27t07:32:00z", "lowercase t/z date-time rejected");
 }
 
-/* Comments/blank-lines/CRLF: lang/eval-okay-fromTOML-053..057.exp. */
 static void test_comments_and_crlf(void) {
     Value v = toml("a = 1 # trailing comment\n# leading comment\nb = 2\r\nc = 3");
     check_int(get(v, "a"), 1, "trailing comment ignored");
@@ -217,14 +178,6 @@ static void test_comments_and_crlf(void) {
     check_int(get(v, "c"), 3, "plain LF after CRLF line");
 }
 
-/* M51: asnix now has a real Float Value kind (include/asnix/value.h's
- * ASNIX_TAG_PTR + heap.h's ASNIX_FLOAT_MARKER), so a TOML float/inf/nan
- * parses to a genuine Nix float value instead of fatally rejecting --
- * see toml.c's parse_float_token. Ground truth: lang/eval-okay-fromTOML-
- * 006/-007/-008/-060.exp all require exactly this (a genuine Nix float
- * value for `1.5`, `inf`, `nan`, `3.0`). NaN can't be compared with `==`
- * (always false, by IEEE-754 definition, even against itself) -- checked
- * via self-inequality instead, the standard NaN test. */
 static void test_float(void) {
     Value v = toml("a = 1.5\nb = 3.0\nc = inf\nd = -inf\ne = nan\nf = -nan");
     check_float(get(v, "a"), 1.5, "basic TOML float");
@@ -257,3 +210,4 @@ int main(void) {
     printf("test_toml: all checks passed\n");
     return 0;
 }
+

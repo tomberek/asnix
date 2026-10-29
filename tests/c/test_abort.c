@@ -1,11 +1,3 @@
-/*
- * Regression coverage for `abort` (and the bare-global exposure of
- * `import`/`map`/`abort` alongside `builtins.X`, added in the same pass --
- * see compiler.c's root ScopeFrame and eval_file.c's root Env for the
- * actual mechanism). `abort` unconditionally exits the process, so this
- * follows the same fork()+exit-code pattern already established by
- * tests/asm/test_stacklimits.c and tests/c/test_apply.c for abort paths.
- */
 #include <stdio.h>
 #include <string.h>
 #include <sys/wait.h>
@@ -28,24 +20,19 @@ static int failures = 0;
         }                                                                  \
     } while (0)
 
-/* `abort "msg"` must exit 1 and print real Nix's core wording (confirmed
- * directly against nix-instantiate: "evaluation aborted with the
- * following error message: '<msg>'" -- the "while calling" trace context
- * real Nix also prints isn't reproduced, same simplification every other
- * fatal error in this project already makes). */
 static void test_abort_exits_with_message(void) {
     int pipefd[2];
     if (pipe(pipefd) != 0) { CHECK(0, "pipe() failed"); return; }
     pid_t pid = fork();
     if (pid == 0) {
         close(pipefd[0]);
-        dup2(pipefd[1], 2); /* redirect stderr into the pipe */
+        dup2(pipefd[1], 2);
         close(pipefd[1]);
         asnix_arena_init(0);
         Value args[1] = { asnix_make_string_value("custom message", 15) };
         Value primop = asnix_make_abort_primop();
         asnix_apply(primop, args, 1);
-        _exit(42); /* reaching here means abort failed to trigger */
+        _exit(42);
     }
     close(pipefd[1]);
     char buf[256] = { 0 };
@@ -67,3 +54,4 @@ int main(void) {
     printf("test_abort: all checks passed\n");
     return 0;
 }
+

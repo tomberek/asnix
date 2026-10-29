@@ -49,3 +49,4 @@ int64_t asnix_base64_decode(const char *s, size_t len, uint8_t *out, size_t out_
     }
     return (int64_t)oi;
 }
+

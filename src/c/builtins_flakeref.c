@@ -8,23 +8,11 @@
 #include <string.h>
 
 #include "asnix/arena.h"
-#include "asnix/ir.h" /* asnix_force_for_print */
+#include "asnix/ir.h"
 #include "base64.h"
 #include "builtins_shared.h"
 #include "symtab.h"
 #include "value_util.h"
-
-/* ---------------------------------------------------------------------
- * M66: builtins.parseFlakeRef / builtins.flakeRefToString.
- *
- * This is pure syntax (no filesystem/network/registry access) -- see
- * docs/architecture.md's M66 scope notes for the full spec derivation and
- * every deliberate scope cut. All intermediate scratch buffers in this
- * file use plain malloc/free (freed before returning), the same pattern
- * builtins_m54.c's toXML uses for its open_memstream buffer -- final
- * results are always copied into a fresh arena-backed Value via
- * asnix_make_string_value/asnix_bshared_make_attrs before returning.
- * --------------------------------------------------------------------- */
 
 static void fr_fatal(const char *who, const char *msg) { asnix_bshared_fatal(who, msg); }
 
@@ -35,13 +23,9 @@ static _Noreturn void fr_fatalf(const char *who, const char *fmt, ...) {
     vsnprintf(buf, sizeof buf, fmt, ap);
     va_end(ap);
     asnix_bshared_fatal(who, buf);
-    exit(1); /* unreachable -- asnix_bshared_fatal never returns */
+    exit(1);
 }
 
-/* ---------------------------------------------------------------------
- * Tiny growable byte buffer (malloc/realloc), used to assemble output
- * strings before handing them to asnix_make_string_value.
- * --------------------------------------------------------------------- */
 typedef struct {
     char *buf;
     int64_t len;
@@ -71,24 +55,6 @@ static Value sb_finish(SB *sb) {
     return v;
 }
 
-/* ---------------------------------------------------------------------
- * Percent-decoding / percent-encoding. Three distinct "safe" charsets,
- * reverse-engineered by sweeping every printable ASCII byte through real
- * `nix-instantiate --eval -E 'builtins.flakeRefToString { ... }'` and
- * comparing which bytes survive bare vs get escaped (see M66 scope notes
- * for the full table):
- *   CS_SEGMENT: a single opaque path segment (owner/repo/ref/id) --
- *     unreserved (A-Za-z0-9-._~) plus ':' '@' survive bare; EVERYTHING
- *     else (including '/' and '%') is escaped. This is deliberately
- *     narrower than RFC3986 "pchar" -- sub-delims like '!' '$' '&' '('
- *     ')' '*' '+' ',' ';' '=' are escaped here too, confirmed directly
- *     against real Nix, not assumed from the RFC.
- *   CS_QPATH: a generic URL path component (git+/tarball+/file+ url
- *     field) -- same as CS_SEGMENT plus '/' survives bare (real path
- *     separators), '?' does not.
- *   CS_QUERY: a query value -- same as CS_QPATH plus '?' ALSO survives
- *     bare.
- * --------------------------------------------------------------------- */
 typedef enum { CS_SEGMENT, CS_QPATH, CS_QUERY } Charset;
 
 static int fr_is_unreserved(unsigned char c) {
@@ -113,10 +79,6 @@ static int fr_hex_val(char c) {
     return -1;
 }
 
-/* Decodes %XX sequences (case-insensitive hex); a stray '%' not followed
- * by two hex digits is passed through literally. Writes into a fresh
- * malloc'd buffer (always no longer than the input), written through
- * `outlen`. */
 static char *fr_pct_decode(const char *s, int64_t len, int64_t *outlen) {
     char *out = malloc((size_t)len + 1);
     int64_t o = 0;
@@ -169,12 +131,6 @@ static int fr_is_hex40(const char *s, int64_t len) {
     return 1;
 }
 
-/* Parses an unsigned decimal integer (optional leading '+', no leading
- * '-', leading zeros allowed -- matches real Nix's underlying
- * `string2Int`, confirmed: "+3" -> 3, "03" -> 3). Returns 0 (and leaves
- * *out untouched) if `s` isn't a valid such integer -- callers treat
- * that as "field absent", matching real Nix silently dropping an
- * unparseable revCount/lastModified rather than erroring. */
 static int fr_parse_uint(const char *s, int64_t len, int64_t *out) {
     int64_t i = 0;
     if (len > 0 && s[0] == '+') i = 1;
@@ -189,12 +145,6 @@ static int fr_parse_uint(const char *s, int64_t len, int64_t *out) {
     return 1;
 }
 
-/* ---------------------------------------------------------------------
- * Query string: "&"-separated "key=value" pairs, both percent-decoded.
- * A piece with no '=' at all is dropped entirely (matches real Nix's
- * "dubious URI query ... missing equal sign, ignoring" warning,
- * confirmed live). Earlier duplicate keys win (first-match-wins,
- * std::map::emplace semantics, confirmed live with "?x=1&x=2"). */
 typedef struct {
     char *key;
     int64_t keylen;
@@ -229,27 +179,17 @@ static QParam *fr_parse_query(const char *s, int64_t len, int64_t *out_n) {
     return out;
 }
 
-/* First (unused-aware is NOT applied here -- callers mark `used`
- * themselves; this always returns the first match, duplicates are never
- * consulted, matching the "first wins" rule above). */
 static QParam *fr_qp_find(QParam *qp, int64_t n, const char *key) {
     for (int64_t i = 0; i < n; i++) if (fr_eq(qp[i].key, qp[i].keylen, key)) return &qp[i];
     return NULL;
 }
-/* Marks every entry (first match AND any later duplicates) with this
- * key as used, so it's excluded from a "leftover" query. */
 static void fr_qp_consume(QParam *qp, int64_t n, const char *key) {
     for (int64_t i = 0; i < n; i++) if (fr_eq(qp[i].key, qp[i].keylen, key)) qp[i].used = 1;
 }
 
-/* ---------------------------------------------------------------------
- * Output query-param list builder: collects (key,value) pairs, then
- * sorts alphabetically by key (confirmed: every serialized query string
- * in every fixture is key-sorted) and joins as "k1=v1&k2=v2...".
- * --------------------------------------------------------------------- */
 typedef struct {
-    const char *key; /* not owned */
-    char *val; /* owned, freed by caller after use */
+    const char *key;
+    char *val;
     int64_t vallen;
 } QOut;
 
@@ -293,16 +233,6 @@ static void sb_append_query(SB *sb, QOut *arr, int n) {
     }
 }
 
-/* ---------------------------------------------------------------------
- * `rev` normalization used only by flakeRefToString for the
- * github/gitlab/git/indirect address forms: a 40-char hex string is
- * lowercased, a "sha1-<base64>" SRI-shaped string is decoded and
- * re-rendered as lowercase hex (confirmed: `convertHash`-adjacent --
- * `flakeRefToString { type="github"; ...; rev="sha1-ASNF...="; }`
- * produces the plain-hex form directly in the URL), anything else is
- * passed through byte for byte (plain non-hash-shaped strings like
- * path-type's `rev = "x"` or `"abc"` are NEVER normalized -- callers for
- * the "path" type must not call this). Returned buffer is malloc'd. */
 static char *fr_normalize_rev(const char *s, int64_t len, int64_t *outlen) {
     if (fr_is_hex40(s, len)) {
         char *out = malloc(40);
@@ -330,15 +260,6 @@ static char *fr_normalize_rev(const char *s, int64_t len, int64_t *outlen) {
     return out;
 }
 
-/* "" is a documented real-Nix quirk: an empty `narHash` attr is rendered
- * as the SRI form of the all-zero sha256 "dummy" hash rather than
- * erroring -- confirmed directly: `flakeRefToString { type="github";
- * ...; narHash=""; }` -> "...?narHash=sha256-AAAA...A%3D" byte for byte.
- * Any other value is passed through as-is (this project does not
- * implement real Nix's full `Hash::parseAny`/SRI validation for narHash
- * -- a deliberate, narrower scope cut, see M66 scope notes: every
- * fixture this project must match only ever gives narHash as either ""
- * or an already-correct SRI string). */
 static const char FR_DUMMY_SHA256_SRI[] = "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
 static void fr_narhash_or_dummy(const char *s, int64_t len, const char **out, int64_t *outlen) {
     if (len == 0) {
@@ -350,18 +271,6 @@ static void fr_narhash_or_dummy(const char *s, int64_t len, const char **out, in
     }
 }
 
-/* ---------------------------------------------------------------------
- * attrset read helpers for flakeRefToString: force + the "negative int
- * given for any flake ref attr" generic guard (confirmed live:
- * `flakeRefToString { type="github"; ...; repo = -1; }` errors
- * "negative value given for flake ref attr repo: -1" -- this check
- * fires for ANY attribute whose forced value happens to be a negative
- * int, regardless of whether that attribute is normally int-shaped;
- * matches eval-fail-flake-ref-to-string-negative-integer.nix, which
- * triggers it via `repo`, not revCount/lastModified). Returns 1 and
- * writes the forced value through `*out` if `name` is present, 0
- * otherwise (never fatal just for being absent -- callers decide
- * optional vs required). */
 static int fr_find(Value attrs, const char *name, Value *out) {
     int64_t idx = asnix_bshared_attrs_find(attrs, asnix_intern(name, strlen(name)));
     if (idx < 0) return 0;
@@ -378,18 +287,6 @@ static void fr_string_bytes(Value v, const char *name, const char **bytes, int64
     *bytes = asnix_ptr_bytes(v, len);
 }
 
-/* ===========================================================================
- * parseFlakeRef
- * ======================================================================= */
-
-/* Splits raw (still percent-escaped) bytes by literal '/' into segments,
- * filtering out EMPTY segments entirely -- confirmed live/by fixture:
- * "github:/a/b", "github:a//b", and the heavily-slashed upstream fixture
- * ("github://////owner%42/////repo%41///branch%43////") all behave as if
- * every run of consecutive '/' (leading, trailing, or internal) were a
- * single separator with nothing meaningful between. `count` caps how
- * many segments are collected (always plenty; path segment counts here
- * are always tiny). */
 static int64_t fr_split_segments(const char *s, int64_t len, const char **seg, int64_t *seglen, int64_t maxn) {
     int64_t n = 0;
     int64_t i = 0;
@@ -417,9 +314,6 @@ static Value fr_string_attr(const char *key, const char *bytes, int64_t len) {
     return asnix_make_string_value(bytes, (size_t)len);
 }
 
-/* Small fixed-capacity attr-list builder shared by every parse_* /
- * *_to_string function below -- avoids six near-identical "collect
- * syms/vals, call asnix_bshared_make_attrs" blocks. */
 typedef struct {
     uint32_t syms[16];
     Value vals[16];
@@ -433,7 +327,6 @@ static void ab_put(AttrBuilder *ab, const char *name, Value v) {
 }
 static Value ab_finish(AttrBuilder *ab) { return asnix_bshared_make_attrs(ab->syms, ab->vals, ab->n); }
 
-/* ---- github:/gitlab: (and any other "owner/repo"-shaped forge) ------ */
 static Value fr_parse_forge(const char *type, const char *rest, int64_t restlen) {
     int64_t qmark = fr_find_char(rest, restlen, '?');
     const char *path_part = rest;
@@ -499,14 +392,6 @@ static Value fr_parse_forge(const char *type, const char *rest, int64_t restlen)
 
     if (has_path_ref && q_ref) fr_fatal("parseFlakeRef", "flake reference specifies a ref both in the path and as a query parameter");
     if (has_path_rev && q_rev) fr_fatal("parseFlakeRef", "flake reference specifies a rev both in the path and as a query parameter");
-    /* A ref AND a rev ending up BOTH set is only legitimate when they both
-     * came from the SAME multi-segment path position (branch-then-commit,
-     * e.g. "owner/repo/branch/<hex40>") -- any other combination (one
-     * from the path and the other from the query, or both from the
-     * query) is ambiguous and a hard error, confirmed by fixture:
-     * eval-fail-parse-flake-ref-github-ref-and-rev.nix (query ref= AND
-     * query rev=) and eval-fail-parse-flake-ref-github-path-ref-and-
-     * rev.nix (path-derived ref, query rev=) both fail. */
     if ((has_path_ref || q_ref) && (has_path_rev || q_rev) && !(has_path_ref && has_path_rev))
         fr_fatal("parseFlakeRef", "flake reference names a branch/tag and a commit at the same time");
 
@@ -525,7 +410,6 @@ static Value fr_parse_forge(const char *type, const char *rest, int64_t restlen)
     return ab_finish(&ab);
 }
 
-/* ---- bare flake id / "flake:" indirect ------------------------------- */
 static int fr_is_id_char(char c, int first) {
     if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) return 1;
     if (first) return 0;
@@ -585,9 +469,6 @@ static Value fr_parse_indirect(const char *rest, int64_t restlen) {
         if (fr_is_hex40(last, lastlen)) { rev_s = last; rev_len = lastlen; has_rev = 1; }
         else free(last);
     }
-    /* Lowercase a hex-shaped rev (confirmed: "nixpkgs/ABCDEF0123..." parses
-     * to rev = "abcdef0123..." -- indirect lowercases at PARSE time, unlike
-     * github/git which only normalize at flakeRefToString time). */
     if (has_rev) for (int64_t i = 0; i < rev_len; i++) rev_s[i] = (char)tolower((unsigned char)rev_s[i]);
 
     int64_t qn = 0;
@@ -596,9 +477,6 @@ static Value fr_parse_indirect(const char *rest, int64_t restlen) {
     QParam *q_rev = qp ? fr_qp_find(qp, qn, "rev") : NULL;
     QParam *q_dir = qp ? fr_qp_find(qp, qn, "dir") : NULL;
     QParam *q_narHash = qp ? fr_qp_find(qp, qn, "narHash") : NULL;
-    /* Unrecognized query keys are silently dropped for indirect --
-     * confirmed live: `flake:nixpkgs?foo=1` -> { id = "nixpkgs"; } with
-     * no error, unlike github/gitlab/path's strict allow-list. */
 
     AttrBuilder ab;
     ab_init(&ab);
@@ -613,14 +491,6 @@ static Value fr_parse_indirect(const char *rest, int64_t restlen) {
     return ab_finish(&ab);
 }
 
-/* ---- path: / bare absolute path -------------------------------------
- * `is_explicit`: 1 for the "path:" scheme prefix (percent-decodes the
- * path component, same as every other scheme), 0 for a bare absolute
- * path string (the path component is taken 100% literally/raw -- NOT
- * percent-decoded -- confirmed by two otherwise-identical fixture
- * entries: bare "/a%20b" keeps literal text "/a%20b", but "path:/a%20b"
- * decodes to "/a b". Only the query component is decoded in both forms.
- */
 static char *fr_normalize_path_text(const char *s, int64_t len, int decode, int64_t *outlen) {
     int leading = len > 0 && s[0] == '/';
     int trailing = len > 1 && s[len - 1] == '/';
@@ -700,24 +570,13 @@ static Value fr_parse_path(const char *rest, int64_t restlen, int is_explicit) {
     return ab_finish(&ab);
 }
 
-/* ---- generic "scheme://[authority]path[?query]" URL (used by
- * git+/tarball+/file+ and bare git://,http(s)://,file:) ---------------
- * Authority's port is normalized here (leading zeros stripped, an empty
- * port dropped entirely -- confirmed live: "u:p@x.org:080/a" ->
- * "u:p@x.org:80/a", "x.org:/a" -> "x.org/a") since BOTH parseFlakeRef and
- * flakeRefToString need this, and parseFlakeRef needs it applied
- * directly to its own output (not just at re-serialization time). Path
- * segments are decoded then immediately re-encoded with CS_SEGMENT (so
- * an escaped '/' baked into one segment, e.g "%41%2f", round-trips back
- * through its decoded form "A/" to "A%2F" -- confirmed live with
- * "https://x.org/%41%2f?%41=%42" -> url "https://x.org/A%2F?A=B"). */
 typedef struct {
     const char *scheme;
     int64_t scheme_len;
     int has_authority;
-    char *authority; /* malloc'd, port-normalized */
+    char *authority;
     int64_t authority_len;
-    char *path; /* malloc'd, segment-normalized */
+    char *path;
     int64_t path_len;
     QParam *query;
     int64_t query_n;
@@ -746,7 +605,7 @@ static char *fr_normalize_authority(const char *s, int64_t len, int64_t *outlen)
         } else if (portlen > 0) {
             sb_char(&sb, ':');
             sb_bytes(&sb, port, portlen);
-        } /* empty port: drop the colon entirely */
+        }
     } else {
         sb_bytes(&sb, hostport, hostport_len);
     }
@@ -762,10 +621,6 @@ static char *fr_normalize_url_path(const char *s, int64_t len, int64_t *outlen) 
     int64_t seglen[256];
     int64_t n = 0;
     int64_t i = 0;
-    /* Unlike fr_split_segments (github/indirect/path), this keeps EMPTY
-     * segments (a genuine "//" in a URL path is preserved, not
-     * collapsed -- only the "path" type's own bespoke grammar collapses
-     * doubled slashes). */
     int64_t start = 0;
     while (i <= len && n < 256) {
         if (i == len || s[i] == '/') {
@@ -839,26 +694,10 @@ static Value fr_rebuild_url(const char *scheme, int64_t scheme_len, int has_auth
     return sb_finish(&sb);
 }
 
-/* Builds the "leftover" query (every param not already consumed by a
- * recognized-key extraction) for git/tarball/file's own `url` field.
- * Two extra rules, both confirmed live/by fixture:
- *   - a literal "url" query key is always dropped outright (confirmed:
- *     `parseFlakeRef "https://x.org/a.tar.gz?dir=d&url=u"` keeps `dir`
- *     but drops `url=u` entirely -- not an error, not kept anywhere).
- *   - duplicate keys: first occurrence wins, later ones are dropped
- *     (same "emplace" semantics as fr_qp_find/the recognized-key path,
- *     confirmed: "?&&x=1&x=2" -> leftover "x=1" only, not "x=1&x=2"). */
 static int qout_has_key(QOut *arr, int n, const char *key, int64_t keylen) {
     for (int i = 0; i < n; i++) if ((int64_t)strlen(arr[i].key) == keylen && memcmp(arr[i].key, key, (size_t)keylen) == 0) return 1;
     return 0;
 }
-/* Adds (key,val) only if `arr` doesn't already have that key -- used by
- * flakeRefToString's git/tarball `url`-merging: an already-present query
- * param embedded directly in the user-given `url` string wins over the
- * same-named top-level attr, confirmed live/by fixture
- * (eval-okay-flake-ref-to-string-schemes.nix's tarball `dir`-conflict
- * entry: url's own "dir=y" survives, the top-level `dir = "x"` attr is
- * silently dropped). */
 static void qout_add_if_absent(QOut *arr, int *n, const char *key, const char *val, int64_t vallen) {
     if (qout_has_key(arr, *n, key, (int64_t)strlen(key))) return;
     qout_add(arr, n, key, val, vallen);
@@ -875,7 +714,6 @@ static void fr_build_leftover(QParam *qp, int64_t qn, QOut *leftover, int *ln) {
     }
 }
 
-/* ---- git+/git:// ------------------------------------------------------ */
 static Value fr_parse_git(const char *url_body, int64_t url_body_len) {
     ParsedUrl pu;
     fr_parse_generic_url(url_body, url_body_len, &pu);
@@ -918,14 +756,6 @@ static Value fr_parse_git(const char *url_body, int64_t url_body_len) {
     return ab_finish(&ab);
 }
 
-/* ---- tarball+/file+ / bare http(s):// / bare file: -------------------
- * `unpack` and `name` are both parsed (so neither is ever mistaken for
- * an "unknown parameter") but never stored as an attribute for either
- * type -- confirmed by fixture: eval-okay-parse-flake-ref-tarball.nix's
- * "...?name=x&unpack=1&narHash=..." entry has neither `name` nor
- * `unpack` in its expected attrset, and flakeRefToString of a hand-built
- * `{type="file";...;unpack=true;}` drops `unpack` too (see
- * fr_file_to_string). */
 static Value fr_parse_tarball_or_file(const char *type, const char *url_body, int64_t url_body_len) {
     ParsedUrl pu;
     fr_parse_generic_url(url_body, url_body_len, &pu);
@@ -961,11 +791,6 @@ static Value fr_parse_tarball_or_file(const char *type, const char *url_body, in
     if (q_lastModified && fr_parse_uint(q_lastModified->val, q_lastModified->vallen, &iv)) ab_put(&ab, "lastModified", asnix_make_int(iv));
     if (q_narHash) ab_put(&ab, "narHash", fr_string_attr("narHash", q_narHash->val, q_narHash->vallen));
     if (q_dir) ab_put(&ab, "dir", fr_string_attr("dir", q_dir->val, q_dir->vallen));
-    /* `name` is recognized (so it's never misreported as an "unknown
-     * parameter") but never stored, same as `unpack` -- confirmed by
-     * fixture: eval-okay-parse-flake-ref-tarball.nix's own
-     * "tarball+https://example.com/a?name=x&unpack=1&narHash=..." entry
-     * has no `name` in its expected attrset either. */
     (void)q_name;
     return ab_finish(&ab);
 }
@@ -976,10 +801,6 @@ static Value prim_parseFlakeRef(const Value *args, int64_t argc) {
     int64_t len;
     const char *bytes = asnix_ptr_bytes(args[0], &len);
 
-    /* Strip a trailing fragment globally -- an EMPTY fragment ("...#")
-     * is silently dropped (confirmed: "nixpkgs#", "tarball+http://.../a#"
-     * both succeed), a non-empty one is a hard error for every scheme
-     * (confirmed: "github:NixOS/nixpkgs#hello" fails). */
     int64_t hash = fr_find_char(bytes, len, '#');
     if (hash >= 0) {
         if (hash + 1 < len) fr_fatal("parseFlakeRef", "unexpected fragment in flake reference");
@@ -1001,10 +822,6 @@ static Value prim_parseFlakeRef(const Value *args, int64_t argc) {
     if (len > 0 && bytes[0] == '/') return fr_parse_path(bytes, len, 0);
     return fr_parse_indirect(bytes, len);
 }
-
-/* ===========================================================================
- * flakeRefToString
- * ======================================================================= */
 
 static void sb_segment(SB *sb, const char *s, int64_t len) { sb_pct_encode(sb, s, len, CS_SEGMENT); }
 
@@ -1089,7 +906,7 @@ static Value fr_indirect_to_string(Value attrs) {
     int has_rev = fr_find(attrs, "rev", &rev_v);
     int has_dir = fr_find(attrs, "dir", &dir_v);
     int has_narHash = fr_find(attrs, "narHash", &narHash_v);
-    (void)has_narHash; /* dropped at toString time, confirmed live -- only read for the negative-int guard */
+    (void)has_narHash;
 
     SB sb;
     sb_init(&sb);
@@ -1153,7 +970,7 @@ static Value fr_path_to_string(Value attrs) {
         const char *b;
         int64_t l;
         fr_string_bytes(v, "narHash", &b, &l);
-        qout_add(q, &qn, "narHash", b, l); /* path type does NOT substitute the dummy hash for "" -- confirmed live */
+        qout_add(q, &qn, "narHash", b, l);
     }
     if (fr_find(attrs, "rev", &v)) {
         const char *b;
@@ -1169,10 +986,6 @@ static Value fr_path_to_string(Value attrs) {
     return sb_finish(&sb);
 }
 
-/* Strips a leading "git+"/"tarball+"/"file+" composite scheme prefix off
- * a `url` attribute's own raw text, if present (confirmed live with a
- * hand-built `url = "git+https://x.org/a?x=1";` -- flakeRefToString must
- * not double it up to "git+git+https://..."). */
 static void fr_strip_composite_prefix(const char *s, int64_t len, const char **out, int64_t *outlen) {
     if (fr_starts_with(s, len, "git+")) { *out = s + 4; *outlen = len - 4; return; }
     if (fr_starts_with(s, len, "tarball+")) { *out = s + 8; *outlen = len - 8; return; }
@@ -1197,9 +1010,6 @@ static Value fr_git_to_string(Value attrs) {
     QOut q[64];
     int qn = 0;
     fr_build_leftover(pu.query, pu.query_n, q, &qn);
-    /* `extra` (ref/rev/shallow/.../dir) is added only if the url's own
-     * embedded query doesn't already have that key -- see
-     * qout_add_if_absent's comment. */
     Value v;
     const char *b;
     int64_t l;
@@ -1272,9 +1082,6 @@ static Value fr_tarball_to_string(Value attrs) {
         fr_string_bytes(v, "dir", &b, &l);
         qout_add_if_absent(q, &qn, "dir", b, l);
     }
-    /* rev/revCount/lastModified/name are never re-added here -- confirmed
-     * by fixture (eval-okay-flake-ref-to-string-schemes.nix's tarball
-     * entry gives top-level lastModified/name but neither survives). */
 
     int bare = pu.scheme_len == 4 && memcmp(pu.scheme, "http", 4) == 0;
     bare = bare || (pu.scheme_len == 5 && memcmp(pu.scheme, "https", 5) == 0);
@@ -1294,15 +1101,6 @@ static Value fr_tarball_to_string(Value attrs) {
     return sb_finish(&sb);
 }
 
-/* FILE type's toString is a documented real-Nix quirk, confirmed by TWO
- * independent fixtures (eval-okay-flake-ref-to-string-schemes.nix's last
- * entry, and eval-okay-flake-ref-round-trip.nix's "file+https://..."
- * entry, which is same=false precisely because of this): it NEVER adds a
- * "file+" prefix and NEVER merges any top-level attr back in -- the
- * output is simply the (prefix-stripped, scheme/authority/path-
- * normalized) `url` field, verbatim. This is lossy (re-parsing the
- * result gives type="tarball", not "file") but matches real Nix exactly,
- * so it is NOT treated as a bug here. */
 static Value fr_file_to_string(Value attrs) {
     Value url_v;
     if (!fr_find(attrs, "url", &url_v)) fr_fatal("flakeRefToString", "file flake reference is missing 'url'");
@@ -1355,3 +1153,4 @@ const AsnixBuiltinFlakerefDef ASNIX_FLAKEREF_BUILTINS[] = {
     { "flakeRefToString", build_flakeRefToString },
 };
 const size_t ASNIX_FLAKEREF_BUILTINS_COUNT = sizeof(ASNIX_FLAKEREF_BUILTINS) / sizeof(ASNIX_FLAKEREF_BUILTINS[0]);
+

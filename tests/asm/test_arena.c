@@ -40,7 +40,7 @@ static void test_alignment(void) {
 static void test_chunk_boundary_crossing(void) {
     asnix_arena_init(0);
     void *first = asnix_arena_alloc(ASNIX_ARENA_CHUNK_SIZE - 64);
-    void *second = asnix_arena_alloc(256); /* must overflow into a fresh chunk */
+    void *second = asnix_arena_alloc(256);
     CHECK(first != NULL && second != NULL, "allocations across a chunk boundary both succeed");
     memset(first, 0x11, ASNIX_ARENA_CHUNK_SIZE - 64);
     memset(second, 0x22, 256);
@@ -50,7 +50,7 @@ static void test_chunk_boundary_crossing(void) {
 
 static void test_large_single_allocation(void) {
     asnix_arena_init(0);
-    uint64_t big = (uint64_t)ASNIX_ARENA_CHUNK_SIZE * 3; /* larger than one default chunk */
+    uint64_t big = (uint64_t)ASNIX_ARENA_CHUNK_SIZE * 3;
     void *p = asnix_arena_alloc(big);
     CHECK(p != NULL, "a single allocation larger than the default chunk size succeeds");
     memset(p, 0x33, big);
@@ -60,11 +60,11 @@ static void test_large_single_allocation(void) {
 static void test_memory_cap_abort(void) {
     pid_t pid = fork();
     if (pid == 0) {
-        freopen("/dev/null", "w", stderr); /* keep the abort message out of test output */
+        freopen("/dev/null", "w", stderr);
         asnix_arena_init(64);
         asnix_arena_alloc(32);
-        asnix_arena_alloc(64); /* 32+64=96 > cap(64) -- must abort(1), never return */
-        _exit(42);              /* reaching here means the cap failed to trigger */
+        asnix_arena_alloc(64);
+        _exit(42);
     }
     int status = 0;
     waitpid(pid, &status, 0);
@@ -85,3 +85,4 @@ int main(void) {
     printf("test_arena: all checks passed\n");
     return 0;
 }
+

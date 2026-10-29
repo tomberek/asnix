@@ -2,7 +2,7 @@
 
 #include <string.h>
 
-static const char ALPHABET[] = "0123456789abcdfghijklmnpqrsvwxyz"; /* 32 chars + NUL */
+static const char ALPHABET[] = "0123456789abcdfghijklmnpqrsvwxyz";
 
 static int base32_char_value(char c) {
     for (int i = 0; i < 32; i++) {
@@ -46,3 +46,4 @@ int asnix_base32_decode(const char *s, size_t len, uint8_t *out, size_t out_len)
     }
     return 0;
 }
+

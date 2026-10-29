@@ -1,7 +1,3 @@
-/* Validates asnix_build_derivation_aterm against two real references,
- * reproduced byte-for-byte (see docs/architecture.md's M8 notes):
- * numtide/nix-conformance's ia-advanced-attributes-defaults.drv, and a
- * real local `nix-instantiate` run for a second, independent case. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -91,12 +87,6 @@ static void test_escaping(void) {
     free(got);
 }
 
-/* M6x: multi-output `Outputs` section -- the map must list every
- * declared output, sorted ascending by name, each still with the
- * trailing empty hashAlgo/hash fields (this project never produces
- * fixed-output/CA outputs here). Shape verified against real Nix's
- * `~/nix/src/libstore/derivation/aterm.cc` unparse logic directly (see
- * docs/architecture.md's scope notes for this milestone). */
 static void test_multi_output(void) {
     const char *args[] = { "-c", "echo hi" };
     AtermEnvVar env[] = {
@@ -134,3 +124,4 @@ int main(void) {
     printf("test_aterm: all checks passed\n");
     return 0;
 }
+

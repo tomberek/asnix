@@ -32,17 +32,12 @@ int main(void) {
     CHECK(slen == 5 && memcmp(sbytes, "hello", 5) == 0, "asnix_ptr_bytes reads a String's bytes correctly");
     CHECK(plen == 12 && memcmp(pbytes, "/abs/foo.nix", 12) == 0, "asnix_ptr_bytes reads a Path's bytes correctly");
 
-    /* toString on a path: real Nix changes its *type* from "path" to
-     * "string" (verified against `nix-instantiate --eval`) -- same bytes,
-     * no longer a Path afterward. */
     Value coerced = asnix_coerce_to_string(p);
     CHECK(!asnix_value_is_path(coerced), "toString(path) produces a plain String, not a Path");
     int64_t clen;
     const char *cbytes = asnix_ptr_bytes(coerced, &clen);
     CHECK(clen == 12 && memcmp(cbytes, "/abs/foo.nix", 12) == 0, "toString(path) keeps the same text");
 
-    /* toString on an already-a-string value is a no-op passthrough
-     * (same Value, not a copy) -- unaffected by the path addition. */
     Value coerced_s = asnix_coerce_to_string(s);
     CHECK(coerced_s.raw == s.raw, "toString(string) still returns the same value unchanged");
 
@@ -53,3 +48,4 @@ int main(void) {
     printf("test_value_util: all checks passed\n");
     return 0;
 }
+

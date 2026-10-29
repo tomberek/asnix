@@ -1,38 +1,9 @@
-// M6: a C-callable force entry point, used by the top-level printer
-// (main.c) to recursively force thunks nested inside lists/attrsets for
-// display -- the only thing that needs to force a value from *outside* an
-// active asnix_eval dispatch loop so far (ordinary in-language forcing
-// happens inline in op_var_ref.S/op_select.S). This is intentionally
-// narrow: it's not a general re-entrant builtin-calls-force mechanism
-// (that's M7+, once real builtins exist and need it); it just sets up its
-// own self-contained mini dispatch context (mirroring asnix_eval's own
-// prologue) to run one thunk's body to completion and return the result.
-#include "asnix/force_scratch.h" // ASNIX_FORCE_{VALSTACK,RETSTACK}_BYTES, per-depth cache (perf)
+#include "asnix/force_scratch.h"
 #include "asnix/heap.h"
 #include "asnix/ir.h"
 #include "asnix/stackcheck.h"
 #include "asnix/value.h"
 
-    // Same silent-corruption-to-loud-abort fix as dispatch.S's main
-    // VALSTACK/RETSP (see include/asnix/stackcheck.h and
-    // docs/architecture.md's "Known bugs" list): previously 4096/1024
-    // bytes with no bounds check; now much larger (still smaller than
-    // dispatch.S's, since this context only ever runs one thunk-forcing
-    // sub-dispatch at a time) and bounds-checked via the same shared
-    // asnix_valstack_limit/asnix_retsp_limit globals the main dispatch
-    // loop uses -- save/restore them around this nested use exactly like
-    // %r12/%r14 themselves, since this routine can run nested inside an
-    // active asnix_eval (a builtin forcing a value, e.g. derivation.c) or
-    // even inside another asnix_force_for_print call.
-    //
-    // asnix_force_depth: how many asnix_force_for_print frames
-    // (including this one, once past the increment below) are currently
-    // live, nested inside each other -- doubles as the index into
-    // force_scratch.c's per-depth buffer cache (see
-    // include/asnix/force_scratch.h's header comment for why indexing by
-    // depth, not a single cached slot, turned out to be necessary: `perf
-    // record -e page-faults -g` on d.nix showed most real calls here ARE
-    // nested a few levels deep via derivation.c, not top-level/flat).
     .bss
     .align 8
     .globl asnix_force_depth
@@ -58,35 +29,15 @@ asnix_force_depth:
 
     .globl asnix_force_for_print
     .type asnix_force_for_print, @function
-asnix_force_for_print:                  // Value asnix_force_for_print(Value v)
-.Lforce_top:                            // M23: re-entered (tail-loop, see .Lforce_done below)
-                                         // whenever a force's *result* turns out to itself be
-                                         // another unforced Thunk -- found via a lazy builtin
-                                         // (map/mapAttrs, M23) whose thunk body calls a
-                                         // lazy-pass-through primop (builtins.getAttr, which
-                                         // deliberately returns an attrset entry's raw value
-                                         // without forcing it -- correct and lazy on its own),
-                                         // so forcing ONE level could leave a Thunk cached as
-                                         // another Thunk's "result" where previously (every
-                                         // ordinary compiled thunk body always forces via
-                                         // OP_VAR_REF/OP_SELECT before its own OP_RET) that
-                                         // could never happen. Real Nix's own `forceValue` is
-                                         // itself a `while (v.isThunk())` loop for exactly this
-                                         // reason -- this was a real, latent gap in the
-                                         // single-force assumption, just never previously
-                                         // reachable.
+asnix_force_for_print:
+.Lforce_top:
     movq %rdi, %rax
     movq %rax, %rcx
     andq $ASNIX_TAG_MASK, %rcx
     cmpq $ASNIX_TAG_THUNK, %rcx
-    jne .Lforce_done                    // not a thunk: return v unchanged
+    jne .Lforce_done
 
-    andq $-8, %rax                      // rax = Thunk*
-    // M103: OFF_STATE is tagged now -- UNFORCED: this word IS the clean
-    // IrProgram* (tag bits 0); IN_PROGRESS/FORCED/FAILED: the bare state
-    // tag alone. Extract the tag into %rdx (first use in this function)
-    // for dispatch, keeping %rcx (the possibly-a-pointer original word)
-    // intact for the UNFORCED path below.
+    andq $-8, %rax
     movq ASNIX_THUNK_OFF_STATE(%rax), %rcx
     movq %rcx, %rdx
     andq $ASNIX_TAG_MASK, %rdx
@@ -97,41 +48,21 @@ asnix_force_for_print:                  // Value asnix_force_for_print(Value v)
     cmpq $ASNIX_THUNK_STATE_FAILED, %rdx
     je .Lforce_reraise
 
-    // Bring our own VALSTACK/RETSP and save every candidate-scratch
-    // register, exactly like asnix_eval's prologue (see docs/abi.md) --
-    // this call may run when no asnix_eval invocation is live at all.
     pushq %r12
     pushq %r13
     pushq %r14
     pushq %rbx
     pushq %rbp
     pushq %r15
-    subq $8, %rsp                       // alignment padding, undone in the epilogue below
-    movq %rax, %rbx                     // stash the Thunk* across the alloc calls
-    // M103: %rcx (the clean prog pointer) would otherwise be clobbered
-    // by the two asnix_force_scratch_* calls below (ordinary SysV calls,
-    // %rcx is caller-saved) -- stash it in %rbp instead: %rbp's
-    // caller-time value is already safely preserved on the stack by the
-    // push above, so the register itself is free scratch until the
-    // matching popq %rbp in the epilogue.
+    subq $8, %rsp
+    movq %rax, %rbx
     movq %rcx, %rbp
 
-    // Save the enclosing dispatch context's VALSTACK/RETSP limits (the
-    // outer asnix_eval, or an outer asnix_force_for_print if this call
-    // nests inside another one) -- restored in the epilogue below,
-    // mirroring how %r12/%r14 themselves are saved/restored. %rax holds
-    // the live Thunk* here (see above); %rdx is free.
     movq asnix_valstack_limit(%rip), %rdx
     pushq %rdx
     movq asnix_retsp_limit(%rip), %rdx
     pushq %rdx
 
-    // perf: asnix_force_scratch_{valstack,retstack} (force_scratch.c)
-    // cache one buffer pair PER DEPTH instead of this routine minting a
-    // brand-new pair from the never-free bump arena on every single
-    // call -- see force_scratch.h's header comment. %rbx (the live
-    // Thunk*) survives both calls: ordinary SysV calls, and %rbx is
-    // callee-saved.
     movq asnix_force_depth(%rip), %rdi
     call asnix_force_scratch_valstack
     movq %rax, %r12
@@ -147,25 +78,17 @@ asnix_force_for_print:                  // Value asnix_force_for_print(Value v)
     incq asnix_force_depth(%rip)
     movq $ASNIX_THUNK_STATE_IN_PROGRESS, ASNIX_THUNK_OFF_STATE(%rbx)
 
-    // Sentinel retframe: when the thunk's OP_RET fires, it memoizes into
-    // force_target (this thunk) then jumps to the sentinel's handler.
     leaq .Lforce_sentinel_ir(%rip), %rax
-    ASNIX_CHECK_RETSP %rcx             // %rcx dead here (the prog pointer it held is already
-                                        // safely stashed in %rbp, see above)
+    ASNIX_CHECK_RETSP %rcx
     movq %rax, ASNIX_RETFRAME_OFF_IP(%r14)
     movq $0, ASNIX_RETFRAME_OFF_ENV(%r14)
     movq $0, ASNIX_RETFRAME_OFF_POOL(%r14)
     movq %rbx, ASNIX_RETFRAME_OFF_FORCE_TARGET(%r14)
     addq $ASNIX_RETFRAME_SIZE, %r14
 
-    // M103: %rbp already holds the clean prog pointer (stashed above) --
-    // no memory read needed (the old separate OFF_PROG field is gone).
     movq ASNIX_IRPROG_OFF_POOL(%rbp), %r13
     movq ASNIX_IRPROG_OFF_OPS(%rbp), %rsi
-    movq ASNIX_THUNK_OFF_ENV(%rbx), %rdi // last read of ENV's original meaning -- safe to repurpose below
-    // M82: push onto the intrusive IN_PROGRESS stack -- see
-    // stacklimits.S's asnix_inprogress_head comment. %rcx is dead here
-    // (last written by the ASNIX_CHECK_RETSP macro above).
+    movq ASNIX_THUNK_OFF_ENV(%rbx), %rdi
     movq asnix_inprogress_head(%rip), %rcx
     movq %rcx, ASNIX_THUNK_OFF_ENV(%rbx)
     movq %rbx, asnix_inprogress_head(%rip)
@@ -173,14 +96,11 @@ asnix_force_for_print:                  // Value asnix_force_for_print(Value v)
     jmp *%rax
 
 asnix_force_epilogue:
-    movq -8(%r12), %rax                 // result, left on VALSTACK by the thunk body's own OP_RET
-    decq asnix_force_depth(%rip)        // pop -- frees this depth's slot in force_scratch.c's
-                                         // per-depth cache for reuse by the NEXT call that
-                                         // reaches this same depth (the buffers themselves are
-                                         // never freed, only their "currently in use" status)
-    popq %rdx                           // restore the enclosing context's RETSP limit (pushed
-    movq %rdx, asnix_retsp_limit(%rip)  // last above, so popped first)
-    popq %rdx                           // ditto for the VALSTACK limit
+    movq -8(%r12), %rax
+    decq asnix_force_depth(%rip)
+    popq %rdx
+    movq %rdx, asnix_retsp_limit(%rip)
+    popq %rdx
     movq %rdx, asnix_valstack_limit(%rip)
     addq $8, %rsp
     popq %r15
@@ -189,10 +109,8 @@ asnix_force_epilogue:
     popq %r14
     popq %r13
     popq %r12
-    movq %rax, %rdi                     // tail-loop (see .Lforce_top's comment): this
-    jmp .Lforce_done                    // invocation's own frame is already fully unwound
-                                         // above, so re-entering the top from here is exactly
-                                         // as safe as an ordinary tail call
+    movq %rax, %rdi
+    jmp .Lforce_done
 
 .Lforce_cached:
     movq ASNIX_THUNK_OFF_ENV(%rax), %rax
@@ -201,92 +119,60 @@ asnix_force_epilogue:
     andq $ASNIX_TAG_MASK, %rcx
     cmpq $ASNIX_TAG_THUNK, %rcx
     jne .Lforce_check_cell
-    movq %rax, %rdi                     // %rdi may be stale here (e.g. the .Lforce_cached
-    jmp .Lforce_top                     // path never touches it) -- always resync from %rax
+    movq %rax, %rdi
+    jmp .Lforce_top
 
-    // M92: not a thunk -- check whether it's a Cell instead (see heap.h's
-    // ASNIX_CELL_MARKER comment): the Cell's own target may itself still
-    // need forcing (another Thunk), or even be another Cell (chained
-    // bare-var aliasing, e.g. `let y=x; z=y;`) -- loop back through
-    // .Lforce_top either way. %rcx still holds the tag bits from the
-    // check just above.
 .Lforce_check_cell:
     cmpq $ASNIX_TAG_PTR, %rcx
     jne .Lforce_ret
     movq %rax, %rdx
-    andq $-8, %rdx                       // clear the low 3 tag bits...
-    shlq $16, %rdx                       // ...and the high 16 bits a packed M118 ThunkMap
-    shrq $16, %rdx                       // word's index occupies (a no-op for every OTHER PTR
-                                          // kind -- String/Path/Float/Cell/LazyApp -- whose own
-                                          // pointers always have zero there already; see heap.h's
-                                          // ASNIX_THUNKMAP_MARKER comment) -- rdx = masked base ptr
+    andq $-8, %rdx
+    shlq $16, %rdx
+    shrq $16, %rdx
     movq ASNIX_CELL_OFF_MARKER(%rdx), %rcx
     cmpq $ASNIX_CELL_MARKER, %rcx
-    jne .Lforce_check_lazyapp            // PTR but not a Cell -- maybe a LazyApp instead
+    jne .Lforce_check_lazyapp
 
-    // It's a Cell -- M162: inline Cell-chain walk, same hand-rolled loop
-    // as op_var_ref.S's matching .Lvar_ref_cell_loop (see that file's
-    // comment for the full rationale/measurement). %rdx already holds
-    // the masked base pointer of a CONFIRMED Cell (the check just
-    // above); none of %r12/%r13/%r14/%rbx/%rbp/%r15 have been
-    // pushed/repurposed yet at this point in the function (that only
-    // happens once a Thunk is confirmed, further down in .Lforce_top),
-    // so %r8/%r9 are free scratch here exactly like %rdx/%rcx already
-    // are. This also drops the old call's `subq/addq $8,%rsp` alignment
-    // pad entirely, since there's no `call` left to align for.
     movq $ASNIX_CELL_CHASE_LIMIT, %r8
 .Lforce_cell_loop:
-    movq ASNIX_CELL_OFF_TARGET(%rdx), %r9 // r9 = target pointer (Value* into an Env's values[])
-    movq (%r9), %rax                      // rax = *target -- the actual next raw Value
+    movq ASNIX_CELL_OFF_TARGET(%rdx), %r9
+    movq (%r9), %rax
     movq %rax, %rcx
     andq $ASNIX_TAG_MASK, %rcx
     cmpq $ASNIX_TAG_PTR, %rcx
-    jne .Lforce_cell_done                // not even a PTR -- can't be a Cell, done chasing
+    jne .Lforce_cell_done
     movq %rax, %rdx
     andq $-8, %rdx
     shlq $16, %rdx
-    shrq $16, %rdx                       // rdx = masked base pointer of the new value
+    shrq $16, %rdx
     movq ASNIX_CELL_OFF_MARKER(%rdx), %rcx
     cmpq $ASNIX_CELL_MARKER, %rcx
-    jne .Lforce_cell_done                // PTR but not a Cell -- done, re-dispatch on %rax
+    jne .Lforce_cell_done
     decq %r8
     jnz .Lforce_cell_loop
-    jmp .Lforce_blackhole                // chase limit exceeded -- a genuine alias cycle
+    jmp .Lforce_blackhole
 .Lforce_cell_done:
     movq %rax, %rdi
     jmp .Lforce_top
 
-    // M113: not a Cell either -- maybe a LazyApp (heap.h's ASNIX_LAZYAPP_
-    // MARKER comment). %rcx already holds the marker value from the Cell
-    // check just above (the only path that reaches this label). Both
-    // LazyApp sub-states (unresolved/resolved) route through the same
-    // asnix_resolve_lazyapp call -- see op_var_ref.S's matching comment.
 .Lforce_check_lazyapp:
     cmpq $ASNIX_LAZYAPP_MARKER, %rcx
     je .Lforce_lazyapp
     cmpq $ASNIX_LAZYAPP_FORCED_MARKER, %rcx
     je .Lforce_lazyapp
-    jmp .Lforce_check_thunkmap           // PTR but not Cell/LazyApp -- maybe a ThunkMap instead
+    jmp .Lforce_check_thunkmap
 .Lforce_lazyapp:
-    movq %rax, %rdi                      // arg1 = the LazyApp value
+    movq %rax, %rdi
     subq $8, %rsp
     call asnix_resolve_lazyapp
     addq $8, %rsp
     movq %rax, %rdi
     jmp .Lforce_top
 
-    // M118: not a Cell/LazyApp either -- maybe a ThunkMap (heap.h's
-    // ASNIX_THUNKMAP_MARKER comment). %rcx already holds the marker value
-    // from the Cell check above (%rdx, computed there, is ALSO still the
-    // fully-masked base pointer -- cleared of both the tag bits and a
-    // ThunkMap word's packed index -- needed here since this is the
-    // first check that might actually be looking at one).
 .Lforce_check_thunkmap:
     cmpq $ASNIX_THUNKMAP_MARKER, %rcx
-    jne .Lforce_ret                      // PTR but not Cell/LazyApp/ThunkMap (String/Path/Float):
-                                          // a real value
-    movq %rax, %rdi                      // arg1 = the ThunkMap value (original, unmasked -- the
-                                          // resolver re-derives desc/idx from the full raw bits)
+    jne .Lforce_ret
+    movq %rax, %rdi
     subq $8, %rsp
     call asnix_resolve_thunkmap
     addq $8, %rsp
@@ -301,11 +187,8 @@ asnix_force_epilogue:
     jmp asnix_fatal
 
 .Lforce_reraise:
-    // M82: see op_var_ref.S's matching .Lvar_ref_reraise comment --
-    // fires before this routine's own prologue pushes anything, so the
-    // stack is exactly as it was on entry, same as .Lforce_blackhole
-    // just above.
     leaq .Lmsg_reeval_failed(%rip), %rdi
     movq $ASNIX_MSG_REEVAL_FAILED_LEN, %rsi
     jmp asnix_tryeval_raise_or_fatal
     .size asnix_force_for_print, . - asnix_force_for_print
+

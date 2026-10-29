@@ -1,36 +1,5 @@
-/* M80: `builtins.path`/`builtins.filterSource` -- `__path`/
- * `__filterSource` in real Nix (~/nix/src/libexpr/primops.cc's
- * `prim_path`/`prim_filterSource`, both funneling into a shared
- * `addPath` helper, read in full before writing this). Neither existed
- * in this project at all before this milestone (confirmed: no "path"/
- * "filterSource" hit anywhere in src/c/ outside of unrelated uses of
- * the word) -- found needed by numtide/nix-conformance's
- * eval-okay-drv-sources.nix, which exercises both directly.
- *
- * Reuses M75's NAR-dump machinery (nar.c's `asnix_copy_path_to_store_ext`,
- * a new, filter/custom-name/flat-method-aware sibling of
- * `asnix_copy_path_to_store` added alongside this file -- see nar.h's
- * own comment) and M73's `asnix_compute_fixed_output_path` formula
- * (derivation.h) for the actual path computation, so this file itself
- * is just argument parsing/validation plus wiring a Nix-level `filter`
- * function into nar.c's plain C callback shape.
- *
- * Scope cuts (none hit by eval-okay-drv-sources.nix/eval-okay-path.nix,
- * all verified against real `nix-instantiate --eval` as "not exercised"
- * rather than silently wrong):
- *   - `sha256` accepts a plain 64-character lowercase hex digest or
- *     Nix's own 52-character base32 ("nix32") encoding (decode_hex32
- *     below), not real Nix's full SRI form (`newHashAllowEmpty` there
- *     also accepts base64/an algo-prefixed SRI string) -- every other
- *     builtins.path-adjacent hash this project parses (derivation.c's
- *     `outputHash`) has the same narrower scope cut already.
- *   - `path`'s own existence/type isn't pre-validated the way real
- *     Nix's `coerceToPath` does beyond what `asnix_copy_path_to_store_ext`
- *     itself already checks (lstat failures still produce a fatal
- *     error, just not real Nix's exact wording).
- */
 
-#define _POSIX_C_SOURCE 200809L /* strndup */
+#define _POSIX_C_SOURCE 200809L
 
 #include "builtins_path.h"
 
@@ -39,21 +8,14 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "asnix/ir.h" /* asnix_force_for_print */
-#include "base32.h" /* M80 (merge): numtide/nix-conformance's eval-okay-path.nix pins its
-                      * 'sha256' attribute in Nix's own base32 ("nix32") encoding, not hex --
-                      * decode_hex32 below accepts both. */
+#include "asnix/ir.h"
+#include "base32.h"
 #include "builtins_shared.h"
 #include "nar.h"
 #include "string_context.h"
 #include "symtab.h"
 #include "value_util.h"
 
-/* Decodes a bare (no algo prefix) sha256 hash string into exactly 32 raw
- * bytes -- either base16 (64 hex chars) or Nix's own base32 (52 chars,
- * base32.h). Narrower than real Nix's `newHashAllowEmpty` (which also
- * accepts base64/SRI), matching this project's standing "support what's
- * actually reachable" convention. */
 static int decode_hex32(const char *hex, size_t len, uint8_t out[32]) {
     if (len == 64) {
         for (int i = 0; i < 32; i++) {
@@ -71,10 +33,6 @@ static int decode_hex32(const char *hex, size_t len, uint8_t out[32]) {
     return 0;
 }
 
-/* Closure over the Nix-level `filter` function, threaded through
- * nar.c's plain-C `AsnixNarFilter` callback shape (see nar.h's own
- * comment on why that module stays decoupled from `Value`/`asnix_apply`
- * entirely). */
 typedef struct {
     Value fn;
 } PathFilterCtx;
@@ -100,10 +58,6 @@ static char *path_value_to_cstr(Value v, const char *who) {
     return strndup(bytes, (size_t)len);
 }
 
-/* Shared tail: runs the (possibly filtered/flat/pinned) copy and
- * attaches the resulting path's own Opaque context -- same convention
- * M75/M76's `asnix_copy_path_to_store` callers already use (e.g.
- * value_util.c's Path-coercion cases). */
 static Value finish_path_copy(const char *path, const char *name, int recursive, int have_filter, Value filter_fn,
                                int have_sha256, const uint8_t sha256[32]) {
     PathFilterCtx fctx;
@@ -195,3 +149,4 @@ const AsnixBuiltinMiscDef ASNIX_PATH_BUILTINS[] = {
     { "filterSource", build_filterSource },
 };
 const size_t ASNIX_PATH_BUILTINS_COUNT = sizeof(ASNIX_PATH_BUILTINS) / sizeof(ASNIX_PATH_BUILTINS[0]);
+

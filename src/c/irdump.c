@@ -1,24 +1,3 @@
-/* irdump -- a standalone companion tool that lexes+parses+compiles a .nix
- * file through this project's own pipeline and pretty-prints the
- * resulting IrProgram: one line per op (index, mnemonic, resolved
- * operands -- symbol ids resolved to names, jump deltas resolved to
- * target op indices, OP_PUSH_CONST's pool entry resolved to a brief
- * printable form), recursing into every nested child IrProgram reached
- * via OP_LAMBDA/OP_MK_THUNK's pool entry (each such program printed
- * exactly once, keyed by pointer identity, however many op sites share
- * it).
- *
- * Usage: ./irdump <file.nix>
- *
- * NOTE: this intentionally decodes the COMPILED op stream using
- * asnix_handler_table (reversing ir_link()'s handler-pointer rewrite
- * back to an op-id) rather than hooking ib_finish() before linking --
- * so it exercises the exact same artifact asnix_eval() itself runs,
- * not a separate pre-link snapshot. op_names[] below must stay in the
- * same order as ir.h's OP_* enum -- the _Static_assert against OP_COUNT
- * catches a size mismatch (a new op added without updating this file),
- * but NOT a reordering; if ir.h's enum order ever changes, update this
- * array to match. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -29,7 +8,7 @@
 #include "asnix/irpass.h"
 #include "asnix/value.h"
 #include "compiler.h"
-#include "irpass_cfold.h" /* M118: ASNIX_IR_OPT -- see main() below */
+#include "irpass_cfold.h"
 #include "irpass_cmpnot.h"
 #include "irpass_constprop.h"
 #include "irpass_dce.h"
@@ -57,8 +36,6 @@ static const char *op_names[] = {
 _Static_assert(sizeof(op_names) / sizeof(op_names[0]) == OP_COUNT,
                "irdump.c's op_names[] is out of sync with ir.h's OP_* enum -- update both");
 
-/* Reverses ir_link()'s in-place handler-pointer rewrite: finds which
- * asnix_handler_table[] slot this op's (already-linked) handler equals. */
 static int op_id_of(void *handler) {
     for (int i = 0; i < OP_COUNT; i++) {
         if (asnix_handler_table[i] == handler) return i;
@@ -142,28 +119,10 @@ static void worklist_push(Worklist *w, IrProgram *p) {
     w->items[w->len++] = p;
 }
 
-/* Counts ops until a HALT/RET-free scan would be unsafe (fixed-width IR
- * has no end marker in the struct itself) -- so we instead walk until we
- * hit a terminating op (RET/HALT) OR, defensively, a generous cap, since
- * every real program this project compiles ends in exactly one of those
- * two and we'd rather print a truncation notice than read past the
- * buffer on a malformed/future op shape. */
 #define IRDUMP_MAX_OPS 200000
 
-/* Set once, at the top of lex_parse_compile_dump, below -- read by
- * byte_pos_to_line so dump_program (called from the worklist loop, not
- * handed `src` directly) can map a tracked op back to a source line.
- * Single global is fine: irdump re-lexes+re-parses+re-compiles once per
- * CLI invocation, never concurrently, never re-entrantly. */
 static const char *g_dump_src = NULL;
 
-/* 1-based source line containing byte offset `pos` -- a plain linear scan
- * (irdump is a debug tool, not the hot production path; re-scanning per
- * op print is simple and fast enough for the file sizes this is meant to
- * be run on). `pos == 0` is ambiguous with "really is line 1" vs "no
- * position recorded" (compiler.c-synthesized nodes default src_pos to 0)
- * -- callers print "line=?" for pos == 0 instead of calling this, see
- * below. */
 static int byte_pos_to_line(uint32_t pos) {
     int line = 1;
     for (uint32_t i = 0; i < pos && g_dump_src[i]; i++) {
@@ -172,33 +131,6 @@ static int byte_pos_to_line(uint32_t pos) {
     return line;
 }
 
-/* M191 (revised): formats the actual nixpkgs source text of the line
- * containing byte offset `pos` into `buf`, for display as a trailing
- * column on the first op row of a same-line run (see dump_program's
- * run-start check below -- never once per op in the run, that would
- * just repeat the identical line and defeat the point). M188/M189
- * already map an op back to a line NUMBER; the actual motivation for
- * doing that at all was letting a human scanning for nixpkgs code
- * worth hand-optimizing see what's there WITHOUT separately opening
- * the file -- a number alone still requires that round trip, the
- * source text doesn't. Leading indentation is trimmed so the snippet
- * doesn't carry the source file's own indentation into the column.
- *
- * Originally printed on its own row above the run with a 160-char cap
- * (plenty of room on a dedicated line); now that it rides at the end
- * of an already-populated op row instead, SNIPPET_CAP is much
- * tighter -- the row ahead of it (index/line:count/mnemonic/b=/the
- * `;`-annotation/any `<<<` pass-firing markers) is already variable
- * and can run 60-100+ chars on its own, so a long snippet needs a
- * short leash to keep the combined line within a normal terminal's
- * width instead of wrapping.
- *
- * M192: bumped 48 -> 52, exactly the width dump_program's row-prefix
- * fields gave up (mnemonic 20->19, b= 8->5 -- see that commit's
- * rationale) -- measured real nixpkgs source (lib/<name>.nix files,
- * pkgs/top-level/all-packages.nix, the generated 783K-line
- * hackage-packages.nix) rather than guessed, so the freed columns go
- * straight to the column this tool actually exists to show. */
 enum { SNIPPET_CAP = 52 };
 static void format_source_snippet(uint32_t pos, char *buf, size_t bufsz) {
     const char *s = g_dump_src;
@@ -215,29 +147,9 @@ static void format_source_snippet(uint32_t pos, char *buf, size_t bufsz) {
 
 static void dump_program(IrProgram *prog, int id, SeenVec *seen, Worklist *work) {
     printf("\n=== program #%d (ops=%p pool=%p) ===\n", id, (void *)prog->ops, (void *)prog->pool);
-    /* NULL when line tracking is off, or for a program ib_finish built
-     * before ib_enable_line_tracking() was ever called -- see
-     * irbuild.h's asnix_ib_lookup_program_lines comment. */
     const uint32_t *prog_lines = asnix_ib_lookup_program_lines(prog);
 
-    /* M189: pre-pass to find this program's op count (same terminator
-     * rule as the print loop below: stop at RET/HALT, or at the last
-     * recognized op if the cap is hit first) so we can precompute, per
-     * op, a resolved source line plus "how many consecutive ops in a
-     * row share this exact line" -- printed together as one compact
-     * `lineno:count` token below, replacing the old separate "(line
-     * NNN)" + "a=X" columns.
-     *
-     * `count` == consecutive-same-line run length, not the op's `a`
-     * operand: M188's whole point is spotting which NIX SOURCE LINES
-     * are worth hand-optimizing, and a run of many ops sharing one line
-     * is exactly the "this line compiled to a lot of IR" signal a human
-     * scanning the dump wants to notice at a glance. The raw `a` value
-     * is still visible wherever it's semantically meaningful (sym=,
-     * depth=/slot=, jump target, etc. in the per-op ';' annotations
-     * below) -- it just no longer gets a bare, unlabeled column of its
-     * own. */
-    int64_t end_idx = -1; /* index of last recognized op (terminator or cap) */
+    int64_t end_idx = -1;
     for (int64_t i = 0; i < IRDUMP_MAX_OPS; i++) {
         int id_of = op_id_of(prog->ops[i].handler);
         if (id_of < 0) break;
@@ -245,16 +157,11 @@ static void dump_program(IrProgram *prog, int id, SeenVec *seen, Worklist *work)
         if (id_of == OP_RET || id_of == OP_HALT) break;
     }
     int64_t n_ops = end_idx + 1;
-    int *line_no = n_ops ? malloc(sizeof(int) * (size_t)n_ops) : NULL; /* 0 == unknown line */
+    int *line_no = n_ops ? malloc(sizeof(int) * (size_t)n_ops) : NULL;
     int *line_run = n_ops ? malloc(sizeof(int) * (size_t)n_ops) : NULL;
     for (int64_t i = 0; i < n_ops; i++) {
         line_no[i] = (prog_lines && prog_lines[i] != 0) ? byte_pos_to_line(prog_lines[i]) : 0;
     }
-    /* One-pass run-length encode: for each run of consecutive ops
-     * sharing the same line_no[], scan ahead once to find its length
-     * and stamp that length onto every op in the run -- O(n) total
-     * despite the nested loop (the outer cursor `i` always jumps
-     * straight to the next run's start). */
     for (int64_t i = 0; i < n_ops;) {
         int64_t j = i + 1;
         while (j < n_ops && line_no[j] == line_no[i]) j++;
@@ -279,53 +186,14 @@ static void dump_program(IrProgram *prog, int id, SeenVec *seen, Worklist *work)
         } else {
             snprintf(lc_buf, sizeof lc_buf, "?:1");
         }
-        /* M191 (revised): a new run (this op's line differs from the
-         * previous op's, or this is the program's first op) gets the
-         * actual source line formatted once, for display in this row's
-         * trailing column below -- never recomputed for every op in the
-         * run, that would just repeat the identical text and defeat the
-         * point (same reasoning as the original one-line-above-the-run
-         * version, just relocated to the end of the row instead of a
-         * row of its own). Empty string means "no snippet for this
-         * row" -- either mid-run (line unchanged from the previous op)
-         * or no tracked position at all. */
         char snippet_buf[SNIPPET_CAP + 8] = "";
         if (i < n_ops && line_no[i] != 0 && (i == 0 || line_no[i] != line_no[i - 1])) {
             format_source_snippet(prog_lines[i], snippet_buf, sizeof snippet_buf);
         }
-        /* M192: leading-column widths tightened to free horizontal
-         * room for the trailing source-snippet column (SNIPPET_CAP
-         * above), based on real measurement rather than a guess --
-         * dumped lib/<name>.nix files, pkgs/top-level/all-packages.nix (10.8K
-         * lines, 8274 programs), and the largest real .nix file in
-         * nixpkgs, the generated 783K-line hackage-packages.nix
-         * (366623 programs):
-         *   - op index [%4lld]: unchanged. Real per-program op counts
-         *     commonly reach 4 digits (5235 in maintainer-list.nix's
-         *     one giant attrset); only hackage-packages.nix's single
-         *     largest program exceeds it (19438) -- 4 stays the right
-         *     size for everything else, and printf doesn't truncate,
-         *     it just loses alignment on that one outlier, same as
-         *     before this change.
-         *   - lineno:count %-8s: unchanged. Observed combined width
-         *     maxes out at 8-9 chars across the same corpus
-         *     ("10779:13", "139703:15") -- already essentially the
-         *     real minimum, nothing to trim.
-         *   - mnemonic %-20s -> %-19s: op_names[]'s longest entries
-         *     (RESOLVE_SEARCH_PATH, REC_OVERRIDES_MERGE,
-         *     INSERT_DYNAMIC_ATTR -- the latter confirmed appearing in
-         *     real nixpkgs dumps) are all exactly 19 chars; the 20th
-         *     column was always dead padding. This is a hard bound
-         *     over the fixed op_names[] set, not a probabilistic one.
-         *   - b=%-8lld -> b=%-5lld: op->b's real observed ceiling
-         *     across the entire corpus above (pool indices, frame
-         *     slots, symbol ids) is 19437 (hackage-packages.nix's
-         *     largest program) -- 5 digits, with comfortable headroom
-         *     to 99999. */
         printf("  [%4lld] %-8s %-19s b=%-5lld", (long long)i, lc_buf, op_names[id_of], (long long)op->b);
 
         switch (id_of) {
-            case OP_PUSH_INT: /* M169: literal lives in the pool now, not inline in `a` */
+            case OP_PUSH_INT:
                 printf("   ; pool[%lld] = value:%lld", (long long)op->b, (long long)prog->pool[op->b]);
                 break;
             case OP_VAR_REF:
@@ -355,9 +223,6 @@ static void dump_program(IrProgram *prog, int id, SeenVec *seen, Worklist *work)
             case OP_NEQ_IF:
             case OP_LT_IF:
             case OP_GE_IF: {
-                /* a = byte delta from THIS op's own slot (see
-                 * ib_patch_delta) -- convert to an absolute op index for
-                 * readability. */
                 long long target = i + op->a / ASNIX_IROP_SIZE;
                 printf("   ; -> op #%lld", target);
                 break;
@@ -384,7 +249,7 @@ static void dump_program(IrProgram *prog, int id, SeenVec *seen, Worklist *work)
             case OP_MK_THUNK: {
                 IrProgram *child = (IrProgram *)(intptr_t)prog->pool[op->b];
                 int cid = seen_find_or_add(seen, child);
-                if (cid == (int)seen->len - 1) worklist_push(work, child); /* first time seen -- queue it */
+                if (cid == (int)seen->len - 1) worklist_push(work, child);
                 printf("   ; -> program #%d", cid);
                 break;
             }
@@ -397,28 +262,10 @@ static void dump_program(IrProgram *prog, int id, SeenVec *seen, Worklist *work)
             default:
                 break;
         }
-        /* M118 follow-up: annotate this line with every logged pass
-         * firing whose location (asnix_irpass_remove's "kept/folded op
-         * ends up at start-1" convention -- irpass.h) is this exact op
-         * index -- a direct "where did it fire" marker, not just the
-         * aggregate per-pass counts asnix_irpass_print_stats gives at the
-         * end. Filtered to THIS program via asnix_irpass_firing_belongs_
-         * to_program -- the firing log is one global list shared across
-         * every nested program's own ib_finish() call (each program's
-         * own indexing independently starts at 0, so raw op-index
-         * collisions across DIFFERENT programs are the common case, not
-         * an edge case), and without this filter a real file showed
-         * markers on lines in programs that never fired at all. Counted
-         * per pass (not printed once per raw log entry): a fixpoint
-         * re-scan commonly collapses several real, distinct firings onto
-         * the same final index (e.g. folding `1+2`, then folding the
-         * result against `==3`, both land at index 0 once everything
-         * shifts down) -- legitimate, but printing the identical marker
-         * 2-3 times in a row is just noise. */
         {
             size_t fire_counts_here[64] = { 0 };
             size_t npasses = asnix_irpass_num_passes();
-            if (npasses > 64) npasses = 64; /* defensive -- ASNIX_IRPASS_MAX_PASSES is currently 32 */
+            if (npasses > 64) npasses = 64;
             for (size_t fi = 0; fi < asnix_irpass_num_firings(); fi++) {
                 if (asnix_irpass_firing_op_index(fi) != (size_t)i) continue;
                 if (!asnix_irpass_firing_belongs_to_program(fi, prog)) continue;
@@ -431,11 +278,6 @@ static void dump_program(IrProgram *prog, int id, SeenVec *seen, Worklist *work)
                 else printf("   <<< %s fired here (x%zu)", asnix_irpass_name(pi), fire_counts_here[pi]);
             }
         }
-        /* M191 (revised): the run's source snippet, if any, rides as
-         * the LAST thing on the row -- after every other annotation --
-         * so it reads as a final "here's the source" column rather
-         * than interrupting the regular op-row fields that come
-         * before it. */
         if (snippet_buf[0]) printf("   | %s", snippet_buf);
         printf("\n");
         if (id_of == OP_RET || id_of == OP_HALT) break;
@@ -444,20 +286,10 @@ static void dump_program(IrProgram *prog, int id, SeenVec *seen, Worklist *work)
     free(line_run);
 }
 
-/* Re-lexes+re-parses+re-compiles `src` from scratch and dumps the result
- * -- called once (ASNIX_IR_OPT unset/1) or twice (ASNIX_IR_OPT=diff,
- * once per side of asnix_irpass_register_cfold/asnix_irpass_clear) from
- * main() below. Re-running the whole pipeline rather than snapshotting
- * ops mid-compile keeps this tool exercising the exact same path
- * ib_finish() takes for a real build, same rationale as this file's own
- * top-of-file comment about decoding the real compiled artifact. */
 static void lex_parse_compile_dump(const char *src, const char *path) {
-    g_dump_src = src; /* see byte_pos_to_line's own comment above */
+    g_dump_src = src;
     Ast *ast = asnix_parse(src);
 
-    /* base_dir only affects relative-import resolution inside the
-     * compiled program, not this dump's own op-level output -- "." is
-     * fine for a standalone decode. */
     IrProgram *root = asnix_compile(ast, ".", path);
 
     SeenVec seen = { 0 };
@@ -498,7 +330,7 @@ int main(int argc, char **argv) {
         return 1;
     }
     asnix_arena_init(0);
-    ib_enable_line_tracking(); /* always on for this debug tool -- see irbuild.h */
+    ib_enable_line_tracking();
 
     FILE *f = fopen(argv[1], "rb");
     if (!f) {
@@ -513,24 +345,12 @@ int main(int argc, char **argv) {
     src[size] = '\0';
     fclose(f);
 
-    /* M118's original flag kept exactly as documented (before.txt/
-     * after.txt via two separate invocations), plus a new combined mode
-     * for a single-command before/after view -- asnix_irpass_clear()
-     * (irpass.h) exists specifically to let one process compile the SAME
-     * source both with and without the pipeline for a paired comparison:
-     *   ./irdump file.nix                 -- before only (unset, unchanged default)
-     *   ASNIX_IR_OPT=1 ./irdump file.nix   -- after only (unchanged)
-     *   ASNIX_IR_OPT=diff ./irdump file.nix -- both, one invocation (new) */
     const char *mode = getenv("ASNIX_IR_OPT");
     if (mode && strcmp(mode, "diff") == 0) {
         printf("===== BEFORE (no pass pipeline) =====\n");
         lex_parse_compile_dump(src, argv[1]);
         register_all_passes();
         printf("\n===== AFTER (pass pipeline applied) =====\n");
-        /* M118 follow-up: per-op <<< markers above are drawn live from
-         * the firing log as each AFTER line prints; this final summary
-         * is the same per-pass totals ASNIX_IR_OPT=1 prints below, just
-         * also shown here so the combined view is self-contained. */
         lex_parse_compile_dump(src, argv[1]);
         printf("\n-- bytecode pass firing counts --\n");
         asnix_irpass_print_stats(stdout);
@@ -549,3 +369,4 @@ int main(int argc, char **argv) {
     free(src);
     return 0;
 }
+

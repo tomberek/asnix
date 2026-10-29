@@ -1,12 +1,3 @@
-/* Exercises builtins_misc.c's ASNIX_BUILTINS_MISC table through the REAL
- * evaluator (asnix_eval over hand-built IR), not by calling the native C
- * functions directly -- this is the only way to actually validate
- * make_curried_native's Closure chain (substring/concatStringsSep), since
- * its whole point is to be driven by OP_LAMBDA/OP_CALL/OP_VAR_REF/OP_RET,
- * the same as any real curried user lambda. Every expected value below
- * was independently checked against a real `nix-instantiate --eval` (see
- * the case-by-case comments and builtins_misc.c's own per-builtin
- * comments for the exact commands run). */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -37,12 +28,6 @@ static Value lookup(const char *name) {
     exit(1);
 }
 
-/* Applies `fn` to `args[0..n-1]` one at a time via REAL OP_CALL dispatch
- * (asnix_eval over hand-built IR) -- works uniformly whether `fn` is a
- * plain arity-1 PrimOp (stringLength, isNull, ...) or the outermost
- * Closure of a make_curried_native chain (substring, concatStringsSep):
- * either way, each curry stage is applied with exactly 1 argument, same
- * as a real `f a b c` call site. */
 static Value call_curried(Value fn, const Value *args, int64_t n) {
     Env *root = asnix_env_alloc(NULL, 1);
     root->values[0] = fn;
@@ -92,11 +77,6 @@ static Value make_empty_attrs(void) {
     return (Value){ .raw = (uint64_t)(uintptr_t)mem | ASNIX_TAG_ATTRS };
 }
 
-/* nix-instantiate --eval -E 'builtins.substring 1 3 "hello"'        => "ell"
- * nix-instantiate --eval -E 'builtins.substring 1 100 "hello"'      => "ello"
- * nix-instantiate --eval -E 'builtins.substring 10 3 "hello"'       => ""
- * nix-instantiate --eval -E 'builtins.substring 5 3 "hello"'        => ""
- * nix-instantiate --eval -E 'builtins.substring 1 (-1) "hello"'     => "ello" */
 static void test_substring(void) {
     Value fn = lookup("substring");
     Value a1[] = { asnix_make_int(1), asnix_make_int(3), str("hello") };
@@ -114,10 +94,6 @@ static void test_substring(void) {
     Value a5[] = { asnix_make_int(1), asnix_make_int(-1), str("hello") };
     check_string(call_curried(fn, a5, 3), "ello", "substring 1 (-1) \"hello\" == \"ello\" (negative len == rest)");
 
-    /* Partial application must itself be a usable function value (real
-     * Nix: `isFunction (builtins.substring 1)` == true), proving the
-     * intermediate Closure stages are real, independently callable
-     * values -- not just an artifact of calling all 3 args in one go. */
     Env *root = asnix_env_alloc(NULL, 1);
     root->values[0] = fn;
     IrBuilder *b = ib_new();
@@ -133,8 +109,6 @@ static void test_substring(void) {
     check_string(call_curried(partial, a6, 1), "ell", "the partially-applied closure, called with \"hello\", == \"ell\"");
 }
 
-/* nix-instantiate --eval -E 'builtins.stringLength "hello"' => 5
- * nix-instantiate --eval -E 'builtins.stringLength ""'      => 0 */
 static void test_stringLength(void) {
     Value fn = lookup("stringLength");
     Value a1[] = { str("hello") };
@@ -146,8 +120,6 @@ static void test_stringLength(void) {
     CHECK(asnix_tag_of(v2) == ASNIX_TAG_INT && asnix_int_value(v2) == 0, "stringLength \"\" == 0");
 }
 
-/* nix-instantiate --eval -E 'builtins.concatStringsSep ", " ["a" "b" "c"]' => "a, b, c"
- * nix-instantiate --eval -E 'builtins.concatStringsSep ", " []'            => "" */
 static void test_concatStringsSep(void) {
     Value fn = lookup("concatStringsSep");
     Value elems[] = { str("a"), str("b"), str("c") };
@@ -158,7 +130,6 @@ static void test_concatStringsSep(void) {
     check_string(call_curried(fn, a2, 2), "", "concatStringsSep \", \" [] == \"\"");
 }
 
-/* nix-instantiate --eval -E 'builtins.isNull null' => true; 'builtins.isNull 1' => false */
 static void test_isNull(void) {
     Value fn = lookup("isNull");
     Value a1[] = { ASNIX_NULL };
@@ -167,7 +138,6 @@ static void test_isNull(void) {
     check_bool(call_curried(fn, a2, 1), 0, "isNull 1 == false");
 }
 
-/* nix-instantiate --eval -E 'builtins.isString "a"' => true; 'builtins.isString 1' => false */
 static void test_isString(void) {
     Value fn = lookup("isString");
     Value a1[] = { str("a") };
@@ -176,7 +146,6 @@ static void test_isString(void) {
     check_bool(call_curried(fn, a2, 1), 0, "isString 1 == false");
 }
 
-/* nix-instantiate --eval -E 'builtins.isList [1 2 3]' => true */
 static void test_isList(void) {
     Value fn = lookup("isList");
     Value elems[] = { asnix_make_int(1), asnix_make_int(2), asnix_make_int(3) };
@@ -186,7 +155,6 @@ static void test_isList(void) {
     check_bool(call_curried(fn, a2, 1), 0, "isList 1 == false");
 }
 
-/* nix-instantiate --eval -E 'builtins.isAttrs { a = 1; }' => true */
 static void test_isAttrs(void) {
     Value fn = lookup("isAttrs");
     Value a1[] = { make_empty_attrs() };
@@ -195,20 +163,16 @@ static void test_isAttrs(void) {
     check_bool(call_curried(fn, a2, 1), 0, "isAttrs 1 == false");
 }
 
-/* nix-instantiate --eval -E 'builtins.isFunction (a: a)' => true
- * nix-instantiate --eval -E 'builtins.isFunction builtins.length' => true
- * nix-instantiate --eval -E 'builtins.isFunction (builtins.substring 1)' => true */
 static void test_isFunction(void) {
     Value fn = lookup("isFunction");
-    Value a1[] = { lookup("isNull") }; /* a PrimOp value */
+    Value a1[] = { lookup("isNull") };
     check_bool(call_curried(fn, a1, 1), 1, "isFunction <primop> == true");
-    Value a2[] = { lookup("substring") }; /* a Closure value (make_curried_native) */
+    Value a2[] = { lookup("substring") };
     check_bool(call_curried(fn, a2, 1), 1, "isFunction <closure> == true");
     Value a3[] = { asnix_make_int(1) };
     check_bool(call_curried(fn, a3, 1), 0, "isFunction 1 == false");
 }
 
-/* nix-instantiate --eval -E 'builtins.isInt 1' => true */
 static void test_isInt(void) {
     Value fn = lookup("isInt");
     Value a1[] = { asnix_make_int(1) };
@@ -217,7 +181,6 @@ static void test_isInt(void) {
     check_bool(call_curried(fn, a2, 1), 0, "isInt \"a\" == false");
 }
 
-/* nix-instantiate --eval -E 'builtins.isBool true' => true */
 static void test_isBool(void) {
     Value fn = lookup("isBool");
     Value a1[] = { ASNIX_TRUE };
@@ -245,3 +208,4 @@ int main(void) {
     printf("test_builtins_misc: all checks passed\n");
     return 0;
 }
+

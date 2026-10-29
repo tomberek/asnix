@@ -17,9 +17,6 @@ static int failures = 0;
     } while (0)
 
 static Env *root_env(void) {
-    /* M118: Env.up is a dedicated-arena-relative compressed offset --
-     * must come from the real allocator, not a hand-rolled general-
-     * arena alloc. */
     return asnix_env_alloc(NULL, 0);
 }
 
@@ -28,7 +25,6 @@ static void check_int_result(Value v, int64_t expected, const char *what) {
     CHECK(asnix_int_value(v) == expected, what);
 }
 
-/* 2 + 3*4 = 14 */
 static void fixture_arith(void) {
     IrBuilder *b = ib_new();
     ib_push_int(b, 2);
@@ -42,7 +38,6 @@ static void fixture_arith(void) {
     check_int_result(v, 14, "fixture_arith: 2 + 3*4 == 14");
 }
 
-/* if true then 1 else 2 == 1; if false then 1 else 2 == 2 */
 static void fixture_if(int cond, int64_t expected) {
     IrBuilder *b = ib_new();
     if (cond)
@@ -63,7 +58,6 @@ static void fixture_if(int cond, int64_t expected) {
     check_int_result(v, expected, cond ? "fixture_if(true) == 1" : "fixture_if(false) == 2");
 }
 
-/* let x=10; y=20; in x+y == 30 -- validates frame alloc + depth-0 lookup */
 static void fixture_let(void) {
     IrBuilder *b = ib_new();
     ib_push_int(b, 10);
@@ -78,15 +72,14 @@ static void fixture_let(void) {
     check_int_result(v, 30, "fixture_let: let x=10;y=20;in x+y == 30");
 }
 
-/* let x=1; in let y=2; in x+y == 3 -- validates the depth-1 up-chain hop */
 static void fixture_nested_let(void) {
     IrBuilder *b = ib_new();
     ib_push_int(b, 1);
     ib_let(b, 1);
     ib_push_int(b, 2);
     ib_let(b, 1);
-    ib_var_ref(b, 1, 0); /* x, one frame up */
-    ib_var_ref(b, 0, 0); /* y, current frame */
+    ib_var_ref(b, 1, 0);
+    ib_var_ref(b, 0, 0);
     ib_add(b);
     ib_halt(b);
     IrProgram *prog = ib_finish(b);
@@ -94,7 +87,6 @@ static void fixture_nested_let(void) {
     check_int_result(v, 3, "fixture_nested_let: let x=1;in let y=2;in x+y == 3");
 }
 
-/* let f = \a b -> a+b; in f 3 4 == 7 -- validates closure capture + call/ret */
 static void fixture_lambda_call(void) {
     IrBuilder *body = ib_new();
     ib_var_ref(body, 0, 0);
@@ -104,9 +96,9 @@ static void fixture_lambda_call(void) {
     IrProgram *body_prog = ib_finish(body);
 
     IrBuilder *b = ib_new();
-    ib_lambda(b, 2, body_prog, 0); /* formals: unused by this test */
+    ib_lambda(b, 2, body_prog, 0);
     ib_let(b, 1);
-    ib_var_ref(b, 0, 0); /* push f */
+    ib_var_ref(b, 0, 0);
     ib_push_int(b, 3);
     ib_push_int(b, 4);
     ib_call(b, 2);
@@ -131,3 +123,4 @@ int main(void) {
     printf("test_m3_fixtures: all checks passed\n");
     return 0;
 }
+

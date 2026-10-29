@@ -25,8 +25,6 @@ int main(void) {
     const char *name = asnix_sym_name(a, &len);
     CHECK(len == 3 && memcmp(name, "foo", 3) == 0, "reverse lookup recovers the name");
 
-    /* Enough distinct names to force at least one rehash (initial table
-     * capacity is 16, 75% load factor). */
     uint32_t ids[200];
     char buf[32];
     for (int i = 0; i < 200; i++) {
@@ -52,3 +50,4 @@ int main(void) {
     printf("test_symtab: all checks passed\n");
     return 0;
 }
+

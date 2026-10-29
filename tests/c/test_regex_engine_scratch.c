@@ -5,7 +5,7 @@
 
 static int fails = 0;
 
-static void check_anchored(const char *re, const char *s, const char *expect_csv /* "a,b,NULL,c" */) {
+static void check_anchored(const char *re, const char *s, const char *expect_csv ) {
     int64_t relen = (int64_t)strlen(re), slen = (int64_t)strlen(s);
     int64_t nsub;
     AsnixCustomRegex *c = asnix_regex_compile(re, relen, &nsub);
@@ -32,7 +32,6 @@ static void check_anchored(const char *re, const char *s, const char *expect_csv
 }
 
 int main(void) {
-    /* Class A validated shapes (expected values taken from real nix-instantiate runs) */
     check_anchored("(a*)*", "aa", "");
     check_anchored("(a*)*", "", "");
     check_anchored("(a?)*", "aa", "");
@@ -62,7 +61,6 @@ int main(void) {
     check_anchored("(ab|a){1,2}", "aba", "a");
     check_anchored("(a|b){1,3}", "aba", "a");
 
-    /* Class B shapes */
     check_anchored("[[:w:]]+", "a_1", "");
     check_anchored("[[.hyphen.][.space.][.tilde.][.period.]]+", "- ~.", "");
     check_anchored("[[.a.]-c]+", "abc", "");
@@ -70,7 +68,6 @@ int main(void) {
     check_anchored("[[=period=]x]+", ".x", "");
     check_anchored("[[:ALPHA:]]+", "aB", "");
 
-    /* Basics / non-ambiguous, sanity */
     check_anchored("(f)(o+)", "foo", "f,oo");
     check_anchored("(a)?(b)", "b", "NULL,b");
     check_anchored("a|ab", "ab", "");
@@ -80,3 +77,4 @@ int main(void) {
     printf("test_regex_engine_scratch: all checks passed\n");
     return 0;
 }
+

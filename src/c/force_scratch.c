@@ -1,7 +1,3 @@
-/* Per-depth scratch-buffer cache backing src/asm/force.S's
- * asnix_force_for_print -- see include/asnix/force_scratch.h's header
- * comment for why this exists and why indexing by depth (rather than a
- * single cached slot) is both correct and necessary in practice. */
 #include "asnix/force_scratch.h"
 
 #include <stdlib.h>
@@ -16,10 +12,6 @@ typedef struct {
 static ForceScratchSlot *g_slots = NULL;
 static size_t g_cap = 0;
 
-/* Same doubling-growth convention as every other dynamic array in this
- * codebase (e.g. eval_file.c's g_import_cache) -- grows to at least
- * `depth + 1` slots, zeroing the newly added ones so a not-yet-cached
- * slot's pointers read back as NULL. */
 static void ensure_cap(size_t depth) {
     if (depth < g_cap) return;
     size_t new_cap = g_cap ? g_cap * 2 : 8;
@@ -46,10 +38,6 @@ void *asnix_force_scratch_retstack(int64_t depth) {
     return slot->retstack;
 }
 
-/* Independent per-depth cache for src/asm/apply.S's asnix_apply -- see
- * force_scratch.h's own comment on asnix_apply_scratch_valstack for why
- * this exists and why it's a second, separate cache rather than reusing
- * g_slots above. */
 static ForceScratchSlot *g_apply_slots = NULL;
 static size_t g_apply_cap = 0;
 
@@ -79,8 +67,6 @@ void *asnix_apply_scratch_retstack(int64_t depth) {
     return slot->retstack;
 }
 
-/* Independent per-depth cache for src/asm/dispatch.S's asnix_eval -- see
- * force_scratch.h's own comment on asnix_eval_scratch_valstack for why. */
 static ForceScratchSlot *g_eval_slots = NULL;
 static size_t g_eval_cap = 0;
 
@@ -109,3 +95,4 @@ void *asnix_eval_scratch_retstack(int64_t depth) {
     if (!slot->retstack) slot->retstack = asnix_arena_alloc(ASNIX_EVAL_RETSTACK_BYTES);
     return slot->retstack;
 }
+

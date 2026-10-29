@@ -1,41 +1,3 @@
-/*
- * builtins.fromJSON -- M51. A scoped, hand-written recursive-descent JSON
- * parser (RFC 8259), modeled on this project's existing toml.c/lexer.c
- * style: plain index-into-buffer scanning, no external dependency, fatal
- * on malformed input.
- *
- * Previously this builtin didn't exist in this codebase AT ALL (flagged
- * explicitly in docs/architecture.md's long-tail-pass notes: "`fromJSON`
- * doesn't exist in this codebase at all yet... not worth building a JSON
- * parser for in isolation" for the sake of a single conformance file).
- * That calculus changes here: numtide/nix-conformance's
- * eval-okay-fromjson.nix is one of the files this milestone's float
- * support was specifically asked to unblock (it contains a handful of
- * ordinary Nix float literals in the comparison value on its RHS, which
- * is what kept it a parse failure before this milestone) -- but getting
- * past that parse error reveals `fromJSON` is ALSO needed to actually
- * evaluate the file, since it calls `builtins.fromJSON` on a literal
- * JSON document and compares the result against a literal Nix value.
- * Writing a real (if deliberately small) JSON parser is the only honest
- * way to pass that file, so it's in scope here rather than out of scope
- * the way it was before.
- *
- * Implemented: objects, arrays, strings (\" \\ \/ \b \f \n \r \t \uXXXX
- * escapes, including UTF-16 surrogate pairs), numbers (JSON's number
- * grammar: optional leading '-', an int part, an optional '.'-fraction,
- * an optional [eE][+-]?digits exponent -- a '.' or exponent makes it a
- * Float Value, otherwise an Int, matching the same int/float split real
- * Nix's own fromJSON makes, confirmed directly against
- * eval-okay-fromjson.nix's own expected output: `23493`/`116`/`-10`
- * stay plain ints, `3.14159` becomes a float), true/false/null.
- *
- * NOT implemented: JSON5-isms (comments, trailing commas, unquoted
- * keys), duplicate-key "last wins" vs "error" policy choice (this parser
- * does last-wins via plain attrset-overwrite semantics, falling out for
- * free from how the entries array is built -- not verified against real
- * Nix's own choice here since no corpus case exercises it, same "not
- * pursued speculatively" convention as every other untested edge in this
- * codebase). */
 #include "builtins_json.h"
 
 #include <ctype.h>
@@ -44,7 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <ucontext.h> /* M67: run_json_parse_on_big_stack -- see its own comment */
+#include <ucontext.h>
 
 #include "asnix/value.h"
 #include "builtins_shared.h"
@@ -55,27 +17,6 @@ typedef struct {
     const char *src;
     size_t len;
     size_t i;
-    /* M80: derivation.c's own `__json` attribute (a raw JSON string the
-     * user hands `derivation {...}` directly -- re-validated/normalized
-     * rather than built from an attrset, see that call site's own
-     * comment) needs a DIFFERENT integer-overflow policy than
-     * `builtins.fromJSON` below: real Nix's `StructuredAttrs::parse`
-     * goes through plain `nlohmann::json::parse` (a DOM parse, no extra
-     * validation layered on top), which silently demotes ANY integer
-     * literal too big to fit into a float rather than erroring --
-     * confirmed directly: `derivation { ... __json =
-     * "{\"d\":100000000000000000000}"; }`'s own `.drv` ends up with
-     * `"d":1e+20`, not an error, via real `nix-instantiate`.
-     * `builtins.fromJSON` goes through a SEPARATE hand-rolled SAX
-     * visitor (real Nix's `json-to-value.cc`) that adds its own
-     * explicit `number_unsigned` overflow check specifically to keep
-     * oversized integers out of the Nix language's own Int type
-     * (eval-fail-fromJSON-overflowing.nix depends on that **erroring**,
-     * not silently becoming a float) -- so the two entry points
-     * genuinely disagree on this, and `permissive_overflow` is this
-     * parser's single switch between them, set per entry point below
-     * rather than threading an extra argument through every mutually
-     * recursive parse_json_* function. */
     int permissive_overflow;
 } JsonParser;
 
@@ -101,10 +42,6 @@ static void jp_expect(JsonParser *p, char c) {
     p->i++;
 }
 
-/* Growable byte buffer, same shape as lexer.c's ByteBuf -- re-declared
- * here rather than shared, same "no textual coupling between unrelated
- * modules" convention this project already uses (see builtins_misc.c's
- * own header comment on this). */
 typedef struct {
     char *buf;
     size_t len, cap;
@@ -139,10 +76,6 @@ static uint32_t parse_hex4(JsonParser *p) {
     return v;
 }
 
-/* Standard UTF-8 encoding of a Unicode code point -- returns the byte
- * count written (1..4). Ported from the same algorithm toml.c's own
- * utf8_encode uses (static to that file, so reimplemented here rather
- * than shared -- see this file's header comment). */
 static size_t utf8_encode(uint32_t cp, char *out) {
     if (cp <= 0x7F) {
         out[0] = (char)cp;
@@ -166,13 +99,6 @@ static size_t utf8_encode(uint32_t cp, char *out) {
     return 4;
 }
 
-/* Parses a JSON string, `p->i` already positioned just past the opening
- * '"'. Decodes \" \\ \/ \b \f \n \r \t directly and \uXXXX via
- * utf8_encode, including the UTF-16 surrogate-pair case (a high
- * surrogate 0xD800-0xDBFF must be immediately followed by a low
- * surrogate 0xDC00-0xDFFF, combined per the standard formula into one
- * codepoint above U+FFFF -- an unpaired surrogate is rejected rather
- * than silently mis-encoded). Returns an asnix String Value. */
 static Value parse_json_string(JsonParser *p) {
     ByteBuf bb = { 0 };
     for (;;) {
@@ -221,21 +147,6 @@ static Value parse_json_string(JsonParser *p) {
             default: json_fatal("invalid escape sequence");
         }
     }
-    /* A JSON string's \u0000 escape (or, in principle, a literal NUL
-     * byte) can produce an embedded NUL -- real Nix rejects this outright
-     * for any string value it builds this way (confirmed directly
-     * against `nix-instantiate --eval`: `builtins.fromJSON ''"a\u0000b"''`
-     * errors "input string 'a\0b' cannot be represented as Nix string
-     * because it contains null bytes", for both JSON string VALUES and
-     * object KEYS -- found via numtide/nix-conformance's
-     * eval-fail-fromJSON-keyWithNullByte.nix/-valueWithNullByte.nix,
-     * both of which this parser silently accepted before this check was
-     * added, since asnix's own String representation tracks length
-     * explicitly rather than relying on NUL-termination and so has no
-     * structural reason to reject this on its own). Checked once here,
-     * in the one shared string-decoding function both keys and values
-     * go through, rather than at each of parse_json_object/
-     * parse_json_value's two call sites. */
     for (size_t k = 0; k < bb.len; k++) {
         if (bb.buf[k] == '\0') json_fatal("input string cannot be represented as Nix string because it contains null bytes");
     }
@@ -244,11 +155,6 @@ static Value parse_json_string(JsonParser *p) {
     return out;
 }
 
-/* JSON number grammar: `-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?`.
- * A '.' or exponent present makes this a Float Value (strtod); otherwise
- * it's an Int Value (strtoll) -- matching real Nix's own fromJSON int/
- * float split (confirmed against eval-okay-fromjson.nix's own expected
- * output: `23493`/`116`/`-10` stay ints, `3.14159` becomes a float). */
 static Value parse_json_number(JsonParser *p) {
     size_t start = p->i;
     if (jp_cur(p) == '-') p->i++;
@@ -276,29 +182,9 @@ static Value parse_json_number(JsonParser *p) {
     if (is_float) {
         out = asnix_make_float_value(strtod(buf, NULL));
     } else {
-        /* An integer JSON number that overflows even a real int64_t (let
-         * alone asnix's own narrower 60-bit range, ASNIX_INT_MIN/MAX --
-         * see include/asnix/value.h) must fail loudly, not silently wrap
-         * or saturate -- found via numtide/nix-conformance's
-         * eval-fail-fromJSON-overflowing.nix (`{"attr":
-         * 18446744073709551615}`, 2^64-1, which doesn't fit in ANY
-         * signed 64-bit integer), checked against `nix-instantiate
-         * --eval`: "unsigned json number 18446744073709551615 outside
-         * of Nix integer range". `errno` catches strtoll's own
-         * ERANGE (set for anything past INT64_MIN/MAX); the explicit
-         * ASNIX_INT_MIN/MAX bounds check on top of that catches the
-         * narrower band asnix itself actually supports (a value that
-         * fits in a real int64_t but not asnix's 60-bit one would
-         * otherwise silently truncate when shifted into the tagged
-         * word, same class of bug this check exists to prevent). */
         errno = 0;
         long long val = strtoll(buf, NULL, 10);
         if (errno == ERANGE || val < ASNIX_INT_MIN || val > ASNIX_INT_MAX) {
-            /* M80: `__json`'s own parser (see `permissive_overflow`'s
-             * header comment above) demotes to a float here instead of
-             * erroring -- matching real Nix's plain `nlohmann::json::
-             * parse` DOM path used by `StructuredAttrs::parse`, as
-             * opposed to `builtins.fromJSON`'s stricter SAX visitor. */
             if (p->permissive_overflow) {
                 out = asnix_make_float_value(strtod(buf, NULL));
                 free(buf);
@@ -374,21 +260,6 @@ static Value parse_json_object(JsonParser *p) {
         jp_expect(p, ':');
         jp_skip_ws(p);
         Value val = parse_json_value(p);
-        /* M80: a repeated key overwrites the EARLIER slot's value in
-         * place -- found chasing eval-okay-json-attr-normalised.nix's
-         * `{"a":1,"a":2}` case through to its `.drv` (whose `__json` env
-         * entry must come out byte-identical to `{"a":2}`'s own, per
-         * real `nix-instantiate`), which this parser's own header
-         * comment already claims ("last-wins via plain attrset-
-         * overwrite semantics") but the code actually below it didn't
-         * implement -- every prior key, even a repeated one, was being
-         * unconditionally appended as its own separate slot, violating
-         * the invariant every other `ASNIX_TAG_ATTRS` producer in this
-         * codebase relies on (no duplicate syms in one attrset) once
-         * this array reached `asnix_bshared_make_attrs` below. Matches
-         * real Nix's own `ValueMap::insert_or_assign` in its SAX
-         * visitor's `JSONObjectState::key()` (json-to-value.cc) --
-         * last-wins, one slot per unique key. */
         int64_t existing = -1;
         for (int64_t j = 0; j < (int64_t)n; j++) {
             if (syms[j] == sym) { existing = j; break; }
@@ -449,7 +320,7 @@ static Value parse_json_value(JsonParser *p) {
     }
     if (c == '-' || isdigit((unsigned char)c)) return parse_json_number(p);
     json_fatal("unexpected character");
-    return asnix_make_imm(ASNIX_IMM_NULL); /* unreachable -- json_fatal exits */
+    return asnix_make_imm(ASNIX_IMM_NULL);
 }
 
 static Value asnix_json_parse(const char *src, size_t len, int permissive_overflow) {
@@ -460,34 +331,7 @@ static Value asnix_json_parse(const char *src, size_t len, int permissive_overfl
     return out;
 }
 
-/* M67: this parser uses one native C stack frame per nesting level (see
- * parse_json_array/parse_json_object/parse_json_value's mutual
- * recursion above) -- fine at ordinary depths, but a sufficiently deep
- * literal (`eval-okay-fromjson-deep.nix` builds `[[[...]]]]` 100,000
- * deep, checking against the real nlohmann-backed `nix-instantiate`'s
- * own comment that it "has no nesting limit") blew the default 8 MiB
- * thread stack and segfaulted -- confirmed directly: the same file's
- * shallower 20,000-deep case already fit and passed, and manually
- * running the whole process under `ulimit -s 65536` (64 MiB) made the
- * 100,000 case pass too, with zero other change.
- *
- * Globally raising the process's own stack (`setrlimit(RLIMIT_STACK,
- * ...)` at startup) was tried first and reverted: it also deepened
- * `builtins.toJSON`'s OWN (unrelated, separate-function) recursive
- * serializer enough to let `eval-fail-toJSON-stack-overflow.nix`
- * actually *finish* instead of crashing -- that conformance case
- * deliberately relies on hitting a stack limit (real Nix has an
- * explicit, interpreter-level max-call-depth counter *independent* of
- * native stack size; this project has no equivalent, so its only
- * "stack overflow" at all is a native one) to prove a controlled
- * failure, so letting it succeed instead flips a passing case to
- * failing. Scoping the bigger stack to ONLY this parser's own
- * recursion -- via a `ucontext.h` side stack, not a new OS thread (no
- * actual concurrency; the caller is suspended for the `swapcontext`
- * duration, same single-threaded execution this whole codebase already
- * assumes elsewhere, e.g. the global arena allocator) -- fixes
- * fromjson-deep without touching toJSON's unrelated call path at all. */
-#define ASNIX_JSON_PARSE_STACK_BYTES (64 * 1024 * 1024) /* 64 MiB, see above */
+#define ASNIX_JSON_PARSE_STACK_BYTES (64 * 1024 * 1024)
 
 typedef struct {
     const char *src;
@@ -496,12 +340,6 @@ typedef struct {
     Value result;
 } JsonParseCtx;
 
-/* Single global, not re-entrancy-safe for nested concurrent use -- fine
- * here since `swapcontext` below runs this to completion (and any
- * further `fromJSON` calls IT makes, if ever nested, would each get
- * their own fresh JsonParseCtx/stack further down this same call chain,
- * never two live at once from unrelated callers) before the caller
- * resumes. */
 static JsonParseCtx *g_json_parse_ctx;
 
 static void json_parse_trampoline(void) {
@@ -511,7 +349,7 @@ static void json_parse_trampoline(void) {
 
 static Value run_json_parse_on_big_stack(const char *src, size_t len, int permissive_overflow) {
     JsonParseCtx ctx = { src, len, permissive_overflow, asnix_make_imm(ASNIX_IMM_NULL) };
-    JsonParseCtx *saved_ctx = g_json_parse_ctx; /* restore on return, supporting nested fromJSON calls */
+    JsonParseCtx *saved_ctx = g_json_parse_ctx;
     g_json_parse_ctx = &ctx;
 
     void *stack_mem = malloc(ASNIX_JSON_PARSE_STACK_BYTES);
@@ -533,7 +371,7 @@ static Value prim_fromJSON(const Value *args, int64_t argc) {
     const char *bytes;
     int64_t len;
     asnix_bshared_string_bytes(args[0], &bytes, &len, "fromJSON");
-    return run_json_parse_on_big_stack(bytes, (size_t)len, /* permissive_overflow */ 0);
+    return run_json_parse_on_big_stack(bytes, (size_t)len,  0);
 }
 
 static Value build_fromJSON(void) { return asnix_bshared_make_primop((void *)prim_fromJSON, 1); }
@@ -542,15 +380,9 @@ const AsnixBuiltinMiscDef ASNIX_JSON_BUILTINS[] = {
     { "fromJSON", build_fromJSON },
 };
 
-/* M80: entry point for derivation.c's own `__json` attribute handling --
- * see `permissive_overflow`'s header comment (this same file, top of
- * `JsonParser`) for why this needs the big-stack machinery AND a parse
- * policy distinct from `builtins.fromJSON`'s `prim_fromJSON` above,
- * rather than being able to just call that primop's own Value-wrapping
- * entry point. Fatal (exit 1) on any malformed JSON, same as fromJSON --
- * exactly what eval-fail-json-attr-not-json.nix needs. */
 Value asnix_json_parse_structured_attrs(const char *bytes, int64_t len) {
-    return run_json_parse_on_big_stack(bytes, (size_t)len, /* permissive_overflow */ 1);
+    return run_json_parse_on_big_stack(bytes, (size_t)len,  1);
 }
 
 const size_t ASNIX_JSON_BUILTINS_COUNT = sizeof(ASNIX_JSON_BUILTINS) / sizeof(ASNIX_JSON_BUILTINS[0]);
+

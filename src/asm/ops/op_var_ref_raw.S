@@ -1,7 +1,3 @@
-// M92: see OP_VAR_REF_RAW's own comment in ir.h. Same De Bruijn
-// depth/slot walk as op_var_ref.S's asnix_op_var_ref, but pushes the
-// slot's raw content verbatim -- no thunk-forcing, no Cell-resolving,
-// nothing. The OP_FRAME_GET of depth-relative reads.
 #include "asnix/env.h"
 #include "asnix/ir.h"
 #include "asnix/stackcheck.h"
@@ -10,20 +6,20 @@
 
     .globl asnix_op_var_ref_raw
     .type asnix_op_var_ref_raw, @function
-asnix_op_var_ref_raw:                   // a = depth, b = slot
-    movq %rdi, %rcx                     // rcx = env, walked up `depth` hops
-    movl ASNIX_IROP_OFF_A(%rsi), %edx   // rdx = depth
+asnix_op_var_ref_raw:
+    movq %rdi, %rcx
+    movl ASNIX_IROP_OFF_A(%rsi), %edx
 .Lvar_ref_raw_walk:
     testq %rdx, %rdx
     jz .Lvar_ref_raw_done
-    movl ASNIX_ENV_OFF_UP(%rcx), %ecx    // M118: zero-extends into %rcx; decompress below
+    movl ASNIX_ENV_OFF_UP(%rcx), %ecx
     addq asnix_env_arena_base(%rip), %rcx
-    andq $-2, %rcx                      // mask off ASNIX_ENV_WITH_TAG in case this hop is a with-frame
+    andq $-2, %rcx
     decq %rdx
     jmp .Lvar_ref_raw_walk
 .Lvar_ref_raw_done:
-    movl ASNIX_IROP_OFF_B(%rsi), %edx   // rdx = slot
-    movq ASNIX_ENV_OFF_VALUES(%rcx, %rdx, 8), %rax // rax = raw tagged value, unforced
+    movl ASNIX_IROP_OFF_B(%rsi), %edx
+    movq ASNIX_ENV_OFF_VALUES(%rcx, %rdx, 8), %rax
 
     ASNIX_CHECK_VALSTACK %rcx
     movq %rax, (%r12)
@@ -32,3 +28,4 @@ asnix_op_var_ref_raw:                   // a = depth, b = slot
     movq (%rsi), %rax
     jmp *%rax
     .size asnix_op_var_ref_raw, . - asnix_op_var_ref_raw
+

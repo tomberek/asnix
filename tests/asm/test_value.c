@@ -35,8 +35,6 @@ static void test_imm_roundtrip(void) {
 }
 
 static void test_tag_extraction(void) {
-    /* Synthesize a raw word for every tag value (no dereference happens --
-     * asnix_tag_of/asnix_is_thunk only ever inspect the low 3 bits). */
     for (int t = ASNIX_TAG_PTR; t <= ASNIX_TAG_PRIMOP; t++) {
         Value v = { .raw = ((uint64_t)0x1000 << ASNIX_TAG_BITS) | (uint64_t)t };
         CHECK(asnix_tag_of(v) == t, "tag_of recovers the synthesized tag");
@@ -63,3 +61,4 @@ int main(void) {
     printf("test_value: all checks passed\n");
     return 0;
 }
+

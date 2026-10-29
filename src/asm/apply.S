@@ -1,143 +1,19 @@
-// M7+: a general re-entrant "call this Value from C" entry point, used by
-// builtins (map/filter/foldl' and friends, next stage) that need to invoke
-// an arbitrary Nix closure/primop VALUE and get its result back. This is
-// the mechanism asnix_force_for_print's own header comment named as
-// explicitly out of its scope ("not a general re-entrant builtin-calls-
-// force mechanism ... that's M7+") -- force.S forces a thunk with zero
-// arguments and memoizes into that thunk cell; this instead applies a
-// function value to caller-supplied arguments and has no thunk to
-// memoize into, so it gets its own sentinel/epilogue pair rather than
-// reusing force.S's force_target convention.
-//
-// Modeled closely on asnix_force_for_print's self-contained-dispatch-
-// context pattern (own fresh VALSTACK+RETSP via asnix_arena_alloc, never
-// shared with whatever asnix_eval/asnix_force_for_print/asnix_apply
-// invocation might already be active on the native call stack -- this
-// may run reentrantly, e.g. a builtin called from within an actively
-// running asnix_eval that itself calls back into asnix_apply) and on
-// op_call.S's two dispatch paths (Closure: allocate a frame, copy args
-// in, push a sentinel RetFrame, jump to the body; PrimOp: call the native
-// fn pointer directly, no Env/VALSTACK/RETSP needed at all) -- including
-// the same type/arity checks op_call.S makes (own copies of the error
-// messages below, since op_call.S's are file-local `.L` labels, but
-// worded the same way for a consistent user-facing error style).
 #include "asnix/env.h"
-#include "asnix/force_scratch.h" // asnix_apply_scratch_{valstack,retstack} (perf)
+#include "asnix/force_scratch.h"
 #include "asnix/heap.h"
 #include "asnix/ir.h"
 #include "asnix/stackcheck.h"
 #include "asnix/value.h"
 
-    // asnix_apply's own nested-recursion depth, same role/discipline as
-    // force.S's asnix_force_depth (see force_scratch.h's header comment
-    // on asnix_apply_scratch_valstack for why this is a SEPARATE counter,
-    // not the same one) -- doubles as the index into force_scratch.c's
-    // per-depth apply-scratch cache below, replacing this function's own
-    // previous "mint a brand-new 320 KiB pair from the never-free bump
-    // arena on every single call" behavior (found chasing a memory-usage
-    // question: this was the single largest contributor to
-    // asnix_arena's own total_allocated counter evaluating d.nix, by far
-    // more than force.S's already-fixed equivalent, since every
-    // `map`/`filter`/`foldl'`-style builtin call reaches here).
     .bss
     .align 8
     .globl asnix_apply_depth
 asnix_apply_depth:
     .quad 0
 
-    // Same sizing as force.S's own nested-forcing buffers (see that
-    // file's comment and docs/architecture.md's "Known bugs" list for why
-    // these are bounds-checked rather than just "large enough"): smaller
-    // than dispatch.S's top-level buffers since this context only ever
-    // runs one applied-closure's body at a time, but still bounds-checked
-    // via the same shared asnix_valstack_limit/asnix_retsp_limit globals
-    // the main dispatch loop and force.S use, so a pathological closure
-    // body (e.g. one that builds a huge list) fails loudly instead of
-    // silently corrupting the arena.
-    // M80: BOTH left at their original sizes, deliberately NOT shrunk
-    // to match the tiny measured peaks a real-nixpkgs sample showed
-    // (352 bytes valstack / 864 bytes retstack -- see
-    // docs/architecture.md's M80 scope notes for the full measurement).
-    // Two independent reasons this sample isn't trustworthy enough to
-    // size against here, unlike dispatch.S's own (much larger, and
-    // independently cross-checked) buffers:
-    //
-    // VALSTACK: `tests/e2e/m9_large_list.nix` (a literal 15,000-element
-    // list passed straight to `builtins.length`) is constructed
-    // entirely *inside this exact buffer*, not dispatch.S's -- op_call.S
-    // forces every primop argument via asnix_force_for_print, which
-    // shares this file's ASNIX_APPLY_VALSTACK_BYTES/
-    // ASNIX_APPLY_RETSTACK_BYTES value with force.S's own ASNIX_FORCE_*
-    // (see force_scratch.h) -- needing ~120,000 bytes for that one test
-    // alone, far more than the tiny per-package measurement ever
-    // touched (none of those five packages happens to pass a large
-    // literal straight into a primop). A shrink to 64 KiB (briefly
-    // tried) regressed that test with a real "value stack overflow"
-    // abort.
-    //
-    // RETSTACK: real Nix's own `max-call-depth` default is 10,000
-    // function calls (see dispatch.S's own comment on
-    // ASNIX_RETSTACK_BYTES for the exact source reference) -- a
-    // deeply-recursive user function invoked *through* `map`/`filter`/
-    // `foldl'` (an extremely ordinary nixpkgs pattern) runs its own
-    // recursive OP_CALLs against THIS RETSTACK, not dispatch.S's, since
-    // once inside this dispatch context further calls stay in it. The
-    // original 64 KiB (2,048 frames) is already below Nix's own 10,000-
-    // call guarantee -- a pre-existing gap, not one this milestone
-    // introduces -- but a further shrink (16 KiB/512 frames, briefly
-    // tried) would have made that gap 4x worse with no real-usage
-    // evidence that it's safe to.
-    .equ ASNIX_APPLY_VALSTACK_BYTES, 262144 // 32,768 Values, 256 KiB
-    .equ ASNIX_APPLY_RETSTACK_BYTES, 65536  // 2,048 call frames, 64 KiB
+    .equ ASNIX_APPLY_VALSTACK_BYTES, 262144
+    .equ ASNIX_APPLY_RETSTACK_BYTES, 65536
 
-    // M38: scratch stack layout for asnix_apply's PrimOp branch's own
-    // argument-forcing loop (see that branch's comment for why it's
-    // needed) -- 8 Value slots is comfortably above every real primop
-    // arity in this codebase (max 3, e.g. replaceStrings/foldl/foldr),
-    // and the fatal fallback below handles anything larger cleanly
-    // rather than silently overflowing. Header (fn ptr/argc/original
-    // args ptr/loop index/self, 5 x 8 bytes = 40) + 8 Value slots (64)
-    // = 104, already ≡ 8 (mod 16) with no extra padding needed --
-    // required because %rsp is already 8 mod 16 at this function's own
-    // entry (the ordinary call-site convention: the return address
-    // consumes 8 of the 16), and subtracting an amount ≡ 8 (mod 16) is
-    // exactly what brings %rsp to 0 mod 16 for every `call` made while
-    // this scratch region is live.
-    //
-    // M62-adjacent (found via d.nix): "self" (header offset 32, forced-
-    // args copy starting right after at 40) exists so that `args[-1]`
-    // -- which builtins_list.c's self_captures() reads to recover a
-    // curried stage PrimOp's own trailing captured Value(s), see that
-    // function's header comment -- is populated the same way op_call.S
-    // already populates it for an ordinary in-language call. Before
-    // this fix, nothing here ever wrote a slot before the forced-args
-    // copy, so calling one of THIS codebase's own self-capturing
-    // PrimOps (e.g. `builtins.elemAt someList`, a curried arity-1
-    // PrimOp instance) through asnix_apply -- which happens whenever a
-    // builtin like foldl'/map hands a *user-supplied* function to
-    // apply2/asnix_apply, and that function's body itself evaluates to
-    // one of these PrimOps (confirmed minimal repro:
-    // `builtins.foldl' (acc: builtins.elemAt [1 2 3]) 0 [0]`, where
-    // `op`'s first application returns `elemAt someList` -- itself a
-    // self-capturing PrimOp -- which is then applied a SECOND time via
-    // apply2's own asnix_apply call, not an ordinary OP_CALL) read
-    // whatever garbage happened to sit one slot before this function's
-    // own scratch buffer, segfaulting. Only fixes the forcing path
-    // (`.Lapply_primop_force_done`'s `args[-1]`) -- the NOFORCE path
-    // just below (`.Lapply_primop_skip_force`) still hands `fn` the
-    // caller's own raw buffer with no slot before it, since that
-    // buffer belongs to code outside this function (apply2 and
-    // friends' own small on-stack arrays) and can't retroactively gain
-    // one; narrower, pre-existing, consistent with the same "only the
-    // OP_CALL convention populates args[-1]" limitation self_captures'
-    // own header comment already names, not a new gap this fix
-    // introduces. NOFORCE is used only by foldl''s stage2 (M53), which
-    // itself calls self_captures -- so the identical crash is still
-    // reachable if a `foldl' op` (after exactly one application) is
-    // itself handed to another apply2/asnix_apply call site rather
-    // than an ordinary Nix-level application; not reproduced, not fixed
-    // here, same documented-scope-cut spirit as every other narrower
-    // limitation in this codebase.
     .equ ASNIX_APPLY_MAX_PRIMOP_ARGC, 8
     .equ ASNIX_APPLY_PRIMOP_SCRATCH_BYTES, 104
 
@@ -163,8 +39,7 @@ asnix_apply_depth:
 
     .globl asnix_apply
     .type asnix_apply, @function
-asnix_apply:                            // Value asnix_apply(Value fn, const Value *args, int64_t argc)
-                                         // rdi = fn, rsi = args, rdx = argc
+asnix_apply:
     movq %rdi, %rax
     movq %rax, %rcx
     andq $ASNIX_TAG_MASK, %rcx
@@ -176,60 +51,14 @@ asnix_apply:                            // Value asnix_apply(Value fn, const Val
     je .Lapply_is_attrs
     jmp .Lapply_type_error
 
-    // `__functor` protocol (M42): an attrset can be "called" if it has a
-    // `__functor` attribute -- see asnix_bshared_call_functor's own
-    // comment (builtins_shared.c) for the full mechanism. Only a single
-    // argument is supported here (argc must be 1, matching every other
-    // call site's one-arg-at-a-time convention in this project); falls
-    // through to the ordinary type error otherwise. Tail-`jmp` (not
-    // `call`), same reasoning the original (pre-M38) primop branch
-    // relied on: %rsp is still exactly as aligned here as it was at
-    // this function's own entry (nothing pushed yet), which is exactly
-    // what a real `call` into `asnix_bshared_call_functor` would expect
-    // to see -- the eventual `ret` inside it pops OUR caller's return
-    // address directly, skipping back past this frame entirely. `%rdi`
-    // (fn/attrs_val) is already in the right place; `%rsi` just needs
-    // to become `args[0]` instead of the args pointer.
 .Lapply_is_attrs:
     cmpq $1, %rdx
     jne .Lapply_type_error
     movq (%rsi), %rsi
     jmp asnix_bshared_call_functor
 
-    // PrimOp: a plain C function, Value (*)(const Value *args, int64_t
-    // argc) -- same convention op_call.S's primop path calls it with (see
-    // docs/abi.md's "Primop calls (M7)" section). No Env/RETSP needed
-    // (a primop has no lexical body to run through the dispatch loop),
-    // but unlike the original tail-jmp version of this branch, it now
-    // needs a real `call` + its own small epilogue:
-    //
-    // M38: force every argument before handing it to the native C
-    // function (mirrors op_call.S's own M25 force loop -- a primop reads
-    // args[i]'s raw tag directly and has no way to force a thunk
-    // itself), and force the return value before handing it back
-    // (mirrors op_call.S's M23 fix for lazy-passthrough primops like
-    // getAttr). asnix_apply is a *separate* call path from the normal
-    // dispatch loop's OP_CALL -- used directly from C by any/all/
-    // partition/concatMap/genericClosure's operator/sort's comparator/
-    // etc. to invoke a user- or builtin-supplied function on a
-    // possibly-still-lazy list element -- so it needs this exact same
-    // forcing discipline independently; OP_CALL's own force loop never
-    // runs for calls made this way. Found via d.nix: a `map`-produced
-    // list's elements, applied to `builtins.attrNames` through one of
-    // these call sites, crashed on an unforced Thunk that OP_CALL's own
-    // force loop would have caught had this gone through the ordinary
-    // dispatch path instead.
-    //
-    // Never mutates the caller's own `args` buffer (it may be read-only,
-    // or read again later by other code after this call returns) --
-    // builds a local forced copy on the stack instead. Every value in
-    // that copy is reloaded from memory around each `call` below rather
-    // than kept in a register, since asnix_force_for_print clobbers
-    // every caller-saved register; this is not a hot path (OP_CALL's own
-    // in-dispatch-loop forcing loop handles the common case), so the
-    // extra loads cost nothing that matters.
 .Lapply_is_primop:
-    andq $-8, %rax                      // rax = real PrimOp*
+    andq $-8, %rax
     movq ASNIX_PRIMOP_OFF_ARITY(%rax), %rcx
     cmpq %rcx, %rdx
     jne .Lapply_arity_error
@@ -240,88 +69,65 @@ asnix_apply:                            // Value asnix_apply(Value fn, const Val
     movq ASNIX_PRIMOP_OFF_NOFORCE(%rax), %r8
 
     subq $ASNIX_APPLY_PRIMOP_SCRATCH_BYTES, %rsp
-    movq %rcx, 0(%rsp)                  // fn ptr
-    movq %rdx, 8(%rsp)                  // argc
-    movq %rsi, 16(%rsp)                 // original args ptr
-    movq $0, 24(%rsp)                   // loop index i
-    movq %rdi, 32(%rsp)                 // self (tagged PrimOp Value, still intact in %rdi here --
-                                         // see this scratch layout's header comment above)
+    movq %rcx, 0(%rsp)
+    movq %rdx, 8(%rsp)
+    movq %rsi, 16(%rsp)
+    movq $0, 24(%rsp)
+    movq %rdi, 32(%rsp)
 
     cmpq $0, %r8
     jne .Lapply_primop_skip_force
 .Lapply_primop_force_loop:
-    movq 24(%rsp), %rcx                 // i
-    movq 8(%rsp), %rdx                  // argc
+    movq 24(%rsp), %rcx
+    movq 8(%rsp), %rdx
     cmpq %rdx, %rcx
     jge .Lapply_primop_force_done
-    movq 16(%rsp), %rsi                 // original args ptr
-    movq (%rsi, %rcx, 8), %rdi          // args[i]
+    movq 16(%rsp), %rsi
+    movq (%rsi, %rcx, 8), %rdi
     call asnix_force_for_print
-    movq 24(%rsp), %rcx                 // reload i (clobbered by the call)
-    movq %rax, 40(%rsp, %rcx, 8)        // forced_args[i] = result (offset 40: right after the
-                                         // "self" slot at 32, see this scratch layout's header
-                                         // comment -- NOT 32 itself, which would overwrite self)
+    movq 24(%rsp), %rcx
+    movq %rax, 40(%rsp, %rcx, 8)
     incq %rcx
     movq %rcx, 24(%rsp)
     jmp .Lapply_primop_force_loop
 .Lapply_primop_force_done:
-    leaq 40(%rsp), %rsi                 // args ptr = our forced local copy (args[-1] == self, at 32)
+    leaq 40(%rsp), %rsi
     jmp .Lapply_primop_call
 .Lapply_primop_skip_force:
-    movq 16(%rsp), %rsi                 // args ptr = original, unforced (e.g. tryEval via apply)
+    movq 16(%rsp), %rsi
 .Lapply_primop_call:
-    movq %rsi, %rdi                     // arg1 = args ptr
-    movq 8(%rsp), %rsi                  // arg2 = argc
-    movq 0(%rsp), %rax                  // fn ptr
+    movq %rsi, %rdi
+    movq 8(%rsp), %rsi
+    movq 0(%rsp), %rax
     call *%rax
     movq %rax, %rdi
-    call asnix_force_for_print          // force the result (M23 parity with op_call.S)
+    call asnix_force_for_print
     addq $ASNIX_APPLY_PRIMOP_SCRATCH_BYTES, %rsp
     ret
 
-    // Closure: needs a real frame and a real dispatch context to run its
-    // IR body through, exactly like op_call.S's closure path, except
-    // there is no enclosing asnix_eval invocation to borrow VALSTACK/
-    // RETSP/the "resume here" IP from -- we bring our own, and use a
-    // sentinel RetFrame (mirroring force.S's .Lforce_sentinel_ir/
-    // asnix_force_epilogue) so OP_RET's ordinary jmp-chain lands back in
-    // native-callable code that returns the result to our C caller.
 .Lapply_is_closure:
-    andq $-8, %rax                      // rax = real Closure*
+    andq $-8, %rax
     movq ASNIX_CLOSURE_OFF_ARITY(%rax), %rcx
     cmpq %rcx, %rdx
     jne .Lapply_arity_error
 
-    // Save every candidate-scratch register, exactly like asnix_eval's/
-    // asnix_force_for_print's own prologues -- this may run when no
-    // asnix_eval invocation is live at all, or nested inside one (or
-    // inside another asnix_apply / asnix_force_for_print call).
     pushq %r12
     pushq %r13
     pushq %r14
     pushq %rbx
     pushq %rbp
     pushq %r15
-    subq $8, %rsp                       // alignment padding, undone in the epilogue below
+    subq $8, %rsp
 
-    movq %rax, %rbx                     // rbx = Closure* (survives the calls below)
-    movq %rsi, %rbp                     // rbp = args ptr (survives the calls below)
-    movq %rdx, %r15                     // r15 = argc (survives the calls below)
+    movq %rax, %rbx
+    movq %rsi, %rbp
+    movq %rdx, %r15
 
-    // Save the enclosing dispatch context's VALSTACK/RETSP limits --
-    // restored in the epilogue below, mirroring %r12/%r14 themselves (see
-    // force.S, which does the same around its own nested use).
     movq asnix_valstack_limit(%rip), %rax
     pushq %rax
     movq asnix_retsp_limit(%rip), %rax
     pushq %rax
 
-    // perf: asnix_apply_scratch_{valstack,retstack} (force_scratch.c)
-    // cache one buffer pair PER DEPTH instead of minting a brand-new
-    // pair from the never-free bump arena on every single call -- see
-    // this file's own asnix_apply_depth comment above. %rbx/%rbp/%r15
-    // (the live Closure*/args ptr/argc) survive both calls: ordinary
-    // SysV calls, and all three are callee-saved.
     movq asnix_apply_depth(%rip), %rdi
     call asnix_apply_scratch_valstack
     movq %rax, %r12
@@ -336,17 +142,11 @@ asnix_apply:                            // Value asnix_apply(Value fn, const Val
 
     incq asnix_apply_depth(%rip)
 
-    // Allocate the new call frame (size = 8 + argc*8, same layout as
-    // op_call.S's closure path) and copy args in from our caller's plain
-    // C array (%rbp), not from VALSTACK -- there is no caller IrOp that
-    // already pushed them there the way an in-language OP_CALL has.
     movq %r15, %rcx
     leaq ASNIX_ENV_OFF_VALUES(, %rcx, 8), %rdi
     call asnix_env_arena_alloc
     incq asnix_stats_env(%rip)
     addq %r15, asnix_stats_env_elements(%rip)
-    // M118: NULL-safe compress -- see op_call.S's identical note
-    // (Closure.up may legitimately be NULL for a native-wrapper closure).
     movq ASNIX_CLOSURE_OFF_UP(%rbx), %rcx
     testq %rcx, %rcx
     jz .Lapply_up_null
@@ -354,20 +154,17 @@ asnix_apply:                            // Value asnix_apply(Value fn, const Val
 .Lapply_up_null:
     movl %ecx, ASNIX_ENV_OFF_UP(%rax)
 
-    xorq %rcx, %rcx                     // rcx = i = 0
+    xorq %rcx, %rcx
 .Lapply_copy_args:
     cmpq %r15, %rcx
     jge .Lapply_copy_done
-    movq (%rbp, %rcx, 8), %rdx          // arg_i, from the caller's args array
+    movq (%rbp, %rcx, 8), %rdx
     movq %rdx, ASNIX_ENV_OFF_VALUES(%rax, %rcx, 8)
     incq %rcx
     jmp .Lapply_copy_args
 .Lapply_copy_done:
 
-    // Sentinel retframe: an ordinary call (force_target = 0, nothing to
-    // memoize) whose IP points at a small epilogue that restores every
-    // saved register and returns the result to our C caller.
-    ASNIX_CHECK_RETSP %rcx              // %rcx dead here (last written by the copy loop above)
+    ASNIX_CHECK_RETSP %rcx
     leaq .Lapply_sentinel_ir(%rip), %rcx
     movq %rcx, ASNIX_RETFRAME_OFF_IP(%r14)
     movq $0, ASNIX_RETFRAME_OFF_ENV(%r14)
@@ -375,24 +172,19 @@ asnix_apply:                            // Value asnix_apply(Value fn, const Val
     movq $0, ASNIX_RETFRAME_OFF_FORCE_TARGET(%r14)
     addq $ASNIX_RETFRAME_SIZE, %r14
 
-    movq %rax, %rdi                     // ENV = new frame
-    // M100: prog (one pointer) replaces {body,pool} -- %rcx is free here
-    // (last held .Lapply_sentinel_ir's address, already written above).
+    movq %rax, %rdi
     movq ASNIX_CLOSURE_OFF_PROG(%rbx), %rcx
-    movq ASNIX_IRPROG_OFF_POOL(%rcx), %r13 // POOL = the callee's own pool, not any caller's
-    movq ASNIX_IRPROG_OFF_OPS(%rcx), %rsi  // IP = closure body
+    movq ASNIX_IRPROG_OFF_POOL(%rcx), %r13
+    movq ASNIX_IRPROG_OFF_OPS(%rcx), %rsi
     movq (%rsi), %rax
     jmp *%rax
 
 asnix_apply_epilogue:
-    movq -8(%r12), %rax                 // result, left on VALSTACK by the closure body's own OP_RET
-    decq asnix_apply_depth(%rip)        // pop -- frees this depth's slot in force_scratch.c's
-                                         // per-depth apply-scratch cache for reuse by the NEXT
-                                         // call that reaches this same depth (the buffers
-                                         // themselves are never freed, only their "in use" status)
-    popq %rcx                           // restore the enclosing context's RETSP limit (pushed
-    movq %rcx, asnix_retsp_limit(%rip)  // last above, so popped first)
-    popq %rcx                           // ditto for the VALSTACK limit
+    movq -8(%r12), %rax
+    decq asnix_apply_depth(%rip)
+    popq %rcx
+    movq %rcx, asnix_retsp_limit(%rip)
+    popq %rcx
     movq %rcx, asnix_valstack_limit(%rip)
     addq $8, %rsp
     popq %r15
@@ -416,3 +208,4 @@ asnix_apply_epilogue:
     movq $ASNIX_MSG_APPLY_TOO_MANY_LEN, %rsi
     jmp asnix_fatal
     .size asnix_apply, . - asnix_apply
+

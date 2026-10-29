@@ -1,19 +1,3 @@
-/*
- * Validates this pass's new builtins (builtins_closure.c, builtins_list2.c,
- * builtins_attrs2.c, builtins_compare.c) through the REAL evaluator
- * (asnix_eval over hand-built IR, via the same call_curried pattern
- * tests/c/test_builtins_misc.c already established) -- not by calling the
- * native C functions directly, since several of these builtins are curried
- * Closure chains (builtins_shared.h's make_curried_native) whose whole
- * point is to be driven by real OP_LAMBDA/OP_CALL/OP_VAR_REF/OP_RET, not a
- * hand-rolled args array. Every expected value below was independently
- * checked against a real `nix-instantiate --eval` -- see
- * tests/e2e/m18_*.nix/.expected for the on-disk equivalents and
- * builtins_closure.c/builtins_list2.c/builtins_attrs2.c/builtins_compare.c's
- * own per-builtin comments for the exact commands run. genericClosure in
- * particular gets its own dedicated fixture here (fixture_genericClosure)
- * since it was the milestone's flagship cut-and-now-implemented feature.
- */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -42,9 +26,6 @@ static int failures = 0;
     } while (0)
 
 static Env *root_env(void) {
-    /* M118: Env.up is a dedicated-arena-relative compressed offset --
-     * must come from the real allocator, not a hand-rolled general-
-     * arena alloc. */
     return asnix_env_alloc(NULL, 0);
 }
 
@@ -56,10 +37,6 @@ static Value lookup(const AsnixBuiltinMiscDef *table, size_t count, const char *
     exit(1);
 }
 
-/* Applies `fn` to `args[0..n-1]` one at a time via REAL OP_CALL dispatch --
- * identical to test_builtins_misc.c's call_curried, works uniformly
- * whether `fn` is a plain arity-1 PrimOp or the outermost Closure of a
- * make_curried_native chain. */
 static Value call_curried(Value fn, const Value *args, int64_t n) {
     Env *root = asnix_env_alloc(NULL, 1);
     root->values[0] = fn;
@@ -111,39 +88,25 @@ static void check_string(Value v, const char *want, const char *msg) {
     if (!ok) fprintf(stderr, "  got:  \"%.*s\"\n  want: \"%s\"\n", (int)len, bytes, want);
 }
 
-/* `a: b: a - b`, two nested arity-1 closures -- exactly how every curried
- * user lambda compiles (same idiom as test_builtins_list.c's
- * make_add_closure) -- used as foldl/foldr's operator. NOT a self-
- * capturing native PrimOp (the way builtins_list.c's own curry stages
- * are): builtins_list2.c's foldl/foldr call the user-supplied `op` via
- * asnix_bshared_apply2, which goes through asnix_apply -- and
- * asnix_apply's PrimOp path does NOT preserve the "args[-1] is my own
- * PrimOp Value" invariant the self-capture trick relies on (see
- * builtins_list.c's own header comment: that trick is only ever used on
- * builtins_list.c's *own* curry stages, reached exclusively via ordinary
- * OP_CALL, never via asnix_apply) -- a real Closure has no such
- * requirement and is what this is testing anyway. */
 static Value make_sub_op(void) {
     IrBuilder *inner = ib_new();
-    ib_var_ref(inner, 1, 0); /* a, one frame up */
-    ib_var_ref(inner, 0, 0); /* b, this frame */
+    ib_var_ref(inner, 1, 0);
+    ib_var_ref(inner, 0, 0);
     ib_sub(inner);
     ib_ret(inner);
     IrProgram *inner_prog = ib_finish(inner);
 
     IrBuilder *outer = ib_new();
-    ib_lambda(outer, 1, inner_prog, 0); /* formals: unused by this test */
+    ib_lambda(outer, 1, inner_prog, 0);
     ib_ret(outer);
     IrProgram *outer_prog = ib_finish(outer);
 
     IrBuilder *top = ib_new();
-    ib_lambda(top, 1, outer_prog, 0); /* formals: unused by this test */
+    ib_lambda(top, 1, outer_prog, 0);
     ib_halt(top);
     return asnix_eval(ib_finish(top), root_env());
 }
 
-/* elem x [1 2 3] -- verified against `builtins.elem 2 [1 2 3]` == true,
- * `builtins.elem 5 [1 2 3]` == false. */
 static void fixture_elem(void) {
     Value elem = lookup(ASNIX_LIST2_BUILTINS, ASNIX_LIST2_BUILTINS_COUNT, "elem");
     int64_t ints[3] = { 1, 2, 3 };
@@ -154,7 +117,6 @@ static void fixture_elem(void) {
     check_bool(call_curried(elem, a2, 2), 0, "elem 5 [1 2 3] == false");
 }
 
-/* sort builtins.lessThan [3 1 2] -- verified == [1 2 3]. */
 static void fixture_sort(void) {
     Value sort = lookup(ASNIX_LIST2_BUILTINS, ASNIX_LIST2_BUILTINS_COUNT, "sort");
     Value lessThan = lookup(ASNIX_COMPARE_BUILTINS, ASNIX_COMPARE_BUILTINS_COUNT, "lessThan");
@@ -168,9 +130,6 @@ static void fixture_sort(void) {
     CHECK(list_elem_int(v, 2) == 3, "sort elem 2 == 3");
 }
 
-/* foldl (a: b: a - b) 0 [1 2 3] == -6; foldr (a: b: a - b) 0 [1 2 3] == 2
- * -- both verified against real `lib.foldl`/`lib.foldr` (plain foldl/foldr
- * aren't core Nix builtins, see builtins_list2.c's header comment). */
 static void fixture_foldl_foldr(void) {
     Value foldl = lookup(ASNIX_LIST2_BUILTINS, ASNIX_LIST2_BUILTINS_COUNT, "foldl");
     Value foldr = lookup(ASNIX_LIST2_BUILTINS, ASNIX_LIST2_BUILTINS_COUNT, "foldr");
@@ -184,14 +143,11 @@ static void fixture_foldl_foldr(void) {
     check_int(call_curried(foldr, rargs, 3), 2, "foldr (a: b: a - b) 0 [1 2 3] == 2");
 }
 
-/* `x: x > 2` as a native arity-1 predicate, standing in for a user lambda
- * -- used by partition below. */
 static Value gt2_pred(const Value *args, int64_t argc) {
     (void)argc;
     return asnix_int_value(args[0]) > 2 ? ASNIX_TRUE : ASNIX_FALSE;
 }
 
-/* partition (x: x > 2) [1 2 3 4] == { right = [3 4]; wrong = [1 2]; }. */
 static void fixture_partition(void) {
     Value partition = lookup(ASNIX_LIST2_BUILTINS, ASNIX_LIST2_BUILTINS_COUNT, "partition");
     int64_t ints[4] = { 1, 2, 3, 4 };
@@ -212,22 +168,6 @@ static void fixture_partition(void) {
           "partition wrong == [1 2]");
 }
 
-/* --- genericClosure -----------------------------------------------------
- * builtins.genericClosure {
- *   startSet = [ { key = 1; } ];
- *   operator = item:
- *     if item.key == 1 then [ {key=2;} {key=3;} ]
- *     else if item.key == 2 then [ {key=4;} ]
- *     else if item.key == 3 then [ {key=5;} ]
- *     else [];
- * }
- * == [ {key=1;} {key=2;} {key=3;} {key=4;} {key=5;} ] -- verified against
- * real `nix-instantiate --eval` (breadth-first order, not depth-first --
- * see builtins_closure.c's header comment). The branching `operator`
- * above is stood in for by a native C predicate (test_operator below),
- * same "native function in place of a hand-written Nix lambda" idiom
- * test_builtins_list.c already uses for map/filter's callbacks.
- * ------------------------------------------------------------------------ */
 static Value make_key_item(uint32_t sym_key, int64_t key) {
     uint32_t syms[1] = { sym_key };
     Value vals[1] = { asnix_make_int(key) };
@@ -278,10 +218,6 @@ static void fixture_genericClosure(void) {
     }
 }
 
-/* genericClosure dedup: operator re-returning an already-seen key (from
- * startSet itself) must not re-add or re-visit it -- verified:
- * startSet=[{key=1;}{key=2;}], operator always returns [{key=1;}{key=3;}]
- * => [ {key=1;} {key=2;} {key=3;} ] (only 3 elements, not 4+). */
 static Value test_operator_dup(const Value *args, int64_t argc) {
     (void)argc, (void)args;
     uint32_t sym_key = asnix_intern("key", 3);
@@ -305,9 +241,6 @@ static void fixture_genericClosure_dedup(void) {
     CHECK(list_count_of(result) == 3, "genericClosure dedup result has exactly 3 elements");
 }
 
-/* splitVersion / compareVersions -- see builtins_compare.c for the
- * ported-from-source algorithm and the exact nix-instantiate commands
- * these numbers come from. */
 static void fixture_versions(void) {
     Value splitVersion = lookup(ASNIX_COMPARE_BUILTINS, ASNIX_COMPARE_BUILTINS_COUNT, "splitVersion");
     Value v = call_curried(splitVersion, (Value[]){ str("1pre") }, 1);
@@ -324,8 +257,6 @@ static void fixture_versions(void) {
               "compareVersions \"1.0\" \"1\" == 1");
 }
 
-/* replaceStrings [""] ["X"] "ab" == "XaXbX" -- the trickiest edge case
- * (empty `from` entry), verified against real `nix-instantiate --eval`. */
 static void fixture_replaceStrings(void) {
     Value replaceStrings = lookup(ASNIX_COMPARE_BUILTINS, ASNIX_COMPARE_BUILTINS_COUNT, "replaceStrings");
     IrBuilder *b = ib_new();
@@ -344,9 +275,6 @@ static void fixture_replaceStrings(void) {
     check_string(v, "XaXbX", "replaceStrings [\"\"] [\"X\"] \"ab\" == \"XaXbX\"");
 }
 
-/* listToAttrs [{name="foo";value=123;} {name="bar";value=456;}
- *              {name="bar";value=420;}] == { bar=456; foo=123; } --
- * first occurrence of a duplicate name wins. */
 static void fixture_listToAttrs(void) {
     Value listToAttrs = lookup(ASNIX_ATTRS2_BUILTINS, ASNIX_ATTRS2_BUILTINS_COUNT, "listToAttrs");
     uint32_t sym_name = asnix_intern("name", 4);
@@ -375,8 +303,6 @@ static void fixture_listToAttrs(void) {
     check_int(asnix_bshared_attrs_value(result, idx), 456, "listToAttrs 'bar' == 456 (first occurrence wins)");
 }
 
-/* attrByPath ["a" "b"] 99 { a = { b = 42; }; } == 42;
- * attrByPath ["a" "b"] 99 { a = {}; } == 99 (missing -> default). */
 static void fixture_attrByPath(void) {
     Value attrByPath = lookup(ASNIX_ATTRS2_BUILTINS, ASNIX_ATTRS2_BUILTINS_COUNT, "attrByPath");
     uint32_t sym_a = asnix_intern("a", 1);
@@ -400,7 +326,7 @@ static void fixture_attrByPath(void) {
               "attrByPath [\"a\" \"b\"] 99 {a={b=42;};} == 42");
 
     uint32_t sa2[1] = { sym_a };
-    Value va2[1] = { asnix_bshared_make_attrs(NULL, NULL, 0) }; /* {} -- count 0, arrays never read */
+    Value va2[1] = { asnix_bshared_make_attrs(NULL, NULL, 0) };
     Value outer2 = asnix_bshared_make_attrs(sa2, va2, 1);
     check_int(call_curried(attrByPath, (Value[]){ path, asnix_make_int(99), outer2 }, 3), 99,
               "attrByPath [\"a\" \"b\"] 99 {a={};} == 99 (default)");
@@ -425,3 +351,4 @@ int main(void) {
     printf("test_builtins_m18: all checks passed\n");
     return 0;
 }
+

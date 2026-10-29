@@ -1,30 +1,3 @@
-// M118: dedicated, bounded arena for Env objects only, enabling Env.up to
-// be stored as a 32-bit offset instead of a 64-bit pointer (env.h).
-// Deliberately SEPARATE from the general, unbounded asnix_arena
-// (arena.S): a compressed offset is only valid if every object it can
-// ever address lives inside ONE bounded, contiguous region, and the
-// general arena's repeated, address-unconstrained mmap() growth (its
-// .Lgrow path) gives no such guarantee -- successive chunks can land
-// anywhere, with no promise of contiguity between them. This arena
-// never grows past its single upfront reservation: a hard, generously-
-// sized cap (ASNIX_ENV_ARENA_SIZE, env.h), not a soft/advisory limit.
-//
-// Unlike the general arena, this one does NOT round allocations up to
-// the next multiple of 8: Env is never itself a tagged Value (unlike
-// every OTHER heap kind that goes through asnix_arena_alloc), so it
-// never needs Value.raw's 3 free low tag bits -- the only thing that
-// ever needs ANY free low bits on an Env address is env.h's own
-// ASNIX_ENV_WITH_TAG (one bit). Rounding to 4 instead of 8 is what lets
-// Env.up's compression actually shrink Env's total allocated size
-// instead of being clawed straight back by rounding, the same way a
-// naive reuse of the general arena's own round_up_8 would (see
-// docs/architecture.md's M118 section for the exact arithmetic -- this
-// is the fix for the blind spot M117's first pass missed).
-//
-// Lazily self-initializes on first call (checked via the bump cursor
-// being exactly 0, which it only ever is before the one-time mmap) so
-// no caller anywhere -- production or test -- needs to remember to
-// call an explicit init function before the first Env allocation.
 #include "asnix/arena.h"
 #include "asnix/env.h"
 
@@ -47,8 +20,7 @@ asnix_env_arena_base:
 
     .align 8
 asnix_env_arena_cur:
-    .quad 0                              // 0 until the first-ever alloc -- doubles as the
-                                          // lazy-init check below
+    .quad 0
     .size asnix_env_arena_cur, 8
 
     .align 8
@@ -68,40 +40,39 @@ asnix_env_arena_end:
 
     .globl asnix_env_arena_alloc
     .type asnix_env_arena_alloc, @function
-asnix_env_arena_alloc:                  // void *asnix_env_arena_alloc(uint64_t n) -- round_up_4, bounded
+asnix_env_arena_alloc:
     .cfi_startproc
     leaq asnix_env_arena_cur(%rip), %rax
     movq (%rax), %rcx
     testq %rcx, %rcx
     jnz .Lenv_arena_ready
 
-    pushq %rdi                          // save n across the one-time lazy-init call
+    pushq %rdi
     call asnix_env_arena_do_init
     popq %rdi
 
 .Lenv_arena_ready:
     addq $3, %rdi
-    andq $-4, %rdi                      // n4 = round_up_4(n)
+    andq $-4, %rdi
     leaq asnix_env_arena_cur(%rip), %rax
-    movq (%rax), %rcx                   // rcx = cur (re-read: do_init may have just set it)
-    leaq (%rcx, %rdi), %rdx             // rdx = cur + n4
+    movq (%rax), %rcx
+    leaq (%rcx, %rdi), %rdx
     leaq asnix_env_arena_end(%rip), %rsi
     cmpq (%rsi), %rdx
     ja .Lenv_arena_abort_cap
-    movq %rdx, (%rax)                   // cur = cur + n4
-    movq %rcx, %rax                     // return old cur
+    movq %rdx, (%rax)
+    movq %rcx, %rax
     ret
 .Lenv_arena_abort_cap:
     leaq .Lmsg_cap(%rip), %rdi
     movq $ASNIX_MSG_CAP_LEN, %rsi
-    jmp asnix_fatal                     // never returns; no stack cleanup needed
+    jmp asnix_fatal
     .cfi_endproc
     .size asnix_env_arena_alloc, . - asnix_env_arena_alloc
 
     .type asnix_env_arena_do_init, @function
-asnix_env_arena_do_init:                // internal, called exactly once (from asnix_env_arena_alloc)
+asnix_env_arena_do_init:
     .cfi_startproc
-    // mmap(NULL, ASNIX_ENV_ARENA_SIZE, PROT_READ|WRITE, MAP_PRIVATE|ANON|NORESERVE, -1, 0)
     xorq %rdi, %rdi
     movq $ASNIX_ENV_ARENA_SIZE, %rsi
     movq $(ASNIX_PROT_READ | ASNIX_PROT_WRITE), %rdx
@@ -113,26 +84,12 @@ asnix_env_arena_do_init:                // internal, called exactly once (from a
     testq %rax, %rax
     jl .Lenv_arena_abort_mmap
 
-    // asnix_huge_pages_available() -- gate the hint below on this, same
-    // reason and same helper as arena.S's own general-arena fix (see
-    // that file's own comment): avoid ever hinting MADV_HUGEPAGE when
-    // the kernel has no free 2 MiB+ block, which under defrag=madvise
-    // would otherwise be assembled by synchronous compaction at fault
-    // time. rax (the mmap result) must survive the call.
     pushq %rax
     call asnix_huge_pages_available
     popq %rax
     testl %eax, %eax
     jz .Lno_env_hugepage_hint
 
-    // madvise(base, ASNIX_ENV_ARENA_SIZE, MADV_HUGEPAGE) -- same hint and
-    // same rationale as arena.S's own general-arena fix: this kernel's
-    // transparent_hugepage/enabled is "madvise", not "always", so this
-    // 1 GiB NORESERVE reservation -- backing EVERY Env object this
-    // evaluator ever allocates -- would otherwise fault in one 4 KiB
-    // page at a time as the bump cursor advances, instead of one 2 MiB
-    // page per 512 Envs. Return value ignored (hint only); rax (the
-    // mmap result, needed right below) must survive the syscall.
     pushq %rax
     movq %rax, %rdi
     movq $ASNIX_ENV_ARENA_SIZE, %rsi
@@ -144,9 +101,6 @@ asnix_env_arena_do_init:                // internal, called exactly once (from a
 .Lno_env_hugepage_hint:
     leaq asnix_env_arena_base(%rip), %rcx
     movq %rax, (%rcx)
-    // cur starts at base+8, not base+0, so a stored offset of 0 can
-    // always mean NULL unambiguously, never a real (if coincidental)
-    // allocation at the arena's very first byte.
     addq $8, %rax
     leaq asnix_env_arena_cur(%rip), %rcx
     movq %rax, (%rcx)
@@ -158,6 +112,7 @@ asnix_env_arena_do_init:                // internal, called exactly once (from a
 .Lenv_arena_abort_mmap:
     leaq .Lmsg_mmap(%rip), %rdi
     movq $ASNIX_MSG_MMAP_LEN, %rsi
-    jmp asnix_fatal                     // never returns; no stack cleanup needed
+    jmp asnix_fatal
     .cfi_endproc
     .size asnix_env_arena_do_init, . - asnix_env_arena_do_init
+

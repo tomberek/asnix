@@ -1,11 +1,4 @@
-/*
- * seq, deepSeq, pathExists, readFile, readFileType, readDir, toPath,
- * getEnv, intersectAttrs, groupBy -- see builtins_m23.h. Verified
- * against real `nix-instantiate --eval` (2.35.2) before being trusted;
- * see each function's own comment for the specific expressions checked.
- */
-#define _DEFAULT_SOURCE /* lstat() is POSIX, not C11 -- same feature-test macro
-                          * eval_file.c's own realpath() needs under -std=c11 */
+#define _DEFAULT_SOURCE
 #include "builtins_m23.h"
 
 #include <ctype.h>
@@ -24,31 +17,6 @@
 #include "symtab.h"
 #include "value_util.h"
 
-/* ---------------------------------------------------------------------
- * seq/deepSeq -- `seq e1 e2` forces e1 (shallow -- if it's a thunk,
- * evaluate it; its own nested fields stay lazy) then returns e2 (also
- * only shallow-forced, matching real Nix's `prim_seq`:
- * `state.forceValue(*args[0]); state.forceValue(*args[1]); v = *args[1];`
- * -- NOT deep on either side). `deepSeq e1 e2` instead walks e1
- * recursively (into every list element / attrset value), matching real
- * Nix's `forceValueDeep`, but still only shallow-forces e2. Verified:
- * `builtins.seq (abort "x") 1` aborts (e1 is forced); `builtins.seq { a
- * = abort "x"; } 1` does NOT abort (only the outer set is forced, not
- * its fields) -- `builtins.deepSeq { a = abort "x"; } 1` DOES abort.
- *
- * deepSeq's recursion needs cycle detection: real Nix's own
- * `forceValueDeep` keeps a `seen` set specifically because a self-
- * referential value (`let as = { x = 123; y = as; }; in as`) is legal,
- * lazy Nix and must not infinite-loop just because `deepSeq` walks it
- * (numtide/nix-conformance's eval-okay-deepseq.nix tests exactly this).
- * This version dedups by the forced heap-object pointer identity
- * (Attrs/List address) rather than real Nix's by-Value-slot-address
- * scheme (a different but equally correct mechanism given asnix's
- * value model: `y`'s thunk forces to the *same* Attrs pointer as the
- * outer value being walked, so pointer-identity dedup catches the cycle
- * the first time that pointer is seen a second time). Not hot-path, so
- * a plain linear-scan growable array is fine (test fixtures are tiny).
- * --------------------------------------------------------------------- */
 typedef struct {
     const void **items;
     size_t len, cap;
@@ -71,7 +39,7 @@ static void deep_force_rec(Value v, PtrSet *seen) {
     int tag = asnix_tag_of(v);
     if (tag != ASNIX_TAG_ATTRS && tag != ASNIX_TAG_LIST) return;
     const void *ptr = (const void *)(uintptr_t)(v.raw & ~(uint64_t)ASNIX_TAG_MASK);
-    if (ptrset_contains_or_add(seen, ptr)) return; /* already visited this object -- a cycle */
+    if (ptrset_contains_or_add(seen, ptr)) return;
     if (tag == ASNIX_TAG_ATTRS) {
         int64_t n = asnix_bshared_attrs_count(v);
         for (int64_t i = 0; i < n; i++) deep_force_rec(asnix_bshared_attrs_value(v, i), seen);
@@ -98,18 +66,8 @@ static Value deepSeq2_impl(const Value *args, int64_t argc) {
 }
 static Value build_deepSeq(void) { return asnix_bshared_make_curried_native((void *)deepSeq2_impl, 2); }
 
-/* ---------------------------------------------------------------------
- * Filesystem path resolution shared by pathExists/readFile/readFileType/
- * readDir/toPath: accepts a Path, an absolute-path String, or anything
- * asnix_coerce_to_string's __toString/outPath protocol can turn into one
- * (same acceptance rule prim_import, builtins.c, already established) --
- * fatal on anything else or a non-absolute string, matching real Nix's
- * own wording for this exact situation (verified: `nix-instantiate --eval
- * -E 'builtins.toPath "foo/bar"'` -> "string 'foo/bar' doesn't represent
- * an absolute path"). Returns a NUL-terminated, arena-owned C string.
- * --------------------------------------------------------------------- */
 static char *resolve_fs_path(Value v, const char *who) {
-    Value coerced = asnix_coerce_to_string(v); /* fatal on anything uncoercible */
+    Value coerced = asnix_coerce_to_string(v);
     int64_t len;
     const char *bytes = asnix_ptr_bytes(coerced, &len);
     if (len == 0 || bytes[0] != '/') {
@@ -122,16 +80,6 @@ static char *resolve_fs_path(Value v, const char *who) {
     return path;
 }
 
-/* `builtins.pathExists p` -- real Nix's one wrinkle: when `p` is a
- * String ending in "/" or "/." it must resolve to a DIRECTORY
- * specifically (not just exist), using a symlink-following `stat`;
- * otherwise plain `lstat` (so a *broken* symlink still counts as
- * "exists", matching real Nix -- verified via numtide/nix-conformance's
- * eval-okay-symlink-resolution fixtures, e.g. `pathExists
- * ./symlink-resolution/broken` => true even though the link's target
- * doesn't exist). Never fatal on a missing path -- only on an
- * uncoercible/non-absolute argument, same as every other path builtin
- * here. */
 static Value prim_pathExists(const Value *args, int64_t argc) {
     (void)argc;
     Value v = asnix_force_for_print(args[0]);
@@ -153,11 +101,6 @@ static Value prim_pathExists(const Value *args, int64_t argc) {
     return asnix_make_imm(exists ? ASNIX_IMM_TRUE : ASNIX_IMM_FALSE);
 }
 
-/* Shared by readFile/hashFile: reads the whole file at `path` into a
- * freshly malloc'd buffer (caller frees), fatal on any failure --
- * same ftell()==-1-on-a-directory defensive check eval_file.c's own
- * read_file() already established (a directory "succeeds" opening via
- * fopen on Linux but can't seek). */
 static char *read_whole_file(const char *path, const char *who, size_t *out_len) {
     FILE *f = fopen(path, "rb");
     if (!f) {
@@ -178,9 +121,6 @@ static char *read_whole_file(const char *path, const char *who, size_t *out_len)
     return buf;
 }
 
-/* `builtins.readFile p` -- fatal if the file can't be opened/read
- * (matching real Nix's hard error on a missing file, unlike
- * pathExists). */
 static Value prim_readFile(const Value *args, int64_t argc) {
     (void)argc;
     char *path = resolve_fs_path(args[0], "readFile");
@@ -198,11 +138,6 @@ static const char *stat_type_str(const struct stat *st) {
     return "unknown";
 }
 
-/* `builtins.readFileType p` -- uses `lstat` (does NOT follow the final
- * symlink component -- a symlink reports "symlink" regardless of its
- * target's type, verified: numtide/nix-conformance's
- * eval-okay-readFileType.nix expects both a symlink-to-a-file and a
- * symlink-to-a-directory to report "symlink", not their targets' types). */
 static Value prim_readFileType(const Value *args, int64_t argc) {
     (void)argc;
     char *path = resolve_fs_path(args[0], "readFileType");
@@ -215,28 +150,6 @@ static Value prim_readFileType(const Value *args, int64_t argc) {
     return asnix_make_string_value(kind, strlen(kind));
 }
 
-/* `builtins.readDir p` -- an attrset of directory-entry-name -> file-type
- * string (same four strings as readFileType, same lstat-not-following
- * convention for each entry). `.`/`..` are skipped, matching real Nix.
- *
- * Perf (found via `strace -c`: 23392 of a real nixpkgs ffmpeg closure's
- * 25389 total newfstatat/lstat calls -- 92% -- traced directly to this
- * loop's unconditional per-entry lstat, driven by nixpkgs's
- * pkgs/top-level/by-name-overlay.nix doing a two-level `readDir` over
- * ~759 shard dirs and ~20000+ package dirs under pkgs/by-name): `readdir`
- * already returns `d_type` (populated straight from the `getdents64`
- * buffer on any filesystem that supports it -- ext4/btrfs/xfs/tmpfs/
- * overlayfs, i.e. everything a Nix store normally lives on) for FREE, no
- * extra syscall. Trust it when it's not DT_UNKNOWN: DT_DIR/DT_REG/DT_LNK
- * map directly to the same three non-"unknown" strings stat_type_str
- * would've produced from an lstat of the same entry (device/fifo/socket
- * entries -- DT_BLK/DT_CHR/DT_FIFO/DT_SOCK -- map to "unknown" the same
- * way stat_type_str's own S_ISDIR/S_ISREG/S_ISLNK-only checks already
- * did, so this is not a behavior change, just skipping a redundant
- * syscall). Only fall back to the old lstat path when d_type genuinely
- * can't tell us (DT_UNKNOWN -- some filesystems/FUSE mounts never
- * populate it), so this is correct on every filesystem, just faster on
- * the common ones. */
 static Value prim_readDir(const Value *args, int64_t argc) {
     (void)argc;
     char *path = resolve_fs_path(args[0], "readDir");
@@ -265,7 +178,7 @@ static Value prim_readDir(const Value *args, int64_t argc) {
                 free(entpath);
                 break;
             }
-            default: kind = "unknown"; break; /* DT_BLK/DT_CHR/DT_FIFO/DT_SOCK */
+            default: kind = "unknown"; break;
         }
         if (n == cap) {
             cap = cap ? cap * 2 : 16;
@@ -283,10 +196,6 @@ static Value prim_readDir(const Value *args, int64_t argc) {
     return result;
 }
 
-/* `builtins.toPath p` -- DEPRECATED even in real Nix (its own docs say
- * so): despite the name, it returns a plain STRING (not a Path value),
- * just the resolved absolute-path text -- verified: `builtins.typeOf
- * (builtins.toPath "/foo/bar")` => "string", not "path". */
 static Value prim_toPath(const Value *args, int64_t argc) {
     (void)argc;
     Value coerced = asnix_coerce_to_string(args[0]);
@@ -299,11 +208,6 @@ static Value prim_toPath(const Value *args, int64_t argc) {
     return asnix_make_string_value(bytes, (size_t)len);
 }
 
-/* `builtins.getEnv name` -- real Nix gates this behind pure-eval mode
- * (erroring instead of reading the real environment); asnix has no such
- * mode, so this always reads the real environment, matching the
- * `--impure`/default-mode behavior. Empty string if unset, matching
- * real Nix either way. */
 static Value prim_getEnv(const Value *args, int64_t argc) {
     (void)argc;
     ASNIX_REQUIRE_STRING(args[0], "getEnv");
@@ -317,12 +221,6 @@ static Value prim_getEnv(const Value *args, int64_t argc) {
     return asnix_make_string_value(val, strlen(val));
 }
 
-/* `builtins.hashFile algo path` -- reads the whole file then hashes it,
- * same four algorithms and hex encoding as `builtins.hashString`
- * (hash_shim.h) -- deliberately NOT sharing builtins.c's own hashString
- * dispatch code (that file's `hash_apply` takes an in-memory string, not
- * a filesystem path), but using the exact same underlying
- * asnix_hash_md5/sha1/sha256/sha512 + asnix_hash_to_hex primitives. */
 static Value hashFile_apply(const char *path, int64_t (*hash_fn)(const void *, size_t, unsigned char *),
                              size_t raw_len) {
     size_t len;
@@ -360,30 +258,6 @@ static Value hashFile2_impl(const Value *args, int64_t argc) {
 }
 static Value build_hashFile(void) { return asnix_bshared_make_curried_native((void *)hashFile2_impl, 2); }
 
-/* ---------------------------------------------------------------------
- * intersectAttrs e1 e2 -- the subset of e2 whose NAMES also appear in
- * e1, keeping e2's (still-lazy) values -- e1's values are never forced,
- * only its attribute *names* are consulted (verified:
- * numtide/nix-conformance's eval-okay-intersectAttrs.nix deliberately
- * fills e1 with `abort`-valued entries to check exactly this).
- *
- * M86 perf: always walking e2 while binary-searching into e1 (the
- * previous approach) is O(n2 log n1) -- fine when both sides are small,
- * but real nixpkgs's `callPackageWith autoArgs f args` evaluates
- * `intersectAttrs (functionArgs f) autoArgs` for every `callPackage`
- * call, where e1 (a function's formal-argument names) is tiny (single
- * digits to a few dozen) and e2 (autoArgs, effectively the whole `pkgs`
- * set) is tens of thousands of entries. Profiling `./asnix d.nix`
- * (ffmpeg.outPath) found this one function responsible for ~18% of
- * total cycles, almost entirely inside calls with n2=28189 (nixpkgs's
- * actual top-level package count). Walking whichever side is SMALLER
- * and binary-searching into the other is O(min(n1,n2) log max(n1,n2))
- * instead -- for the real callPackage shape that's ~20 * log2(28189)
- * instead of 28189 * log2(20), a ~400x reduction in binary-search
- * steps for that call shape. Correct regardless of which side is
- * walked: both inputs are sorted by symbol id, so walking either one
- * in order yields an output already sorted by symbol id (no re-sort
- * needed), and the emitted value always comes from e2 either way. */
 Value asnix_prim_intersectAttrs2_impl(const Value *args, int64_t argc) {
     (void)argc;
     Value e1 = args[0], e2 = args[1];
@@ -415,7 +289,7 @@ Value asnix_prim_intersectAttrs2_impl(const Value *args, int64_t argc) {
             }
         }
     }
-    Value result = asnix_bshared_make_attrs(syms, vals, out_n); /* already sorted -- re-sort is a cheap no-op */
+    Value result = asnix_bshared_make_attrs(syms, vals, out_n);
     free(syms);
     free(vals);
     return result;
@@ -424,34 +298,6 @@ static Value build_intersectAttrs(void) {
     return asnix_bshared_make_curried_native((void *)asnix_prim_intersectAttrs2_impl, 2);
 }
 
-/* ---------------------------------------------------------------------
- * groupBy f list -- buckets `list`'s elements by `f elem` (which must
- * force to a string -- real Nix: "value is $type while a string was
- * expected"), preserving each bucket's original relative order.
- * Verified: `builtins.groupBy (n: if n < 0 then "neg" else "pos") [ -1 2
- * -3 4 ]` == `{ neg = [ -1 -3 ]; pos = [ 2 4 ]; }`.
- *
- * perf: below ASNIX_GROUPBY_HASH_MIN, a plain linear bucket-search is
- * fine (and faster than hashing, same small-N reasoning as
- * attrs_find_flat_noresolve's <=8 linear-scan threshold and
- * asnix_bshared_make_attrs's/json_encode_attrs_ctx's 32-entry stack-
- * array thresholds elsewhere in this codebase) -- most real groupBy
- * calls carry only a handful of items. This WAS an unconditional
- * O(n * distinct-keys) scan with no size-based escape valve (the
- * previous version of this comment called it "not hot-path" and
- * assumed that was fine for every real call); a real profile of
- * plasma-system-eval.nix found one single call with n=5234 and nearly
- * all-distinct keys -- consistent with nixpkgs's own
- * lib.tests.maintainers-style whole-list duplicate-field check
- * (`groupBy (m: toString m.githubId) nixpkgs-maintainers-list`, keyed
- * on each maintainer's near-unique numeric GitHub ID) -- costing
- * ~13M wasted scan iterations and ~0.6-0.7% of total self-time on both
- * `ll` and `asnix`. Above the threshold, an open-addressing hash index
- * (keyed on the already-interned `sym`, sized once from `n` -- an
- * upper bound on the eventual distinct-key count known before the loop
- * starts, so no incremental grow is needed) gives O(1)-average lookup
- * instead, the same bug class and same style of fix as
- * prim_genericClosure's own O(n^2)-dedup-scan fix. */
 #define ASNIX_GROUPBY_HASH_MIN 32
 
 typedef struct {
@@ -471,7 +317,7 @@ static Value groupBy2_impl(const Value *args, int64_t argc) {
 
     int use_hash = n > ASNIX_GROUPBY_HASH_MIN;
     size_t hcap = 0;
-    uint32_t *hsym = NULL;  /* hcap entries, parallel to hused/hbucket */
+    uint32_t *hsym = NULL;
     size_t *hbucket = NULL;
     uint8_t *hused = NULL;
     if (use_hash) {
@@ -555,17 +401,6 @@ static Value groupBy2_impl(const Value *args, int64_t argc) {
 }
 static Value build_groupBy(void) { return asnix_bshared_make_curried_native((void *)groupBy2_impl, 2); }
 
-/* `builtins.parseDrvName s` -- splits a derivation-name-style string
- * into `{ name; version; }`, ported directly from real Nix's own
- * `DrvName::DrvName` (~/nix/src/libstore/names.cc): the split point is
- * the FIRST '-' immediately followed by a non-letter (not just any
- * '-'), so "xf86-video-i810-1.7.4" splits at the dash before "1.7.4"
- * (the two earlier dashes are followed by letters, so skipped), and a
- * doubled "--" splits at the FIRST of the pair (since '-' itself isn't
- * a letter) -- verified against every case in numtide/nix-conformance's
- * eval-okay-versions.nix, including the "name-that-ends-with-dash--1.0"
- * edge case (=> name "name-that-ends-with-dash", version "-1.0"). No
- * matching dash at all means the whole string is the name, version "". */
 static Value prim_parseDrvName(const Value *args, int64_t argc) {
     (void)argc;
     ASNIX_REQUIRE_STRING(args[0], "parseDrvName");
@@ -588,24 +423,9 @@ static Value prim_parseDrvName(const Value *args, int64_t argc) {
     }
     uint32_t syms[2] = { asnix_intern("name", 4), asnix_intern("version", 7) };
     Value vals[2] = { name_val, version_val };
-    /* order doesn't matter -- asnix_bshared_make_attrs sorts by sym id */
     return asnix_bshared_make_attrs(syms, vals, 2);
 }
 
-/* `builtins.add`/`sub`/`mul`/`div` -- plain two-argument arithmetic,
- * exposed as builtins (distinct from the `+`/`-`/`*`/`/` *operators*,
- * which compile to IR ops directly -- see compiler.c/op_arith.S). M51:
- * now shares the exact same int/float promotion rule the operators use
- * (asnix_add_values/asnix_sub_values/asnix_mul_values/asnix_div_values,
- * value_util.c) rather than being INT-only -- verified against
- * `nix-instantiate --eval`: `builtins.add 2.0 2` => 4 (and
- * `builtins.typeOf (builtins.add 2.0 2)` => "float"), matching real
- * Nix's own `prim_add`/`prim_sub`/`prim_mul`/`prim_div`
- * (~/nix/src/libexpr/primops.cc), which promote exactly the same way
- * `+`/`-`/`*`/`/` do -- these are not two independently-scoped features.
- * The all-int fast path asnix_add_values/etc. themselves keep (checked
- * first, before ever considering float) means `builtins.add 2 3` still
- * costs nothing extra over before this milestone. */
 static Value add2_impl(const Value *args, int64_t argc) {
     (void)argc;
     return asnix_add_values(args[0], args[1]);
@@ -620,17 +440,6 @@ static Value sub2_impl(const Value *args, int64_t argc) {
 static Value mul2_impl(const Value *args, int64_t argc) {
     (void)argc;
     if (asnix_tag_of(args[0]) == ASNIX_TAG_INT && asnix_tag_of(args[1]) == ASNIX_TAG_INT) {
-        /* M56: unlike add/sub (operands already bounded to +-2^60, so plain
-         * int64 `+`/`-` can never themselves overflow), two such operands'
-         * *product* genuinely can overflow int64 -- true signed-overflow UB
-         * in C, not just a value asnix_make_int could catch after the fact.
-         * __builtin_mul_overflow computes the product without that UB and
-         * reports it; asnix_make_int (src/asm/value.S) still re-checks the
-         * narrower +-2^60 window for a product that fits in 64 bits but not
-         * that window. M51: a non-int operand (a float) falls through to
-         * asnix_mul_values below instead of this fast, overflow-checked
-         * int-only path -- matching add2/sub2_impl's own int-fast-path-
-         * plus-float-fallback shape just above. */
         int64_t a = asnix_int_value(args[0]), b = asnix_int_value(args[1]), r;
         if (__builtin_mul_overflow(a, b, &r)) {
             fprintf(stderr, "asnix: integer overflow in multiplying %lld * %lld\n", (long long)a, (long long)b);
@@ -671,11 +480,6 @@ const AsnixBuiltinMiscDef ASNIX_M23_BUILTINS[] = {
 
 const size_t ASNIX_M23_BUILTINS_COUNT = sizeof(ASNIX_M23_BUILTINS) / sizeof(ASNIX_M23_BUILTINS[0]);
 
-/* pathExists/readFile/readFileType/readDir/toPath/getEnv are plain
- * arity-1 PrimOps -- registered directly in builtins.c's own BUILTINS[]
- * table (the {name, fn, arity} shape) rather than through this file's
- * {name, build()} table, since they don't need currying. Exposed here
- * for that registration. */
 Value asnix_prim_pathExists(const Value *args, int64_t argc) { return prim_pathExists(args, argc); }
 Value asnix_prim_readFile(const Value *args, int64_t argc) { return prim_readFile(args, argc); }
 Value asnix_prim_readFileType(const Value *args, int64_t argc) { return prim_readFileType(args, argc); }
@@ -683,3 +487,4 @@ Value asnix_prim_readDir(const Value *args, int64_t argc) { return prim_readDir(
 Value asnix_prim_toPath(const Value *args, int64_t argc) { return prim_toPath(args, argc); }
 Value asnix_prim_getEnv(const Value *args, int64_t argc) { return prim_getEnv(args, argc); }
 Value asnix_prim_parseDrvName(const Value *args, int64_t argc) { return prim_parseDrvName(args, argc); }
+

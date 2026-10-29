@@ -2,39 +2,6 @@
 #include "asnix/ir.h"
 #include "asnix/value.h"
 
-// Lambda-patterns (`{a, b ? d, ...}: body`): eager, pre-destructuring
-// validation of the single attrset call argument, matching real Nix's
-// timing exactly (confirmed against `nix-instantiate`: a type mismatch or a
-// missing required field aborts even when the lambda body never reads the
-// bad field; `...` present suppresses only the "unexpected argument" check,
-// not the type/required checks).
-//
-// Pool layout at pool_idx (see ib_check_formals() in irbuild.c):
-//   pool[pool_idx + 0]                                   = total declared-field
-//       count, or -1 if the pattern has `...` (skips phase 2 below)
-//   pool[pool_idx + 1 .. pool_idx + required_count]       = required fields'
-//       symbol ids, sorted ascending (required_count = IrOp.a)
-//   pool[pool_idx + 1 + required_count .. +total_count]   = *every* declared
-//       field's symbol id, sorted ascending (only present/read when `...`
-//       is absent)
-//
-// No heap allocation and no nested `call` happens anywhere in the
-// success path of this handler, so (unlike op_let.S/op_call.S/
-// op_mk_thunk.S) there is no need to save/restore IP(%rsi)/ENV(%rdi)
-// around anything -- every register other than %rsi/%rdi/%r12/%r13/%r14
-// is free scratch for the whole handler body. (M50: the two fatal-only
-// miss paths below now `call` into C to name the specific field -- safe
-// without any IP/ENV save, same as every other fatal-only `call` in this
-// codebase, since the process exits before ever returning.)
-//
-// M88 (lazy `//` union-layering, heap.h) amends the paragraph above: the
-// given attrset's `count` can be NEGATIVE (a UnionHdr, not a flat Attrs)
-// -- resolving it needs a real, non-tail `call` into
-// asnix_bshared_attrs_resolve, so IP/ENV ARE saved/restored around THAT
-// one call (same push/pop pattern op_update.S's call to
-// asnix_attrs_update already uses). This only happens on the union path;
-// the common flat-attrs path below still makes no call at all.
-
     .section .rodata
 .Lmsg_cf_type:
     .ascii "asnix: lambda pattern argument is not a set, aborting\n"
@@ -44,17 +11,17 @@
 
     .globl asnix_op_check_formals
     .type asnix_op_check_formals, @function
-asnix_op_check_formals:                 // a = required_count; b = pool_idx
+asnix_op_check_formals:
     subq $8, %r12
-    movq (%r12), %rax                   // rax = attrs tagged value (popped)
+    movq (%r12), %rax
     movq %rax, %rcx
     andq $ASNIX_TAG_MASK, %rcx
     cmpq $ASNIX_TAG_ATTRS, %rcx
     jne .Lcf_type_error
 
-    movq %rax, %r10                     // r10 = tagged value, kept across the maybe-call below
-    andq $-8, %rax                      // rax = Attrs* (untagged)
-    movq ASNIX_ATTRS_OFF_COUNT(%rax), %rbx     // rbx = given entry count (n) -- maybe negative (M88)
+    movq %rax, %r10
+    andq $-8, %rax
+    movq ASNIX_ATTRS_OFF_COUNT(%rax), %rbx
     testq %rbx, %rbx
     jns .Lcf_resolved
     pushq %rsi
@@ -66,84 +33,78 @@ asnix_op_check_formals:                 // a = required_count; b = pool_idx
     popq %rsi
     movq %r10, %rax
     andq $-8, %rax
-    movq ASNIX_ATTRS_OFF_COUNT(%rax), %rbx     // reload -- now guaranteed non-negative
+    movq ASNIX_ATTRS_OFF_COUNT(%rax), %rbx
 .Lcf_resolved:
-    leaq ASNIX_ATTRS_OFF_ENTRIES(%rax), %rbp   // rbp = given entries base
+    leaq ASNIX_ATTRS_OFF_ENTRIES(%rax), %rbp
 
-    movl ASNIX_IROP_OFF_A(%rsi), %r8d   // r8 = required_count
-    movl ASNIX_IROP_OFF_B(%rsi), %r9d   // r9 = pool_idx
+    movl ASNIX_IROP_OFF_A(%rsi), %r8d
+    movl ASNIX_IROP_OFF_B(%rsi), %r9d
 
-    // ---- Phase 1: every required field must be present among the given
-    // entries (binary search, since the given Attrs is sorted by sym). ----
-    xorq %r10, %r10                     // r10 = i, index into the required-syms pool region
+    xorq %r10, %r10
 .Lcf_req_loop:
     cmpq %r8, %r10
     jge .Lcf_req_done
     movq %r9, %r11
     addq $1, %r11
-    addq %r10, %r11                     // r11 = pool_idx + 1 + i
-    movq (%r13, %r11, 8), %r15          // r15 = required sym to find (persists through the search)
+    addq %r10, %r11
+    movq (%r13, %r11, 8), %r15
 
-    xorq %rcx, %rcx                     // lo = 0
-    movq %rbx, %rdx                     // hi = n
+    xorq %rcx, %rcx
+    movq %rbx, %rdx
 .Lcf_req_bs:
     cmpq %rdx, %rcx
-    jge .Lcf_missing_error              // lo >= hi: not found among given entries
+    jge .Lcf_missing_error
     leaq (%rcx, %rdx), %r11
-    sarq $1, %r11                       // r11 = mid
+    sarq $1, %r11
     movq %r11, %rax
-    imulq $ASNIX_ATTR_SIZE, %rax         // rax = mid * ASNIX_ATTR_SIZE (12 -- not a power of 2)
-    movl ASNIX_ATTR_OFF_SYM(%rbp, %rax, 1), %eax // rax = loaded sym at entries[mid] (zero-extends;
-        // must be 32-bit -- M103 removed the pad word, see heap.h)
+    imulq $ASNIX_ATTR_SIZE, %rax
+    movl ASNIX_ATTR_OFF_SYM(%rbp, %rax, 1), %eax
     cmpq %r15, %rax
     je .Lcf_req_found
     jl .Lcf_req_right
-    movq %r11, %rdx                     // hi = mid
+    movq %r11, %rdx
     jmp .Lcf_req_bs
 .Lcf_req_right:
-    leaq 1(%r11), %rcx                  // lo = mid + 1
+    leaq 1(%r11), %rcx
     jmp .Lcf_req_bs
 .Lcf_req_found:
     incq %r10
     jmp .Lcf_req_loop
 .Lcf_req_done:
 
-    // ---- Phase 2 (skipped when the pattern has `...`): every given entry
-    // must be one of the declared fields. ----
-    movq (%r13, %r9, 8), %rax           // rax = total_count_or_minus1
+    movq (%r13, %r9, 8), %rax
     cmpq $-1, %rax
     je .Lcf_done
-    movq %rax, %r15                     // r15 = total_count (required-sym search is done with it)
+    movq %rax, %r15
     movq %r9, %r10
     addq $1, %r10
-    addq %r8, %r10                      // r10 = allowed-syms pool base index
+    addq %r8, %r10
 
-    xorq %r8, %r8                       // r8 = j, index into given entries (required_count no longer needed)
+    xorq %r8, %r8
 .Lcf_extra_loop:
     cmpq %rbx, %r8
     jge .Lcf_done
     movq %r8, %rax
-    imulq $ASNIX_ATTR_SIZE, %rax         // rax = j * ASNIX_ATTR_SIZE (12 -- not a power of 2)
-    movl ASNIX_ATTR_OFF_SYM(%rbp, %rax, 1), %r11d // r11 = given entries[j]'s sym (persists through
-        // the search; zero-extends, must be 32-bit -- M103 removed the pad word, see heap.h)
+    imulq $ASNIX_ATTR_SIZE, %rax
+    movl ASNIX_ATTR_OFF_SYM(%rbp, %rax, 1), %r11d
 
-    xorq %rcx, %rcx                     // lo = 0
-    movq %r15, %rdx                     // hi = total_count
+    xorq %rcx, %rcx
+    movq %r15, %rdx
 .Lcf_extra_bs:
     cmpq %rdx, %rcx
-    jge .Lcf_extra_error                // lo >= hi: this given key isn't declared
+    jge .Lcf_extra_error
     leaq (%rcx, %rdx), %rax
-    sarq $1, %rax                       // rax = mid
+    sarq $1, %rax
     movq %r10, %r9
-    addq %rax, %r9                      // r9 = allowed_base + mid (index, not yet dereferenced)
-    movq (%r13, %r9, 8), %r9            // r9 = loaded allowed sym
+    addq %rax, %r9
+    movq (%r13, %r9, 8), %r9
     cmpq %r11, %r9
     je .Lcf_extra_found
     jl .Lcf_extra_right
-    movq %rax, %rdx                     // hi = mid
+    movq %rax, %rdx
     jmp .Lcf_extra_bs
 .Lcf_extra_right:
-    leaq 1(%rax), %rcx                  // lo = mid + 1
+    leaq 1(%rax), %rcx
     jmp .Lcf_extra_bs
 .Lcf_extra_found:
     incq %r8
@@ -159,20 +120,10 @@ asnix_op_check_formals:                 // a = required_count; b = pool_idx
     movq $ASNIX_MSG_CF_TYPE_LEN, %rsi
     jmp asnix_fatal
 .Lcf_missing_error:
-    // M50: names the specific required field (real `call` into C, same
-    // reasoning as op_select.S's .Lselect_missing/M36: %rsp is already
-    // 16-byte aligned entering this handler -- see this file's own header
-    // comment confirming no other push/call happens anywhere above --
-    // and asnix_bshared_cf_missing_fatal is _Noreturn, so the pushed
-    // return address is never used). %r15 still holds the required sym
-    // that the binary search just failed to find (set above, persists
-    // through the search per its own comment).
     movq %r15, %rdi
     call asnix_bshared_cf_missing_fatal
 .Lcf_extra_error:
-    // M50: same idea, for the specific unexpected given field. %r11
-    // still holds the given entry's sym (set above, persists through the
-    // search per its own comment).
     movq %r11, %rdi
     call asnix_bshared_cf_extra_fatal
     .size asnix_op_check_formals, . - asnix_op_check_formals
+
