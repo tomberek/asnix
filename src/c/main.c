@@ -297,12 +297,28 @@ typedef struct {
     Value value;
 } CliArg;
 
-static Value select_attrpath(Value v, const char *attrpath) {
+static Value auto_call(Value fn, const CliArg *args, size_t nargs);
+
+/* Matches real Nix's `findAlongAttrPath` (`~/nix/gc-unlock/src/libexpr/
+ * attr-path.cc`) exactly, confirmed directly against `nix-instantiate
+ * --eval -A`: a function is auto-called (its formals filled from `args`,
+ * falling back to each formal's own default) BEFORE every single
+ * indexing step, including the very first -- `-A ffmpeg.outPath` on a
+ * file whose top level is itself a function (nixpkgs' own default.nix)
+ * needs the root auto-called before `.ffmpeg` can be selected at all.
+ * This happens UNCONDITIONALLY, regardless of whether `args` is empty --
+ * unlike the SEPARATE, --arg-gated auto-call `main()` applies to the
+ * fully-resolved TERMINAL value afterward (confirmed: `-A f` on `{ f =
+ * x: x; }` prints the function itself, uncalled, when no --arg is
+ * given -- the path-walk's own auto-call never reaches past the last
+ * segment). */
+static Value select_attrpath(Value v, const char *attrpath, const CliArg *args, size_t nargs) {
     const char *p = attrpath;
     while (*p) {
         const char *dot = strchr(p, '.');
         size_t seglen = dot ? (size_t)(dot - p) : strlen(p);
         v = asnix_force_for_print(v);
+        v = auto_call(v, args, nargs);
         if (asnix_tag_of(v) != ASNIX_TAG_ATTRS) {
             fprintf(stderr, "asnix: -A: '%.*s' is not a set\n", (int)seglen, p);
             exit(1);
@@ -463,12 +479,18 @@ int main(int argc, char **argv) {
             snprintf(dir_buf, sizeof(dir_buf), "%s", flake_ref);
         }
         result = asnix_eval_flake_outputs(dir_buf);
-        if (fragment) result = select_attrpath(result, fragment);
+        if (fragment) result = select_attrpath(result, fragment, cli_args, n_cli_args);
     } else {
         result = asnix_eval_file(file_path);
     }
-    result = auto_call(result, cli_args, n_cli_args);
-    if (attrpath) result = select_attrpath(result, attrpath);
+    if (attrpath) result = select_attrpath(result, attrpath, cli_args, n_cli_args);
+    /* Separate from select_attrpath's own per-segment auto-call above:
+     * real Nix's `nix-instantiate --eval` auto-calls the fully-resolved
+     * TERMINAL value too, but ONLY when at least one --arg/--argstr was
+     * actually given (confirmed: `-A f` on `{ f = x: x; }` with no
+     * --arg prints the function itself, uncalled) -- gated the same
+     * way here, not unconditional like the per-segment case above. */
+    if (n_cli_args > 0) result = auto_call(result, cli_args, n_cli_args);
     if (want_json) {
         char *json = asnix_toJSON_cstr(result);
         printf("%s\n", json);
