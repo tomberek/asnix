@@ -22113,3 +22113,192 @@ reconstructed wholesale, was already swept through this codebase's
 history before this investigation even started. Its easy wins appear
 exhausted. What remains keeps costing real implementation effort just
 to measure, against a shrinking set of plausible candidates.
+
+## M199: a full "every heap-resident kind becomes a handle" experiment. One kind wins on both metrics.
+
+M197 and M198 ran two ECS-style experiments before this one. M197
+tried deduplicating `PrimOp`, the one `Value` kind with its own
+dedicated tag, into a dense table instead of re-allocating a 24-byte
+struct every time. It measured a clean instruction regression, because
+this project's bump-arena allocation is already nearly free, and a
+dedup check costs more than the allocation it replaces. M198 shrank
+`Closure` from 32 to 24 bytes by converting its `up` and `prog` fields
+to 32-bit arena offsets, the same scheme M119 already used for
+`Env.up`. It also regressed, because `op_call.S`'s hot dispatch path
+needed one extra instruction on every CLOSURE CALL, not just creation,
+and calls vastly outnumber constructions for a long-lived closure.
+
+This milestone asked for the same treatment applied to every other
+heap-resident kind this evaluator has: `String`, `Path`, `Float`,
+`Cell`, `LazyApp`, `ThunkMapDesc`, `Attrs`, and `List`, including, if
+it turned out to help, redesigning the tag scheme itself.
+`include/asnix/value.h` confirms the tag scheme has no room left to
+redesign cheaply. All 8 values of the 3-bit tag (`PTR`, `INT`, `IMM`,
+`ATTRS`, `LIST`, `CLOSURE`, `THUNK`, `PRIMOP`) are already spoken for.
+`String`, `Path`, `Float`, `Cell`, `LazyApp`, and `ThunkMapDesc` all
+share the single `PTR` tag and are told apart by an in-band marker
+word at offset 0 of the pointee (`include/asnix/heap.h`'s
+`ASNIX_PATH_MARKER`, `ASNIX_FLOAT_MARKER`, `ASNIX_CELL_MARKER`,
+`ASNIX_LAZYAPP_MARKER`, `ASNIX_LAZYAPP_FORCED_MARKER`, and
+`ASNIX_THUNKMAP_MARKER`, all distinct small negative numbers, with a
+non-negative value there instead meaning "this is a `String`, offset 0
+is its length"). There was no spare tag bit to give any of them their
+own direct tag, short of widening every `Value` or every tag check in
+`src/asm/ops/*.S`. That change was too large to build and verify
+correctly in the time this one experiment had.
+
+**Per-kind research, before writing any code.** Each kind's
+allocation sites and every `ASNIX_*_OFF_*` read site were read and
+counted, the same precision M198's `Thunk`/`Closure` research used,
+extended to the remaining eight kinds.
+
+`String`, `Path`, and `Float` have no internal pointer field at all.
+`String` holds just a length and bytes. `Path` adds a marker ahead of
+the same shape. `Float` holds a marker and a double
+(`src/c/value_util.c:23-50`). None of them reference another heap
+object, so the ECS technique, replacing a pointer field with a narrow
+index into another kind's table, has nothing to act on. They were
+never real candidates. There is no pointer field to shrink, not
+because they were skipped for time.
+
+`LazyApp` and `ThunkMapDesc` hold `Value`-typed fields, not raw
+pointers into one homogeneous kind's table. Narrowing a `Value` field
+to a 32-bit handle would require redesigning `Value` itself first,
+which circles back to the saturated tag space above. Both also reuse
+the same field for two different purposes across their unforced and
+forced lifecycle. `ASNIX_LAZYAPP_OFF_FN` and `ASNIX_LAZYAPP_OFF_RESULT`
+are the same offset (`include/asnix/heap.h:25-26`). That is the same
+"needs a full unconstrained 8 bytes in one state" shape that M198
+proved makes `Thunk` impossible to shrink.
+
+`Attrs` and `List` already store their variable-length payload as one
+arena allocation, with the header immediately followed by entries or
+elements (`src/asm/ops/op_mk_list.S:15` allocates the header and every
+element in a single call). `Attrs`'s `sym` field is already a 32-bit
+interned symbol id, not a string pointer, so that part of the ECS idea
+is already in place. Their only remaining header field is a plain
+count, not a pointer, so narrowing it needs no access-time conversion
+arithmetic and is not disqualified the way `Closure` and `Thunk` were.
+But it also saves at most 4 bytes per allocation, out of headers that
+are already the smallest part of the struct. A real eval shows 356,781
+attrsets holding 6,944,625 entries between them, so entries outweigh
+headers by roughly 29 to 1 in byte count. This project's primary
+metric is instructions, not RSS, and this change would be a tiny,
+instruction-neutral RSS trim at best. It was not worth implementing
+and measuring on its own. The honest state here is researched, sized,
+and declined as too small to be worth the engineering risk, not
+regressed.
+
+**`Cell` is the one kind that is not disqualified, and was built and
+measured for real.** `Cell` holds a marker and a target pointer, 16
+bytes total, used for forward and self references inside recursive
+bindings (code shaped like `rec { a = 1; b = a; }`). `src/c/
+compiler.c`'s `try_cell_ref` emits `OP_VAR_REF_CELL` instead of a full
+thunk whenever a binding's value is a bare variable reference, and
+`src/asm/ops/op_var_ref_cell.S` is the only construction site. It
+always takes the address of an `ASNIX_ENV_OFF_VALUES` slot inside the
+Env arena. `Cell` is `Thunk`'s closest analogue, a single pointer
+field that gets chased at force time, but unlike `Thunk.env`, that one
+field is never repurposed to hold an arbitrary memoized `Value`
+afterward. It is always and only a pointer into the Env arena. That is
+exactly the one condition M198's alignment argument needed and could
+not get for `Thunk`, so `Cell` can shrink where `Thunk` provably
+cannot.
+
+Before implementing anything, the real risk was measured, not
+guessed, following the same pattern M197 and M198 both found the hard
+way: a per-access tax paid far more often than the one-time
+construction saving. A temporary counter was added to all 5 chase
+sites (`force.S`, `op_select.S`, `op_select_or.S`, `op_var_ref.S`, and
+`op_with.S`) and removed again once the number was in hand. On the
+real `d.nix` ffmpeg eval, cells constructed (`asnix_stats_cell`)
+totaled 786,099. Cell-chase hops totaled 1,346,958. That is 1.71 hops
+per cell.
+
+Unlike `Closure`, which gets called a large number of times relative
+to its own construction count, `Cell` gets chased close to once per
+construction. An attrset entry that is a bare alias is still read
+through its `Cell` on every select, since nothing memoizes at the
+`Attrs`-entry level. But the underlying `Thunk` it eventually resolves
+to does memoize on first force, so repeat selects only re-pay the
+`Cell` hop, not the whole computation. At about 1.3 million total hops
+against a roughly 5.2 billion instruction eval, even a full extra
+instruction per hop sits below the noise floor.
+
+**What got built.** `Cell`'s marker shrinks from a 64-bit to a 32-bit
+field, and `target` shrinks from a raw 8-byte pointer to a 32-bit
+offset from `asnix_env_arena_base`, the same scheme M119 already uses
+for `Env.up`. The marker load at all 6 generic-dispatch check sites
+changes from `movq` to `movslq`, a sign-extending load. That
+reproduces the exact same 64-bit comparison value for every other
+`TAG_PTR` sub-kind's marker too, since their fields stay full 64 bits
+and a small negative `int64_t`'s low 32 bits sign-extend back to
+itself. This is not a `Cell`-only change to the dispatch code, even
+though it is a `Cell`-only change to the struct layout. The target
+load at each of the 5 chase loops changes from a plain `movq` to a
+`movl` that zero-extends the 32-bit offset, plus one `addq` against
+`asnix_env_arena_base`, the predicted per-hop tax. Total size: 16
+bytes down to 8. Files touched: `include/asnix/heap.h`, `src/c/
+value_util.c` and `value_util.h`, `src/asm/force.S`, and
+`src/asm/ops/op_select.S`, `op_select_or.S`, `op_var_ref.S`, and
+`op_with.S`.
+
+**Verification.** `make test` (all 25 unit, IR, and C binaries),
+`make test-e2e`, `make test-conformance`, and `make test-flake` all
+pass, with one unrelated failure: `tests/flake/
+minimal.selfOutPath.expected` hardcodes the canonical `~/asnix`
+checkout path and fails from any worktree with a different path, both
+before and after this change, with nothing to do with `Cell`. `./asnix
+d.nix` prints the exact same store path, and `ASNIX_SHOW_STATS=1`
+prints an identical `cells: 786099` before and after.
+
+**Measurement method**: `perf stat -e cpu_core/instructions/,
+cpu_core/cycles/`, pinned with `taskset -c 0`, 8 interleaved trials on
+the real `d.nix` ffmpeg eval, with the before build coming from a
+separate `git worktree add -d` checkout of this milestone's own parent
+commit. Instructions averaged 5,215,952,402 before and 5,210,391,414
+after, a decrease of about 0.107 percent, or 5.56 million instructions,
+with 8 out of 8 trials winning in fully non-overlapping ranges.
+
+This is a real instruction decrease, the opposite direction from
+M197's `PrimOp` and M198's `Closure` results, and larger than the
+roughly 1.3 million hop-count tax predicted above. The most likely
+explanation is not the dispatch loop at all. `src/asm/arena.S:85`
+grows the bump arena in 2 MiB chunks (`include/asnix/arena.h:9`), and
+`arena.S:119` calls `madvise` with `MADV_POPULATE_WRITE` on every new
+chunk, which makes the kernel fault in and zero every page of it up
+front. Shrinking 786,099 cells by 8 bytes each removes about 6.3 MB of
+total demand from the same shared arena every other kind also
+allocates from, enough to cross roughly three fewer 2 MiB chunk
+boundaries over the whole eval. The `cpu_core/instructions/` event was
+measured without a `:u`, user-only, suffix, so the kernel-mode
+instructions spent zeroing those pages are part of the count. This
+reads as a real, if modest, side effect of the RSS win, not a second
+independent mechanism.
+
+Peak RSS, measured with `/usr/bin/time -v` across 3 trials each, went
+from about 505.6 MB before (505,472 to 505,824 KB) to about 499.4 MB
+after (499,312 to 499,488 KB), a decrease of about 6.16 MB. That
+matches 786,099 times 8 bytes, 6.14 MB, almost exactly.
+
+**Recommendation: adopt `Cell`'s shrink.** It is a clean win on both
+of this project's tracked metrics, with zero correctness cost, and it
+is a genuinely different outcome from M197's `PrimOp` and M198's
+`Closure` precisely because it breaks their shared disqualifying
+assumption that access count vastly exceeds construction count.
+`Cell` is chased close to once per construction, not called or
+selected an unbounded number of times after one allocation. Do not
+extend this pattern to the other seven kinds. `String`, `Path`, and
+`Float` have no pointer field to narrow at all. `LazyApp` and
+`ThunkMapDesc` would need `Value` itself redesigned first, which the
+saturated 3-bit tag space makes expensive enough that it was out of
+scope for this experiment to attempt and still verify correctly.
+`Attrs` and `List` are technically shrinkable by a few bytes, but the
+saving is too small, relative to the entries and elements they carry,
+to be worth the risk of touching their hot select and index paths for
+a change that moves neither of this project's two tracked metrics by
+a measurable amount. Full ECS everywhere, as originally scoped, does
+not survive contact with this codebase's actual allocation profile.
+ECS where the struct's own alignment arithmetic allows it, and the
+field is read about as often as it is written, does survive, and
+`Cell` was the one kind in this inventory that qualifies.
