@@ -10,6 +10,7 @@
 #include <sys/stat.h>
 
 #include "asnix/arena.h"
+#include "asnix/env.h"
 #include "asnix/heap.h"
 #include "asnix/ir.h"
 #include "asnix/stats.h"
@@ -49,17 +50,24 @@ double asnix_float_value(Value v) {
     return *(const double *)(base + ASNIX_FLOAT_OFF_VALUE);
 }
 
+/* M199: target is always a pointer into the bounded Env arena (the only
+ * construction site is op_var_ref_cell.S, taking the address of an
+ * ASNIX_ENV_OFF_VALUES slot) -- store it as a 32-bit offset from
+ * asnix_env_arena_base, same scheme as Env.up (M119), instead of a raw
+ * 8-byte pointer. Shrinks Cell from 16 to 8 bytes. */
 Value asnix_make_cell_value(Value *target) {
-    void *mem = asnix_arena_alloc(16);
+    void *mem = asnix_arena_alloc(8);
     asnix_stats_cell++;
-    *(int64_t *)((char *)mem + ASNIX_CELL_OFF_MARKER) = ASNIX_CELL_MARKER;
-    *(Value **)((char *)mem + ASNIX_CELL_OFF_TARGET) = target;
+    uint32_t off = (uint32_t)((uintptr_t)target - (uintptr_t)asnix_env_arena_base);
+    *(int32_t *)((char *)mem + ASNIX_CELL_OFF_MARKER) = ASNIX_CELL_MARKER;
+    *(uint32_t *)((char *)mem + ASNIX_CELL_OFF_TARGET) = off;
     return (Value){ .raw = (uint64_t)(uintptr_t)mem | ASNIX_TAG_PTR };
 }
 
 Value *asnix_cell_target(Value v) {
     const char *base = (const char *)(v.raw & ASNIX_PTR_BASE_MASK);
-    return *(Value **)(base + ASNIX_CELL_OFF_TARGET);
+    uint32_t off = *(const uint32_t *)(base + ASNIX_CELL_OFF_TARGET);
+    return (Value *)((char *)asnix_env_arena_base + off);
 }
 
 Value asnix_resolve_cell_chain(Value v) {

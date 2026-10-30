@@ -34,7 +34,10 @@ Value asnix_make_cell_value(Value *target);
 static inline __attribute__((always_inline)) int asnix_value_is_cell(Value v) {
     if ((v.raw & ASNIX_TAG_MASK) != ASNIX_TAG_PTR) return 0;
     const char *base = (const char *)(v.raw & ASNIX_PTR_BASE_MASK);
-    return *(const int64_t *)(base + ASNIX_CELL_OFF_MARKER) == ASNIX_CELL_MARKER;
+    /* M199: marker is now a 32-bit field (see heap.h) -- read it as
+     * int32_t, not int64_t, or we'd read 4 bytes of the packed target
+     * offset along with it. */
+    return *(const int32_t *)(base + ASNIX_CELL_OFF_MARKER) == ASNIX_CELL_MARKER;
 }
 
 Value *asnix_cell_target(Value v);

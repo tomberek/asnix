@@ -79,13 +79,14 @@ asnix_op_var_ref:
     andq $-8, %r8
     shlq $16, %r8
     shrq $16, %r8
-    movq ASNIX_CELL_OFF_MARKER(%r8), %r9
+    movslq ASNIX_CELL_OFF_MARKER(%r8), %r9
     cmpq $ASNIX_CELL_MARKER, %r9
     jne .Lvar_ref_check_lazyapp
 
     movq $ASNIX_CELL_CHASE_LIMIT, %rdx
 .Lvar_ref_cell_loop:
-    movq ASNIX_CELL_OFF_TARGET(%r8), %r10
+    movl ASNIX_CELL_OFF_TARGET(%r8), %r10d
+    addq asnix_env_arena_base(%rip), %r10
     movq (%r10), %rax
     movq %rax, %rcx
     andq $ASNIX_TAG_MASK, %rcx
@@ -95,7 +96,7 @@ asnix_op_var_ref:
     andq $-8, %r8
     shlq $16, %r8
     shrq $16, %r8
-    movq ASNIX_CELL_OFF_MARKER(%r8), %r9
+    movslq ASNIX_CELL_OFF_MARKER(%r8), %r9
     cmpq $ASNIX_CELL_MARKER, %r9
     jne .Lvar_ref_resolve
     decq %rdx

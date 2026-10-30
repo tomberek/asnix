@@ -13,9 +13,24 @@
 #define ASNIX_FLOAT_OFF_MARKER 0
 #define ASNIX_FLOAT_OFF_VALUE  8
 
+/* M199: Cell is the one TAG_PTR sub-kind whose single pointer field is
+ * PROVABLY always a pointer into the bounded, 32-bit-offset-addressable
+ * Env arena (see env.h's ASNIX_ENV_ARENA_SIZE and M119) -- every
+ * construction site (op_var_ref_cell.S) takes the address of an
+ * ASNIX_ENV_OFF_VALUES slot and nothing else ever writes a Cell's
+ * target. That makes it the one heap-resident kind in this project
+ * where M198's "env/target field needs a full unconstrained 8 bytes"
+ * disqualifier (true for Thunk.env, Cell's own closest analogue)
+ * does NOT apply: the marker shrinks from a 64-bit field to a 32-bit
+ * one (still compared via a sign-extending movslq, so every OTHER
+ * TAG_PTR sub-kind's marker check is bit-for-bit unchanged) and the
+ * target shrinks from a raw 8-byte pointer to a 32-bit env-arena
+ * offset, added to asnix_env_arena_base at each chase site. Total Cell
+ * footprint: 16 bytes -> 8 bytes. See docs/architecture.md M199.
+ */
 #define ASNIX_CELL_MARKER     (-3)
 #define ASNIX_CELL_OFF_MARKER 0
-#define ASNIX_CELL_OFF_TARGET 8
+#define ASNIX_CELL_OFF_TARGET 4
 
 #define ASNIX_CELL_CHASE_LIMIT 1000000
 

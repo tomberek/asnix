@@ -129,13 +129,14 @@ asnix_force_epilogue:
     andq $-8, %rdx
     shlq $16, %rdx
     shrq $16, %rdx
-    movq ASNIX_CELL_OFF_MARKER(%rdx), %rcx
+    movslq ASNIX_CELL_OFF_MARKER(%rdx), %rcx
     cmpq $ASNIX_CELL_MARKER, %rcx
     jne .Lforce_check_lazyapp
 
     movq $ASNIX_CELL_CHASE_LIMIT, %r8
 .Lforce_cell_loop:
-    movq ASNIX_CELL_OFF_TARGET(%rdx), %r9
+    movl ASNIX_CELL_OFF_TARGET(%rdx), %r9d
+    addq asnix_env_arena_base(%rip), %r9
     movq (%r9), %rax
     movq %rax, %rcx
     andq $ASNIX_TAG_MASK, %rcx
@@ -145,7 +146,7 @@ asnix_force_epilogue:
     andq $-8, %rdx
     shlq $16, %rdx
     shrq $16, %rdx
-    movq ASNIX_CELL_OFF_MARKER(%rdx), %rcx
+    movslq ASNIX_CELL_OFF_MARKER(%rdx), %rcx
     cmpq $ASNIX_CELL_MARKER, %rcx
     jne .Lforce_cell_done
     decq %r8
