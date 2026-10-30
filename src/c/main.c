@@ -467,7 +467,7 @@ int main(int argc, char **argv) {
     } else {
         result = asnix_eval_file(file_path);
     }
-    if (n_cli_args > 0) result = auto_call(result, cli_args, n_cli_args);
+    result = auto_call(result, cli_args, n_cli_args);
     if (attrpath) result = select_attrpath(result, attrpath);
     if (want_json) {
         char *json = asnix_toJSON_cstr(result);
