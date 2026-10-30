@@ -21897,3 +21897,219 @@ dispatch_table.c`, `src/c/eval_file.c` (lifetime extension for `src`/
 `base_dir`/`file_path` when the flag is on), `src/c/irbuild.c`, `src/c/
 main.c` (env var read), `src/c/parser.c` (retention toggle at every
 binding/attrset-literal/let site).
+
+## M197: ECS-style dense table for `PrimOp`. Measured regression. Declined.
+
+This milestone tested an Entity-Component-System framing for the
+remaining raw-pointer heap kinds. M118, M119, and M121 already
+compressed some pointers earlier this session. Those milestones left
+`PrimOp` untouched. The ECS idea: give each kind a dense, fixed-size
+table (the component array). Make a `Value` of that kind hold a small
+index into the table (the entity handle), not a pointer to its own
+allocation.
+
+`PrimOp` (tag `ASNIX_TAG_PRIMOP`, `value.h:14`) was the pilot. It has
+its own dedicated tag. The set of distinct `(fn, arity, noforce)`
+triples a stateless native-function wrapper can have is fixed at
+compile time. Measurement via `asnix_stats_primop` found about 105
+distinct functions. Construction (`asnix_bshared_make_primop`,
+`asnix_bshared_make_primop_noforce`, in `builtins_shared.c`) and
+dereference (`op_call.S`, `apply.S`) both already go through narrow
+chokepoints.
+
+The waste looked real at first glance. `asnix_make_builtins_attrs_ex`
+(`builtins.c`) rebuilds the full `builtins.*` attrset, about 100
+entries, from scratch on every file import. `make_root_env_ex`
+(`eval_file.c`) calls it unconditionally, by M65's "fresh root env per
+import" design. The same roughly 100 native functions get a brand-new
+24-byte `PrimOp` object every time, byte-for-byte identical every
+time.
+
+**First attempt.** A fixed 512-row table
+(`AsnixPrimopTableRow`, holding `fn`, `arity`, and `noforce`). The table never calls
+`realloc`, because a previously-returned `Value`'s pointer must never
+move once a caller holds it. This matches `derivation.c`'s
+`ASNIX_DRV_MAX_*` convention: a generous fixed cap, with a fatal error
+if a caller ever exceeds it. A linear scan over `fn` deduped each
+call. Five of this project's independent `make_primop_value`-shaped
+reimplementations (in `builtins.c`, `builtins_misc.c`,
+`builtins_attrs.c`, `builtins_list.c`'s stateless `make_primop0`, and
+the canonical `builtins_shared.c` pair) were redirected into one
+shared, deduping constructor. `op_call.S` and `apply.S` needed no
+changes at all: the returned `Value` still just holds a pointer, now
+into the static table instead of the arena.
+
+**Measurement method**: `perf stat -e cpu_core/instructions/,
+cpu_core/cycles/`, pinned with `taskset -c 0`, on the real `d.nix`
+ffmpeg eval. The before build came from a throwaway `git worktree` at
+the parent commit, not from `git stash`. This repo's stash ref is
+shared across concurrent forks, so `git stash` is unsafe here.
+
+**Result of the first attempt**: a clean, zero-overlap +3.5%
+instruction regression. Before: about 5.063 to 5.065 billion
+instructions across 4 trials, with a standard deviation under 0.04%.
+After: about 5.241 to 5.242 billion instructions across 4 trials,
+equally tight. The linear scan's own cost, paid on each of the roughly
+100 lookups per file import across nixpkgs' whole closure, exceeded
+the near-free bump-pointer allocation it replaced.
+
+**Second attempt.** The same table, but with a fixed 1024-slot
+open-addressing hash index keyed by `fn` pointer identity. This
+follows the same precedent as `derivation.c`'s `input_ref_add_src` and
+`input_ref_add_built`, and M160's fix to `nar.c`'s `copy_cache_find`.
+The only difference: this index is keyed by pointer, not by a string
+hash, and it is fixed-size rather than growable. The hash index
+reduced the regression, but did not reverse it: +2.5% instructions,
+still clean and consistent across 4 interleaved trials.
+
+**Decision: declined and reverted.** `git checkout --` restored all
+five touched files, confirmed clean by `git status` and `git diff`.
+This follows the same standing discipline M100, M119, M187, and M192
+already set earlier this session: ship the write-up of a measured
+non-win, not the code. `make test` and `make test-e2e` passed again
+after the revert. `./asnix d.nix`'s output stayed unchanged
+throughout.
+
+**Why this happened.** This project's never-free bump arena already
+makes "allocate a fresh object" close to the cheapest operation
+possible: a pointer compare, a store, and an increment. Any dedup
+check has to beat that bar, even an O(1) hashed one. Multiplying that
+check by "run it about 100 times per file import, for every import in
+a large real-world closure" raises the bar far higher than it first
+appears. The real waste here is coarser-grained than per-object dedup
+can fix. The whole roughly 100-entry attrset gets rebuilt from
+scratch, not just its individual leaves. A more promising fix, not yet
+attempted and scoped differently from this milestone: cache
+`asnix_make_builtins_attrs()`'s own return value once per process,
+reused across every import. That turns about 100 checks per import
+into one check per import.
+
+**Takeaway for any future ECS-style work on this codebase.** `Thunk`
+and `Closure` were sketched earlier as a possible follow-on to this
+pilot. The pattern's value depends entirely on the access shape. It
+helps when many genuinely distinct objects get looked up occasionally.
+It hurts when a small, fixed set gets reconstructed wholesale,
+repeatedly, by one caller. That second shape matches `PrimOp` exactly,
+and plausibly matches `Thunk` too, since thunks are also created
+fresh, never deduped, at every force site. Measure the actual access
+pattern before assuming a dense table plus a handle is a win. Object
+size alone does not predict the outcome.
+
+## M198: `IrProgram` tabling for `Closure`. Byte savings confirmed real. Still a regression. Declined.
+
+This milestone followed up on M197's own closing note. `Thunk` was
+the first follow-on candidate checked. Alignment arithmetic ruled it
+out before any code was written. `Thunk` is a directly tagged `Value`
+kind, so every instance needs an 8-byte-aligned starting address.
+`asnix_arena_alloc` (`src/asm/arena.S:52-53`) rounds every allocation
+size up to the next multiple of 8, to guarantee that same alignment
+for the next allocation too. `Thunk`'s `env` field needs a full,
+unconstrained 8 bytes in its FORCED state. A memoized result can be
+any `Value`, including a raw 61-bit pointer. That leaves only its
+`state`/`prog` field with any real slack. Shrinking just that one
+field, from 8 bytes down to 4, gives 12 bytes total. The arena rounds
+that straight back up to 16. No size between 8 and 16 both fits the
+data and survives the rounding rule. `IrProgram` tabling cannot help
+`Thunk`, no matter how `IrProgram` itself gets represented.
+
+`Closure` was the second candidate. This one survives the same
+arithmetic. `Closure` is 32 bytes today: `up`, `prog`, `arity`, and
+`formals`, 8 bytes each. M118's own original analysis
+(`docs/architecture.md:12627`) already found that shrinking `up` and
+`prog` together, from 8 bytes each down to 4, gives 4 + 4 + 8 + 8 = 24
+bytes. That total is itself already a clean multiple of 8, so no
+further field needs to shrink. `up` could reuse M119's existing,
+already-proven-safe Env-arena-offset scheme outright. `Env.up`
+already works this way. `Closure.up` was simply never converted to
+match. `prog` needed a new, parallel arena for `IrProgram`, since
+today it is a plain pointer to a separately `malloc`'d or `calloc`'d
+header. That header (`ir.h:117-120`) is just two pointers, `ops` and
+`pool`, 16 bytes fixed, each pointing at an independently-sized
+array.
+
+**Building it.** A new, single-`mmap`'d, 64 MiB fixed arena for
+`IrProgram` went into `src/c/irprog_arena.c`, written in plain C, not
+assembly. Every allocation happens at compile time, from `irbuild.c`'s
+`ib_finish` and four sites in `bytecode.c`'s deserialize path, never
+from the hot asm dispatch path itself. `Closure.up` and `.prog` became
+32-bit offsets, shrinking `ASNIX_CLOSURE_SIZE` from 32 to 24. This
+touched only the sites that actually read or write those two fields
+directly: one write site (`op_lambda.S`), two read sites (`op_call.S`
+and `apply.S`), five C-level curried-native `Closure` constructors,
+and one display-only read in `main.c`. Two things were confirmed by
+direct inspection first, not assumed. `prog`'s own identity stays
+stable even under M196's `OP_LAZY_THUNK_BODY` mutate-in-place
+upgrade: `compiler.c:355-358` swaps a stub's `ops` and `pool` contents
+later, but never relocates the stub itself. And every one of the five
+existing allocation sites already assigns both fields unconditionally
+right after allocating, so switching from a zero-initializing
+`calloc` to a plain bump allocator needed no companion fix.
+
+**A real bug found and fixed during construction, the same class
+M196 already hit once this session.** The first working build
+segfaulted deep into the real `d.nix` ffmpeg eval, inside
+`op_frame.S`'s completely unrelated `Env.up` traversal. `%rdi` held a
+garbage address there. The root cause was found by setting a
+breakpoint at the actual write site and inspecting values directly,
+rather than guessing. `op_lambda.S`'s new conversion code computed
+`Closure.up`'s offset by subtracting the Env-arena base directly INTO
+`%rdi` itself, instead of into a scratch register. `%rdi` is the
+VM-wide "current env" register. The next op in the dispatch chain
+still expects to read it. It is not scratch space local to this one
+op. Overwriting it corrupted every env lookup downstream of the next
+lambda creation. The fix routes the subtraction through `%rcx`
+instead, leaving `%rdi` untouched. Every test that exercises lambda
+creation already covers this case in principle, but the specific
+failure only showed up on the real eval, not in the `make test` or
+`make test-e2e` suites, because those do not happen to chain a lambda
+creation directly into a later `OP_FRAME_EXIT` the way real nixpkgs
+code does.
+
+**Measurement method**: the same one M197 used. `perf stat -e
+cpu_core/instructions/,cpu_core/cycles/`, pinned with `taskset -c 0`,
+on the real `d.nix` ffmpeg eval. The before build came from a
+throwaway `git worktree`, not from `git stash`. After fixing the
+segfault, this measured a clean, zero-overlap **+2.8% instruction
+regression**: about 5.064 to 5.071 billion instructions before, across
+4 trials, against about 5.210 to 5.212 billion after, across 4 trials,
+both tight ranges. `/usr/bin/time -v`'s peak RSS did improve, by about
+0.7%. The byte savings are real. They are simply outweighed on the
+metric this project's whole optimization campaign has consistently
+treated as primary.
+
+**Why this happened.** `op_call.S`'s and `apply.S`'s hot dispatch path
+already did a two-step dereference to reach a called closure's
+compiled body: load `Closure.prog`, then read its `ops` and `pool`
+fields off that pointer, 3 instructions total. Converting `prog` to
+an offset adds exactly one more instruction, an `addq` against
+`asnix_irprog_arena_base`, to turn the offset back into a real address
+before that same two-step read. That one instruction gets paid on
+every CLOSURE CALL, not just every closure creation, on one of the
+hottest paths in the whole interpreter. `Closure.up`'s own conversion
+was free, or even a small win, by itself: the old code's
+null-check-and-subtract sequence collapsed to a plain 4-byte copy,
+since `up` was already stored as an offset by the time it gets read.
+It was specifically `prog`'s added instruction that tipped the net
+result negative.
+
+**Decision: declined and reverted.** `git checkout --` restored all
+twelve touched files. The new `irprog_arena.c` was deleted. Both
+confirmed clean by `git status` and `git diff`. `make test`, `make
+test-e2e`, `make test-conformance`, `make test-flake`, and `make
+test-nix-conformance` all passed again at the exact same baseline as
+before this milestone (`pass=653 fail=0 known=3 skip=208`). `./asnix
+d.nix`'s output stayed unchanged throughout.
+
+**Where this leaves the broader investigation.** M197 and M198
+together investigated three candidates. Each was declined for a
+specific, different, concrete reason, not a vague "it did not work."
+`PrimOp`'s dedup cost exceeded the near-free allocation it replaced.
+`Thunk`'s alignment arithmetic ruled it out entirely, before any code
+was written. `Closure`'s byte savings were real, but the dispatch-path
+addressing tax outweighed them. This project's own already-proven
+version of this general technique, a dense table plus an O(1) lookup
+for genuinely distinct keys looked up occasionally rather than
+reconstructed wholesale, was already swept through this codebase's
+history before this investigation even started. Its easy wins appear
+exhausted. What remains keeps costing real implementation effort just
+to measure, against a shrinking set of plausible candidates.
