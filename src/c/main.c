@@ -10,6 +10,7 @@
 #include "asnix/irpass.h"
 #include "asnix/stats.h"
 #include "asnix/value.h"
+#include "builtins_compare.h"
 #include "builtins_shared.h"
 #include "compiler.h"
 #include "eval_file.h"
@@ -372,6 +373,9 @@ int main(int argc, char **argv) {
     const char *file_path = NULL;
     const char *flake_ref = NULL;
     const char *attrpath = NULL;
+    const char *expr_source = NULL;
+    int want_json = 0;
+    int want_raw = 0;
     CliArg *cli_args = NULL;
     size_t n_cli_args = 0, cap_cli_args = 0;
 
@@ -379,6 +383,13 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "--flake") == 0 && i + 1 < argc) {
             flake_ref = argv[i + 1];
             i += 1;
+        } else if ((strcmp(argv[i], "-E") == 0 || strcmp(argv[i], "--expr") == 0) && i + 1 < argc) {
+            expr_source = argv[i + 1];
+            i += 1;
+        } else if (strcmp(argv[i], "--json") == 0) {
+            want_json = 1;
+        } else if (strcmp(argv[i], "--raw") == 0) {
+            want_raw = 1;
         } else if (strcmp(argv[i], "--arg") == 0 && i + 2 < argc) {
             if (n_cli_args == cap_cli_args) {
                 cap_cli_args = cap_cli_args ? cap_cli_args * 2 : 4;
@@ -401,29 +412,41 @@ int main(int argc, char **argv) {
             attrpath = argv[i + 1];
             i += 1;
         } else if (argv[i][0] == '-') {
-            fprintf(stderr, "asnix: unrecognized flag '%s' (only --arg/--argstr/-A/--flake are supported)\n", argv[i]);
+            fprintf(stderr,
+                    "asnix: unrecognized flag '%s' (only --arg/--argstr/-A/--flake/-E/--expr/--json/--raw are "
+                    "supported)\n",
+                    argv[i]);
             return 1;
         } else if (file_path) {
-            fprintf(stderr, "usage: %s [--arg name expr] [--argstr name str] [-A attrpath] <file.nix>\n", argv[0]);
+            fprintf(stderr,
+                    "usage: %s [--arg name expr] [--argstr name str] [-A attrpath] [--json|--raw] <file.nix>\n",
+                    argv[0]);
             return 1;
         } else {
             file_path = argv[i];
         }
     }
-    if (flake_ref && file_path) {
-        fprintf(stderr, "asnix: --flake cannot be combined with a plain <file.nix> argument\n");
+    if ((flake_ref ? 1 : 0) + (file_path ? 1 : 0) + (expr_source ? 1 : 0) > 1) {
+        fprintf(stderr, "asnix: --flake, -E/--expr, and a plain <file.nix> argument are mutually exclusive\n");
         return 1;
     }
-    if (!file_path && !flake_ref) {
+    if (want_json && want_raw) {
+        fprintf(stderr, "asnix: --json and --raw are mutually exclusive\n");
+        return 1;
+    }
+    if (!file_path && !flake_ref && !expr_source) {
         fprintf(stderr,
-                "usage: %s [--arg name expr] [--argstr name str] [-A attrpath] <file.nix>\n"
-                "       %s --flake <dir>[#attr.path] [-A attrpath]\n",
-                argv[0], argv[0]);
+                "usage: %s [--arg name expr] [--argstr name str] [-A attrpath] [--json|--raw] <file.nix>\n"
+                "       %s [--arg name expr] [--argstr name str] [-A attrpath] [--json|--raw] -E <expr>\n"
+                "       %s --flake <dir>[#attr.path] [-A attrpath] [--json|--raw]\n",
+                argv[0], argv[0], argv[0]);
         return 1;
     }
 
     Value result;
-    if (flake_ref) {
+    if (expr_source) {
+        result = asnix_eval_expr_source(expr_source);
+    } else if (flake_ref) {
         const char *hash = strchr(flake_ref, '#');
         char dir_buf[1024];
         const char *fragment = NULL;
@@ -446,7 +469,18 @@ int main(int argc, char **argv) {
     }
     if (n_cli_args > 0) result = auto_call(result, cli_args, n_cli_args);
     if (attrpath) result = select_attrpath(result, attrpath);
-    print_value(result);
+    if (want_json) {
+        char *json = asnix_toJSON_cstr(result);
+        printf("%s\n", json);
+        free(json);
+    } else if (want_raw) {
+        Value coerced = asnix_coerce_to_string(asnix_force_for_print(result));
+        int64_t len;
+        const char *bytes = asnix_ptr_bytes(coerced, &len);
+        fwrite(bytes, 1, (size_t)len, stdout);
+    } else {
+        print_value(result);
+    }
     if (getenv("ASNIX_SHOW_STATS")) asnix_stats_print();
     if (getenv("ASNIX_IR_OPT")) asnix_irpass_print_stats(stderr);
     return 0;
