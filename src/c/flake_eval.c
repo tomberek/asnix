@@ -9,6 +9,7 @@
 #include "asnix/ir.h"
 #include "base64.h"
 #include "builtins_shared.h"
+#include "derivation.h"
 #include "eval_file.h"
 #include "nar.h"
 #include "string_context.h"
@@ -18,6 +19,14 @@
 static _Noreturn void flake_fatal(const char *msg) {
     fprintf(stderr, "asnix: --flake: %s\n", msg);
     exit(1);
+}
+
+static int exclude_git_filter(void *ctx, const char *path, const char *type) {
+    (void)ctx;
+    (void)type;
+    const char *slash = strrchr(path, '/');
+    const char *base = slash ? slash + 1 : path;
+    return strcmp(base, ".git") != 0;
 }
 
 static const char *const CALL_FLAKE_MIN =
@@ -34,7 +43,7 @@ static const char *const CALL_FLAKE_MIN =
 
 static Value make_source_info(const char *dir) {
     uint8_t digest[32];
-    if (asnix_hash_path_nar_sha256(dir, NULL, NULL, digest) != 0) {
+    if (asnix_hash_path_nar_sha256(dir, exclude_git_filter, NULL, digest) != 0) {
         flake_fatal("failed to load libcrypto -- enter the flake devShell");
     }
     size_t b64len = asnix_base64_encoded_length(32);
@@ -43,8 +52,14 @@ static Value make_source_info(const char *dir) {
     char narhash_str[80];
     snprintf(narhash_str, sizeof(narhash_str), "sha256-%.*s", (int)b64len, narhash_b64);
 
+    /* `asnix_copy_path_to_store_ext` would NAR-dump `dir` a second time
+     * from scratch just to get the same digest already computed above
+     * -- for a real git checkout (nixpkgs: 165k+ tracked files, a 9GB
+     * `.git`) that's a second full tree walk for nothing. Feed the
+     * already-computed digest straight into the same formula that
+     * function uses internally instead. */
     char out_path[300];
-    asnix_copy_path_to_store_ext(dir, "source", 1, NULL, NULL, NULL, out_path, sizeof(out_path));
+    asnix_compute_fixed_output_path("recursive", digest, 32, "sha256", 6, "source", out_path, sizeof(out_path));
 
     Value out_path_str = asnix_make_string_value(out_path, strlen(out_path));
     AsnixStringContext ctx;
