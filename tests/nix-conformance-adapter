@@ -15,15 +15,51 @@ bin="${ASNIX_BIN:-$root/asnix}"
 
 case "$op" in
   eval)
-    # asnix's own CLI flags (--arg/--argstr/-A/--flake, see main.c) are a
-    # different namespace from nix-instantiate's own flags (the FLAGs a
-    # case's .flags sidecar supplies here, e.g.
-    # --extra-experimental-features/--max-call-depth) -- none of the
-    # lang/ cases need -A (they evaluate the whole file), so any FLAGs at
-    # all mean this case needs something asnix's CLI has no equivalent
-    # for. Honestly unsupported, not guessed at.
-    [ "$#" -eq 0 ] || exit 3
-    exec "$bin" "$file"
+    # The FLAGs are nix-instantiate's own, from a case's .flags sidecar.
+    # Each one is either
+    #   - translated to asnix's CLI: --arg/--argstr/-A (see main.c), and -I,
+    #     which is a NIX_PATH entry in front of the others (compiler.c's
+    #     resolve_search_path reads $NIX_PATH);
+    #   - accepted because it changes nothing asnix prints: --eval/--strict
+    #     are what this op is, --no-show-trace only changes the error text;
+    #   - a feature this build implements (--extra-experimental-features);
+    #   - or unsupported, and the case is skipped (exit 3), never guessed
+    #     at: --impure, --lint-*, --max-call-depth, any other feature.
+    args=()
+    nix_path=${NIX_PATH:-}
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --eval | --strict | --no-show-trace) shift ;;
+        --arg | --argstr)
+          [ "$#" -ge 3 ] || exit 3
+          args+=("$1" "$2" "$3")
+          shift 3
+          ;;
+        -A)
+          [ "$#" -ge 2 ] || exit 3
+          args+=(-A "$2")
+          shift 2
+          ;;
+        -I)
+          [ "$#" -ge 2 ] || exit 3
+          nix_path="$2${nix_path:+:$nix_path}"
+          shift 2
+          ;;
+        --extra-experimental-features)
+          [ "$#" -ge 2 ] || exit 3
+          for feature in $2; do
+            case "$feature" in
+              parse-toml-timestamps) ;;
+              *) exit 3 ;;
+            esac
+          done
+          shift 2
+          ;;
+        *) exit 3 ;;
+      esac
+    done
+    [ -z "$nix_path" ] || export NIX_PATH="$nix_path"
+    exec "$bin" ${args[@]+"${args[@]}"} "$file"
     ;;
   *)
     # parse/check/nar/drv/flake/eval-xml/wire: not implemented.
